@@ -1,0 +1,8 @@
+/target/
+/.idea/
+/.vscode/
+*.swp
+.DS_Store
+/tmp/
+/benchmarks/results/
+/.env

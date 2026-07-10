@@ -1,0 +1,167 @@
+use std::sync::Arc;
+
+use arrow::{
+    array::{ArrayRef, new_null_array},
+    datatypes::SchemaRef,
+    record_batch::{RecordBatch, RecordBatchOptions},
+};
+use async_stream::try_stream;
+use futures::{StreamExt, stream::BoxStream};
+use parquet::arrow::{
+    ParquetRecordBatchStreamBuilder, ProjectionMask, arrow_reader::ArrowReaderMetadata,
+};
+
+use super::{
+    hive::HivePartitions,
+    parquet_reader::{QueryIo, SnapshotParquetReader},
+};
+use crate::{
+    Error, Result,
+    runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream},
+    storage::{ObjectSnapshot, ObjectSource},
+};
+
+pub(super) struct ParquetMorsel {
+    pub(super) file_index: usize,
+    pub(super) file: ObjectSource,
+    pub(super) snapshot: ObjectSnapshot,
+    pub(super) metadata: ArrowReaderMetadata,
+    pub(super) projection: Vec<usize>,
+    pub(super) row_group: usize,
+    pub(super) row_limit: Option<usize>,
+}
+
+pub(super) type ParquetMorselStream = BoxStream<'static, Result<ParquetMorsel>>;
+
+pub(super) fn scan_morsels(
+    morsels: ParquetMorselStream,
+    output_schema: SchemaRef,
+    hive: Option<Arc<HivePartitions>>,
+    context: Arc<QueryContext>,
+    io_concurrency: usize,
+    batch_size: usize,
+    limit: Option<usize>,
+) -> RecordBatchStream {
+    let streams = morsels.map({
+        let output_schema = Arc::clone(&output_schema);
+        let hive = hive.clone();
+        let context = Arc::clone(&context);
+        move |morsel| match morsel {
+            Ok(morsel) => morsel_stream(
+                morsel,
+                Arc::clone(&output_schema),
+                hive.clone(),
+                Arc::clone(&context),
+                batch_size,
+            ),
+            Err(error) => {
+                boxed_record_batch_stream(futures::stream::once(async move { Err(error) }))
+            }
+        }
+    });
+    let mut merged = streams.flatten_unordered(io_concurrency);
+    boxed_record_batch_stream(try_stream! {
+        let mut remaining = limit.unwrap_or(usize::MAX);
+        while remaining > 0 {
+            let Some(batch) = merged.next().await else {
+                break;
+            };
+            context.check_cancelled()?;
+            let batch = batch?;
+            let batch = if batch.num_rows() > remaining {
+                batch.slice(0, remaining)
+            } else {
+                batch
+            };
+            remaining = remaining.saturating_sub(batch.num_rows());
+            yield batch;
+        }
+    })
+}
+
+fn morsel_stream(
+    morsel: ParquetMorsel,
+    output_schema: SchemaRef,
+    hive: Option<Arc<HivePartitions>>,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+) -> RecordBatchStream {
+    boxed_record_batch_stream(try_stream! {
+        context.check_cancelled()?;
+        let reader = SnapshotParquetReader::new(
+            &morsel.file,
+            morsel.snapshot,
+            Some(QueryIo::new(
+                context.control.clone(),
+                context.metrics.clone(),
+            )),
+        );
+        let mask = ProjectionMask::roots(
+            morsel.metadata.parquet_schema(),
+            morsel.projection,
+        );
+        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+            reader,
+            morsel.metadata,
+        )
+        .with_batch_size(batch_size)
+        .with_projection(mask)
+        .with_row_groups(vec![morsel.row_group]);
+        if let Some(limit) = morsel.row_limit {
+            builder = builder.with_limit(limit);
+        }
+        let mut batches = builder.build()?;
+
+        while let Some(batch) = batches.next().await {
+            context.check_cancelled()?;
+            let batch = align_batch(
+                batch?,
+                &output_schema,
+                hive.as_deref(),
+                morsel.file_index,
+            )?;
+            context.metrics.record_scan(
+                u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
+                1,
+                u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX),
+            );
+            yield batch;
+        }
+    })
+}
+
+pub(super) fn align_batch(
+    batch: RecordBatch,
+    schema: &SchemaRef,
+    hive: Option<&HivePartitions>,
+    file: usize,
+) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let column = match batch.schema().index_of(field.name()) {
+            Ok(index) => {
+                let column = Arc::clone(batch.column(index));
+                if column.data_type() != field.data_type() {
+                    return Err(Error::Execution(format!(
+                        "Parquet column {} changed type during scan",
+                        field.name()
+                    )));
+                }
+                column
+            }
+            Err(_) => match hive {
+                Some(hive) => hive
+                    .array(file, field.name(), batch.num_rows())?
+                    .unwrap_or_else(|| new_null_array(field.data_type(), batch.num_rows())),
+                None => new_null_array(field.data_type(), batch.num_rows()),
+            },
+        };
+        columns.push(column);
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &options,
+    )?)
+}

@@ -1,0 +1,61 @@
+services:
+  dev:
+    image: rustdb-dev:1.97
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/workspace/target
+      - rustup-toolchains:/usr/local/rustup
+    environment:
+      RUSTUP_TOOLCHAIN: 1.97.0
+      AWS_ACCESS_KEY_ID: rustdb-test
+      AWS_SECRET_ACCESS_KEY: rustdb-test-secret
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+      RUSTDB_MINIO_ENDPOINT: http://minio:9000
+      RUSTDB_REQUIRE_MINIO: "1"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: rustdb-test
+      MINIO_ROOT_PASSWORD: rustdb-test-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set rustdb http://minio:9000 rustdb-test rustdb-test-secret &&
+        mc mb --ignore-existing rustdb/rustdb-tests &&
+        mc mb --ignore-existing rustdb/rustdb-public &&
+        mc anonymous set download rustdb/rustdb-public
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  rustup-toolchains:
+  minio-data:

@@ -1,0 +1,13 @@
+{
+  "title": "RustDB single-node OLAP engine v0.1",
+  "slug": "rustdb-v0.1",
+  "status": "completed",
+  "approval": "user_requested_implementation",
+  "packets": {
+    "runtime_spill": "completed",
+    "datasources": "completed",
+    "sql_execution": "completed",
+    "integration": "completed"
+  },
+  "verification": "passed"
+}

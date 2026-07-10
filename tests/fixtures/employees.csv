@@ -1,0 +1,7 @@
+id,name,department,salary,active
+1,Ada,engineering,120000,true
+2,Grace,engineering,125000,true
+3,Linus,engineering,110000,false
+4,Barbara,research,130000,true
+5,Edsger,research,115000,true
+6,Margaret,operations,105000,true
