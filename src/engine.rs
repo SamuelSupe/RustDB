@@ -258,8 +258,12 @@ impl Session {
             context.clone(),
         )
         .await?;
+        let crate::table_function::PreparedSql {
+            statement,
+            generated_tables,
+        } = prepared;
         let planned = async {
-            let bound = crate::sql::bind_sql(&self.catalog, &prepared.sql)?;
+            let bound = crate::sql::bind_statement(&self.catalog, statement)?;
             if let Some(context) = context.as_ref() {
                 crate::execution::prepare_plan(bound.logical_plan(), Arc::clone(context)).await?;
                 context.seal_object_snapshots();
@@ -267,7 +271,7 @@ impl Session {
             crate::sql::optimize_statement(bound, context.as_deref())
         }
         .await;
-        for name in prepared.generated_tables {
+        for name in generated_tables {
             self.catalog.unregister(&name);
         }
         planned
@@ -485,6 +489,48 @@ mod tests {
             ..EngineConfig::default()
         };
         assert!(Engine::new(config).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_table_function_binding_preserves_original_source_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("values.csv");
+        std::fs::write(&path, "id\n1\n").unwrap();
+        let session = Engine::new(
+            EngineConfig::builder()
+                .spill_directory(directory.path().join("spill"))
+                .build(),
+        )
+        .unwrap()
+        .session();
+        let sql = format!(
+            "SELECT id, count(*)\nFROM read_csv('{}', header = true)\nGROUP BY 3",
+            path.display()
+        );
+
+        let error = match session.execute(&sql).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("invalid GROUP BY ordinal unexpectedly succeeded"),
+        };
+        assert_eq!(
+            error,
+            "invalid argument: GROUP BY position 3 is out of range (select list has 2 items) at line 3, column 10"
+        );
+        assert!(session.catalog().table_names().is_empty());
+
+        let view_sql = format!(
+            "CREATE TEMP VIEW invalid_view AS\nSELECT id, count(*)\nFROM read_csv('{}', header = true)\nGROUP BY 3",
+            path.display()
+        );
+        let error = match session.execute(&view_sql).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("invalid CREATE VIEW ordinal unexpectedly succeeded"),
+        };
+        assert_eq!(
+            error,
+            "invalid argument: GROUP BY position 3 is out of range (select list has 2 items) at line 4, column 10"
+        );
+        assert!(session.catalog().table_names().is_empty());
     }
 
     #[tokio::test]

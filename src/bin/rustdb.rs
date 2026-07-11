@@ -4,9 +4,10 @@ mod args;
 mod output;
 #[path = "rustdb/repl.rs"]
 mod repl;
+#[path = "rustdb/sql_input.rs"]
+mod sql_input;
 
 use clap::Parser;
-use sqlparser::{dialect::DuckDbDialect, parser::Parser as SqlParser};
 
 use args::Args;
 use rustdb::{Engine, EngineConfig, Error, Result};
@@ -98,12 +99,12 @@ pub(crate) async fn execute_statements(
     format: args::OutputFormat,
     metrics: bool,
 ) -> Result<()> {
-    let statements = SqlParser::parse_sql(&DuckDbDialect {}, sql)?;
+    let statements = sql_input::parse_statements(sql)?;
     if statements.is_empty() {
         return Err(Error::InvalidArgument("SQL input is empty".to_owned()));
     }
     for statement in statements {
-        repl::execute(session, &statement.to_string(), format, metrics).await?;
+        repl::execute(session, &statement, format, metrics).await?;
     }
     Ok(())
 }

@@ -1,12 +1,15 @@
 use std::{fs::File, sync::Arc};
 
 use arrow::{
-    array::{Float64Array, Int64Array, StringArray},
-    datatypes::{DataType, Field, Schema},
+    array::{ArrayRef, Float64Array, Int64Array, StringArray, StringDictionaryBuilder},
+    datatypes::{DataType, Field, Int8Type, Schema},
     record_batch::RecordBatch,
 };
 use futures::StreamExt;
-use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+use parquet::{
+    arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+    file::properties::WriterProperties,
+};
 use rustdb::{Engine, EngineConfig, ParquetOptions, ParquetSchemaMode, Result};
 
 mod support;
@@ -294,6 +297,59 @@ async fn safe_widening_reads_real_files_and_refreshes_missing_and_new_columns() 
 }
 
 #[tokio::test]
+async fn dictionary_encoded_files_decode_in_every_schema_mode() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("dictionary");
+    std::fs::create_dir(&data).unwrap();
+    let dictionary_path = data.join("a.parquet");
+    write_dictionary_fixture(&dictionary_path, &["alpha", "beta"])?;
+    write_string_fixture(&data.join("b.parquet"), &["gamma"])?;
+    let dictionary_reader = ParquetRecordBatchReaderBuilder::try_new(
+        File::open(&dictionary_path)
+            .map_err(|error| rustdb::Error::io(Some(dictionary_path.clone()), error))?,
+    )?;
+    assert!(matches!(
+        dictionary_reader.schema().field(0).data_type(),
+        DataType::Dictionary(_, value) if value.as_ref() == &DataType::Utf8
+    ));
+
+    let session = Engine::new(EngineConfig::default())?.session();
+    let pattern = format!("{}/*.parquet", data.display());
+    for (table, mode) in [
+        ("dictionary_strict", ParquetSchemaMode::Strict),
+        ("dictionary_union", ParquetSchemaMode::UnionByName),
+        ("dictionary_widening", ParquetSchemaMode::SafeWidening),
+    ] {
+        session
+            .register_parquet(
+                table,
+                [pattern.clone()],
+                ParquetOptions {
+                    schema_mode: mode,
+                    ..ParquetOptions::default()
+                },
+            )
+            .await?;
+        let mut result = session
+            .execute(&format!("SELECT name FROM {table} ORDER BY name"))
+            .await?;
+        assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
+        let mut values = Vec::new();
+        while let Some(batch) = result.stream().next().await {
+            let batch = batch?;
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Dictionary values must be decoded to Utf8");
+            values.extend(names.iter().map(|value| value.unwrap().to_owned()));
+        }
+        assert_eq!(values, ["alpha", "beta", "gamma"]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn reads_all_row_group_morsels_with_bounded_concurrency() -> Result<()> {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("morsels.parquet");
@@ -411,6 +467,27 @@ fn write_id_extra_fixture(path: &std::path::Path, ids: &[i64], extra: &[&str]) -
             Arc::new(StringArray::from(extra.to_vec())),
         ],
     )?)?;
+    writer.close()?;
+    Ok(())
+}
+
+fn write_dictionary_fixture(path: &std::path::Path, values: &[&str]) -> Result<()> {
+    let mut builder = StringDictionaryBuilder::<Int8Type>::new();
+    for value in values {
+        builder.append(*value)?;
+    }
+    write_name_batch(path, Arc::new(builder.finish()) as ArrayRef)
+}
+
+fn write_string_fixture(path: &std::path::Path, values: &[&str]) -> Result<()> {
+    write_name_batch(path, Arc::new(StringArray::from(values.to_vec())))
+}
+
+fn write_name_batch(path: &std::path::Path, names: ArrayRef) -> Result<()> {
+    let batch = RecordBatch::try_from_iter([("name", names)])?;
+    let file = File::create(path).map_err(|error| rustdb::Error::io(Some(path.into()), error))?;
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
+    writer.write(&batch)?;
     writer.close()?;
     Ok(())
 }

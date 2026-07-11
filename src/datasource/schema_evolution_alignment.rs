@@ -7,7 +7,7 @@ use arrow::{
     record_batch::{RecordBatch, RecordBatchOptions},
 };
 
-use super::{ParquetSchemaMode, canonical_type, merge_types};
+use super::{ParquetSchemaMode, canonical_type, canonicalize_schema, merge_types};
 use crate::{Error, Result};
 
 pub(crate) fn align_batch_to_schema(
@@ -15,6 +15,7 @@ pub(crate) fn align_batch_to_schema(
     target: SchemaRef,
     uri: &str,
 ) -> Result<RecordBatch> {
+    let target = canonicalize_schema(target);
     let source_schema = batch.schema();
     let mut target_names = BTreeSet::new();
     for field in target.fields() {

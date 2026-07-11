@@ -7,10 +7,10 @@ use sqlparser::{
         Distinct, Expr, LimitClause, ObjectName, OrderByKind, Query, SetExpr, Spanned, Statement,
         Value,
     },
-    dialect::DuckDbDialect,
-    parser::Parser,
     tokenizer::Span,
 };
+#[cfg(test)]
+use sqlparser::{dialect::DuckDbDialect, parser::Parser};
 
 use crate::{Catalog, Error, Result, runtime::QueryContext};
 
@@ -31,18 +31,23 @@ pub fn plan_sql(catalog: &Catalog, sql: &str) -> Result<StatementPlan> {
     optimize_statement(bind_sql(catalog, sql)?, None)
 }
 
-pub(crate) fn bind_sql(catalog: &Catalog, sql: &str) -> Result<StatementPlan> {
+#[cfg(test)]
+fn bind_sql(catalog: &Catalog, sql: &str) -> Result<StatementPlan> {
     let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql)?;
     if statements.len() != 1 {
         return Err(Error::InvalidArgument(
             "exactly one SQL statement is required".into(),
         ));
     }
+    bind_statement(catalog, statements.remove(0))
+}
+
+pub(crate) fn bind_statement(catalog: &Catalog, statement: Statement) -> Result<StatementPlan> {
     Planner {
         catalog,
         next_scalar: Cell::new(0),
     }
-    .plan_statement(statements.remove(0))
+    .plan_statement(statement)
 }
 
 pub(crate) fn optimize_statement(

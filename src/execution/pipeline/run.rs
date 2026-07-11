@@ -8,15 +8,23 @@ use crate::{
     Result,
     datasource::{ScanRequest, ScanTask},
     runtime::{BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream},
+    sql::BoundExpr,
 };
 
-use super::{FusedPipeline, PipelineOperator};
+use super::{FusedPipeline, PipelineOperator, compact};
 use crate::execution::{expr, scan};
 
 enum LaneMessage {
     Batch(BatchEnvelope),
     Error(crate::Error),
     Done,
+}
+
+struct LanePlan {
+    operators: Vec<PipelineOperator>,
+    compact_filters: Option<Vec<BoundExpr>>,
+    projection: Option<Vec<usize>>,
+    scan_schema: arrow::datatypes::SchemaRef,
 }
 
 pub(super) fn execute(pipeline: FusedPipeline, context: Arc<QueryContext>) -> MemoryBatchStream {
@@ -41,22 +49,27 @@ pub(super) fn execute(pipeline: FusedPipeline, context: Arc<QueryContext>) -> Me
         }
 
         let lanes = context.scheduler.lanes_for(tasks.len());
+        let compact_filters = compact_filters(&pipeline.operators, pipeline.scan.projection.as_deref())?;
+        let lane_plan = Arc::new(LanePlan {
+            operators: pipeline.operators,
+            compact_filters,
+            projection: pipeline.scan.projection,
+            scan_schema: pipeline.scan.schema,
+        });
         let pending = Arc::new(Mutex::new(VecDeque::from(tasks)));
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = CancelOnDrop(cancellation.clone());
-        // Memory reservations, rather than a batch-count multiplier, control
-        // concurrency. One queued envelope keeps backpressure close to the
-        // active lanes for wide batches.
-        let (sender, mut receiver) = mpsc::channel(1);
+        // Every queued envelope owns a memory reservation, so the global
+        // budget remains authoritative while one slot per lane avoids
+        // serializing independent scan workers behind a single sender.
+        let (sender, mut receiver) = mpsc::channel(lanes);
 
         for _ in 0..lanes {
             tokio::spawn(run_lane(
                 Arc::clone(&pending),
                 sender.clone(),
                 cancellation.clone(),
-                pipeline.operators.clone(),
-                pipeline.scan.projection.clone(),
-                Arc::clone(&pipeline.scan.schema),
+                Arc::clone(&lane_plan),
                 Arc::clone(&context),
             ));
         }
@@ -91,21 +104,10 @@ async fn run_lane(
     pending: Arc<Mutex<VecDeque<ScanTask>>>,
     sender: mpsc::Sender<LaneMessage>,
     cancellation: CancellationToken,
-    operators: Vec<PipelineOperator>,
-    projection: Option<Vec<usize>>,
-    scan_schema: arrow::datatypes::SchemaRef,
+    plan: Arc<LanePlan>,
     context: Arc<QueryContext>,
 ) {
-    let result = run_lane_inner(
-        pending,
-        &sender,
-        &cancellation,
-        &operators,
-        projection.as_deref(),
-        &scan_schema,
-        &context,
-    )
-    .await;
+    let result = run_lane_inner(pending, &sender, &cancellation, &plan, &context).await;
 
     if let Err(error) = result
         && !cancellation.is_cancelled()
@@ -121,9 +123,7 @@ async fn run_lane_inner(
     pending: Arc<Mutex<VecDeque<ScanTask>>>,
     sender: &mpsc::Sender<LaneMessage>,
     cancellation: &CancellationToken,
-    operators: &[PipelineOperator],
-    projection: Option<&[usize]>,
-    scan_schema: &arrow::datatypes::SchemaRef,
+    plan: &LanePlan,
     context: &QueryContext,
 ) -> Result<()> {
     loop {
@@ -145,11 +145,41 @@ async fn run_lane_inner(
             };
             check_running(cancellation, context)?;
             let mut batch = batch?;
-            if let Some(projection) = projection.filter(|projection| !projection.is_empty()) {
+            let mut emit = true;
+            if let Some(filters) = plan.compact_filters.as_deref() {
+                for predicate in filters {
+                    let workspace = context
+                        .reserve_memory_while_holding(
+                            expr::filter_workspace_bytes(predicate, batch.batch()),
+                            batch.memory_size(),
+                            "compact pipeline filter workspace",
+                        )
+                        .await?;
+                    let filtered = expr::filter(predicate, batch.batch())?;
+                    if filtered.num_rows() == 0 {
+                        emit = false;
+                        break;
+                    }
+                    batch = batch.replace_with_reservation(
+                        filtered,
+                        workspace,
+                        "compact pipeline filter",
+                    )?;
+                }
+            }
+            if !emit {
+                drop(active);
+                continue;
+            }
+            if let Some(projection) = plan
+                .projection
+                .as_deref()
+                .filter(|projection| !projection.is_empty())
+            {
                 let workspace = context
                     .reserve_memory_while_holding(
                         crate::runtime::estimate_schema_batch_bytes(
-                            scan_schema.as_ref(),
+                            plan.scan_schema.as_ref(),
                             batch.num_rows(),
                         ),
                         batch.memory_size(),
@@ -157,15 +187,18 @@ async fn run_lane_inner(
                     )
                     .await?;
                 let expanded =
-                    scan::expand_projection(batch.batch().clone(), scan_schema, projection)?;
+                    scan::expand_projection(batch.batch().clone(), &plan.scan_schema, projection)?;
                 batch = batch.replace_with_reservation(
                     expanded,
                     workspace,
                     "scan projection expansion",
                 )?;
             }
-            let mut emit = true;
-            for operator in operators {
+            for operator in plan
+                .operators
+                .iter()
+                .filter(|_| plan.compact_filters.is_none())
+            {
                 match operator {
                     PipelineOperator::Filter(predicate) => {
                         let workspace = context
@@ -213,6 +246,31 @@ async fn run_lane_inner(
             }
         }
     }
+}
+
+fn compact_filters(
+    operators: &[PipelineOperator],
+    projection: Option<&[usize]>,
+) -> Result<Option<Vec<BoundExpr>>> {
+    let Some(projection) = projection.filter(|projection| !projection.is_empty()) else {
+        return Ok(None);
+    };
+    if !operators
+        .iter()
+        .all(|operator| matches!(operator, PipelineOperator::Filter(_)))
+    {
+        return Ok(None);
+    }
+    operators
+        .iter()
+        .map(|operator| {
+            let PipelineOperator::Filter(predicate) = operator else {
+                unreachable!("all operators were checked as filters")
+            };
+            compact::remap_filter(predicate, projection)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 async fn send_batch(

@@ -59,6 +59,23 @@ fn decodes_dictionary_values() {
 }
 
 #[test]
+fn canonicalizes_top_level_dictionary_targets() {
+    let batch = RecordBatch::try_from_iter([(
+        "name",
+        Arc::new(arrow::array::StringArray::from(vec!["alpha", "beta"])) as ArrayRef,
+    )])
+    .unwrap();
+    let target = Arc::new(schema(vec![(
+        "name",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        false,
+    )]));
+    let aligned = align_batch_to_schema(batch, target, "file:///explicit.parquet").unwrap();
+    assert_eq!(aligned.schema().field(0).data_type(), &DataType::Utf8);
+    assert_eq!(aligned.column(0).data_type(), &DataType::Utf8);
+}
+
+#[test]
 fn rejects_overflow_nullability_and_lossy_casts() {
     let timestamp = Arc::new(TimestampSecondArray::from(vec![i64::MAX])) as ArrayRef;
     let batch = RecordBatch::try_from_iter([("created_at", timestamp)]).unwrap();

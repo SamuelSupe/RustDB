@@ -16,7 +16,10 @@ use super::{
     parquet_pruning::can_prune_row_group,
     parquet_scan::{ParquetMorsel, ParquetMorselStream, morsel_stream, scan_morsels},
     provider::prepare_object_sources,
-    schema_evolution::{ParquetSchemaMode, SchemaSource, merge_file_schemas},
+    schema_evolution::{
+        ParquetSchemaMode, SchemaSource, canonical_type, canonicalize_schema, merge_file_schemas,
+        merge_types,
+    },
 };
 use crate::{
     EngineConfig, Error, ParquetOptions, Result,
@@ -103,6 +106,7 @@ impl ParquetTable {
             schema_mode: _,
             hive_partitioning,
         } = options;
+        let explicit_schema = explicit_schema.map(canonicalize_schema);
         let has_explicit_schema = explicit_schema.is_some();
         let mut schema_reservation = context.as_ref().map(|context| context.memory.reservation());
         if let Some(schema) = &explicit_schema {
@@ -141,12 +145,7 @@ impl ParquetTable {
         let mut physical_schema = match explicit_schema {
             Some(schema) => {
                 for file in &file_schemas {
-                    validate_file_schema(&file.schema, &schema, schema_mode).map_err(|error| {
-                        Error::InvalidArgument(format!(
-                            "incompatible Parquet schema for {}: {error}",
-                            file.uri
-                        ))
-                    })?;
+                    validate_file_schema(&file.uri, &file.schema, &schema, schema_mode)?;
                 }
                 schema
             }
@@ -223,10 +222,9 @@ impl ParquetTable {
         mode: ParquetSchemaMode,
     ) -> Result<()> {
         for file in self.file_schemas.iter() {
-            validate_file_schema(&file.schema, expected, mode).map_err(|error| {
+            validate_file_schema(&file.uri, &file.schema, expected, mode).map_err(|error| {
                 Error::Execution(format!(
-                    "Parquet schema for {} is incompatible with the registered schema: {error}",
-                    file.uri
+                    "Parquet file is incompatible with the registered schema: {error}"
                 ))
             })?;
         }
@@ -506,45 +504,53 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
     })
 }
 
-fn validate_file_schema(actual: &Schema, expected: &Schema, mode: ParquetSchemaMode) -> Result<()> {
+fn validate_file_schema(
+    uri: &str,
+    actual: &Schema,
+    expected: &Schema,
+    mode: ParquetSchemaMode,
+) -> Result<()> {
     for field in expected.fields() {
         match actual.field_with_name(field.name()) {
-            Ok(actual_field) if actual_field.data_type() == field.data_type() => {}
+            Ok(actual_field)
+                if canonical_type(actual_field.data_type())
+                    == canonical_type(field.data_type()) => {}
             Ok(actual_field) if mode == ParquetSchemaMode::SafeWidening => {
-                let actual_schema = Schema::new(vec![actual_field.clone()]);
-                let expected_schema = Schema::new(vec![field.clone()]);
-                let sources = [
-                    SchemaSource {
-                        uri: "actual",
-                        schema: &actual_schema,
-                    },
-                    SchemaSource {
-                        uri: "registered",
-                        schema: &expected_schema,
-                    },
-                ];
-                let merged = merge_file_schemas(&sources, mode, Some(&expected_schema))?;
-                if merged.field(0).data_type() != field.data_type() {
-                    return Err(Error::InvalidArgument(format!(
-                        "column {} requires widening from {:?} to {:?}; run REFRESH TABLE",
+                let actual_type = canonical_type(actual_field.data_type());
+                let expected_type = canonical_type(field.data_type());
+                let merged = merge_types(&actual_type, &expected_type, mode).map_err(|reason| {
+                    incompatible_file_column(
+                        uri,
                         field.name(),
-                        field.data_type(),
-                        merged.field(0).data_type(),
+                        &expected_type,
+                        &actual_type,
+                        &reason,
+                    )
+                })?;
+                if merged != expected_type {
+                    return Err(Error::InvalidArgument(format!(
+                        "Parquet schema for URI '{uri}', column '{}' requires widening from {:?} to {:?}; run REFRESH TABLE",
+                        field.name(),
+                        expected_type,
+                        merged,
                     )));
                 }
             }
             Ok(actual_field) => {
-                return Err(Error::InvalidArgument(format!(
-                    "incompatible Parquet column {}: expected {:?}, found {:?}",
+                let actual_type = canonical_type(actual_field.data_type());
+                let expected_type = canonical_type(field.data_type());
+                return Err(incompatible_file_column(
+                    uri,
                     field.name(),
-                    field.data_type(),
-                    actual_field.data_type()
-                )));
+                    &expected_type,
+                    &actual_type,
+                    &format!("types differ under {mode:?} mode"),
+                ));
             }
             Err(_) if mode == ParquetSchemaMode::UnionByName => {}
             Err(_) => {
                 return Err(Error::InvalidArgument(format!(
-                    "Parquet column {} is missing",
+                    "Parquet schema for URI '{uri}' is missing column '{}'",
                     field.name()
                 )));
             }
@@ -553,18 +559,26 @@ fn validate_file_schema(actual: &Schema, expected: &Schema, mode: ParquetSchemaM
     Ok(())
 }
 
+fn incompatible_file_column(
+    uri: &str,
+    column: &str,
+    expected: &arrow::datatypes::DataType,
+    actual: &arrow::datatypes::DataType,
+    reason: &str,
+) -> Error {
+    Error::InvalidArgument(format!(
+        "incompatible Parquet schema for URI '{uri}', column '{column}': expected {expected:?}, found {actual:?}: {reason}"
+    ))
+}
+
 fn validate_scan_schema(
     file: &ObjectSource,
     actual: &Schema,
     expected: &Schema,
     schema_mode: ParquetSchemaMode,
 ) -> Result<()> {
-    validate_file_schema(actual, expected, schema_mode).map_err(|error| {
-        Error::Execution(format!(
-            "Parquet schema changed for {}: {error}",
-            file.uri()
-        ))
-    })
+    validate_file_schema(file.uri(), actual, expected, schema_mode)
+        .map_err(|error| Error::Execution(format!("Parquet schema changed during query: {error}")))
 }
 
 fn nullable_schema(schema: &Schema) -> SchemaRef {

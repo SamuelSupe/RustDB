@@ -1,3 +1,4 @@
+mod compact;
 mod plan;
 mod run;
 
@@ -14,3 +15,6 @@ pub(super) fn try_execute(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod compact_pipeline_tests;

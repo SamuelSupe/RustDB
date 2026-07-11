@@ -1,1 +1,1 @@
-GROUP BY position 3 is out of range
+GROUP BY position 3 is out of range (select list has 2 items) at line 3, column 10

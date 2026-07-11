@@ -16,7 +16,7 @@ pub use expr::{
 pub use plan::{JoinType, LogicalPlan, PlanSchema, StatementPlan};
 #[cfg(test)]
 pub use planner::plan_sql;
-pub(crate) use planner::{bind_sql, optimize_statement};
+pub(crate) use planner::{bind_statement, optimize_statement};
 
 #[cfg(test)]
 mod correctness_tests;

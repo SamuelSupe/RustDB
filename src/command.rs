@@ -10,7 +10,7 @@ use futures::StreamExt;
 use sqlparser::{
     ast::{
         CreateTableOptions, DescribeAlias, ObjectName, ObjectNamePart, ObjectType,
-        ShowStatementOptions, Statement,
+        ShowStatementOptions, Spanned, Statement,
     },
     dialect::DuckDbDialect,
     parser::Parser,
@@ -23,6 +23,9 @@ use crate::runtime::{
 };
 use crate::sql::{LogicalPlan, StatementPlan};
 use crate::{Catalog, EngineConfig, Error, Result};
+
+#[path = "command/source.rs"]
+mod source;
 
 pub(crate) enum SessionCommand {
     ShowTables,
@@ -116,7 +119,8 @@ pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
             }
             Some(SessionCommand::CreateTempView {
                 name: simple_name(&view.name, "view")?,
-                query: view.query.to_string(),
+                query: source::suffix_with_location(sql, view.query.span())
+                    .unwrap_or_else(|| view.query.to_string()),
                 replace: view.or_replace,
             })
         }
@@ -308,8 +312,12 @@ impl ViewTable {
             context.clone(),
         )
         .await?;
-        let planned = crate::sql::bind_sql(&self.catalog, &prepared.sql);
-        for name in prepared.generated_tables {
+        let crate::table_function::PreparedSql {
+            statement,
+            generated_tables,
+        } = prepared;
+        let planned = crate::sql::bind_statement(&self.catalog, statement);
+        for name in generated_tables {
             self.catalog.unregister(&name);
         }
         let StatementPlan::Query(plan) = planned? else {

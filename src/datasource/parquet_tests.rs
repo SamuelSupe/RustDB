@@ -9,15 +9,68 @@ use futures::{StreamExt, TryStreamExt};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tempfile::tempdir;
 
-use super::ParquetTable;
+use super::{ParquetTable, validate_file_schema};
 use crate::{
-    EngineConfig, Error, ParquetOptions,
+    EngineConfig, Error, ParquetOptions, ParquetSchemaMode,
     datasource::parquet_scan::align_batch,
     datasource::{
         ComparisonOp, MetadataCache, PredicateValue, ScanPredicate, ScanRequest, TableProvider,
     },
     runtime::{MemoryPool, QueryContext},
 };
+
+#[test]
+fn schema_validation_decodes_only_top_level_dictionaries() {
+    let dictionary = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+    let actual = Schema::new(vec![Field::new("name", dictionary, false)]);
+    let expected = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+    for mode in [
+        ParquetSchemaMode::Strict,
+        ParquetSchemaMode::UnionByName,
+        ParquetSchemaMode::SafeWidening,
+    ] {
+        validate_file_schema("s3://bucket/dictionary.parquet", &actual, &expected, mode).unwrap();
+    }
+
+    let dictionary_integer = Schema::new(vec![Field::new(
+        "id",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
+        false,
+    )]);
+    let widened_integer = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+    validate_file_schema(
+        "file:///dictionary-int.parquet",
+        &dictionary_integer,
+        &widened_integer,
+        ParquetSchemaMode::SafeWidening,
+    )
+    .unwrap();
+
+    let nested_dictionary = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )));
+    let nested_plain = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+    let actual = Schema::new(vec![Field::new("items", nested_dictionary, true)]);
+    let expected = Schema::new(vec![Field::new("items", nested_plain, true)]);
+    for mode in [
+        ParquetSchemaMode::Strict,
+        ParquetSchemaMode::UnionByName,
+        ParquetSchemaMode::SafeWidening,
+    ] {
+        let error = validate_file_schema(
+            "s3://bucket/nested-dictionary.parquet",
+            &actual,
+            &expected,
+            mode,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("nested-dictionary.parquet"), "{error}");
+        assert!(error.contains("column 'items'"), "{error}");
+    }
+}
 
 #[test]
 fn alignment_fills_missing_union_columns_with_null() {

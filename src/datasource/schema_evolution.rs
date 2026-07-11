@@ -13,7 +13,7 @@ mod alignment;
 #[path = "schema_evolution_types.rs"]
 mod types;
 
-use types::{canonical_type, merge_types};
+pub(crate) use types::{canonical_type, merge_types};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ParquetSchemaMode {
@@ -34,6 +34,34 @@ pub(crate) fn align_batch_to_schema(
     uri: &str,
 ) -> Result<RecordBatch> {
     alignment::align_batch_to_schema(batch, target, uri)
+}
+
+pub(crate) fn canonicalize_schema(schema: SchemaRef) -> SchemaRef {
+    if schema
+        .fields()
+        .iter()
+        .all(|field| canonical_type(field.data_type()) == *field.data_type())
+    {
+        return schema;
+    }
+
+    Arc::new(Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| {
+                Arc::new(
+                    Field::new(
+                        field.name(),
+                        canonical_type(field.data_type()),
+                        field.is_nullable(),
+                    )
+                    .with_metadata(field.metadata().clone()),
+                )
+            })
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
 }
 
 pub(crate) fn merge_file_schemas(

@@ -19,12 +19,14 @@ use crate::{
     runtime::QueryContext,
 };
 
-/// SQL rewritten to use query-local catalog providers.
+/// Statement rewritten to use query-local catalog providers.
 ///
 /// `generated_tables` is the exact ownership list for this preparation.  The
-/// caller must remove only these entries after binding the rewritten SQL.
+/// caller must remove only these entries after binding the rewritten
+/// statement. Keeping the parsed AST avoids losing source spans by formatting
+/// and reparsing the SQL after table-function replacement.
 pub(crate) struct PreparedSql {
-    pub(crate) sql: String,
+    pub(crate) statement: Statement,
     pub(crate) generated_tables: Vec<String>,
 }
 
@@ -65,7 +67,7 @@ pub(crate) async fn prepare_with_cache_for_query(
     let specs = collect_specs(&statement)?;
     if specs.is_empty() {
         return Ok(PreparedSql {
-            sql: sql.to_owned(),
+            statement,
             generated_tables: Vec::new(),
         });
     }
@@ -104,7 +106,7 @@ pub(crate) async fn prepare_with_cache_for_query(
         registered.push(name);
     }
     Ok(PreparedSql {
-        sql: statement.to_string(),
+        statement,
         generated_tables,
     })
 }
@@ -595,9 +597,10 @@ mod tests {
         assert_eq!(names.len(), 1);
         assert!(names[0].starts_with("__rustdb_file_"));
         assert_eq!(prepared.generated_tables, names);
-        assert!(prepared.sql.contains(&names[0]));
-        assert!(prepared.sql.contains("source"));
-        assert!(!prepared.sql.to_ascii_lowercase().contains("read_csv"));
+        let rewritten = prepared.statement.to_string();
+        assert!(rewritten.contains(&names[0]));
+        assert!(rewritten.contains("source"));
+        assert!(!rewritten.to_ascii_lowercase().contains("read_csv"));
     }
 
     #[tokio::test]
@@ -619,10 +622,11 @@ mod tests {
             .expect("prepare join functions");
         assert_eq!(catalog.table_names().len(), 2);
         assert_eq!(prepared.generated_tables.len(), 2);
-        assert!(prepared.sql.starts_with("EXPLAIN"));
-        assert!(prepared.sql.contains("left_file"));
-        assert!(prepared.sql.contains("right_file"));
-        assert!(!prepared.sql.to_ascii_lowercase().contains("read_csv"));
+        let rewritten = prepared.statement.to_string();
+        assert!(rewritten.starts_with("EXPLAIN"));
+        assert!(rewritten.contains("left_file"));
+        assert!(rewritten.contains("right_file"));
+        assert!(!rewritten.to_ascii_lowercase().contains("read_csv"));
     }
 
     #[tokio::test]
@@ -644,8 +648,9 @@ mod tests {
             .await
             .expect("prepare nested file functions");
         assert_eq!(prepared.generated_tables.len(), 2);
-        assert!(!prepared.sql.to_ascii_lowercase().contains("read_csv"));
-        crate::sql::plan_sql(&catalog, &prepared.sql).expect("plan rewritten nested query");
+        let rewritten = prepared.statement.to_string();
+        assert!(!rewritten.to_ascii_lowercase().contains("read_csv"));
+        crate::sql::plan_sql(&catalog, &rewritten).expect("plan rewritten nested query");
     }
 
     #[tokio::test]

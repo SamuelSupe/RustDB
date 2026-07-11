@@ -2,14 +2,14 @@ use arrow::datatypes::{DataType, TimeUnit};
 
 use super::ParquetSchemaMode;
 
-pub(super) fn canonical_type(data_type: &DataType) -> DataType {
+pub(crate) fn canonical_type(data_type: &DataType) -> DataType {
     match data_type {
         DataType::Dictionary(_, value) => canonical_type(value),
         _ => data_type.clone(),
     }
 }
 
-pub(super) fn merge_types(
+pub(crate) fn merge_types(
     left: &DataType,
     right: &DataType,
     mode: ParquetSchemaMode,
