@@ -3,21 +3,24 @@ use std::sync::Arc;
 use arrow::datatypes::{Schema, SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
+use futures::StreamExt;
+use tokio::sync::Semaphore;
 
 use super::{
-    MetadataCache, ScanRequest, TableProvider, TableStatistics,
+    MetadataCache, ScanRequest, ScanTask, TableProvider, TableStatistics,
     hive::HivePartitions,
     parquet_metadata::{
         load_parquet_metadata, registration_metadata_limit, resize_schema_budget,
         schema_memory_size,
     },
     parquet_pruning::can_prune_row_group,
-    parquet_scan::{ParquetMorsel, ParquetMorselStream, scan_morsels},
+    parquet_scan::{ParquetMorsel, ParquetMorselStream, morsel_stream, scan_morsels},
     provider::prepare_object_sources,
+    schema_evolution::{ParquetSchemaMode, SchemaSource, merge_file_schemas},
 };
 use crate::{
     EngineConfig, Error, ParquetOptions, Result,
-    runtime::{MemoryReservation, QueryContext, RecordBatchStream},
+    runtime::{MemoryReservation, QueryContext, RecordBatchStream, estimate_schema_batch_bytes},
     storage::{LocationResolver, ObjectSource},
 };
 
@@ -28,10 +31,17 @@ pub struct ParquetTable {
     physical_schema: SchemaRef,
     statistics: TableStatistics,
     hive: Option<Arc<HivePartitions>>,
-    union_by_name: bool,
+    schema_mode: ParquetSchemaMode,
+    file_schemas: Arc<[FileSchema]>,
     metadata_cache: MetadataCache,
     io_concurrency: usize,
     _schema_reservation: Option<Arc<MemoryReservation>>,
+}
+
+#[derive(Clone, Debug)]
+struct FileSchema {
+    uri: String,
+    schema: SchemaRef,
 }
 
 impl ParquetTable {
@@ -86,15 +96,16 @@ impl ParquetTable {
             ));
         }
 
+        let schema_mode = options.effective_schema_mode()?;
         let ParquetOptions {
             schema: explicit_schema,
-            union_by_name,
+            union_by_name: _,
+            schema_mode: _,
             hive_partitioning,
         } = options;
         let has_explicit_schema = explicit_schema.is_some();
-        let mut physical_schema = explicit_schema;
         let mut schema_reservation = context.as_ref().map(|context| context.memory.reservation());
-        if let Some(schema) = &physical_schema {
+        if let Some(schema) = &explicit_schema {
             resize_schema_budget(
                 schema_memory_size(schema),
                 context.as_deref(),
@@ -102,9 +113,9 @@ impl ParquetTable {
                 schema_reservation.as_mut(),
             )?;
         }
-
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
+        let mut file_schemas = Vec::with_capacity(files.len());
         for file in &files {
             let metadata = load_parquet_metadata(
                 file,
@@ -116,53 +127,10 @@ impl ParquetTable {
             .await?;
             let reader_metadata = metadata.reader_metadata();
             let incoming = reader_metadata.schema();
-            if has_explicit_schema {
-                let expected = physical_schema
-                    .as_deref()
-                    .ok_or_else(|| Error::Internal("missing explicit Parquet schema".to_owned()))?;
-                validate_file_schema(incoming, expected, union_by_name)?;
-            } else if union_by_name {
-                physical_schema = Some(match physical_schema.take() {
-                    Some(current) => {
-                        resize_schema_budget(
-                            schema_memory_size(&current)
-                                .saturating_add(schema_memory_size(incoming)),
-                            context.as_deref(),
-                            registration_limit,
-                            schema_reservation.as_mut(),
-                        )?;
-                        let merged = merge_union_schema(&current, incoming)?;
-                        drop(current);
-                        resize_schema_budget(
-                            schema_memory_size(&merged),
-                            context.as_deref(),
-                            registration_limit,
-                            schema_reservation.as_mut(),
-                        )?;
-                        merged
-                    }
-                    None => {
-                        let schema = Arc::new(Schema::new(incoming.fields().clone()));
-                        resize_schema_budget(
-                            schema_memory_size(&schema),
-                            context.as_deref(),
-                            registration_limit,
-                            schema_reservation.as_mut(),
-                        )?;
-                        schema
-                    }
-                });
-            } else if let Some(expected) = &physical_schema {
-                validate_file_schema(incoming, expected, false)?;
-            } else {
-                resize_schema_budget(
-                    schema_memory_size(incoming),
-                    context.as_deref(),
-                    registration_limit,
-                    schema_reservation.as_mut(),
-                )?;
-                physical_schema = Some(Arc::clone(incoming));
-            }
+            file_schemas.push(FileSchema {
+                uri: file.uri().to_owned(),
+                schema: Arc::clone(incoming),
+            });
             rows = rows.saturating_add(
                 u64::try_from(reader_metadata.metadata().file_metadata().num_rows())
                     .unwrap_or(u64::MAX),
@@ -170,28 +138,42 @@ impl ParquetTable {
             bytes = bytes.saturating_add(file.snapshot().size);
         }
 
-        let mut physical_schema =
-            physical_schema.ok_or_else(|| Error::Internal("missing Parquet schema".to_owned()))?;
-        if union_by_name && !has_explicit_schema {
-            resize_schema_budget(
-                schema_memory_size(&physical_schema).saturating_mul(2),
-                context.as_deref(),
-                registration_limit,
-                schema_reservation.as_mut(),
-            )?;
-            let fields: Vec<_> = physical_schema
-                .fields()
-                .iter()
-                .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
-                .collect();
-            physical_schema = Arc::new(Schema::new(fields));
-            resize_schema_budget(
-                schema_memory_size(&physical_schema),
-                context.as_deref(),
-                registration_limit,
-                schema_reservation.as_mut(),
-            )?;
+        let mut physical_schema = match explicit_schema {
+            Some(schema) => {
+                for file in &file_schemas {
+                    validate_file_schema(&file.schema, &schema, schema_mode).map_err(|error| {
+                        Error::InvalidArgument(format!(
+                            "incompatible Parquet schema for {}: {error}",
+                            file.uri
+                        ))
+                    })?;
+                }
+                schema
+            }
+            None => {
+                let sources = file_schemas
+                    .iter()
+                    .map(|file| SchemaSource {
+                        uri: &file.uri,
+                        schema: &file.schema,
+                    })
+                    .collect::<Vec<_>>();
+                merge_file_schemas(&sources, schema_mode, None)?
+            }
+        };
+        if !has_explicit_schema && schema_mode == ParquetSchemaMode::UnionByName {
+            physical_schema = nullable_schema(&physical_schema);
         }
+        resize_schema_budget(
+            file_schemas
+                .iter()
+                .fold(schema_memory_size(&physical_schema), |bytes, file| {
+                    bytes.saturating_add(schema_memory_size(&file.schema))
+                }),
+            context.as_deref(),
+            registration_limit,
+            schema_reservation.as_mut(),
+        )?;
         let hive = if hive_partitioning {
             HivePartitions::discover(&files, &physical_schema)?.map(Arc::new)
         } else {
@@ -231,11 +213,32 @@ impl ParquetTable {
             physical_schema,
             statistics,
             hive,
-            union_by_name,
+            schema_mode,
+            file_schemas: file_schemas.into(),
             metadata_cache,
             io_concurrency,
             _schema_reservation: schema_reservation.map(Arc::new),
         })
+    }
+
+    pub(crate) fn physical_schema(&self) -> SchemaRef {
+        Arc::clone(&self.physical_schema)
+    }
+
+    pub(crate) fn validate_compatible_with(
+        &self,
+        expected: &Schema,
+        mode: ParquetSchemaMode,
+    ) -> Result<()> {
+        for file in self.file_schemas.iter() {
+            validate_file_schema(&file.schema, expected, mode).map_err(|error| {
+                Error::Execution(format!(
+                    "Parquet schema for {} is incompatible with the registered schema: {error}",
+                    file.uri
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -275,7 +278,7 @@ impl TableProvider for ParquetTable {
             table_schema,
             physical_schema: Arc::clone(&self.physical_schema),
             hive: hive.clone(),
-            union_by_name: self.union_by_name,
+            schema_mode: self.schema_mode,
             request,
             context: Arc::clone(&context),
             metadata_cache: self.metadata_cache.clone(),
@@ -290,6 +293,114 @@ impl TableProvider for ParquetTable {
             limit,
         ))
     }
+
+    async fn scan_tasks(
+        &self,
+        request: ScanRequest,
+        context: Arc<QueryContext>,
+        target_tasks: usize,
+    ) -> Result<Vec<ScanTask>> {
+        if request.batch_size == 0 {
+            return Err(Error::InvalidArgument(
+                "scan batch_size must be greater than zero".to_owned(),
+            ));
+        }
+        let output_schema = request.projected_schema(&self.schema)?;
+        let batch_size = request.batch_size;
+        let preclaim = estimate_schema_batch_bytes(output_schema.as_ref(), batch_size);
+        let hive = self.hive.clone();
+        let mut morsels = plan_morsels(ScanPlanning {
+            files: Arc::clone(&self.files),
+            output_schema: Arc::clone(&output_schema),
+            table_schema: Arc::clone(&self.schema),
+            physical_schema: Arc::clone(&self.physical_schema),
+            hive: hive.clone(),
+            schema_mode: self.schema_mode,
+            request,
+            context: Arc::clone(&context),
+            metadata_cache: self.metadata_cache.clone(),
+        });
+
+        // Prefetch at most one first morsel per configured lane. This reveals
+        // the exact task count when the source has fewer row groups than
+        // workers, while keeping planning metadata bounded for files with very
+        // many row groups. Remaining morsels stay lazy behind the shared
+        // planning stream.
+        let target_tasks = target_tasks.max(1);
+        let mut first_morsels = Vec::with_capacity(target_tasks);
+        while first_morsels.len() < target_tasks {
+            context.check_cancelled()?;
+            let Some(morsel) = morsels.next().await else {
+                break;
+            };
+            first_morsels.push(morsel?);
+        }
+        if first_morsels.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ScanTask is the schedulable lane input. Do not manufacture empty
+        // workers up to the configured thread count: a one-row-group file has
+        // one unit of work and therefore one active lane. Each task owns one
+        // guaranteed first morsel, then pulls remaining work one morsel at a
+        // time without holding the planning lock during decode or output.
+        let morsels = Arc::new(tokio::sync::Mutex::new(morsels));
+        let io_permits = Arc::new(Semaphore::new(self.io_concurrency));
+        Ok(first_morsels
+            .into_iter()
+            .enumerate()
+            .map(|(id, first_morsel)| {
+                let morsels = Arc::clone(&morsels);
+                let io_permits = Arc::clone(&io_permits);
+                let output_schema = Arc::clone(&output_schema);
+                let hive = hive.clone();
+                let task_context = Arc::clone(&context);
+                let stream_context = Arc::clone(&task_context);
+                ScanTask::from_public(
+                    id,
+                    crate::runtime::boxed_record_batch_stream(try_stream! {
+                        let mut next = Some(first_morsel);
+                        loop {
+                            let morsel = match next.take() {
+                                Some(morsel) => morsel,
+                                None => {
+                                    let mut remaining = morsels.lock().await;
+                                    let Some(morsel) = remaining.next().await else {
+                                        break;
+                                    };
+                                    morsel?
+                                }
+                            };
+                            stream_context.check_cancelled()?;
+                            // Compute lanes may outnumber the configured object
+                            // I/O concurrency. Keep independently schedulable
+                            // row groups, but admit only the configured number
+                            // of active Parquet readers at once.
+                            let _io_permit = Arc::clone(&io_permits)
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| Error::Internal(
+                                    "Parquet I/O concurrency limiter closed unexpectedly".into(),
+                                ))?;
+                            let mut input = morsel_stream(
+                                morsel,
+                                Arc::clone(&output_schema),
+                                hive.clone(),
+                                Arc::clone(&stream_context),
+                                batch_size,
+                            );
+                            while let Some(batch) = input.next().await {
+                                yield batch?;
+                            }
+                        }
+                    }),
+                    task_context,
+                    preclaim,
+                    "Parquet scan task",
+                )
+            })
+            .collect())
+    }
 }
 
 struct ScanPlanning {
@@ -298,7 +409,7 @@ struct ScanPlanning {
     table_schema: SchemaRef,
     physical_schema: SchemaRef,
     hive: Option<Arc<HivePartitions>>,
-    union_by_name: bool,
+    schema_mode: ParquetSchemaMode,
     request: ScanRequest,
     context: Arc<QueryContext>,
     metadata_cache: MetadataCache,
@@ -338,7 +449,7 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                 file,
                 &file_schema,
                 &plan.physical_schema,
-                plan.union_by_name,
+                plan.schema_mode,
             )?;
             if let Some(hive) = &plan.hive {
                 hive.validate_physical_schema(&file_schema)?;
@@ -392,25 +503,33 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
     })
 }
 
-fn merge_union_schema(current: &Schema, incoming: &Schema) -> Result<SchemaRef> {
-    let schemas = [
-        Schema::new(current.fields().clone()),
-        Schema::new(incoming.fields().clone()),
-    ];
-    Ok(Arc::new(Schema::try_merge(schemas)?))
-}
-
-fn validate_file_schema(actual: &Schema, expected: &Schema, allow_missing: bool) -> Result<()> {
-    if !allow_missing && actual.fields().len() != expected.fields().len() {
-        return Err(Error::InvalidArgument(format!(
-            "incompatible Parquet schemas: expected {} columns, found {}",
-            expected.fields().len(),
-            actual.fields().len()
-        )));
-    }
+fn validate_file_schema(actual: &Schema, expected: &Schema, mode: ParquetSchemaMode) -> Result<()> {
     for field in expected.fields() {
         match actual.field_with_name(field.name()) {
             Ok(actual_field) if actual_field.data_type() == field.data_type() => {}
+            Ok(actual_field) if mode == ParquetSchemaMode::SafeWidening => {
+                let actual_schema = Schema::new(vec![actual_field.clone()]);
+                let expected_schema = Schema::new(vec![field.clone()]);
+                let sources = [
+                    SchemaSource {
+                        uri: "actual",
+                        schema: &actual_schema,
+                    },
+                    SchemaSource {
+                        uri: "registered",
+                        schema: &expected_schema,
+                    },
+                ];
+                let merged = merge_file_schemas(&sources, mode, Some(&expected_schema))?;
+                if merged.field(0).data_type() != field.data_type() {
+                    return Err(Error::InvalidArgument(format!(
+                        "column {} requires widening from {:?} to {:?}; run REFRESH TABLE",
+                        field.name(),
+                        field.data_type(),
+                        merged.field(0).data_type(),
+                    )));
+                }
+            }
             Ok(actual_field) => {
                 return Err(Error::InvalidArgument(format!(
                     "incompatible Parquet column {}: expected {:?}, found {:?}",
@@ -419,7 +538,7 @@ fn validate_file_schema(actual: &Schema, expected: &Schema, allow_missing: bool)
                     actual_field.data_type()
                 )));
             }
-            Err(_) if allow_missing => {}
+            Err(_) if mode == ParquetSchemaMode::UnionByName => {}
             Err(_) => {
                 return Err(Error::InvalidArgument(format!(
                     "Parquet column {} is missing",
@@ -435,14 +554,25 @@ fn validate_scan_schema(
     file: &ObjectSource,
     actual: &Schema,
     expected: &Schema,
-    union_by_name: bool,
+    schema_mode: ParquetSchemaMode,
 ) -> Result<()> {
-    validate_file_schema(actual, expected, union_by_name).map_err(|error| {
+    validate_file_schema(actual, expected, schema_mode).map_err(|error| {
         Error::Execution(format!(
             "Parquet schema changed for {}: {error}",
             file.uri()
         ))
     })
+}
+
+fn nullable_schema(schema: &Schema) -> SchemaRef {
+    Arc::new(Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
 }
 
 fn file_projection(file_schema: &Schema, output_schema: &Schema) -> Vec<usize> {

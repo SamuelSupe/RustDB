@@ -13,7 +13,8 @@ use sqlparser::{
 use uuid::Uuid;
 
 use crate::{
-    Catalog, CsvHeader, CsvOptions, EngineConfig, Error, ParquetOptions, Result, TableEntry,
+    Catalog, CsvHeader, CsvOptions, EngineConfig, Error, ParquetOptions, ParquetSchemaMode, Result,
+    TableEntry,
     datasource::{CsvTable, MetadataCache, ParquetTable, TableProvider},
     runtime::QueryContext,
 };
@@ -221,14 +222,28 @@ fn parse_factor(factor: &TableFactor) -> Result<Option<FileSpec>> {
         }
         FileKind::Parquet => {
             let mut options = ParquetOptions::default();
+            let mut union_by_name_set = false;
+            let mut schema_mode_set = false;
             for (name, value) in named {
                 match name.as_str() {
-                    "union_by_name" => options.union_by_name = boolean(value, &name)?,
+                    "union_by_name" => {
+                        union_by_name_set = true;
+                        options.union_by_name = boolean(value, &name)?;
+                    }
+                    "schema_mode" => {
+                        schema_mode_set = true;
+                        options.schema_mode = parquet_schema_mode(value)?;
+                    }
                     "hive_partitioning" => {
                         options.hive_partitioning = hive_partitioning(value)?;
                     }
                     _ => return Err(unknown_argument(kind, &name)),
                 }
+            }
+            if union_by_name_set && schema_mode_set {
+                return Err(Error::InvalidArgument(
+                    "read_parquet arguments union_by_name and schema_mode conflict".to_owned(),
+                ));
             }
             Ok(Some(FileSpec::Parquet { location, options }))
         }
@@ -433,6 +448,18 @@ fn hive_partitioning(argument: &FunctionArgExpr) -> Result<bool> {
     }
 }
 
+fn parquet_schema_mode(argument: &FunctionArgExpr) -> Result<ParquetSchemaMode> {
+    let value = literal_string(argument, "schema_mode")?;
+    match value.to_ascii_lowercase().as_str() {
+        "strict" => Ok(ParquetSchemaMode::Strict),
+        "union" | "union_by_name" => Ok(ParquetSchemaMode::UnionByName),
+        "safe_widening" => Ok(ParquetSchemaMode::SafeWidening),
+        _ => Err(Error::InvalidArgument(
+            "Parquet schema_mode must be 'strict', 'union', or 'safe_widening'".to_owned(),
+        )),
+    }
+}
+
 fn unknown_argument(kind: FileKind, name: &str) -> Error {
     if is_secret_argument(name) {
         Error::InvalidArgument(format!(
@@ -467,7 +494,7 @@ mod tests {
     use sqlparser::{ast::Statement, dialect::DuckDbDialect, parser::Parser};
 
     use super::{FileSpec, collect_specs, parse_factor, prepare};
-    use crate::{Catalog, CsvHeader, EngineConfig, Error};
+    use crate::{Catalog, CsvHeader, EngineConfig, Error, ParquetSchemaMode};
 
     fn factor(sql: &str) -> sqlparser::ast::TableFactor {
         let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql).expect("parse SQL");
@@ -501,6 +528,24 @@ mod tests {
         };
         assert!(options.union_by_name);
         assert!(options.hive_partitioning);
+
+        let widening =
+            factor("SELECT * FROM read_parquet('data.parquet', schema_mode = 'safe_widening')");
+        let Some(FileSpec::Parquet { options, .. }) = parse_factor(&widening).unwrap() else {
+            panic!("Parquet spec expected");
+        };
+        assert_eq!(options.schema_mode, ParquetSchemaMode::SafeWidening);
+    }
+
+    #[test]
+    fn rejects_conflicting_parquet_schema_options() {
+        let factor = factor(
+            "SELECT * FROM read_parquet('data.parquet', union_by_name = true, schema_mode = 'union')",
+        );
+        assert!(matches!(
+            parse_factor(&factor),
+            Err(Error::InvalidArgument(message)) if message.contains("conflict")
+        ));
     }
 
     #[test]

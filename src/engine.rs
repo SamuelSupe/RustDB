@@ -9,10 +9,10 @@ use uuid::Uuid;
 use crate::{
     Catalog, CsvOptions, EngineConfig, Error, ParquetOptions, QueryMetrics, Result, TableEntry,
     command::{SessionCommand, ViewTable},
-    datasource::{CsvTable, MetadataCache, ParquetTable},
+    datasource::{MetadataCache, RegisteredCsvTable, RegisteredParquetTable},
     runtime::{
-        ComputeRuntime, MemoryPool, QueryContext, QueryControl, RecordBatchStream,
-        boxed_record_batch_stream,
+        ComputeRuntime, MemoryPool, QueryContext, QueryControl, RecordBatchStream, SpillIoPool,
+        SpillQuotaPool, boxed_record_batch_stream, scavenge_orphans,
     },
     sql::{LogicalPlan, StatementPlan},
 };
@@ -28,17 +28,22 @@ struct EngineInner {
     admission: Arc<Semaphore>,
     compute: ComputeRuntime,
     metadata_cache: MetadataCache,
+    spill_quota: SpillQuotaPool,
+    spill_io: SpillIoPool,
 }
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Result<Self> {
         validate_config(&config)?;
-        std::fs::create_dir_all(&config.temp_dir)
-            .map_err(|error| Error::io(Some(config.temp_dir.clone()), error))?;
+        std::fs::create_dir_all(&config.spill.directory)
+            .map_err(|error| Error::io(Some(config.spill.directory.clone()), error))?;
+        scavenge_orphans(&config.spill.directory, config.spill.orphan_ttl)?;
         let memory = MemoryPool::named_root("engine", config.memory_limit);
         let admission = Arc::new(Semaphore::new(config.max_concurrent_queries));
         let compute = ComputeRuntime::new(config.compute_threads)?;
         let metadata_cache = MetadataCache::new(config.metadata_cache_bytes);
+        let spill_quota = SpillQuotaPool::new(config.spill.clone())?;
+        let spill_io = SpillIoPool::new(config.spill.io_threads)?;
         Ok(Self {
             inner: Arc::new(EngineInner {
                 config,
@@ -46,6 +51,8 @@ impl Engine {
                 admission,
                 compute,
                 metadata_cache,
+                spill_quota,
+                spill_io,
             }),
         })
     }
@@ -93,7 +100,7 @@ impl Session {
         S: Into<String>,
     {
         let locations = normalize_locations(locations);
-        let provider = ParquetTable::try_new_with_cache(
+        let provider = RegisteredParquetTable::try_new(
             locations,
             options,
             &self.engine.inner.config,
@@ -115,9 +122,26 @@ impl Session {
         S: Into<String>,
     {
         let locations = normalize_locations(locations);
-        let provider = CsvTable::try_new(locations, options, &self.engine.inner.config).await?;
+        let provider =
+            RegisteredCsvTable::try_new(locations, options, &self.engine.inner.config).await?;
         self.catalog
             .register(TableEntry::new(name, Arc::new(provider)))
+    }
+
+    pub async fn refresh_table(&self, name: &str) -> Result<SchemaRef> {
+        let entry = self
+            .catalog
+            .table(name)
+            .ok_or_else(|| Error::Catalog(format!("table '{name}' does not exist")))?;
+        let replacement = entry.provider().refreshed().await?.ok_or_else(|| {
+            Error::Catalog(format!(
+                "table '{name}' is not a refreshable external table"
+            ))
+        })?;
+        let schema = replacement.schema();
+        self.catalog
+            .replace_provider(name, entry.provider(), replacement)?;
+        Ok(schema)
     }
 
     pub async fn execute(&self, sql: &str) -> Result<QueryResult> {
@@ -137,11 +161,18 @@ impl Session {
         // Start query accounting before file-function schema discovery so the
         // reported elapsed time includes planning and metadata preparation.
         let context = self.query_context()?;
-        let plan = self
+        let plan = match self
             .prepare_statement_for_query(sql, Some(Arc::clone(&context)))
-            .await?;
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => return Err(context.error_with_cleanup(error)),
+        };
         let schema = plan.schema();
-        let stream = crate::execution::execute(plan, Arc::clone(&context)).await?;
+        let stream = match crate::execution::execute_internal(plan, Arc::clone(&context)).await {
+            Ok(stream) => stream,
+            Err(error) => return Err(context.error_with_cleanup(error)),
+        };
         let stream = self.engine.inner.compute.pipe(stream, Arc::clone(&context));
         Ok(query_result(schema, stream, context, permit))
     }
@@ -152,35 +183,46 @@ impl Session {
         permit: OwnedSemaphorePermit,
     ) -> Result<QueryResult> {
         let context = self.query_context()?;
-        let batch = match command {
-            SessionCommand::ShowTables => crate::command::show_tables(&self.catalog)?,
-            SessionCommand::Describe { name } => crate::command::describe(&self.catalog, &name)?,
-            SessionCommand::CreateTempView {
-                name,
-                query,
-                replace,
-            } => {
-                let plan = self
-                    .prepare_view_plan(&query, Some(Arc::clone(&context)))
-                    .await?;
-                let provider = Arc::new(ViewTable::new(
-                    name.clone(),
-                    query.clone(),
-                    plan,
-                    self.catalog.clone(),
-                    self.engine.inner.config.clone(),
-                    self.engine.inner.metadata_cache.clone(),
-                ));
-                self.catalog
-                    .register_view(TableEntry::new(name, provider), query, replace)?;
-                crate::command::status("CREATE VIEW")?
-            }
-            SessionCommand::DropView { name, if_exists } => {
-                if !self.catalog.drop_view(&name) && !if_exists {
-                    return Err(Error::Catalog(format!("view '{name}' does not exist")));
+        let batch = async {
+            match command {
+                SessionCommand::ShowTables => crate::command::show_tables(&self.catalog),
+                SessionCommand::Describe { name } => crate::command::describe(&self.catalog, &name),
+                SessionCommand::RefreshTable { name } => {
+                    self.refresh_table(&name).await?;
+                    crate::command::status("REFRESH TABLE")
                 }
-                crate::command::status("DROP VIEW")?
+                SessionCommand::CreateTempView {
+                    name,
+                    query,
+                    replace,
+                } => {
+                    let plan = self
+                        .prepare_view_plan(&query, Some(Arc::clone(&context)))
+                        .await?;
+                    let provider = Arc::new(ViewTable::new(
+                        name.clone(),
+                        query.clone(),
+                        plan,
+                        self.catalog.clone(),
+                        self.engine.inner.config.clone(),
+                        self.engine.inner.metadata_cache.clone(),
+                    ));
+                    self.catalog
+                        .register_view(TableEntry::new(name, provider), query, replace)?;
+                    crate::command::status("CREATE VIEW")
+                }
+                SessionCommand::DropView { name, if_exists } => {
+                    if !self.catalog.drop_view(&name) && !if_exists {
+                        return Err(Error::Catalog(format!("view '{name}' does not exist")));
+                    }
+                    crate::command::status("DROP VIEW")
+                }
             }
+        }
+        .await;
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => return Err(context.error_with_cleanup(error)),
         };
         self.batch_result(batch, permit, context)
     }
@@ -213,10 +255,18 @@ impl Session {
             &self.engine.inner.config,
             &self.engine.inner.metadata_cache,
             sql,
-            context,
+            context.clone(),
         )
         .await?;
-        let planned = crate::sql::plan_sql(&self.catalog, &prepared.sql);
+        let planned = async {
+            let bound = crate::sql::bind_sql(&self.catalog, &prepared.sql)?;
+            if let Some(context) = context.as_ref() {
+                crate::execution::prepare_plan(bound.logical_plan(), Arc::clone(context)).await?;
+                context.seal_object_snapshots();
+            }
+            crate::sql::optimize_statement(bound, context.as_deref())
+        }
+        .await;
         for name in prepared.generated_tables {
             self.catalog.unregister(&name);
         }
@@ -240,12 +290,16 @@ impl Session {
             format!("query-{query_id}"),
             self.engine.inner.config.memory_limit,
         );
-        Ok(Arc::new(QueryContext::with_query_id_and_batch_size(
+        let context = Arc::new(QueryContext::with_spill_resources(
             query_id,
             query_memory,
-            &self.engine.inner.config.temp_dir,
+            &self.engine.inner.config.spill.directory,
             self.engine.inner.config.batch_size,
-        )?))
+            self.engine.inner.spill_quota.start_query(),
+            self.engine.inner.spill_io.clone(),
+        )?);
+        context.configure_compute_lanes(self.engine.inner.config.compute_threads);
+        Ok(context)
     }
 }
 
@@ -322,8 +376,7 @@ fn instrument_output(
         while let Some(item) = input.next().await {
             if let Err(error) = context.check_cancelled() {
                 context.metrics.finish();
-                let _ = context.spill.cleanup();
-                yield Err(error);
+                yield Err(context.error_with_cleanup(error));
                 return;
             }
             match item {
@@ -340,14 +393,13 @@ fn instrument_output(
                     // A QueryResult may remain alive after the consumer sees
                     // an execution error.  Clean this query's files now rather
                     // than waiting for QueryContext::drop().
-                    let _ = context.spill.cleanup();
-                    yield Err(error);
+                    yield Err(context.error_with_cleanup(error));
                     return;
                 }
             }
         }
         context.metrics.finish();
-        if let Err(error) = context.spill.cleanup() {
+        if let Err(error) = context.cleanup_spill() {
             yield Err(error);
         }
     })
@@ -390,7 +442,8 @@ fn validate_config(config: &EngineConfig) -> Result<()> {
     if let Some(endpoint) = &config.s3.endpoint {
         crate::storage::validate_endpoint(endpoint, config.s3.allow_http)?;
     }
-    ensure_directory_parent(&config.temp_dir)
+    config.spill.validate()?;
+    ensure_directory_parent(&config.spill.directory)
 }
 
 fn ensure_directory_parent(path: &Path) -> Result<()> {
@@ -405,7 +458,13 @@ fn ensure_directory_parent(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use arrow::{
         array::{Int64Array, StringArray},
@@ -415,7 +474,8 @@ mod tests {
     use futures::{StreamExt, TryStreamExt, future::try_join_all};
 
     use crate::{
-        CsvHeader, CsvOptions, Engine, EngineConfig, Error, QueryResult, sql::StatementPlan,
+        CsvHeader, CsvOptions, Engine, EngineConfig, Error, QueryResult, SpillConfig,
+        sql::StatementPlan,
     };
 
     #[test]
@@ -431,7 +491,10 @@ mod tests {
     async fn creates_describes_queries_and_drops_temp_views() {
         let directory = tempfile::tempdir().unwrap();
         let config = EngineConfig {
-            temp_dir: directory.path().join("spill"),
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
             ..EngineConfig::default()
         };
         let session = Engine::new(config).unwrap().session();
@@ -499,12 +562,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explain_analyze_metrics_exclude_the_explanation_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = Engine::new(
+            EngineConfig::builder()
+                .spill_directory(directory.path().join("spill"))
+                .build(),
+        )
+        .unwrap()
+        .session();
+        let mut result = session.execute("EXPLAIN ANALYZE SELECT 1").await.unwrap();
+        let batches = result.stream().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let metrics = result.metrics().snapshot();
+        assert_eq!(metrics.rows_returned, 1);
+        assert_eq!(metrics.batches_returned, 1);
+    }
+
+    #[tokio::test]
     async fn view_keeps_file_provider_and_drop_view_preserves_external_table() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("values.csv");
         std::fs::write(&path, "id,label\n1,one\n2,two\n").unwrap();
         let config = EngineConfig {
-            temp_dir: directory.path().join("spill"),
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
             ..EngineConfig::default()
         };
         let session = Engine::new(config).unwrap().session();
@@ -563,7 +647,10 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         std::fs::write(data.join("a.csv"), "id\n1\n").unwrap();
         let session = Engine::new(EngineConfig {
-            temp_dir: directory.path().join("spill"),
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
             ..EngineConfig::default()
         })
         .unwrap()
@@ -614,7 +701,10 @@ mod tests {
         std::fs::write(&second, "id\n2\n").unwrap();
         let session = Engine::new(EngineConfig {
             compute_threads: 2,
-            temp_dir: directory.path().join("spill"),
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
             ..EngineConfig::default()
         })
         .unwrap()
@@ -702,7 +792,10 @@ mod tests {
         std::fs::write(&path, "id\n1\n2\n3\n").unwrap();
         let session = Engine::new(EngineConfig {
             max_concurrent_queries: 8,
-            temp_dir: directory.path().join("spill"),
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
             ..EngineConfig::default()
         })
         .unwrap()
@@ -741,10 +834,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_csv_discovers_files_per_query_and_freezes_each_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("parts");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("a.csv"), "id\n1\n").unwrap();
+        let session = Engine::new(EngineConfig {
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap()
+        .session();
+        session
+            .register_csv(
+                "dynamic_csv",
+                [format!("{}/*.csv", data.display())],
+                CsvOptions {
+                    header: CsvHeader::Present,
+                    ..CsvOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(query_count(&session, "dynamic_csv").await, 1);
+        std::fs::write(data.join("b.csv"), "id\n2\n").unwrap();
+        assert_eq!(query_count(&session, "dynamic_csv").await, 2);
+
+        let StatementPlan::Query(plan) = session
+            .prepare_statement("SELECT count(*) FROM dynamic_csv")
+            .await
+            .unwrap()
+        else {
+            panic!("expected query plan");
+        };
+        let context = session.query_context().unwrap();
+        crate::execution::prepare_plan(&plan, Arc::clone(&context))
+            .await
+            .unwrap();
+        context.seal_object_snapshots();
+        std::fs::write(data.join("c.csv"), "id\n3\n").unwrap();
+        let fixed = crate::execution::execute(StatementPlan::Query(plan), context)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(first_i64(&fixed), 2);
+
+        assert_eq!(query_count(&session, "dynamic_csv").await, 3);
+        std::fs::remove_file(data.join("a.csv")).unwrap();
+        assert_eq!(query_count(&session, "dynamic_csv").await, 2);
+    }
+
+    #[tokio::test]
+    async fn dynamic_statistics_are_query_scoped_and_drive_join_planning() {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left");
+        let right = directory.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let left_rows = (0..100)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(left.join("a.csv"), format!("id\n{left_rows}\n")).unwrap();
+        std::fs::write(right.join("a.csv"), "id\n1\n").unwrap();
+
+        let session = Engine::new(EngineConfig {
+            compute_threads: 3,
+            max_concurrent_queries: 4,
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap()
+        .session();
+        let options = CsvOptions {
+            header: CsvHeader::Present,
+            ..CsvOptions::default()
+        };
+        session
+            .register_csv(
+                "left_rows",
+                [format!("{}/*.csv", left.display())],
+                options.clone(),
+            )
+            .await
+            .unwrap();
+        session
+            .register_csv(
+                "right_rows",
+                [format!("{}/*.csv", right.display())],
+                options,
+            )
+            .await
+            .unwrap();
+
+        let added_rows = (0..2_000)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(right.join("b.csv"), format!("id\n{added_rows}\n")).unwrap();
+        let sql = "EXPLAIN SELECT l.id FROM left_rows l \
+                   JOIN right_rows r ON l.id = r.id";
+        let first = session.execute(sql).await.unwrap();
+
+        // Keep the first QueryResult alive while a second query fixes a newer
+        // file snapshot. Neither snapshot may be published to the Catalog.
+        std::fs::write(right.join("c.csv"), "id\n2001\n").unwrap();
+        let second = session.execute(sql).await.unwrap();
+        let first = explain_value(collect(first).await);
+        let second = explain_value(collect(second).await);
+
+        let first_right = scan_line(&first, "right_rows");
+        let second_right = scan_line(&second, "right_rows");
+        assert!(first_right.contains("files=2"), "{first_right}");
+        assert!(second_right.contains("files=3"), "{second_right}");
+        assert!(first.contains("lane_limit=3"), "{first}");
+        assert!(first.contains("partitions=64"), "{first}");
+        assert!(first.contains("repartition_seeds=2"), "{first}");
+        assert!(first.contains("fallback=sort_merge"), "{first}");
+
+        // The newly discovered right side is now larger, so the optimizer
+        // swaps the inner join and keeps the smaller left relation as build.
+        assert!(
+            first.find("Scan table=right_rows").unwrap()
+                < first.find("Scan table=left_rows").unwrap(),
+            "{first}"
+        );
+        assert_eq!(
+            session
+                .catalog()
+                .table("right_rows")
+                .unwrap()
+                .provider()
+                .statistics()
+                .file_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_table_atomically_replaces_the_registered_csv_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("parts");
+        std::fs::create_dir(&data).unwrap();
+        let first = data.join("a.csv");
+        std::fs::write(&first, "id\n1\n").unwrap();
+        let session = Engine::new(EngineConfig {
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap()
+        .session();
+        session
+            .register_csv(
+                "dynamic_csv",
+                [format!("{}/*.csv", data.display())],
+                CsvOptions {
+                    header: CsvHeader::Present,
+                    ..CsvOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        std::fs::remove_file(first).unwrap();
+        std::fs::write(data.join("b.csv"), "id,label\n2,two\n").unwrap();
+        assert!(session.execute("SELECT * FROM dynamic_csv").await.is_err());
+
+        let schema = session.refresh_table("dynamic_csv").await.unwrap();
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(1).name(), "label");
+        let rows = collect(
+            session
+                .execute("SELECT label FROM dynamic_csv")
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "two"
+        );
+
+        std::fs::write(data.join("b.csv"), "id,label,extra\n2,two,x\n").unwrap();
+        collect(session.execute("REFRESH TABLE dynamic_csv").await.unwrap()).await;
+        let described = collect(session.execute("DESCRIBE dynamic_csv").await.unwrap()).await;
+        assert_eq!(described[0].num_rows(), 3);
+    }
+
+    #[tokio::test]
     async fn stream_error_cleans_spill_before_query_result_is_dropped() {
         let directory = tempfile::tempdir().unwrap();
         let engine = Engine::new(EngineConfig {
-            temp_dir: directory.path().join("spill"),
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
             ..EngineConfig::default()
         })
         .unwrap();
@@ -779,7 +1080,149 @@ mod tests {
         assert!(!query_directory.exists());
     }
 
+    #[tokio::test]
+    async fn successful_stream_returns_terminal_cleanup_failure_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Engine::new(EngineConfig {
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let context = engine.session().query_context().unwrap();
+        let cleanup_attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&cleanup_attempts);
+        context.set_spill_cleanup_hook(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Err(Error::ResourceExhausted(
+                "injected successful-query cleanup failure".to_owned(),
+            ))
+        });
+        let permit = Arc::clone(&engine.inner.admission)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::empty());
+        let input = crate::runtime::boxed_record_batch_stream(futures::stream::empty());
+        let mut result = super::query_result(schema, input, context, permit);
+
+        let error = result.stream().next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, Error::ResourceExhausted(message) if message == "injected successful-query cleanup failure")
+        );
+        assert!(result.stream().next().await.is_none());
+        drop(result);
+        assert_eq!(cleanup_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_error_preserves_execution_and_cleanup_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Engine::new(EngineConfig {
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let context = engine.session().query_context().unwrap();
+        context.set_spill_cleanup_hook(|| {
+            Err(Error::ResourceExhausted(
+                "injected error-path cleanup failure".to_owned(),
+            ))
+        });
+        let permit = Arc::clone(&engine.inner.admission)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::empty());
+        let input = crate::runtime::boxed_record_batch_stream(futures::stream::once(async {
+            Err(Error::Execution("injected operator failure".to_owned()))
+        }));
+        let mut result = super::query_result(schema, input, context, permit);
+
+        let error = result.stream().next().await.unwrap().unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("injected operator failure"));
+        assert!(message.contains("injected error-path cleanup failure"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_preserves_cleanup_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Engine::new(EngineConfig {
+            spill: SpillConfig {
+                directory: directory.path().join("spill"),
+                ..SpillConfig::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let context = engine.session().query_context().unwrap();
+        context.set_spill_cleanup_hook(|| {
+            Err(Error::ResourceExhausted(
+                "injected cancellation cleanup failure".to_owned(),
+            ))
+        });
+        let permit = Arc::clone(&engine.inner.admission)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::empty());
+        let input_schema = Arc::clone(&schema);
+        let input = crate::runtime::boxed_record_batch_stream(futures::stream::once(async move {
+            Ok(RecordBatch::new_empty(input_schema))
+        }));
+        let mut result = super::query_result(schema, input, context, permit);
+        result.cancel();
+
+        let error = result.stream().next().await.unwrap().unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("query cancelled"));
+        assert!(message.contains("injected cancellation cleanup failure"));
+    }
+
     async fn collect(result: QueryResult) -> Vec<arrow::record_batch::RecordBatch> {
         result.into_stream().try_collect::<Vec<_>>().await.unwrap()
+    }
+
+    fn explain_value(batches: Vec<RecordBatch>) -> String {
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_owned()
+    }
+
+    fn scan_line<'a>(explain: &'a str, table: &str) -> &'a str {
+        explain
+            .lines()
+            .find(|line| line.contains(&format!("Scan table={table} ")))
+            .unwrap_or_else(|| panic!("missing scan for {table}: {explain}"))
+    }
+
+    async fn query_count(session: &crate::Session, table: &str) -> i64 {
+        let batches = collect(
+            session
+                .execute(&format!("SELECT count(*) FROM {table}"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        first_i64(&batches)
+    }
+
+    fn first_i64(batches: &[RecordBatch]) -> i64 {
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
     }
 }

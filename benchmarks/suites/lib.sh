@@ -252,7 +252,7 @@ run_benchmark_report() (
     --batch-size "$batch_size" \
     --io-concurrency "$io_concurrency" \
     --metadata-cache-bytes "$metadata_cache_bytes" \
-    --temp-dir "$temp_dir"
+    --spill-directory "$temp_dir"
   if [ "$require_spill" = 1 ]; then
     set -- "$@" --require-spill
   fi

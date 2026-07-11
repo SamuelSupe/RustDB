@@ -5,15 +5,50 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use tempfile::tempdir;
 
-use super::{MERGE_FAN_IN, run::MAX_PENDING_RUNS, sort};
+use super::{MERGE_FAN_IN, merge::MergeIterator, run::MAX_PENDING_RUNS, sort};
 use crate::sql::{BoundExpr, SortExpr};
 use crate::{
     Error,
     runtime::{MemoryPool, QueryContext, boxed_record_batch_stream},
 };
+
+#[tokio::test]
+async fn output_materialization_transfers_its_workspace_into_the_batch_lease() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values((0_i64..128).rev()))],
+    )
+    .unwrap();
+    let directory = tempdir().unwrap();
+    let context = Arc::new(QueryContext::new(MemoryPool::new(1 << 20), directory.path()).unwrap());
+    let input = boxed_record_batch_stream(stream::iter([Ok(batch)]));
+    let mut output = sort(
+        input,
+        vec![SortExpr {
+            expr: BoundExpr::column(0, DataType::Int64, "value"),
+            descending: false,
+            nulls_first: false,
+        }],
+        None,
+        schema,
+        Arc::clone(&context),
+        64,
+    );
+
+    let batch = output.next().await.unwrap().unwrap();
+    drop(output);
+    assert_eq!(context.memory.used(), batch.memory_size());
+    drop(batch);
+    assert_eq!(context.memory.used(), 0);
+}
 
 #[tokio::test]
 async fn orders_multiple_keys_with_explicit_null_placement() {
@@ -88,6 +123,89 @@ async fn orders_multiple_keys_with_explicit_null_placement() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_lanes_generate_runs_for_a_global_merge() {
+    const LANES: usize = 4;
+    const BATCHES: i64 = 24;
+    const ROWS_PER_BATCH: i64 = 2_048;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let input_batches = (0..BATCHES)
+        .rev()
+        .map(|batch| {
+            let start = batch * ROWS_PER_BATCH;
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(
+                    (start..start + ROWS_PER_BATCH).rev(),
+                ))],
+            )
+            .unwrap())
+        })
+        .collect::<Vec<_>>();
+    let directory = tempdir().unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(128 << 20), directory.path()).unwrap());
+    context.configure_compute_lanes(LANES);
+    let input = boxed_record_batch_stream(stream::iter(input_batches));
+    let expression = SortExpr {
+        expr: BoundExpr::column(0, DataType::Int64, "value"),
+        descending: false,
+        nulls_first: false,
+    };
+
+    let batches = sort(
+        input,
+        vec![expression],
+        None,
+        Arc::clone(&schema),
+        Arc::clone(&context),
+        512,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        values,
+        (0_i64..BATCHES * ROWS_PER_BATCH).collect::<Vec<_>>()
+    );
+    let peak = context.metrics.snapshot().peak_active_lanes;
+    assert!((2..=LANES as u64).contains(&peak), "unexpected peak {peak}");
+    assert_eq!(context.metrics.snapshot().spill_files, 0);
+    assert!(context.memory.peak() <= context.memory.limit());
+    assert_eq!(context.memory.used(), 0);
+    assert_eq!(
+        std::fs::read_dir(context.spill.directory())
+            .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "arrow")
+            }))
+            .count(),
+        0
+    );
+}
+
 #[tokio::test]
 async fn spills_and_merges_top_k_with_bounded_memory() {
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -145,14 +263,65 @@ async fn spills_and_merges_top_k_with_bounded_memory() {
     assert_eq!(values, (24_526_i64..24_576).rev().collect::<Vec<_>>());
     let metrics = context.metrics.snapshot();
     assert!(metrics.spill_bytes > 0);
+    assert!(metrics.spill_read_bytes > 0);
+    assert!(metrics.spill_write_bytes > 0);
     assert!(metrics.spill_partitions > MERGE_FAN_IN as u64);
     assert_eq!(
         std::fs::read_dir(context.spill.directory())
             .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "arrow")))
             .count(),
         0
     );
     assert!(context.memory.peak() <= context.memory.limit());
+}
+
+#[test]
+fn merge_heap_copies_of_long_keys_are_memory_accounted() {
+    const RUNS: usize = MERGE_FAN_IN;
+    const KEY_BYTES: usize = 1 << 20;
+    const MEMORY_LIMIT: usize = 20 << 20;
+    let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
+    let directory = tempdir().unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(MEMORY_LIMIT), directory.path()).unwrap());
+    let files = (0..RUNS)
+        .map(|run| {
+            let key = format!("{run:02}{}", "x".repeat(KEY_BYTES));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(StringArray::from(vec![key]))],
+            )
+            .unwrap();
+            context
+                .spill
+                .write_record_batches("long-merge-key", Arc::clone(&schema), [batch])
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let expression = SortExpr {
+        expr: BoundExpr::column(0, DataType::Utf8, "key"),
+        descending: false,
+        nulls_first: false,
+    };
+
+    let error = match MergeIterator::new(
+        &files,
+        vec![expression],
+        None,
+        schema,
+        Arc::clone(&context),
+        context.memory.reservation(),
+        1,
+    ) {
+        Ok(_) => panic!("merge unexpectedly fit unaccounted long heap keys"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, Error::ResourceExhausted(_)), "{error:?}");
+    assert!(context.memory.peak() <= MEMORY_LIMIT);
 }
 
 #[tokio::test]
@@ -242,12 +411,15 @@ async fn rejects_an_input_batch_whose_retained_buffers_exceed_the_budget() {
     .try_collect::<Vec<_>>()
     .await
     .unwrap_err();
-    assert!(matches!(
-        error,
-        Error::ResourceExhausted(message)
-            if message.contains("complete input batch")
-                && message.contains("query limit 32768 bytes")
-    ));
+    assert!(
+        matches!(
+            &error,
+            Error::ResourceExhausted(message)
+                if message.contains("sort input batch")
+                    && message.contains("query limit 32768")
+        ),
+        "unexpected error: {error:?}"
+    );
     assert_eq!(context.memory.used(), 0);
 }
 
@@ -408,6 +580,10 @@ async fn dropping_after_one_output_cleans_sort_runs_and_reservations() {
     assert_eq!(
         std::fs::read_dir(context.spill.directory())
             .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "arrow")))
             .count(),
         0
     );
@@ -451,7 +627,10 @@ async fn compacts_run_metadata_during_a_long_spilling_input() {
     .try_collect::<Vec<_>>()
     .await
     .unwrap();
-    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        8
+    );
     assert!(context.metrics.snapshot().spill_partitions > MAX_PENDING_RUNS as u64);
     assert!(context.memory.peak() <= context.memory.limit());
 }

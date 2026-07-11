@@ -8,12 +8,15 @@ use std::{
     },
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::{Error, Result, sql::LogicalPlan, storage::ObjectSnapshot};
+use crate::{Error, Result, datasource::TableProvider, sql::LogicalPlan, storage::ObjectSnapshot};
 
-use super::{MemoryPool, MemoryReservation, QueryControl, QueryMetrics, SpillManager};
+use super::{
+    MemoryPool, MemoryReservation, QueryControl, QueryMetrics, QueryScheduler, QuerySpillQuota,
+    SpillIoPool, SpillManager,
+};
 
 pub struct QueryContext {
     pub query_id: Uuid,
@@ -22,10 +25,15 @@ pub struct QueryContext {
     pub metrics: QueryMetrics,
     pub memory: MemoryPool,
     pub spill: SpillManager,
+    pub(crate) scheduler: QueryScheduler,
+    spill_cleanup_attempted: Mutex<bool>,
+    #[cfg(test)]
+    spill_cleanup_hook: RwLock<Option<SpillCleanupHook>>,
     view_depth: Arc<AtomicUsize>,
     object_snapshots: RwLock<ObjectSnapshots>,
     object_snapshots_sealed: AtomicBool,
     view_plans: RwLock<HashMap<String, LogicalPlan>>,
+    prepared_providers: RwLock<HashMap<u64, Arc<dyn TableProvider>>>,
 }
 
 impl QueryContext {
@@ -47,6 +55,7 @@ impl QueryContext {
         Self::with_query_id_and_batch_size(query_id, memory, spill_root, Self::DEFAULT_BATCH_SIZE)
     }
 
+    #[cfg(test)]
     pub fn with_query_id_and_batch_size(
         query_id: Uuid,
         memory: MemoryPool,
@@ -62,14 +71,58 @@ impl QueryContext {
             memory.clone(),
             Some(metrics.clone()),
         )?;
+        Ok(Self::from_runtime_parts(
+            query_id, memory, batch_size, control, metrics, spill,
+        ))
+    }
+
+    /// Creates a query over engine-shared spill quota and blocking-I/O
+    /// resources. Engine should use this constructor for production queries.
+    pub(crate) fn with_spill_resources(
+        query_id: Uuid,
+        memory: MemoryPool,
+        spill_root: impl AsRef<Path>,
+        batch_size: usize,
+        spill_quota: QuerySpillQuota,
+        spill_io: SpillIoPool,
+    ) -> Result<Self> {
+        let control = QueryControl::new();
+        let metrics = QueryMetrics::with_memory_pool(memory.clone());
+        let spill = SpillManager::for_query_with_resources(
+            spill_root,
+            query_id,
+            &control,
+            memory.clone(),
+            Some(metrics.clone()),
+            spill_quota,
+            spill_io,
+        )?;
+        Ok(Self::from_runtime_parts(
+            query_id, memory, batch_size, control, metrics, spill,
+        ))
+    }
+
+    fn from_runtime_parts(
+        query_id: Uuid,
+        memory: MemoryPool,
+        batch_size: usize,
+        control: QueryControl,
+        metrics: QueryMetrics,
+        spill: SpillManager,
+    ) -> Self {
+        let scheduler = QueryScheduler::new(metrics.clone());
         let snapshot_memory = memory.reservation();
-        Ok(Self {
+        Self {
             query_id,
             batch_size,
             control,
             metrics,
             memory,
             spill,
+            scheduler,
+            spill_cleanup_attempted: Mutex::new(false),
+            #[cfg(test)]
+            spill_cleanup_hook: RwLock::new(None),
             view_depth: Arc::new(AtomicUsize::new(0)),
             object_snapshots: RwLock::new(ObjectSnapshots {
                 entries: HashMap::new(),
@@ -77,7 +130,8 @@ impl QueryContext {
             }),
             object_snapshots_sealed: AtomicBool::new(false),
             view_plans: RwLock::new(HashMap::new()),
-        })
+            prepared_providers: RwLock::new(HashMap::new()),
+        }
     }
 
     #[cfg(test)]
@@ -87,6 +141,42 @@ impl QueryContext {
 
     pub fn check_cancelled(&self) -> Result<()> {
         self.control.check_cancelled()
+    }
+
+    pub(crate) async fn reserve_memory(
+        &self,
+        bytes: usize,
+        owner: &'static str,
+    ) -> Result<MemoryReservation> {
+        self.reserve_memory_while_holding(bytes, 0, owner).await
+    }
+
+    /// Waits only for releasable pipeline pressure. If one kernel would need
+    /// more than the query limit while its input lease remains live, fail
+    /// immediately instead of waiting for memory that this operation itself
+    /// prevents from being released.
+    pub(crate) async fn reserve_memory_while_holding(
+        &self,
+        bytes: usize,
+        held_bytes: usize,
+        owner: &'static str,
+    ) -> Result<MemoryReservation> {
+        // Object snapshots live for the whole query. They cannot release memory
+        // to satisfy a blocked kernel, so include them in the impossible
+        // single-operation check without treating releasable queue pressure as
+        // permanent.
+        let retained_bytes = held_bytes.saturating_add(self.object_snapshots.read().memory.size());
+        self.memory
+            .reserve_wait(bytes, retained_bytes, &self.control)
+            .await
+            .map_err(|error| match error {
+                Error::Cancelled => Error::Cancelled,
+                error => Error::ResourceExhausted(format!(
+                    "{owner} requires {bytes} bytes while retaining {retained_bytes} bytes (query limit {}, available {}): {error}",
+                    self.memory.limit(),
+                    self.memory.available(),
+                )),
+            })
     }
 
     #[cfg(test)]
@@ -99,6 +189,47 @@ impl QueryContext {
     pub fn cancel(&self) {
         self.control.cancel();
         self.metrics.finish();
+    }
+
+    /// Removes this query's spill resources exactly once through the query
+    /// lifecycle. The first caller receives any deletion failure; later
+    /// teardown paths are no-ops so they cannot mask or duplicate that error.
+    pub(crate) fn cleanup_spill(&self) -> Result<()> {
+        let mut attempted = self.spill_cleanup_attempted.lock();
+        if *attempted {
+            return Ok(());
+        }
+        *attempted = true;
+
+        #[cfg(test)]
+        if let Some(cleanup) = self.spill_cleanup_hook.read().as_ref() {
+            return cleanup();
+        }
+
+        self.spill.cleanup()
+    }
+
+    /// Preserves an execution/cancellation failure while making a concurrent
+    /// spill deletion failure visible to the caller as one terminal error.
+    pub(crate) fn error_with_cleanup(&self, error: Error) -> Error {
+        match self.cleanup_spill() {
+            Ok(()) => error,
+            Err(cleanup_error) => Error::Execution(format!(
+                "{error}; additionally failed to clean spill resources: {cleanup_error}"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_spill_cleanup_hook(
+        &self,
+        cleanup: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) {
+        *self.spill_cleanup_hook.write() = Some(Arc::new(cleanup));
+    }
+
+    pub(crate) fn configure_compute_lanes(&self, lanes: usize) {
+        self.scheduler.configure(lanes);
     }
 
     pub(crate) fn enter_view(&self, name: &str) -> Result<ViewExpansion> {
@@ -193,6 +324,27 @@ impl QueryContext {
             .get(&name.to_ascii_lowercase())
             .cloned()
     }
+
+    pub(crate) fn cache_prepared_provider(
+        &self,
+        id: u64,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<()> {
+        if self.object_snapshots_sealed() {
+            return Err(Error::Internal(
+                "external table was prepared after query snapshots were fixed".to_owned(),
+            ));
+        }
+        self.prepared_providers
+            .write()
+            .entry(id)
+            .or_insert(provider);
+        Ok(())
+    }
+
+    pub(crate) fn prepared_provider(&self, id: u64) -> Option<Arc<dyn TableProvider>> {
+        self.prepared_providers.read().get(&id).cloned()
+    }
 }
 
 struct ObjectSnapshots {
@@ -224,15 +376,30 @@ impl Drop for ViewExpansion {
 impl Drop for QueryContext {
     fn drop(&mut self) {
         self.metrics.finish();
-        let _ = self.spill.cleanup();
+        if let Err(error) = self.cleanup_spill() {
+            tracing::error!(
+                %error,
+                query_id = %self.query_id,
+                directory = %self.spill.directory().display(),
+                "failed to clean spill resources while dropping query context"
+            );
+        }
     }
 }
 
 #[cfg(test)]
+type SpillCleanupHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+#[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::QueryContext;
-    use crate::runtime::MemoryPool;
     use crate::storage::ObjectSnapshot;
+    use crate::{Error, runtime::MemoryPool};
 
     #[test]
     fn context_tracks_memory_and_cleans_spill_on_drop() {
@@ -248,6 +415,26 @@ mod tests {
 
         assert!(!directory.exists());
         assert!(!metrics.snapshot().elapsed.is_zero());
+    }
+
+    #[test]
+    fn cleanup_failure_is_reported_once_across_teardown_paths() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let context = QueryContext::new(MemoryPool::new(128), root.path()).expect("context");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        context.set_spill_cleanup_hook(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Err(Error::ResourceExhausted(
+                "injected cleanup rejection".to_owned(),
+            ))
+        });
+
+        let error = context.cleanup_spill().unwrap_err();
+        assert!(error.to_string().contains("injected cleanup rejection"));
+        assert!(context.cleanup_spill().is_ok());
+        drop(context);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[test]

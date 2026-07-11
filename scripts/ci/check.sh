@@ -31,7 +31,13 @@ test_with_minio() {
 }
 
 test_portable() {
+  tool_tests
   run cargo test --locked --all-targets
+}
+
+tool_tests() {
+  run python3 -m unittest discover -s benchmarks/tests -p 'test_*.py'
+  run python3 tools/tpch/test_canonicalize.py
 }
 
 release_build() {
@@ -57,6 +63,7 @@ case "${1:-}" in
     lint
     ;;
   test|minio-test)
+    tool_tests
     test_with_minio
     ;;
   portable)
@@ -67,6 +74,7 @@ case "${1:-}" in
     ;;
   all)
     lint
+    tool_tests
     test_with_minio
     release_build
     ;;

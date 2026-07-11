@@ -1,36 +1,58 @@
-use std::{collections::HashSet, io::Cursor, sync::Arc};
+use std::{collections::HashSet, io::Cursor, ops::Deref, sync::Arc};
 
 use arrow::{
     csv::reader::Format,
     datatypes::{DataType, Schema, SchemaRef},
 };
+use bytes::Bytes;
 use object_store::GetRange;
 
-use crate::{CsvHeader, CsvOptions, Error, Result, runtime::QueryContext, storage::ObjectSource};
+use crate::{
+    CsvHeader, CsvOptions, Error, Result,
+    runtime::{MemoryReservation, QueryContext},
+    storage::ObjectSource,
+};
 
 const INITIAL_SAMPLE_BYTES: u64 = 1024 * 1024;
+const MAX_SAMPLE_BYTES: usize = 64 * 1024 * 1024;
+
+pub(super) fn sample_byte_cap(memory_limit: usize) -> usize {
+    (memory_limit / 4).clamp(1, MAX_SAMPLE_BYTES)
+}
 
 pub(super) async fn infer_table_schema(
     files: &[ObjectSource],
     options: &CsvOptions,
+    sample_byte_cap: usize,
     context: Option<&QueryContext>,
 ) -> Result<(SchemaRef, bool)> {
     let first = files
         .first()
         .ok_or_else(|| Error::InvalidArgument("CSV table requires at least one file".to_owned()))?;
-    let first_sample = read_sample(first, options, context).await?;
-    let has_header = match options.header {
-        CsvHeader::Present => true,
-        CsvHeader::Absent => false,
-        CsvHeader::Auto => detect_header(&first_sample, options)
-            .map_err(|error| csv_schema_error(first.uri(), error))?,
-    };
 
     if let Some(schema) = &options.schema {
+        if options.header == CsvHeader::Absent {
+            return Ok((Arc::clone(schema), false));
+        }
+
+        let required_records = if options.header == CsvHeader::Auto {
+            2
+        } else {
+            1
+        };
+        let first_sample =
+            read_sample(first, options, sample_byte_cap, required_records, context).await?;
+        let has_header = match options.header {
+            CsvHeader::Present => true,
+            CsvHeader::Auto => detect_header(&first_sample, options)
+                .map_err(|error| csv_schema_error(first.uri(), error))?,
+            CsvHeader::Absent => unreachable!("handled before sampling"),
+        };
         if has_header {
             validate_header_names(&first_sample, schema, options, first.uri())?;
+            drop(first_sample);
             for file in files.iter().skip(1) {
-                let sample = read_sample(file, options, context).await?;
+                let sample = read_sample(file, options, sample_byte_cap, 1, context).await?;
                 validate_header_names(&sample, schema, options, file.uri())?;
             }
         }
@@ -42,6 +64,18 @@ pub(super) async fn infer_table_schema(
         ));
     }
 
+    let required_records = match options.header {
+        CsvHeader::Absent => 1,
+        CsvHeader::Present | CsvHeader::Auto => 2,
+    };
+    let first_sample =
+        read_sample(first, options, sample_byte_cap, required_records, context).await?;
+    let has_header = match options.header {
+        CsvHeader::Present => true,
+        CsvHeader::Absent => false,
+        CsvHeader::Auto => detect_header(&first_sample, options)
+            .map_err(|error| csv_schema_error(first.uri(), error))?,
+    };
     let schema = infer(&first_sample, options, has_header)
         .map_err(|error| csv_schema_error(first.uri(), error))?;
     if schema.fields().is_empty() {
@@ -50,8 +84,10 @@ pub(super) async fn infer_table_schema(
             first.uri()
         )));
     }
+    drop(first_sample);
     for file in files.iter().skip(1) {
-        let sample = read_sample(file, options, context).await?;
+        let required_records = if has_header { 2 } else { 1 };
+        let sample = read_sample(file, options, sample_byte_cap, required_records, context).await?;
         let actual = infer(&sample, options, has_header)
             .map_err(|error| csv_schema_error(file.uri(), error))?;
         validate_schema(&actual, &schema, file.uri())?;
@@ -75,37 +111,58 @@ pub(super) fn format(options: &CsvOptions, has_header: bool) -> Format {
 async fn read_sample(
     file: &ObjectSource,
     options: &CsvOptions,
+    sample_byte_cap: usize,
+    required_records: usize,
     context: Option<&QueryContext>,
-) -> Result<Vec<u8>> {
+) -> Result<CsvSample> {
+    debug_assert!(sample_byte_cap > 0);
+    debug_assert!(required_records > 0);
     if file.snapshot().size == 0 {
-        return Ok(Vec::new());
+        return Ok(CsvSample::empty());
     }
 
-    let mut end = file.snapshot().size.min(INITIAL_SAMPLE_BYTES);
+    let cap = u64::try_from(sample_byte_cap).unwrap_or(u64::MAX);
+    let mut end = file.snapshot().size.min(INITIAL_SAMPLE_BYTES).min(cap);
     loop {
         if let Some(context) = context {
             context.check_cancelled()?;
-            if file.is_s3() {
-                context.metrics.add_s3_requests(1);
-            }
+        }
+        let mut memory = match context {
+            Some(context) => Some(context.memory.try_reserve(end as usize).map_err(|error| {
+                csv_sample_memory_error(file.uri(), end as usize, context, error)
+            })?),
+            None => None,
+        };
+        if let Some(context) = context
+            && file.is_s3()
+        {
+            context.metrics.add_s3_requests(1);
         }
         let mut get_options = file.get_options_for(file.snapshot());
         get_options.range = Some(GetRange::Bounded(0..end));
         let request = async {
-            file.store()
+            let response = file
+                .store()
                 .get_opts(file.location(), get_options)
-                .await?
-                .bytes()
                 .await
+                .map_err(Error::from)?;
+            file.snapshot()
+                .validate_get_response(file.uri(), &response.meta)?;
+            response.bytes().await.map_err(Error::from)
         };
         let bytes = match context {
             Some(context) => tokio::select! {
                 _ = context.control.cancelled() => Err(Error::Cancelled),
-                result = request => result.map_err(Error::from),
+                result = request => result,
             },
-            None => request.await.map_err(Error::from),
+            None => request.await,
         }
         .map_err(|error| csv_sample_error(file.uri(), error))?;
+        if let (Some(memory), Some(context)) = (&mut memory, context) {
+            memory.try_resize(bytes.len()).map_err(|error| {
+                csv_sample_memory_error(file.uri(), bytes.len(), context, error)
+            })?;
+        }
         if file.is_s3()
             && let Some(context) = context
         {
@@ -119,11 +176,53 @@ async fn read_sample(
             options.escape,
             end == file.snapshot().size,
         );
-        if records >= 2 || end == file.snapshot().size {
-            return Ok(bytes[..complete_end].to_vec());
+        if records >= required_records || end == file.snapshot().size {
+            return Ok(CsvSample {
+                bytes,
+                complete_end,
+                _memory: memory,
+            });
         }
-        end = end.saturating_mul(2).min(file.snapshot().size);
+        if end >= cap {
+            return Err(Error::ResourceExhausted(format!(
+                "CSV schema/header sample for {} reached its {sample_byte_cap}-byte limit before finding {required_records} complete record(s); provide an explicit schema/header or increase the engine memory limit",
+                file.uri()
+            )));
+        }
+        end = end.saturating_mul(2).min(file.snapshot().size).min(cap);
     }
+}
+
+struct CsvSample {
+    bytes: Bytes,
+    complete_end: usize,
+    _memory: Option<MemoryReservation>,
+}
+
+impl CsvSample {
+    fn empty() -> Self {
+        Self {
+            bytes: Bytes::new(),
+            complete_end: 0,
+            _memory: None,
+        }
+    }
+}
+
+impl Deref for CsvSample {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes[..self.complete_end]
+    }
+}
+
+fn csv_sample_memory_error(uri: &str, bytes: usize, context: &QueryContext, error: Error) -> Error {
+    Error::ResourceExhausted(format!(
+        "CSV schema/header sample for {uri} requires {bytes} bytes (query limit {}, available {}): {error}",
+        context.memory.limit(),
+        context.memory.available()
+    ))
 }
 
 fn infer(sample: &[u8], options: &CsvOptions, has_header: bool) -> Result<Schema> {
@@ -264,8 +363,17 @@ fn is_identifier(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_prefix, detect_header};
-    use crate::CsvOptions;
+    use std::{fs, sync::Arc};
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use tempfile::tempdir;
+
+    use super::{complete_prefix, detect_header, infer_table_schema, sample_byte_cap};
+    use crate::{
+        CsvHeader, CsvOptions, Error, S3Config,
+        runtime::{MemoryPool, QueryContext},
+        storage::LocationResolver,
+    };
 
     #[test]
     fn sample_boundary_ignores_newlines_inside_quotes() {
@@ -279,5 +387,77 @@ mod tests {
     fn header_detection_uses_type_change() {
         let input = b"id,amount\n1,10.5\n2,20.0\n";
         assert!(detect_header(input, &CsvOptions::default()).unwrap());
+    }
+
+    #[test]
+    fn sample_cap_is_a_quarter_of_memory_up_to_sixty_four_mib() {
+        assert_eq!(sample_byte_cap(1), 1);
+        assert_eq!(sample_byte_cap(1024), 256);
+        assert_eq!(sample_byte_cap(usize::MAX), 64 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn bounded_sample_rejects_a_huge_unterminated_record() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("unterminated.csv");
+        let memory_limit = 1024;
+        let cap = sample_byte_cap(memory_limit);
+        let mut contents = b"id,note\n1,\"".to_vec();
+        contents.extend(vec![b'x'; cap * 2]);
+        fs::write(&path, contents).unwrap();
+
+        let resolver = LocationResolver::with_memory_limit(S3Config::default(), 1024 * 1024);
+        let files = resolver
+            .resolve(&[path.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        let context = QueryContext::new(MemoryPool::new(4096), directory.path()).unwrap();
+        let baseline = context.memory.used();
+        let error = infer_table_schema(&files, &CsvOptions::default(), cap, Some(&context))
+            .await
+            .unwrap_err();
+
+        match error {
+            Error::ResourceExhausted(message) => {
+                assert!(message.contains(files[0].uri()));
+                assert!(message.contains("256-byte limit"));
+                assert!(message.contains("2 complete record"));
+            }
+            other => panic!("expected resource error, got {other:?}"),
+        }
+        assert_eq!(context.memory.used(), baseline);
+        assert!(context.memory.peak() >= cap);
+    }
+
+    #[tokio::test]
+    async fn explicit_schema_without_a_header_does_not_sample_the_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("explicit.csv");
+        fs::write(&path, b"1,\"unterminated").unwrap();
+        let resolver = LocationResolver::with_memory_limit(S3Config::default(), 1024 * 1024);
+        let files = resolver
+            .resolve(&[path.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        let context = QueryContext::new(MemoryPool::new(4096), directory.path()).unwrap();
+        let baseline = context.memory.used();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let options = CsvOptions {
+            schema: Some(Arc::clone(&schema)),
+            header: CsvHeader::Absent,
+            ..CsvOptions::default()
+        };
+
+        let (actual, has_header) = infer_table_schema(&files, &options, 1, Some(&context))
+            .await
+            .unwrap();
+
+        assert_eq!(actual, schema);
+        assert!(!has_header);
+        assert_eq!(context.memory.used(), baseline);
+        assert_eq!(context.memory.peak(), baseline);
     }
 }

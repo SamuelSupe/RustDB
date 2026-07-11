@@ -8,11 +8,10 @@ use arrow::{
 
 use crate::{
     Result,
-    runtime::{MemoryReservation, QueryContext, SpillFile},
+    runtime::{BatchEnvelope, MemoryReservation, QueryContext, SpillFile},
 };
 
 const COMPACTION_FAN_IN: usize = 64;
-const HASH_TABLE_BYTES_PER_ROW: usize = 128;
 const IPC_BLOCK_METADATA_BYTES: usize = 64;
 const CONCAT_ARRAY_METADATA_BYTES: usize = 256;
 
@@ -57,7 +56,9 @@ pub(in crate::execution::join) fn load_build_partition(
     for file in files {
         let mut source_batches = 0usize;
         for batch in context.spill.read_file(file)? {
-            footprint.observe_batch(&batch?);
+            let batch =
+                BatchEnvelope::try_new(batch?, &context.memory, "join build footprint batch")?;
+            footprint.observe_batch(batch.batch());
             source_batches = source_batches.saturating_add(1);
         }
         footprint.finish_file(source_batches);
@@ -77,6 +78,16 @@ pub(in crate::execution::join) fn load_build_partition(
     }
     let batch = compact_batches(batches, schema)?
         .unwrap_or_else(|| RecordBatch::new_empty(Arc::clone(schema)));
+    if reservation
+        .try_resize(batch.get_array_memory_size())
+        .is_err()
+    {
+        drop(batch);
+        reservation.try_resize(0)?;
+        return Ok(BuildPartition::TooLarge {
+            rows: footprint.rows,
+        });
+    }
     Ok(BuildPartition::Loaded(batch))
 }
 
@@ -159,7 +170,6 @@ fn estimated_build_bytes(
     footprint
         .buffer_bytes
         .saturating_mul(2)
-        .saturating_add(footprint.rows.saturating_mul(HASH_TABLE_BYTES_PER_ROW))
         .saturating_add(retained_metadata)
         .saturating_add(
             footprint

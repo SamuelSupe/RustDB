@@ -6,7 +6,8 @@ use crate::{Error, Result};
 use super::{BinaryOp, BoundExpr, ExprKind, PlanSchema, ScalarValue, UnaryOp};
 use super::{
     coercion::{
-        cast, cast_if_needed, coerce_arithmetic, coerce_comparison, common_case_type, is_string,
+        cast, cast_if_needed, coerce_arithmetic, coerce_comparison, common_case_type, is_numeric,
+        is_string,
     },
     literal::{bind_interval, bind_typed_string, bind_value, string_value},
 };
@@ -109,16 +110,16 @@ pub(super) fn bind_expr(expr: &Expr, schema: &PlanSchema) -> Result<BoundExpr> {
         }
         Expr::IsNull(expr) => make_is_null(bind_expr(expr, schema)?, false),
         Expr::IsNotNull(expr) => make_is_null(bind_expr(expr, schema)?, true),
-        Expr::IsTrue(expr) => make_binary(
-            bind_expr(expr, schema)?,
-            BinaryOp::Eq,
-            BoundExpr::literal(ScalarValue::Boolean(true)),
-        ),
-        Expr::IsFalse(expr) => make_binary(
-            bind_expr(expr, schema)?,
-            BinaryOp::Eq,
-            BoundExpr::literal(ScalarValue::Boolean(false)),
-        ),
+        Expr::IsTrue(expr) => make_is_truth(bind_expr(expr, schema)?, TruthValue::True, false),
+        Expr::IsNotTrue(expr) => make_is_truth(bind_expr(expr, schema)?, TruthValue::True, true),
+        Expr::IsFalse(expr) => make_is_truth(bind_expr(expr, schema)?, TruthValue::False, false),
+        Expr::IsNotFalse(expr) => make_is_truth(bind_expr(expr, schema)?, TruthValue::False, true),
+        Expr::IsUnknown(expr) => {
+            make_is_truth(bind_expr(expr, schema)?, TruthValue::Unknown, false)
+        }
+        Expr::IsNotUnknown(expr) => {
+            make_is_truth(bind_expr(expr, schema)?, TruthValue::Unknown, true)
+        }
         Expr::InList {
             expr,
             list,
@@ -320,6 +321,67 @@ pub(super) fn make_is_null(expr: BoundExpr, negated: bool) -> Result<BoundExpr> 
         data_type: DataType::Boolean,
         display_name,
     })
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum TruthValue {
+    True,
+    False,
+    Unknown,
+}
+
+pub(super) fn make_is_truth(
+    expr: BoundExpr,
+    truth: TruthValue,
+    negated: bool,
+) -> Result<BoundExpr> {
+    if truth == TruthValue::Unknown {
+        let original_name = expr.display_name.clone();
+        let mut output = make_is_null(expr, negated)?;
+        output.display_name = truth_display(&original_name, truth, negated);
+        return Ok(output);
+    }
+    if !matches!(expr.data_type, DataType::Boolean | DataType::Null)
+        && !is_numeric(&expr.data_type)
+        && !is_string(&expr.data_type)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "IS TRUE/FALSE does not support {}",
+            expr.data_type
+        )));
+    }
+    let original_name = expr.display_name.clone();
+    let expr = cast_if_needed(expr, &DataType::Boolean);
+    let expected = BoundExpr::literal(ScalarValue::Boolean(truth == TruthValue::True));
+    let null_test = make_is_null(expr.clone(), !negated)?;
+    let comparison = make_binary(
+        expr,
+        if negated {
+            BinaryOp::NotEq
+        } else {
+            BinaryOp::Eq
+        },
+        expected,
+    )?;
+    let mut output = make_binary(
+        null_test,
+        if negated { BinaryOp::Or } else { BinaryOp::And },
+        comparison,
+    )?;
+    output.display_name = truth_display(&original_name, truth, negated);
+    Ok(output)
+}
+
+fn truth_display(expr_name: &str, truth: TruthValue, negated: bool) -> String {
+    let truth = match truth {
+        TruthValue::True => "TRUE",
+        TruthValue::False => "FALSE",
+        TruthValue::Unknown => "UNKNOWN",
+    };
+    format!(
+        "{expr_name} IS {}{truth}",
+        if negated { "NOT " } else { "" }
+    )
 }
 
 pub(super) fn make_like(

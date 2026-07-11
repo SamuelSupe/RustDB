@@ -8,7 +8,7 @@ use arrow::{
 use futures::TryStreamExt;
 
 use super::{
-    aggregate, build_partial_batch, partial_schema, spill,
+    OutputMode, aggregate, build_output_envelope, build_partial_batch, partial_schema, spill,
     state::{AggregateState, GroupState},
 };
 use crate::{
@@ -18,6 +18,43 @@ use crate::{
 };
 
 use super::super::value::CellValue;
+
+#[tokio::test]
+async fn output_materialization_transfers_its_workspace_into_the_batch_lease() {
+    let groups = vec![BoundExpr::column(0, DataType::Utf8, "key")];
+    let aggregates = vec![AggregateExpr {
+        function: AggregateFunction::Count,
+        expr: None,
+        data_type: DataType::Int64,
+        display_name: "count(*)".into(),
+    }];
+    let mut state = GroupState::new(
+        vec![CellValue::Utf8("leased-output".repeat(128))],
+        &aggregates,
+    );
+    state.aggregates[0].update(&aggregates[0], None).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("rows", DataType::Int64, false),
+    ]));
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(1 << 20), temp.path()).unwrap();
+
+    let output = build_output_envelope(
+        &[state],
+        &groups,
+        &aggregates,
+        schema,
+        OutputMode::Final,
+        &context,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(context.memory.used(), output.memory_size());
+    drop(output);
+    assert_eq!(context.memory.used(), 0);
+}
 
 #[test]
 fn decimal_aggregates_preserve_scale_nulls_and_overflow() {
@@ -306,7 +343,7 @@ fn spill_merge_streams_and_accounts_many_batches_from_one_file() {
 
     drop(states);
     reservation.try_resize(0).unwrap();
-    context.spill.remove_file(&file);
+    context.spill.remove_file(&file).unwrap();
     assert_eq!(context.memory.used(), 0);
 }
 
@@ -355,7 +392,50 @@ fn spill_merge_reports_when_one_ipc_batch_exceeds_budget() {
                 && message.contains("query limit 32768 bytes")
     ));
     assert!(context.memory.used() > 0);
-    context.spill.remove_file(&file);
+    context.spill.remove_file(&file).unwrap();
+    assert_eq!(context.memory.used(), 0);
+}
+
+#[test]
+fn spill_merge_accounts_for_the_index_copy_of_long_string_keys() {
+    let groups = vec![BoundExpr::column(0, DataType::Utf8, "key")];
+    let aggregates = vec![AggregateExpr {
+        function: AggregateFunction::Count,
+        expr: None,
+        data_type: DataType::Int64,
+        display_name: "count(*)".into(),
+    }];
+    let schema = partial_schema(&groups, &aggregates);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["x".repeat(16 << 10)])),
+            Arc::new(Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(256 << 10), temp.path()).unwrap();
+    let file = context
+        .spill
+        .write_record_batches("aggregate-long-index-key", schema, [batch])
+        .unwrap();
+    let state_pool = context.memory.child("aggregate-long-index", 24 << 10);
+    let mut reservation = state_pool.reservation();
+    let error = spill::merge_partition(
+        std::slice::from_ref(&file),
+        &groups,
+        &aggregates,
+        &context,
+        &mut reservation,
+    )
+    .err()
+    .expect("state plus hash-index key copies must exceed the child budget");
+    assert!(matches!(
+        error,
+        Error::ResourceExhausted(message) if message.contains("one aggregate group")
+    ));
+    context.spill.remove_file(&file).unwrap();
     assert_eq!(context.memory.used(), 0);
 }
 
@@ -414,7 +494,14 @@ async fn spilling_signed_sum_preserves_transient_wide_partial_and_cleans_up() {
     assert!(
         std::fs::read_dir(&spill_directory)
             .unwrap()
-            .next()
+            .find(|entry| {
+                entry.as_ref().is_ok_and(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "arrow")
+                })
+            })
             .is_none(),
         "aggregate left spill files after stream completion"
     );
@@ -568,6 +655,6 @@ async fn reports_when_one_group_cannot_fit() {
     assert!(matches!(
         error,
         Error::ResourceExhausted(message)
-            if message.contains("one aggregate group") && message.contains("query limit")
+            if message.contains("aggregate input") && message.contains("query limit")
     ));
 }

@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    runtime::{QueryContext, SpillFile},
+    runtime::{BatchEnvelope, QueryContext, SpillFile},
     sql::{BoundExpr, JoinType},
 };
 
@@ -20,11 +20,17 @@ pub(super) struct PartitionTask {
     pub(super) left: Vec<SpillFile>,
     pub(super) right: Vec<SpillFile>,
     pub(super) depth: usize,
+    pub(super) stagnant_repartitions: usize,
 }
 
 impl PartitionTask {
     fn new(left: Vec<SpillFile>, right: Vec<SpillFile>, depth: usize) -> Self {
-        Self { left, right, depth }
+        Self {
+            left,
+            right,
+            depth,
+            stagnant_repartitions: 0,
+        }
     }
 }
 
@@ -58,8 +64,11 @@ pub(super) fn repartition(
 
     for file in &task.left {
         for batch in context.spill.read_file(file)? {
+            let batch =
+                BatchEnvelope::try_new(batch?, &context.memory, "join repartition left batch")?;
+            let (batch, _batch_memory) = batch.into_parts();
             spill_batch(
-                batch?,
+                batch,
                 left_expressions,
                 Side::Left,
                 join_type,
@@ -73,8 +82,11 @@ pub(super) fn repartition(
     let mut right_spiller = PartitionSpiller::new(context, format!("join-right-r{next_depth}"));
     for file in &task.right {
         for batch in context.spill.read_file(file)? {
+            let batch =
+                BatchEnvelope::try_new(batch?, &context.memory, "join repartition right batch")?;
+            let (batch, _batch_memory) = batch.into_parts();
             let counts = spill_batch(
-                batch?,
+                batch,
                 right_expressions,
                 Side::Right,
                 join_type,
@@ -104,21 +116,23 @@ pub(super) fn repartition(
     })
 }
 
-pub(super) fn remove_task(context: &QueryContext, task: &PartitionTask) {
-    remove_files(context, &task.left);
-    remove_files(context, &task.right);
+pub(super) fn remove_task(context: &QueryContext, task: &PartitionTask) -> Result<()> {
+    remove_files(context, &task.left)?;
+    remove_files(context, &task.right)
 }
 
-pub(super) fn remove_tasks(context: &QueryContext, tasks: &[PartitionTask]) {
+pub(super) fn remove_tasks(context: &QueryContext, tasks: &[PartitionTask]) -> Result<()> {
     for task in tasks {
-        remove_task(context, task);
+        remove_task(context, task)?;
     }
+    Ok(())
 }
 
-pub(super) fn remove_files(context: &QueryContext, files: &[SpillFile]) {
+pub(super) fn remove_files(context: &QueryContext, files: &[SpillFile]) -> Result<()> {
     for file in files {
-        context.spill.remove_file(file);
+        context.spill.remove_file(file)?;
     }
+    Ok(())
 }
 
 fn seed_for_depth(depth: usize) -> u64 {

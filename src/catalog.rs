@@ -56,6 +56,26 @@ impl Catalog {
         self.tables.read().get(&normalize(name)).cloned()
     }
 
+    pub(crate) fn replace_provider(
+        &self,
+        name: &str,
+        expected: &Arc<dyn TableProvider>,
+        replacement: Arc<dyn TableProvider>,
+    ) -> Result<()> {
+        let key = normalize(name);
+        let mut tables = self.tables.write();
+        let entry = tables
+            .get_mut(&key)
+            .ok_or_else(|| crate::Error::Catalog(format!("table '{name}' does not exist")))?;
+        if !Arc::ptr_eq(entry.provider(), expected) {
+            return Err(crate::Error::Catalog(format!(
+                "table '{name}' changed while it was being refreshed"
+            )));
+        }
+        *entry = TableEntry::new(entry.name().to_owned(), replacement);
+        Ok(())
+    }
+
     pub fn table_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self
             .tables

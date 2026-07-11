@@ -98,8 +98,35 @@ metadata cache and no warmup; the runner does not claim to flush the OS page
 cache, and records that fact in its manifest. MinIO data must already be
 uploaded at `--minio-root`; the runner starts and initializes the repository's
 MinIO service by default (`START_MINIO=0` disables that behavior). It compares
-the remote and local dataset manifests, then checksum-validates the actual
-local and MinIO query outputs independently before timing either target.
+the remote and local dataset manifests. Before timing, every distinct
+target/thread/batch configuration is executed independently and compared with
+DuckDB; t1 and t4 entries therefore reference different checksum artifacts.
+The manifest records SHA-256 digests of the runner, helper library, and
+checksum runner used to produce the evidence.
+
+For the v0.2 M5 Max gate, capture the local SF10 candidate and compare it with
+the clean `v0.1.0-alpha.2` SF10 manifest:
+
+```sh
+THREADS_LIST="1 4" BATCH_SIZES=8192 CACHE_MODES=warm \
+MEMORY_LIMIT_BYTES=1073741824 WARMUP=2 ITERATIONS=5 START_MINIO=0 \
+benchmarks/run_baseline.sh --local-root data/tpch-sf10 \
+  --output benchmarks/results/baseline/<candidate-run>
+
+docker compose run --rm --no-deps --no-TTY dev \
+  python3 benchmarks/check_parallel_gate.py \
+  --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
+  --baseline benchmarks/results/baseline/<alpha2-sf10-run>/manifest.json
+```
+
+The checker reads only local, metadata-warm, batch-8192 reports for
+`scan-filter` and `aggregate` at one and four threads. It requires M5 Max,
+native release, 1 GiB, two warmups, five measured runs, matching build/data
+fingerprints and checksums, at least 2.0x four-thread throughput, and no more
+than 10% one-thread regression. The candidate manifest must name the exact
+40-character commit of the current clean worktree, and every selected thread
+configuration must have its own checksum path. Any missing or inconsistent
+field fails.
 
 For the repository-generated TPC-H datasets, upload the matching scale first:
 

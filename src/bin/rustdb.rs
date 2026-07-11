@@ -57,8 +57,20 @@ async fn run(args: Args) -> Result<()> {
     if let Some(max_concurrent_queries) = args.max_concurrent_queries {
         config.max_concurrent_queries = max_concurrent_queries;
     }
-    if let Some(temp_dir) = args.temp_dir {
-        config.temp_dir = temp_dir;
+    if let Some(directory) = args.spill_directory {
+        config.spill.directory = directory;
+    }
+    if let Some(limit) = args.spill_engine_limit {
+        config.spill.engine_limit_bytes = Some(u64::try_from(limit).unwrap_or(u64::MAX));
+    }
+    if let Some(limit) = args.spill_query_limit {
+        config.spill.query_limit_bytes = Some(u64::try_from(limit).unwrap_or(u64::MAX));
+    }
+    if let Some(bytes) = args.spill_min_free_bytes {
+        config.spill.min_free_bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    }
+    if let Some(threads) = args.spill_io_threads {
+        config.spill.io_threads = threads;
     }
     config.s3.region = args.s3_region;
     config.s3.endpoint = args.s3_endpoint;

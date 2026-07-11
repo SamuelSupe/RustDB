@@ -36,8 +36,8 @@ struct Args {
     #[arg(long)]
     metadata_cache_bytes: Option<usize>,
 
-    #[arg(long)]
-    temp_dir: Option<PathBuf>,
+    #[arg(long = "spill-directory", alias = "temp-dir")]
+    spill_directory: Option<PathBuf>,
 
     #[arg(long)]
     s3_endpoint: Option<String>,
@@ -127,8 +127,14 @@ struct RunReport {
     scanned_rows: u64,
     scanned_bytes: u64,
     peak_memory_bytes: u64,
+    peak_active_lanes: u64,
+    scheduler_wait_ms: f64,
     rss_bytes_after: Option<u64>,
     spill_bytes: u64,
+    spill_read_bytes: u64,
+    spill_write_bytes: u64,
+    spill_files: u64,
+    spill_quota_rejections: u64,
     spill_partitions: u64,
     s3_requests: u64,
     s3_bytes_transferred: u64,
@@ -178,8 +184,8 @@ async fn run(args: Args) -> Result<()> {
     if let Some(metadata_cache_bytes) = args.metadata_cache_bytes {
         config.metadata_cache_bytes = metadata_cache_bytes;
     }
-    if let Some(temp_dir) = args.temp_dir {
-        config.temp_dir = temp_dir;
+    if let Some(directory) = args.spill_directory {
+        config.spill.directory = directory;
     }
     config.s3.endpoint = args.s3_endpoint;
     config.s3.region = args.s3_region;
@@ -192,7 +198,7 @@ async fn run(args: Args) -> Result<()> {
         io_concurrency: config.io_concurrency,
         metadata_cache_bytes: config.metadata_cache_bytes,
     };
-    let temp_dir = config.temp_dir.clone();
+    let temp_dir = config.spill.directory.clone();
     let memory_limit = config.memory_limit;
     let session = Engine::new(config)?.session();
 
@@ -288,8 +294,14 @@ async fn run_once(
         scanned_rows: metrics.rows_scanned,
         scanned_bytes: metrics.bytes_scanned,
         peak_memory_bytes: metrics.peak_memory_bytes,
+        peak_active_lanes: metrics.peak_active_lanes,
+        scheduler_wait_ms: metrics.scheduler_wait.as_secs_f64() * 1_000.0,
         rss_bytes_after: current_rss_bytes(),
         spill_bytes: metrics.spill_bytes,
+        spill_read_bytes: metrics.spill_read_bytes,
+        spill_write_bytes: metrics.spill_write_bytes,
+        spill_files: metrics.spill_files,
+        spill_quota_rejections: metrics.spill_quota_rejections,
         spill_partitions: metrics.spill_partitions,
         s3_requests: metrics.s3_requests,
         s3_bytes_transferred: metrics.s3_bytes_transferred,

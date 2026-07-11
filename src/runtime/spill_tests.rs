@@ -1,15 +1,55 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    io,
+    path::Path,
+    sync::{Arc, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
 
 use arrow::{
-    array::{ArrayRef, Int32Array, StringArray},
+    array::{ArrayRef, BinaryArray, Int32Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
 use futures::StreamExt;
+use rand::{RngCore, SeedableRng, rngs::StdRng};
 
+use super::io::copy_memory_bytes;
 use super::metadata::{ACTIVE_FILE_METADATA_BASE_BYTES, active_file_metadata_bytes};
-use super::{MemoryPool, QueryControl, QueryMetrics, SpillManager, writer_memory_bytes};
-use crate::Error;
+use super::{
+    DiskSpace, DiskSpaceProbe, MemoryPool, QueryControl, QueryMetrics, SpillIoPool, SpillManager,
+    SpillQuotaPool, writer_memory_bytes,
+};
+use crate::{Error, config::SpillConfig};
+
+#[derive(Debug)]
+struct FixedProbe(io::Result<DiskSpace>);
+
+impl DiskSpaceProbe for FixedProbe {
+    fn probe(&self, _path: &Path) -> io::Result<DiskSpace> {
+        match &self.0 {
+            Ok(space) => Ok(*space),
+            Err(error) => Err(error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), error.to_string()),
+                io::Error::from_raw_os_error,
+            )),
+        }
+    }
+}
+
+fn spill_file_count(manager: &SpillManager) -> usize {
+    std::fs::read_dir(manager.directory())
+        .expect("spill directory")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "arrow")
+        })
+        .count()
+}
 
 fn batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -24,6 +64,21 @@ fn batch() -> RecordBatch {
         ],
     )
     .expect("valid batch")
+}
+
+fn binary_batch(bytes: usize) -> RecordBatch {
+    let mut payload = vec![0_u8; bytes];
+    StdRng::seed_from_u64(0x5eed).fill_bytes(&mut payload);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "payload",
+        DataType::Binary,
+        false,
+    )]));
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(BinaryArray::from(vec![payload.as_slice()]))],
+    )
+    .expect("valid binary batch")
 }
 
 #[test]
@@ -104,14 +159,9 @@ fn incremental_writer_appends_batches_and_drops_unfinished_files() {
     assert!(!unfinished_path.exists());
     assert_eq!(memory.used(), completed_bytes);
 
-    manager.remove_file(&completed);
+    manager.remove_file(&completed).unwrap();
     assert_eq!(memory.used(), 0);
-    assert_eq!(
-        std::fs::read_dir(manager.directory())
-            .expect("spill directory")
-            .count(),
-        0
-    );
+    assert_eq!(spill_file_count(&manager), 0);
 }
 
 #[test]
@@ -125,9 +175,12 @@ fn streaming_writer_keeps_many_batch_blocks_out_of_a_file_footer() {
         .writer("many-stream-batches", batch.schema())
         .expect("stream writer");
     let writer_charge = memory.used();
-    for _ in 0..BATCHES {
+    writer.write_batch(&batch).expect("first stream batch");
+    assert!(memory.used() >= writer_charge);
+    for _ in 1..BATCHES {
         writer.write_batch(&batch).expect("stream batch");
-        assert_eq!(memory.used(), writer_charge);
+        assert!(memory.used() >= writer_charge);
+        assert!(memory.used() <= writer_charge + (256 << 10));
     }
     let spill = writer.finish(1).expect("finish stream");
 
@@ -135,8 +188,127 @@ fn streaming_writer_keeps_many_batch_blocks_out_of_a_file_footer() {
     assert_eq!(&prefix[..4], &[0xff, 0xff, 0xff, 0xff]);
     assert_ne!(&prefix[..6], b"ARROW1");
     assert_eq!(manager.read_batches(&spill).unwrap().len(), BATCHES);
-    manager.remove_file(&spill);
+    manager.remove_file(&spill).unwrap();
     assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn write_copy_reserves_before_allocation_and_cancel_releases_a_queued_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let control = QueryControl::new();
+    let memory = MemoryPool::new(8 << 20);
+    let io_pool = SpillIoPool::new(1).unwrap();
+    let config = SpillConfig {
+        directory: root.path().to_path_buf(),
+        min_free_ratio: 0.0,
+        min_free_bytes: 0,
+        io_threads: 1,
+        ..SpillConfig::default()
+    };
+    let quota = SpillQuotaPool::with_probe(
+        config,
+        Arc::new(FixedProbe(Ok(DiskSpace {
+            available_bytes: 64 << 20,
+            total_bytes: 64 << 20,
+        }))),
+    )
+    .unwrap()
+    .start_query();
+    let manager = SpillManager::for_query_with_resources(
+        root.path(),
+        uuid::Uuid::new_v4(),
+        &control,
+        memory.clone(),
+        None,
+        quota.clone(),
+        io_pool.clone(),
+    )
+    .unwrap();
+    let batch = binary_batch(2 << 20);
+    let writer = manager.writer("queued-copy", batch.schema()).unwrap();
+    let expected_writer_bytes = writer_memory_bytes(batch.schema().as_ref());
+    let baseline = memory.used();
+
+    let (blocked_sender, blocked_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let blocking_pool = io_pool.clone();
+    let blocker = thread::spawn(move || {
+        blocking_pool.run(move || {
+            blocked_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            Ok(())
+        })
+    });
+    blocked_receiver.recv().unwrap();
+
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    let writer_thread = thread::spawn(move || {
+        let mut writer = writer;
+        let result = writer.write_batch(&batch);
+        result_sender.send(result).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while memory.used() == baseline && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        quota.pending_bytes(),
+        0,
+        "queued writes are not disk writes"
+    );
+    assert_eq!(memory.used(), baseline + copy_memory_bytes(memory.limit()));
+    assert!(baseline >= expected_writer_bytes);
+    assert!(memory.used() <= memory.limit());
+
+    let cancel_started = Instant::now();
+    control.cancel();
+    assert!(cancel_started.elapsed() < Duration::from_secs(1));
+    assert!(matches!(
+        result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued writer must observe cancellation"),
+        Err(Error::Cancelled)
+    ));
+    writer_thread.join().unwrap();
+    assert_eq!(memory.used(), 0);
+
+    release_sender.send(()).unwrap();
+    blocker.join().unwrap().unwrap();
+    drop(manager);
+}
+
+#[test]
+fn write_copy_budget_failure_is_reported_before_arrow_writer_is_called() {
+    let root = tempfile::tempdir().unwrap();
+    let batch = binary_batch(128 << 10);
+    let query_id = uuid::Uuid::nil();
+    let path = root
+        .path()
+        .join(format!("query-{query_id}"))
+        .join("00000000-copy-budget.arrow");
+    let writer_bytes = writer_memory_bytes(batch.schema().as_ref());
+    let copy_bytes = copy_memory_bytes(32 << 10);
+    let memory = MemoryPool::new(
+        writer_bytes + active_file_metadata_bytes(&path) + copy_bytes.saturating_sub(1),
+    );
+    let manager = SpillManager::for_query(
+        root.path(),
+        query_id,
+        &QueryControl::new(),
+        memory.clone(),
+        None,
+    )
+    .unwrap();
+    let error = match manager.writer("copy-budget", batch.schema()) {
+        Ok(_) => panic!("writer unexpectedly retained an unbudgeted copy buffer"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        Error::ResourceExhausted(message) if message.contains("spill I/O queue copy")
+    ));
+    assert_eq!(memory.used(), 0);
+    assert_eq!(spill_file_count(&manager), 0);
 }
 
 #[test]
@@ -160,7 +332,7 @@ fn streaming_writer_rejects_dictionary_state_before_creating_a_file() {
             if message.contains("decode dictionaries before spilling")
     ));
     assert_eq!(memory.used(), 0);
-    assert_eq!(std::fs::read_dir(manager.directory()).unwrap().count(), 0);
+    assert_eq!(spill_file_count(&manager), 0);
 }
 
 #[test]
@@ -208,7 +380,8 @@ fn active_file_metadata_obeys_budget_and_reuses_released_capacity() {
     let second_bytes = active_file_metadata_bytes(&second_path);
     let batch = batch();
     let writer_bytes = writer_memory_bytes(batch.schema().as_ref());
-    let memory = MemoryPool::new(first_bytes + second_bytes + writer_bytes);
+    let memory =
+        MemoryPool::new(first_bytes + second_bytes + writer_bytes + copy_memory_bytes(32 << 10));
     let control = QueryControl::new();
     let manager = SpillManager::for_query(root.path(), query_id, &control, memory.clone(), None)
         .expect("spill manager");
@@ -220,7 +393,7 @@ fn active_file_metadata_obeys_budget_and_reuses_released_capacity() {
         .write_record_batches("second", batch.schema(), [batch.clone()])
         .expect("second spill file");
     assert_eq!(memory.used(), first_bytes + second_bytes);
-    assert_eq!(std::fs::read_dir(manager.directory()).unwrap().count(), 2);
+    assert_eq!(spill_file_count(&manager), 2);
 
     let error = manager
         .write_record_batches("over-budget", batch.schema(), [batch.clone()])
@@ -232,9 +405,9 @@ fn active_file_metadata_obeys_budget_and_reuses_released_capacity() {
                 && message.contains("active files 2")
     ));
     assert_eq!(memory.used(), first_bytes + second_bytes);
-    assert_eq!(std::fs::read_dir(manager.directory()).unwrap().count(), 2);
+    assert_eq!(spill_file_count(&manager), 2);
 
-    manager.remove_file(&first);
+    manager.remove_file(&first).unwrap();
     assert_eq!(memory.used(), second_bytes);
     let replacement = manager
         .write_record_batches("first", batch.schema(), [batch])
@@ -268,7 +441,7 @@ fn writer_budget_fails_before_file_creation_and_releases_on_finish() {
                 && message.contains("buffered streaming IPC/LZ4 state")
     ));
     assert_eq!(memory.used(), 0);
-    assert_eq!(std::fs::read_dir(manager.directory()).unwrap().count(), 0);
+    assert_eq!(spill_file_count(&manager), 0);
 
     let root = tempfile::tempdir().expect("tempdir");
     let memory = MemoryPool::new(64 * ACTIVE_FILE_METADATA_BASE_BYTES);
@@ -284,7 +457,7 @@ fn writer_budget_fails_before_file_creation_and_releases_on_finish() {
     writer.write_batch(&batch).expect("write batch");
     let completed = writer.finish(1).expect("finish writer");
     assert_eq!(memory.used(), active_file_metadata_bytes(completed.path()));
-    manager.remove_file(&completed);
+    manager.remove_file(&completed).unwrap();
     assert_eq!(memory.used(), 0);
     assert!(memory.peak() <= memory.limit());
 }
@@ -315,4 +488,205 @@ async fn cancellation_stops_reading_and_removes_query_directory() {
     assert!(!manager.directory().exists());
     assert_eq!(memory.used(), 0);
     assert!(matches!(stream.next().await, Some(Err(Error::Cancelled))));
+}
+
+#[test]
+fn production_resources_charge_bytes_until_physical_deletion() {
+    let root = tempfile::tempdir().unwrap();
+    let config = SpillConfig {
+        directory: root.path().to_path_buf(),
+        engine_limit_bytes: Some(1 << 20),
+        query_limit_bytes: Some(1 << 20),
+        min_free_ratio: 0.0,
+        min_free_bytes: 0,
+        io_threads: 1,
+        ..SpillConfig::default()
+    };
+    let quota_pool = SpillQuotaPool::with_probe(
+        config,
+        Arc::new(FixedProbe(Ok(DiskSpace {
+            available_bytes: 10 << 20,
+            total_bytes: 10 << 20,
+        }))),
+    )
+    .unwrap();
+    let query_quota = quota_pool.start_query();
+    let metrics = QueryMetrics::new();
+    let control = QueryControl::new();
+    let manager = SpillManager::for_query_with_resources(
+        root.path(),
+        uuid::Uuid::new_v4(),
+        &control,
+        MemoryPool::new(1 << 20),
+        Some(metrics.clone()),
+        query_quota.clone(),
+        SpillIoPool::new(1).unwrap(),
+    )
+    .unwrap();
+    assert!(manager.directory().join(".rustdb-spill").is_file());
+
+    let batch = batch();
+    let file = manager
+        .write_record_batches("quota", batch.schema(), [batch.clone()])
+        .unwrap();
+    let charged = query_quota.committed_bytes();
+    assert!(charged > 0);
+    assert_eq!(charged, std::fs::metadata(file.path()).unwrap().len());
+    assert_eq!(quota_pool.committed_bytes(), charged);
+    assert_eq!(manager.read_batches(&file).unwrap(), vec![batch]);
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.spill_files, 1);
+    assert_eq!(snapshot.spill_write_bytes, charged);
+    assert!(snapshot.spill_read_bytes >= charged);
+    assert_eq!(snapshot.spill_quota_rejections, 0);
+
+    manager.remove_file(&file).unwrap();
+    assert_eq!(query_quota.committed_bytes(), 0);
+    assert_eq!(quota_pool.committed_bytes(), 0);
+}
+
+#[test]
+fn quota_and_injected_enospc_rejections_are_reported_and_cleaned() {
+    for (probe, query_limit) in [
+        (
+            FixedProbe(Ok(DiskSpace {
+                available_bytes: 10 << 20,
+                total_bytes: 10 << 20,
+            })),
+            Some(1),
+        ),
+        (FixedProbe(Err(io::Error::from_raw_os_error(28))), None),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = SpillConfig {
+            directory: root.path().to_path_buf(),
+            query_limit_bytes: query_limit,
+            min_free_ratio: 0.0,
+            min_free_bytes: 0,
+            io_threads: 1,
+            ..SpillConfig::default()
+        };
+        let quota_pool = SpillQuotaPool::with_probe(config, Arc::new(probe)).unwrap();
+        let query_quota = quota_pool.start_query();
+        let metrics = QueryMetrics::new();
+        let control = QueryControl::new();
+        let manager = SpillManager::for_query_with_resources(
+            root.path(),
+            uuid::Uuid::new_v4(),
+            &control,
+            MemoryPool::new(1 << 20),
+            Some(metrics.clone()),
+            query_quota.clone(),
+            SpillIoPool::new(1).unwrap(),
+        )
+        .unwrap();
+        let batch = batch();
+        let error = manager
+            .write_record_batches("rejected", batch.schema(), [batch])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ResourceExhausted(_) | Error::Io { .. }
+        ));
+        assert_eq!(metrics.snapshot().spill_quota_rejections, 1);
+        assert_eq!(query_quota.committed_bytes(), 0);
+        assert_eq!(query_quota.pending_bytes(), 0);
+        assert_eq!(spill_file_count(&manager), 0);
+        manager.cleanup().unwrap();
+        assert!(!manager.directory().exists());
+    }
+}
+
+#[test]
+fn deletion_failure_is_returned_and_retains_the_quota_charge() {
+    let root = tempfile::tempdir().unwrap();
+    let config = SpillConfig {
+        directory: root.path().to_path_buf(),
+        min_free_ratio: 0.0,
+        min_free_bytes: 0,
+        io_threads: 1,
+        ..SpillConfig::default()
+    };
+    let quota_pool = SpillQuotaPool::with_probe(
+        config,
+        Arc::new(FixedProbe(Ok(DiskSpace {
+            available_bytes: 10 << 20,
+            total_bytes: 10 << 20,
+        }))),
+    )
+    .unwrap();
+    let query_quota = quota_pool.start_query();
+    let control = QueryControl::new();
+    let manager = SpillManager::for_query_with_resources(
+        root.path(),
+        uuid::Uuid::new_v4(),
+        &control,
+        MemoryPool::new(1 << 20),
+        None,
+        query_quota.clone(),
+        SpillIoPool::new(1).unwrap(),
+    )
+    .unwrap();
+    let batch = batch();
+    let file = manager
+        .write_record_batches("delete-error", batch.schema(), [batch])
+        .unwrap();
+    let charged = query_quota.committed_bytes();
+    std::fs::remove_file(file.path()).unwrap();
+    std::fs::create_dir(file.path()).unwrap();
+
+    assert!(matches!(manager.remove_file(&file), Err(Error::Io { .. })));
+    assert_eq!(query_quota.committed_bytes(), charged);
+    manager.cleanup().unwrap();
+    assert_eq!(query_quota.committed_bytes(), 0);
+}
+
+#[test]
+fn permanent_cleanup_failure_retains_engine_quota_after_manager_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let config = SpillConfig {
+        directory: root.path().to_path_buf(),
+        engine_limit_bytes: Some(1 << 20),
+        query_limit_bytes: Some(1 << 20),
+        min_free_ratio: 0.0,
+        min_free_bytes: 0,
+        io_threads: 1,
+        ..SpillConfig::default()
+    };
+    let quota_pool = SpillQuotaPool::with_probe(
+        config,
+        Arc::new(FixedProbe(Ok(DiskSpace {
+            available_bytes: 10 << 20,
+            total_bytes: 10 << 20,
+        }))),
+    )
+    .unwrap();
+    let query_quota = quota_pool.start_query();
+    let control = QueryControl::new();
+    let io_pool = SpillIoPool::new(1).unwrap();
+    let manager = SpillManager::for_query_with_resources(
+        root.path(),
+        uuid::Uuid::new_v4(),
+        &control,
+        MemoryPool::new(1 << 20),
+        None,
+        query_quota.clone(),
+        io_pool.clone(),
+    )
+    .unwrap();
+    let directory = manager.directory().to_path_buf();
+    let file = manager
+        .write_record_batches("retained-orphan", batch().schema(), [batch()])
+        .unwrap();
+    let charged = std::fs::metadata(file.path()).unwrap().len();
+    assert_eq!(quota_pool.committed_bytes(), charged);
+
+    io_pool.shutdown_for_test();
+    drop(manager);
+    assert!(directory.exists());
+    assert_eq!(query_quota.committed_bytes(), 0);
+    assert_eq!(quota_pool.committed_bytes(), charged);
+
+    std::fs::remove_dir_all(directory).unwrap();
 }

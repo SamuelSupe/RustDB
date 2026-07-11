@@ -12,8 +12,8 @@ use super::{
     AggregateExpr, AggregateFunction, BinaryOp, BoundExpr, LogicalPlan, PlanSchema, ScalarValue,
     UnaryOp,
     binder::{
-        bind_expr, ensure_boolean, make_binary, make_case, make_is_null, make_like, make_unary,
-        map_binary, parse_escape,
+        TruthValue, bind_expr, ensure_boolean, make_binary, make_case, make_is_null, make_is_truth,
+        make_like, make_unary, map_binary, parse_escape,
     },
     coercion::{cast, is_numeric},
 };
@@ -242,15 +242,35 @@ fn bind_after_aggregate(
             bind_after_aggregate(expr, input_schema, group_ast, group_exprs, aggregates)?,
             true,
         ),
-        Expr::IsTrue(expr) => make_binary(
+        Expr::IsTrue(expr) => make_is_truth(
             bind_after_aggregate(expr, input_schema, group_ast, group_exprs, aggregates)?,
-            BinaryOp::Eq,
-            BoundExpr::literal(ScalarValue::Boolean(true)),
+            TruthValue::True,
+            false,
         ),
-        Expr::IsFalse(expr) => make_binary(
+        Expr::IsNotTrue(expr) => make_is_truth(
             bind_after_aggregate(expr, input_schema, group_ast, group_exprs, aggregates)?,
-            BinaryOp::Eq,
-            BoundExpr::literal(ScalarValue::Boolean(false)),
+            TruthValue::True,
+            true,
+        ),
+        Expr::IsFalse(expr) => make_is_truth(
+            bind_after_aggregate(expr, input_schema, group_ast, group_exprs, aggregates)?,
+            TruthValue::False,
+            false,
+        ),
+        Expr::IsNotFalse(expr) => make_is_truth(
+            bind_after_aggregate(expr, input_schema, group_ast, group_exprs, aggregates)?,
+            TruthValue::False,
+            true,
+        ),
+        Expr::IsUnknown(expr) => make_is_truth(
+            bind_after_aggregate(expr, input_schema, group_ast, group_exprs, aggregates)?,
+            TruthValue::Unknown,
+            false,
+        ),
+        Expr::IsNotUnknown(expr) => make_is_truth(
+            bind_after_aggregate(expr, input_schema, group_ast, group_exprs, aggregates)?,
+            TruthValue::Unknown,
+            true,
         ),
         Expr::InList {
             expr,
@@ -476,7 +496,11 @@ fn contains_aggregate(expr: &Expr) -> bool {
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
         | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
         | Expr::Cast { expr, .. } => contains_aggregate(expr),
         Expr::InList { expr, list, .. } => {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)

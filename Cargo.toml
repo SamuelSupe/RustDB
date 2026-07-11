@@ -1,6 +1,6 @@
 [package]
 name = "rustdb"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 description = "A single-node, read-only OLAP engine for local and object-store files"
 license = "Apache-2.0"

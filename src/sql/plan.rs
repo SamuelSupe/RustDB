@@ -2,7 +2,10 @@ use std::{fmt, sync::Arc};
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 
-use crate::datasource::TableProvider;
+use crate::{
+    datasource::{TableProvider, TableStatistics},
+    runtime::QueryContext,
+};
 
 use super::{AggregateExpr, BoundExpr, SortExpr};
 
@@ -87,6 +90,7 @@ pub enum LogicalPlan {
     Scan {
         table_name: String,
         provider: Arc<dyn TableProvider>,
+        statistics: TableStatistics,
         projection: Option<Vec<usize>>,
         pushed_filter: Option<BoundExpr>,
         limit: Option<usize>,
@@ -151,9 +155,38 @@ impl LogicalPlan {
     }
 
     pub fn explain(&self) -> String {
+        self.explain_with_lane_limit(None)
+    }
+
+    pub(crate) fn explain_for_query(&self, context: &QueryContext) -> String {
+        self.explain_with_lane_limit(Some(context.scheduler.configured_lanes()))
+    }
+
+    fn explain_with_lane_limit(&self, lane_limit: Option<usize>) -> String {
         let mut output = String::new();
-        self.write_explain(0, &mut output);
+        self.write_explain(0, lane_limit, &mut output);
         output
+    }
+
+    pub(crate) fn freeze_query_statistics(&mut self, context: &QueryContext) {
+        match self {
+            Self::Empty { .. } => {}
+            Self::Scan {
+                provider,
+                statistics,
+                ..
+            } => *statistics = provider.query_statistics(context),
+            Self::Filter { input, .. }
+            | Self::Projection { input, .. }
+            | Self::Scalarize { input, .. }
+            | Self::Aggregate { input, .. }
+            | Self::Sort { input, .. }
+            | Self::Limit { input, .. } => input.freeze_query_statistics(context),
+            Self::Join { left, right, .. } => {
+                left.freeze_query_statistics(context);
+                right.freeze_query_statistics(context);
+            }
+        }
     }
 
     pub(crate) fn collect_scan_providers(&self, providers: &mut Vec<Arc<dyn TableProvider>>) {
@@ -173,20 +206,22 @@ impl LogicalPlan {
         }
     }
 
-    fn write_explain(&self, depth: usize, output: &mut String) {
+    fn write_explain(&self, depth: usize, lane_limit: Option<usize>, output: &mut String) {
         let indent = "  ".repeat(depth);
+        let lanes = lane_limit
+            .map(|lanes| lanes.to_string())
+            .unwrap_or_else(|| "runtime".to_owned());
         match self {
             Self::Empty { .. } => output.push_str(&format!("{indent}Empty\n")),
             Self::Scan {
                 table_name,
-                provider,
+                statistics,
                 projection,
                 limit,
                 ..
             } => {
-                let statistics = provider.statistics();
                 output.push_str(&format!(
-                    "{indent}Scan table={table_name} projection={projection:?} limit={limit:?} rows={:?} bytes={:?} files={}\n",
+                    "{indent}Scan table={table_name} projection={projection:?} limit={limit:?} rows={:?} bytes={:?} files={} pipeline=fused lane_limit={lanes}\n",
                     statistics.row_count,
                     statistics.total_byte_size,
                     statistics.file_count,
@@ -196,7 +231,7 @@ impl LogicalPlan {
                 input, predicate, ..
             } => {
                 output.push_str(&format!("{indent}Filter {}\n", predicate.display_name));
-                input.write_explain(depth + 1, output);
+                input.write_explain(depth + 1, lane_limit, output);
             }
             Self::Projection {
                 input, expressions, ..
@@ -206,11 +241,11 @@ impl LogicalPlan {
                     .map(|expr| expr.display_name.as_str())
                     .collect();
                 output.push_str(&format!("{indent}Projection {names:?}\n"));
-                input.write_explain(depth + 1, output);
+                input.write_explain(depth + 1, lane_limit, output);
             }
             Self::Scalarize { input, .. } => {
                 output.push_str(&format!("{indent}Scalarize\n"));
-                input.write_explain(depth + 1, output);
+                input.write_explain(depth + 1, lane_limit, output);
             }
             Self::Aggregate {
                 input,
@@ -227,9 +262,9 @@ impl LogicalPlan {
                     .map(|expr| expr.display_name.as_str())
                     .collect();
                 output.push_str(&format!(
-                    "{indent}Aggregate groups={groups:?} aggregates={aggregates:?}\n"
+                    "{indent}Aggregate groups={groups:?} aggregates={aggregates:?} partial_lane_limit={lanes} final=merge\n"
                 ));
-                input.write_explain(depth + 1, output);
+                input.write_explain(depth + 1, lane_limit, output);
             }
             Self::Sort {
                 input,
@@ -241,8 +276,10 @@ impl LogicalPlan {
                     .iter()
                     .map(|expr| expr.expr.display_name.as_str())
                     .collect();
-                output.push_str(&format!("{indent}Sort {names:?} fetch={fetch:?}\n"));
-                input.write_explain(depth + 1, output);
+                output.push_str(&format!(
+                    "{indent}Sort {names:?} fetch={fetch:?} run_lane_limit={lanes} merge=kway\n"
+                ));
+                input.write_explain(depth + 1, lane_limit, output);
             }
             Self::Limit {
                 input,
@@ -251,7 +288,7 @@ impl LogicalPlan {
                 ..
             } => {
                 output.push_str(&format!("{indent}Limit offset={offset} limit={limit:?}\n"));
-                input.write_explain(depth + 1, output);
+                input.write_explain(depth + 1, lane_limit, output);
             }
             Self::Join {
                 left,
@@ -264,12 +301,12 @@ impl LogicalPlan {
                     output.push_str(&format!("{indent}ScalarBroadcast build=right\n"));
                 } else {
                     output.push_str(&format!(
-                        "{indent}{join_type:?}Join keys={} build=right\n",
+                        "{indent}{join_type:?}Join keys={} build=right strategy=hash_partition lane_limit={lanes} partitions=64 repartition_seeds=2 fallback=sort_merge\n",
                         on.len()
                     ));
                 }
-                left.write_explain(depth + 1, output);
-                right.write_explain(depth + 1, output);
+                left.write_explain(depth + 1, lane_limit, output);
+                right.write_explain(depth + 1, lane_limit, output);
             }
         }
     }
@@ -302,6 +339,12 @@ impl fmt::Debug for StatementPlan {
 }
 
 impl StatementPlan {
+    pub(crate) fn logical_plan(&self) -> &LogicalPlan {
+        match self {
+            Self::Query(plan) | Self::Explain(plan) | Self::ExplainAnalyze(plan) => plan,
+        }
+    }
+
     pub fn schema(&self) -> SchemaRef {
         match self {
             Self::Query(plan) => Arc::clone(plan.schema().arrow()),

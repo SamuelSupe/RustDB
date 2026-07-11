@@ -13,6 +13,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
+use crate::runtime::estimate_array_bytes;
 use crate::sql::{BinaryOp, BoundExpr, ExprKind, ScalarValue, UnaryOp};
 use crate::{Error, Result};
 
@@ -87,6 +88,134 @@ pub(crate) fn project(
 pub(crate) fn filter(predicate: &BoundExpr, batch: &RecordBatch) -> Result<RecordBatch> {
     let predicate = evaluate(predicate, batch)?;
     Ok(filter_record_batch(batch, as_boolean(&predicate)?)?)
+}
+
+pub(crate) fn projection_workspace_bytes(expressions: &[BoundExpr], batch: &RecordBatch) -> usize {
+    let mut retained = 0usize;
+    let mut peak = 0usize;
+    for expression in expressions {
+        let estimate = expression_memory(expression, batch);
+        peak = peak.max(retained.saturating_add(estimate.peak));
+        retained = retained.saturating_add(estimate.output);
+    }
+    peak.max(retained)
+        .saturating_add(expressions.len().saturating_mul(256))
+        .max(1)
+}
+
+pub(crate) fn filter_workspace_bytes(predicate: &BoundExpr, batch: &RecordBatch) -> usize {
+    expression_memory(predicate, batch)
+        .peak
+        .saturating_add(batch.get_array_memory_size())
+        .max(1)
+}
+
+#[derive(Clone, Copy)]
+struct ExpressionMemory {
+    output: usize,
+    peak: usize,
+}
+
+fn expression_memory(expression: &BoundExpr, batch: &RecordBatch) -> ExpressionMemory {
+    let output = expression_output_bytes(expression, batch);
+    match &expression.kind {
+        ExprKind::Column(_) | ExprKind::Literal(_) => ExpressionMemory {
+            output,
+            peak: output,
+        },
+        ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Cast { expr } => {
+            let input = expression_memory(expr, batch);
+            ExpressionMemory {
+                output,
+                peak: input.peak.max(input.output.saturating_add(output)),
+            }
+        }
+        ExprKind::Binary { left, right, .. }
+        | ExprKind::Like {
+            expr: left,
+            pattern: right,
+            ..
+        } => binary_expression_memory(left, right, output, batch),
+        ExprKind::Case {
+            when_then,
+            else_expr,
+        } => {
+            // CASE retains the current output while each condition/result pair
+            // and the next zip output are evaluated. Summing branch peaks is
+            // conservative for variable-width branches without making every
+            // projection pay for unrelated expressions.
+            let mut current = expression_memory(else_expr, batch);
+            let mut peak = current.peak;
+            for (condition, result) in when_then.iter().rev() {
+                let condition = expression_memory(condition, batch);
+                let result = expression_memory(result, batch);
+                peak = peak
+                    .max(current.output.saturating_add(condition.peak))
+                    .max(
+                        current
+                            .output
+                            .saturating_add(condition.output)
+                            .saturating_add(result.peak),
+                    )
+                    .max(
+                        current
+                            .output
+                            .saturating_add(condition.output)
+                            .saturating_add(result.output)
+                            .saturating_add(output),
+                    );
+                current = ExpressionMemory { output, peak };
+            }
+            ExpressionMemory { output, peak }
+        }
+    }
+}
+
+fn binary_expression_memory(
+    left: &BoundExpr,
+    right: &BoundExpr,
+    output: usize,
+    batch: &RecordBatch,
+) -> ExpressionMemory {
+    let left = expression_memory(left, batch);
+    let right = expression_memory(right, batch);
+    ExpressionMemory {
+        output,
+        peak: left.peak.max(left.output.saturating_add(right.peak)).max(
+            left.output
+                .saturating_add(right.output)
+                .saturating_add(output),
+        ),
+    }
+}
+
+fn expression_output_bytes(expression: &BoundExpr, batch: &RecordBatch) -> usize {
+    match &expression.kind {
+        ExprKind::Column(index) => batch
+            .columns()
+            .get(*index)
+            .map_or_else(
+                || estimate_array_bytes(&expression.data_type, batch.num_rows()),
+                |array| array.get_array_memory_size(),
+            )
+            .max(1),
+        ExprKind::Literal(ScalarValue::Utf8(value)) => batch
+            .num_rows()
+            .saturating_mul(value.len().saturating_add(4))
+            .saturating_add(batch.num_rows().div_ceil(8))
+            .saturating_add(512)
+            .max(1),
+        ExprKind::Cast { expr }
+            if matches!(
+                &expression.data_type,
+                arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8
+            ) =>
+        {
+            estimate_array_bytes(&expression.data_type, batch.num_rows())
+                .max(expression_output_bytes(expr, batch))
+        }
+        _ => estimate_array_bytes(&expression.data_type, batch.num_rows()),
+    }
 }
 
 fn evaluate_binary(op: BinaryOp, left: ArrayRef, right: ArrayRef) -> Result<ArrayRef> {

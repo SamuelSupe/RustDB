@@ -155,7 +155,11 @@ fn contains_subquery(expr: &Expr) -> bool {
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
         | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
         | Expr::Cast { expr, .. } => contains_subquery(expr),
         Expr::Case {
             operand,

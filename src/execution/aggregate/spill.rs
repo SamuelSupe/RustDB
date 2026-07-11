@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
+    mem::size_of,
 };
 
 use arrow::record_batch::RecordBatch;
@@ -77,8 +78,9 @@ pub(super) fn merge_partition(
                 let index = if let Some(index) = group_index.get(&key) {
                     *index
                 } else {
+                    let index_bytes = estimate_index_key_bytes(&key);
                     let state = GroupState::new(key.clone(), aggregates);
-                    let bytes = estimate_group_bytes(&state);
+                    let bytes = estimate_group_bytes(&state).saturating_add(index_bytes);
                     if reservation.try_grow(bytes).is_err() {
                         if states.is_empty() {
                             return Err(single_group_error(
@@ -109,10 +111,25 @@ pub(super) fn merge_partition(
     Ok(MergeOutcome::Merged(states))
 }
 
-pub(super) fn remove_files(context: &QueryContext, files: &[SpillFile]) {
+fn estimate_index_key_bytes(key: &Vec<super::CellValue>) -> usize {
+    key.capacity()
+        .saturating_mul(size_of::<super::CellValue>())
+        .saturating_add(key.iter().fold(0usize, |bytes, value| {
+            bytes.saturating_add(match value {
+                super::CellValue::Utf8(value) => value.capacity(),
+                super::CellValue::Binary(value) => value.capacity(),
+                _ => 0,
+            })
+        }))
+        // HashMap bucket, stored Vec header, and usize value.
+        .saturating_add(64)
+}
+
+pub(super) fn remove_files(context: &QueryContext, files: &[SpillFile]) -> Result<()> {
     for file in files {
-        context.spill.remove_file(file);
+        context.spill.remove_file(file)?;
     }
+    Ok(())
 }
 
 pub(super) fn single_group_error(

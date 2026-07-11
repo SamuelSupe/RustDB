@@ -197,6 +197,94 @@ async fn queries_csv_through_file_table_function() -> Result<()> {
 }
 
 #[tokio::test]
+async fn csv_refresh_preserves_old_column_order_and_maps_the_new_header() -> Result<()> {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dynamic.csv");
+    fs::write(&path, "b,a\n1,old\n").unwrap();
+    let session = Engine::new(
+        EngineConfig::builder()
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )?
+    .session();
+    session
+        .register_csv(
+            "dynamic",
+            [path.to_string_lossy()],
+            CsvOptions {
+                header: CsvHeader::Present,
+                ..CsvOptions::default()
+            },
+        )
+        .await?;
+
+    fs::write(&path, "a,z,c,b\nnew,last,middle,2\n").unwrap();
+    let schema = session.refresh_table("dynamic").await?;
+    let names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["b", "a", "c", "z"]);
+
+    let batches = collect(session.execute("SELECT * FROM dynamic").await?).await?;
+    assert_eq!(batches[0].schema(), schema);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
+    for (column, expected) in [(1, "new"), (2, "middle"), (3, "last")] {
+        assert_eq!(
+            batches[0]
+                .column(column)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_refresh_reports_incompatible_file_uri_and_column() -> Result<()> {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("parts");
+    fs::create_dir(&data).unwrap();
+    fs::write(data.join("a.csv"), "id,label\n1,one\n").unwrap();
+    let session = Engine::new(
+        EngineConfig::builder()
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )?
+    .session();
+    session
+        .register_csv(
+            "dynamic",
+            [format!("{}/*.csv", data.display())],
+            CsvOptions {
+                header: CsvHeader::Present,
+                ..CsvOptions::default()
+            },
+        )
+        .await?;
+
+    fs::write(data.join("b.csv"), "id,label\nnot-an-integer,two\n").unwrap();
+    let error = session.refresh_table("dynamic").await.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("b.csv"), "{message}");
+    assert!(message.contains("column id"), "{message}");
+    assert!(message.contains("Int64"), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn join_streams_high_fanout_in_configured_batches() -> Result<()> {
     let directory = tempfile::tempdir().unwrap();
     let left = directory.path().join("left.csv");
@@ -205,11 +293,12 @@ async fn join_streams_high_fanout_in_configured_batches() -> Result<()> {
     let right_rows = (0..100).map(|_| "1").collect::<Vec<_>>().join("\n");
     fs::write(&right, format!("key\n{right_rows}\n")).unwrap();
 
-    let session = Engine::new(EngineConfig {
-        batch_size: 7,
-        temp_dir: directory.path().join("spill"),
-        ..EngineConfig::default()
-    })?
+    let session = Engine::new(
+        EngineConfig::builder()
+            .batch_size(7)
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )?
     .session();
     let options = CsvOptions {
         header: CsvHeader::Present,

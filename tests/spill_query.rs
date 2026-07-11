@@ -13,12 +13,11 @@ const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 
 fn low_memory_config(temp_dir: &Path, memory_limit: usize) -> EngineConfig {
-    EngineConfig {
-        memory_limit,
-        temp_dir: temp_dir.join("spill"),
-        batch_size: 4_096,
-        ..EngineConfig::default()
-    }
+    EngineConfig::builder()
+        .memory_limit(memory_limit)
+        .spill_directory(temp_dir.join("spill"))
+        .batch_size(4_096)
+        .build()
 }
 
 async fn consume(result: &mut QueryResult) -> Result<Vec<arrow::record_batch::RecordBatch>> {
@@ -95,7 +94,10 @@ fn assert_multichunk_fixture(path: &Path) {
 async fn high_cardinality_aggregate_spills_and_cleans_query_directory() -> Result<()> {
     const GROUPS: i64 = 12_000;
     const REPEATS: i64 = 3;
-    const MEMORY_LIMIT: usize = 2 * MIB;
+    // Full v0.2 batch, queue, state, and spill-writer accounting needs room
+    // for one decoded batch plus the partition writers. The state budget is
+    // still half this value, so the fixture is forced to spill.
+    const MEMORY_LIMIT: usize = 4 * MIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let csv = temp.path().join("aggregate.csv");
@@ -103,7 +105,7 @@ async fn high_cardinality_aggregate_spills_and_cleans_query_directory() -> Resul
     assert_multichunk_fixture(&csv);
 
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
-    let spill_root = config.temp_dir.clone();
+    let spill_root = config.spill.directory.clone();
     let session = Engine::new(config)?.session();
     session
         .register_csv(
@@ -179,7 +181,7 @@ async fn hash_join_spills_and_cleans_query_directory() -> Result<()> {
     assert_multichunk_fixture(&right_csv);
 
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
-    let spill_root = config.temp_dir.clone();
+    let spill_root = config.spill.directory.clone();
     let session = Engine::new(config)?.session();
     let csv_options = CsvOptions {
         header: CsvHeader::Present,
@@ -270,7 +272,7 @@ async fn left_hash_join_spills_preserves_unmatched_rows_and_cleans_up() -> Resul
     assert_multichunk_fixture(&right_csv);
 
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
-    let spill_root = config.temp_dir.clone();
+    let spill_root = config.spill.directory.clone();
     let session = Engine::new(config)?.session();
     let csv_options = CsvOptions {
         header: CsvHeader::Present,
@@ -364,13 +366,13 @@ async fn left_hash_join_spills_preserves_unmatched_rows_and_cleans_up() -> Resul
 async fn order_by_top_k_and_full_sort_spill_and_cleanup() -> Result<()> {
     const ROWS: i64 = 40_000;
     const TOP_K: i64 = 257;
-    const MEMORY_LIMIT: usize = 512 * KIB;
+    const MEMORY_LIMIT: usize = 2 * MIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let csv_files = write_sort_inputs(temp.path(), ROWS, ROWS);
 
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
-    let spill_root = config.temp_dir.clone();
+    let spill_root = config.spill.directory.clone();
     let session = Engine::new(config)?.session();
     session
         .register_csv(
@@ -452,12 +454,12 @@ async fn order_by_top_k_and_full_sort_spill_and_cleanup() -> Result<()> {
 #[tokio::test]
 async fn dropping_a_partially_consumed_spilling_query_cleans_up_immediately() -> Result<()> {
     const ROWS: i64 = 40_000;
-    const MEMORY_LIMIT: usize = 512 * KIB;
+    const MEMORY_LIMIT: usize = 2 * MIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let csv_files = write_sort_inputs(temp.path(), ROWS, ROWS);
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
-    let spill_root = config.temp_dir.clone();
+    let spill_root = config.spill.directory.clone();
     let session = Engine::new(config)?.session();
     session
         .register_csv(

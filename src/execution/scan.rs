@@ -7,7 +7,10 @@ use arrow::{
 };
 
 use crate::datasource::{ComparisonOp, PredicateValue, ScanPredicate, ScanRequest, TableProvider};
-use crate::runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream};
+use crate::runtime::{
+    BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream,
+    estimate_schema_batch_bytes,
+};
 use crate::sql::{BinaryOp, BoundExpr, ExprKind, ScalarValue};
 use crate::{Error, Result};
 
@@ -19,26 +22,56 @@ pub(crate) async fn scan(
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
-) -> Result<RecordBatchStream> {
+) -> Result<MemoryBatchStream> {
     let mut request = ScanRequest::new(batch_size);
     request.projection = projection.clone();
     request.predicate = predicate.and_then(to_scan_predicate);
     request.limit = limit;
-    let input = provider.scan(request, context).await?;
-    let Some(projection) = projection else {
-        return Ok(input);
-    };
+    let decoded_schema = request.projected_schema(&provider.schema())?;
+    let preclaim = estimate_schema_batch_bytes(decoded_schema.as_ref(), batch_size).max(1);
+    let mut input = provider.scan(request, Arc::clone(&context)).await?;
     let stream = async_stream::try_stream! {
-        futures::pin_mut!(input);
         use futures::StreamExt;
-        while let Some(batch) = input.next().await {
-            yield expand_projection(batch?, &schema, &projection)?;
+        loop {
+            context.check_cancelled()?;
+            // Reserve decoder credit before polling. The exact returned Arrow
+            // buffers are reconciled immediately by from_reservation.
+            let reservation = context.reserve_memory(preclaim, "scan decode credit").await?;
+            let next = tokio::select! {
+                _ = context.control.cancelled() => Err(Error::Cancelled),
+                next = input.next() => Ok(next),
+            }?;
+            let Some(batch) = next else {
+                break;
+            };
+            let mut batch = BatchEnvelope::from_reservation(
+                batch?,
+                reservation,
+                "scan decoded",
+            )?;
+            if let Some(projection) = projection.as_deref().filter(|projection| !projection.is_empty()) {
+                let workspace_bytes = estimate_schema_batch_bytes(schema.as_ref(), batch.num_rows());
+                let workspace = context
+                    .reserve_memory_while_holding(
+                        workspace_bytes,
+                        batch.memory_size(),
+                        "scan projection expansion workspace",
+                    )
+                    .await?;
+                let expanded = expand_projection(batch.batch().clone(), &schema, projection)?;
+                batch = batch.replace_with_reservation(
+                    expanded,
+                    workspace,
+                    "scan projection expansion",
+                )?;
+            }
+            yield batch;
         }
     };
-    Ok(boxed_record_batch_stream(stream))
+    Ok(boxed_memory_batch_stream(stream))
 }
 
-fn expand_projection(
+pub(super) fn expand_projection(
     batch: RecordBatch,
     full_schema: &SchemaRef,
     projection: &[usize],
@@ -49,6 +82,15 @@ fn expand_projection(
             batch.num_columns(),
             projection.len()
         )));
+    }
+    // An explicit empty projection is a physical zero-column contract, not a
+    // request to reconstruct every logical column as NULL.  Keeping the batch
+    // empty lets metadata-only scans such as Parquet COUNT(*) flow through
+    // fused operators without allocating one validity buffer per source field.
+    // Operators above this boundary can still use the row count, and any
+    // visible literal projection materializes its own correctly typed output.
+    if projection.is_empty() {
+        return Ok(batch);
     }
     let mut projected_position = vec![None; full_schema.fields().len()];
     for (position, index) in projection.iter().copied().enumerate() {
@@ -84,7 +126,7 @@ fn expand_projection(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn to_scan_predicate(expr: &BoundExpr) -> Option<ScanPredicate> {
+pub(super) fn to_scan_predicate(expr: &BoundExpr) -> Option<ScanPredicate> {
     match &expr.kind {
         ExprKind::Binary {
             left,
@@ -173,5 +215,35 @@ fn reverse(op: ComparisonOp) -> ComparisonOp {
         ComparisonOp::LtEq => ComparisonOp::GtEq,
         ComparisonOp::Gt => ComparisonOp::Lt,
         ComparisonOp::GtEq => ComparisonOp::LtEq,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        datatypes::{DataType, Field, Schema},
+        record_batch::{RecordBatch, RecordBatchOptions},
+    };
+
+    use super::expand_projection;
+
+    #[test]
+    fn empty_projection_stays_zero_column_and_preserves_rows() {
+        let physical = Arc::new(Schema::empty());
+        let options = RecordBatchOptions::new().with_row_count(Some(7));
+        let batch = RecordBatch::try_new_with_options(physical, Vec::new(), &options).unwrap();
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, true),
+        ]));
+
+        let expanded = expand_projection(batch, &logical, &[]).unwrap();
+
+        assert_eq!(expanded.num_rows(), 7);
+        assert_eq!(expanded.num_columns(), 0);
+        assert!(expanded.schema().fields().is_empty());
+        assert_eq!(expanded.get_array_memory_size(), 0);
     }
 }

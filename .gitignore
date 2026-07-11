@@ -6,4 +6,6 @@
 /tmp/
 /data/
 /benchmarks/results/
+__pycache__/
+*.py[cod]
 /.env

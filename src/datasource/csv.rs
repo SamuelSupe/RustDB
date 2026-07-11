@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use arrow::{csv::ReaderBuilder, datatypes::SchemaRef};
 use async_stream::try_stream;
@@ -7,13 +10,17 @@ use bytes::{Buf, Bytes};
 use futures::{StreamExt, stream};
 
 use super::{
-    ScanRequest, TableProvider, TableStatistics,
-    csv_infer::{format, infer_table_schema},
+    ScanRequest, ScanTask, TableProvider, TableStatistics,
+    csv_infer::{format, infer_table_schema, sample_byte_cap},
+    parquet_metadata::schema_memory_size,
     provider::prepare_object_sources,
 };
 use crate::{
     CsvOptions, EngineConfig, Error, Result,
-    runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream},
+    runtime::{
+        MemoryReservation, QueryContext, RecordBatchStream, boxed_record_batch_stream,
+        estimate_schema_batch_bytes,
+    },
     storage::{LocationResolver, ObjectSource},
 };
 
@@ -25,6 +32,7 @@ pub struct CsvTable {
     has_header: bool,
     io_concurrency: usize,
     statistics: TableStatistics,
+    _schema_reservation: Option<Arc<MemoryReservation>>,
 }
 
 impl CsvTable {
@@ -47,18 +55,31 @@ impl CsvTable {
             Some(context) => resolver.resolve_for_query(&locations, context).await?,
             None => resolver.resolve(&locations).await?,
         };
-        Self::from_files(files, options, config.io_concurrency, context).await
+        Self::from_files(
+            files,
+            options,
+            config.io_concurrency,
+            sample_byte_cap(config.memory_limit),
+            context,
+        )
+        .await
     }
 
     pub async fn from_files(
         files: Vec<ObjectSource>,
         options: CsvOptions,
         io_concurrency: usize,
+        sample_byte_cap: usize,
         context: Option<Arc<QueryContext>>,
     ) -> Result<Self> {
         if io_concurrency == 0 {
             return Err(Error::InvalidArgument(
                 "I/O concurrency must be greater than zero".to_owned(),
+            ));
+        }
+        if sample_byte_cap == 0 {
+            return Err(Error::InvalidArgument(
+                "CSV sample byte limit must be greater than zero".to_owned(),
             ));
         }
         for file in &files {
@@ -71,7 +92,21 @@ impl CsvTable {
             }
         }
 
-        let (schema, has_header) = infer_table_schema(&files, &options, context.as_deref()).await?;
+        let (schema, has_header) =
+            infer_table_schema(&files, &options, sample_byte_cap, context.as_deref()).await?;
+        let schema_reservation = context
+            .as_ref()
+            .map(|context| {
+                let bytes = schema_memory_size(&schema);
+                context.memory.try_reserve(bytes).map(Arc::new).map_err(|_| {
+                    Error::ResourceExhausted(format!(
+                        "CSV schema requires {bytes} bytes, but the query memory pool has {} bytes available (limit {} bytes)",
+                        context.memory.available(),
+                        context.memory.limit(),
+                    ))
+                })
+            })
+            .transpose()?;
         let total_byte_size = files.iter().fold(0_u64, |total, file| {
             total.saturating_add(file.snapshot().size)
         });
@@ -87,7 +122,12 @@ impl CsvTable {
             has_header,
             io_concurrency,
             statistics,
+            _schema_reservation: schema_reservation,
         })
+    }
+
+    pub(crate) fn has_header(&self) -> bool {
+        self.has_header
     }
 }
 
@@ -162,6 +202,104 @@ impl TableProvider for CsvTable {
         };
         Ok(boxed_record_batch_stream(stream))
     }
+
+    async fn scan_tasks(
+        &self,
+        request: ScanRequest,
+        context: Arc<QueryContext>,
+        target_tasks: usize,
+    ) -> Result<Vec<ScanTask>> {
+        if request.batch_size == 0 {
+            return Err(Error::InvalidArgument(
+                "scan batch_size must be greater than zero".to_owned(),
+            ));
+        }
+        let output_schema = request.projected_schema(&self.schema)?;
+        let preclaim = estimate_schema_batch_bytes(output_schema.as_ref(), request.batch_size);
+        let file_scan = CsvFileScan {
+            schema: Arc::clone(&self.schema),
+            options: self.options.clone(),
+            has_header: self.has_header,
+            projection: request.projection,
+            batch_size: request.batch_size,
+        };
+        let remaining = request.limit.map(|limit| Arc::new(AtomicUsize::new(limit)));
+        let next_file = Arc::new(AtomicUsize::new(0));
+        let task_count = target_tasks
+            .max(1)
+            .min(self.files.len())
+            .min(self.io_concurrency);
+        Ok((0..task_count)
+            .map(|task| {
+                let files = Arc::clone(&self.files);
+                let file_scan = file_scan.clone();
+                let task_context = Arc::clone(&context);
+                let stream_context = Arc::clone(&task_context);
+                let output_schema = Arc::clone(&output_schema);
+                let remaining = remaining.clone();
+                let next_file = Arc::clone(&next_file);
+                ScanTask::from_public(
+                    task,
+                    boxed_record_batch_stream(try_stream! {
+                        loop {
+                            if remaining.as_ref().is_some_and(|remaining| remaining.load(Ordering::Acquire) == 0) {
+                                break;
+                            }
+                            let index = next_file.fetch_add(1, Ordering::AcqRel);
+                            if index >= files.len() {
+                                break;
+                            }
+                            let mut input = csv_file_stream(
+                                Arc::clone(&files),
+                                index,
+                                file_scan.clone(),
+                                Arc::clone(&stream_context),
+                            );
+                            while let Some(batch) = input.next().await {
+                                stream_context.check_cancelled()?;
+                                let batch = batch?;
+                                let claimed = remaining.as_ref().map_or(batch.num_rows(), |remaining| {
+                                    claim_rows(remaining, batch.num_rows())
+                                });
+                                if claimed == 0 {
+                                    break;
+                                }
+                                let batch = if batch.num_rows() > claimed {
+                                    batch.slice(0, claimed)
+                                } else {
+                                    batch
+                                };
+                                debug_assert_eq!(batch.schema(), output_schema);
+                                yield batch;
+                            }
+                        }
+                    }),
+                    task_context,
+                    preclaim,
+                    "CSV scan task",
+                )
+            })
+            .collect())
+    }
+}
+
+fn claim_rows(remaining: &AtomicUsize, available: usize) -> usize {
+    let mut current = remaining.load(Ordering::Acquire);
+    loop {
+        let claimed = current.min(available);
+        if claimed == 0 {
+            return 0;
+        }
+        match remaining.compare_exchange_weak(
+            current,
+            current - claimed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return claimed,
+            Err(updated) => current = updated,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -192,6 +330,7 @@ fn csv_file_stream(
                 get.map_err(|error| csv_object_error(file.uri(), error))
             },
         }?;
+        snapshot.validate_get_response(file.uri(), &get.meta)?;
         let mut input = get.into_stream();
         let mut builder = ReaderBuilder::new(scan.schema)
             .with_format(format(&scan.options, scan.has_header))
@@ -282,7 +421,7 @@ mod tests {
     use std::{fs, sync::Arc};
 
     use arrow::array::{Array, StringArray};
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt};
     use tempfile::tempdir;
 
     use super::CsvTable;
@@ -334,6 +473,137 @@ mod tests {
         );
         assert!(batches.iter().all(|batch| batch.num_columns() == 1));
         assert_eq!(batches[0].schema().field(0).name(), "note");
+    }
+
+    #[tokio::test]
+    async fn full_get_rejects_size_change_without_an_identity_token() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("changing.csv");
+        fs::write(&path, b"id\n1\n").unwrap();
+        let table = CsvTable::try_new(
+            vec![path.to_string_lossy().into_owned()],
+            CsvOptions::default(),
+            &EngineConfig::default(),
+        )
+        .await
+        .unwrap();
+        let file = &table.files[0];
+        let mut snapshot = file.snapshot().clone();
+        snapshot.e_tag = None;
+        snapshot.version = None;
+        let context = Arc::new(
+            QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap(),
+        );
+        context
+            .register_object_snapshot(file.uri(), snapshot)
+            .unwrap();
+        context.seal_object_snapshots();
+
+        fs::write(&path, b"id\n123456789\n").unwrap();
+        let mut input = table.scan(ScanRequest::new(8), context).await.unwrap();
+        let error = input
+            .next()
+            .await
+            .expect("changed CSV must produce a terminal result")
+            .expect_err("changed CSV must fail before decoding its body")
+            .to_string();
+
+        assert!(error.contains("object changed during query"), "{error}");
+        assert!(error.contains("changing.csv"), "{error}");
+        assert!(error.contains("expected size"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn scan_tasks_share_one_global_limit_across_files() {
+        let directory = tempdir().unwrap();
+        for (name, start) in [("a.csv", 0), ("b.csv", 10), ("c.csv", 20)] {
+            fs::write(
+                directory.path().join(name),
+                format!("id\n{start}\n{}\n{}\n", start + 1, start + 2),
+            )
+            .unwrap();
+        }
+        let table = CsvTable::try_new(
+            vec![format!("{}/*.csv", directory.path().display())],
+            CsvOptions::default(),
+            &EngineConfig::default(),
+        )
+        .await
+        .unwrap();
+        let context = Arc::new(
+            QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap(),
+        );
+        table.prepare(Arc::clone(&context)).await.unwrap();
+        context.seal_object_snapshots();
+        let mut request = ScanRequest::new(2);
+        request.limit = Some(4);
+        let tasks = table
+            .scan_tasks(request, Arc::clone(&context), 2)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 2);
+        let batches = futures::stream::iter(tasks.into_iter().map(|task| task.into_stream()))
+            .flatten_unordered(2)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_task_count_never_exceeds_io_concurrency() {
+        let directory = tempdir().unwrap();
+        for name in ["a.csv", "b.csv", "c.csv"] {
+            fs::write(directory.path().join(name), b"id\n1\n").unwrap();
+        }
+        let config = EngineConfig {
+            io_concurrency: 1,
+            ..EngineConfig::default()
+        };
+        let table = CsvTable::try_new(
+            vec![format!("{}/*.csv", directory.path().display())],
+            CsvOptions::default(),
+            &config,
+        )
+        .await
+        .unwrap();
+        let context = Arc::new(
+            QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap(),
+        );
+
+        let tasks = table
+            .scan_tasks(ScanRequest::new(8), context, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_schema_reservation_lives_with_the_csv_table() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("schema.csv");
+        fs::write(&path, b"id,name\n1,one\n").unwrap();
+        let context = Arc::new(
+            QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap(),
+        );
+        let table = CsvTable::try_new_for_query(
+            vec![path.to_string_lossy().into_owned()],
+            CsvOptions::default(),
+            &EngineConfig::default(),
+            Some(Arc::clone(&context)),
+        )
+        .await
+        .unwrap();
+        let retained = context.memory.used();
+        let clone = table.clone();
+        drop(table);
+        assert_eq!(context.memory.used(), retained);
+        drop(clone);
+        assert!(context.memory.used() < retained);
     }
 
     #[tokio::test]

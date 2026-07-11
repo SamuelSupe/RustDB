@@ -13,7 +13,7 @@ use futures::StreamExt;
 
 use crate::{
     Error, Result,
-    runtime::{MemoryPool, QueryContext, RecordBatchStream, SpillFile, SpillManager, SpillWriter},
+    runtime::{MemoryBatchStream, MemoryPool, QueryContext, SpillFile, SpillManager, SpillWriter},
     sql::{BoundExpr, JoinType},
 };
 
@@ -75,19 +75,55 @@ impl PartitionSpiller {
             self.finish_partition(partition)?;
         }
 
-        let sink = &mut self.partitions[partition];
-        if sink.writer.is_none() {
-            sink.writer = Some(
-                self.spill
-                    .writer(&format!("{}-p{partition}", self.label), batch.schema())?,
-            );
+        if self.partitions[partition].writer.is_none() {
+            self.open_writer(partition, batch.schema())?;
         }
+        let sink = &mut self.partitions[partition];
         sink.writer
             .as_mut()
             .expect("partition writer was created above")
             .write_batch(&batch)?;
         sink.uncompressed_bytes = sink.uncompressed_bytes.saturating_add(bytes);
         Ok(())
+    }
+
+    fn open_writer(&mut self, partition: usize, schema: arrow::datatypes::SchemaRef) -> Result<()> {
+        let label = format!("{}-p{partition}", self.label);
+        loop {
+            let headroom = self.spill.writer_headroom_bytes(&label, schema.as_ref());
+            if self.memory.available() < headroom
+                && self.finish_largest_open_partition(partition)?
+            {
+                continue;
+            }
+            match self.spill.writer(&label, schema.clone()) {
+                Ok(writer) => {
+                    self.partitions[partition].writer = Some(writer);
+                    return Ok(());
+                }
+                Err(error @ Error::ResourceExhausted(_)) => {
+                    if !self.finish_largest_open_partition(partition)? {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn finish_largest_open_partition(&mut self, excluded: usize) -> Result<bool> {
+        let victim = self
+            .partitions
+            .iter()
+            .enumerate()
+            .filter(|(partition, sink)| *partition != excluded && sink.writer.is_some())
+            .max_by_key(|(_, sink)| sink.uncompressed_bytes)
+            .map(|(partition, _)| partition);
+        let Some(victim) = victim else {
+            return Ok(false);
+        };
+        self.finish_partition(victim)?;
+        Ok(true)
     }
 
     fn finish_partition(&mut self, partition: usize) -> Result<()> {
@@ -113,7 +149,7 @@ impl PartitionSpiller {
 }
 
 pub(in crate::execution::join) async fn spill_stream(
-    stream: &mut RecordBatchStream,
+    stream: &mut MemoryBatchStream,
     expressions: &[BoundExpr],
     side: Side,
     join_type: JoinType,
@@ -123,7 +159,9 @@ pub(in crate::execution::join) async fn spill_stream(
     let mut spiller = PartitionSpiller::new(context, label);
     while let Some(batch) = stream.next().await {
         context.check_cancelled()?;
-        spill_batch(batch?, expressions, side, join_type, &mut spiller, 0)?;
+        let (batch, memory) = batch?.into_parts();
+        spill_batch(batch, expressions, side, join_type, &mut spiller, 0)?;
+        drop(memory);
     }
     spiller.finish()
 }
@@ -145,8 +183,36 @@ pub(in crate::execution::join) fn spill_batch(
         let mut rows = preferred_rows.min(batch.num_rows() - offset);
         loop {
             let required = spill_temporary_bytes(&batch, offset, rows)?;
+            let copy_headroom = spiller.spill.write_copy_headroom_bytes();
+            if required > spiller.memory.available().saturating_sub(copy_headroom) {
+                if rows > 1 {
+                    rows /= 2;
+                    continue;
+                }
+                return Err(Error::ResourceExhausted(format!(
+                    "join spill cannot reserve the minimum one-row temporary state of \
+                     {required} bytes while preserving {copy_headroom} bytes of spill I/O copy \
+                     headroom (used {}, limit {})",
+                    spiller.memory.used(),
+                    spiller.memory.limit(),
+                )));
+            }
             match spiller.memory.try_reserve(required) {
                 Ok(temporary) => {
+                    if spiller.memory.available() < copy_headroom {
+                        drop(temporary);
+                        if rows > 1 {
+                            rows /= 2;
+                            continue;
+                        }
+                        return Err(Error::ResourceExhausted(format!(
+                            "join spill reserved the minimum one-row temporary state of \
+                             {required} bytes but could not preserve {copy_headroom} bytes of \
+                             spill I/O copy headroom (used {}, limit {})",
+                            spiller.memory.used(),
+                            spiller.memory.limit(),
+                        )));
+                    }
                     let counts = spill_batch_slice(
                         &batch,
                         offset,
@@ -168,7 +234,8 @@ pub(in crate::execution::join) fn spill_batch(
                 Err(error) => {
                     return Err(Error::ResourceExhausted(format!(
                         "join spill cannot reserve the minimum one-row temporary state of \
-                         {required} bytes (used {}, limit {}): {error}",
+                         {required} bytes while preserving {copy_headroom} bytes of spill I/O \
+                         copy headroom (used {}, limit {}): {error}",
                         spiller.memory.used(),
                         spiller.memory.limit(),
                     )));

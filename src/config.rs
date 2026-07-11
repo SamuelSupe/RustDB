@@ -1,17 +1,105 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use arrow::datatypes::SchemaRef;
 
+use crate::{Error, ParquetSchemaMode, Result};
+
+mod builder;
+pub use builder::EngineConfigBuilder;
+
+const DEFAULT_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
+pub struct SpillConfig {
+    pub directory: PathBuf,
+    pub engine_limit_bytes: Option<u64>,
+    pub query_limit_bytes: Option<u64>,
+    pub min_free_ratio: f64,
+    pub min_free_bytes: u64,
+    pub orphan_ttl: Duration,
+    pub io_threads: usize,
+}
+
+impl SpillConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.directory.as_os_str().is_empty() {
+            return Err(Error::InvalidArgument(
+                "spill.directory must not be empty".to_owned(),
+            ));
+        }
+        if matches!(self.engine_limit_bytes, Some(0)) {
+            return Err(Error::InvalidArgument(
+                "spill.engine_limit_bytes must be greater than zero when configured".to_owned(),
+            ));
+        }
+        if matches!(self.query_limit_bytes, Some(0)) {
+            return Err(Error::InvalidArgument(
+                "spill.query_limit_bytes must be greater than zero when configured".to_owned(),
+            ));
+        }
+        if let (Some(engine), Some(query)) = (self.engine_limit_bytes, self.query_limit_bytes)
+            && query > engine
+        {
+            return Err(Error::InvalidArgument(format!(
+                "spill.query_limit_bytes ({query}) must not exceed spill.engine_limit_bytes ({engine})"
+            )));
+        }
+        if !self.min_free_ratio.is_finite() || !(0.0..1.0).contains(&self.min_free_ratio) {
+            return Err(Error::InvalidArgument(
+                "spill.min_free_ratio must be finite and in the range [0, 1)".to_owned(),
+            ));
+        }
+        if self.orphan_ttl.is_zero() {
+            return Err(Error::InvalidArgument(
+                "spill.orphan_ttl must be greater than zero".to_owned(),
+            ));
+        }
+        if self.io_threads == 0 {
+            return Err(Error::InvalidArgument(
+                "spill.io_threads must be greater than zero".to_owned(),
+            ));
+        }
+        if SystemTime::UNIX_EPOCH
+            .checked_add(self.orphan_ttl)
+            .is_none()
+        {
+            return Err(Error::InvalidArgument(
+                "spill.orphan_ttl is too large".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for SpillConfig {
+    fn default() -> Self {
+        Self {
+            directory: std::env::temp_dir().join("rustdb-spill"),
+            engine_limit_bytes: None,
+            query_limit_bytes: None,
+            min_free_ratio: 0.10,
+            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+            orphan_ttl: Duration::from_secs(24 * 60 * 60),
+            io_threads: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EngineConfig {
     pub memory_limit: usize,
-    pub temp_dir: PathBuf,
     pub batch_size: usize,
     pub compute_threads: usize,
     pub io_concurrency: usize,
     pub max_concurrent_queries: usize,
     pub metadata_cache_bytes: usize,
     pub s3: S3Config,
+    pub spill: SpillConfig,
 }
 
 impl Default for EngineConfig {
@@ -24,16 +112,23 @@ impl Default for EngineConfig {
             .map(usize::from)
             .unwrap_or(1);
 
+        let spill = SpillConfig::default();
         Self {
             memory_limit: memory_limit.max(64 * 1024 * 1024),
-            temp_dir: std::env::temp_dir().join("rustdb-spill"),
             batch_size: 8_192,
             compute_threads,
             io_concurrency: 32,
             max_concurrent_queries: 1,
             metadata_cache_bytes: 64 * 1024 * 1024,
             s3: S3Config::default(),
+            spill,
         }
+    }
+}
+
+impl EngineConfig {
+    pub fn builder() -> EngineConfigBuilder {
+        EngineConfigBuilder::default()
     }
 }
 
@@ -99,12 +194,28 @@ impl Default for CsvOptions {
 pub struct ParquetOptions {
     pub schema: Option<Arc<arrow::datatypes::Schema>>,
     pub union_by_name: bool,
+    pub schema_mode: ParquetSchemaMode,
     pub hive_partitioning: bool,
+}
+
+impl ParquetOptions {
+    pub(crate) fn effective_schema_mode(&self) -> Result<ParquetSchemaMode> {
+        match (self.union_by_name, self.schema_mode) {
+            (false, mode) => Ok(mode),
+            (true, ParquetSchemaMode::Strict) => Ok(ParquetSchemaMode::UnionByName),
+            (true, _) => Err(Error::InvalidArgument(
+                "union_by_name and schema_mode cannot both be configured".to_owned(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::S3Config;
+    use std::{path::PathBuf, time::Duration};
+
+    use super::{S3Config, SpillConfig};
+    use crate::Error;
 
     #[test]
     fn debug_output_redacts_configured_endpoint() {
@@ -115,5 +226,64 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("<configured>"));
         assert!(!debug.contains("user-secret"));
+    }
+
+    #[test]
+    fn spill_defaults_apply_the_safety_policy() {
+        let config = SpillConfig::default();
+        assert_eq!(config.min_free_ratio, 0.10);
+        assert_eq!(config.min_free_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.orphan_ttl, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(config.io_threads, 2);
+        assert_eq!(config.engine_limit_bytes, None);
+        assert_eq!(config.query_limit_bytes, None);
+        config.validate().expect("default config must be valid");
+    }
+
+    #[test]
+    fn spill_validation_rejects_invalid_limits_and_safety_values() {
+        let cases = [
+            SpillConfig {
+                directory: PathBuf::new(),
+                ..SpillConfig::default()
+            },
+            SpillConfig {
+                engine_limit_bytes: Some(0),
+                ..SpillConfig::default()
+            },
+            SpillConfig {
+                query_limit_bytes: Some(0),
+                ..SpillConfig::default()
+            },
+            SpillConfig {
+                engine_limit_bytes: Some(10),
+                query_limit_bytes: Some(11),
+                ..SpillConfig::default()
+            },
+            SpillConfig {
+                min_free_ratio: f64::NAN,
+                ..SpillConfig::default()
+            },
+            SpillConfig {
+                min_free_ratio: -0.1,
+                ..SpillConfig::default()
+            },
+            SpillConfig {
+                min_free_ratio: 1.0,
+                ..SpillConfig::default()
+            },
+            SpillConfig {
+                orphan_ttl: Duration::ZERO,
+                ..SpillConfig::default()
+            },
+            SpillConfig {
+                io_threads: 0,
+                ..SpillConfig::default()
+            },
+        ];
+
+        for config in cases {
+            assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
+        }
     }
 }

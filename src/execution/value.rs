@@ -50,7 +50,10 @@ impl CellValue {
             (Self::Boolean(left), Self::Boolean(right)) => Ok(left.cmp(right)),
             (Self::Int64(left), Self::Int64(right)) => Ok(left.cmp(right)),
             (Self::UInt64(left), Self::UInt64(right)) => Ok(left.cmp(right)),
-            (Self::Float64(left), Self::Float64(right)) => Ok(left.total_cmp(right)),
+            (Self::Float64(left), Self::Float64(right)) => {
+                Ok(f64::from_bits(normalized_float(*left))
+                    .total_cmp(&f64::from_bits(normalized_float(*right))))
+            }
             (Self::Utf8(left), Self::Utf8(right)) => Ok(left.cmp(right)),
             (Self::Binary(left), Self::Binary(right)) => Ok(left.cmp(right)),
             (Self::Decimal128(left), Self::Decimal128(right)) => Ok(left.cmp(right)),
@@ -149,6 +152,24 @@ pub(crate) fn cell(array: &ArrayRef, row: usize) -> Result<CellValue> {
         }
     };
     Ok(value)
+}
+
+pub(crate) fn canonicalize_sort_key(array: ArrayRef) -> Result<ArrayRef> {
+    if !matches!(
+        array.data_type(),
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) {
+        return Ok(array);
+    }
+    let values = (0..array.len())
+        .map(|row| match cell(&array, row)? {
+            CellValue::Float64(value) => {
+                Ok(CellValue::Float64(f64::from_bits(normalized_float(value))))
+            }
+            value => Ok(value),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    values_to_array(&values, array.data_type())
 }
 
 pub(crate) fn values_to_array(values: &[CellValue], data_type: &DataType) -> Result<ArrayRef> {

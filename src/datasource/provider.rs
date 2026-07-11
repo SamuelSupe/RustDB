@@ -2,11 +2,14 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::{
     Error, Result,
-    runtime::{QueryContext, RecordBatchStream},
+    runtime::{
+        BatchEnvelope, MemoryBatchStream, QueryContext, RecordBatchStream,
+        boxed_memory_batch_stream, estimate_schema_batch_bytes,
+    },
     storage::ObjectSource,
 };
 
@@ -66,6 +69,55 @@ pub struct ScanRequest {
     pub batch_size: usize,
 }
 
+/// One independently pollable unit of scan work. File-backed providers should
+/// expose their natural morsels here (Parquet row groups and CSV files) so the
+/// execution pipeline can drive them on separate compute lanes.
+pub(crate) struct ScanTask {
+    id: usize,
+    stream: MemoryBatchStream,
+}
+
+impl ScanTask {
+    pub(crate) fn new(id: usize, stream: MemoryBatchStream) -> Self {
+        Self { id, stream }
+    }
+
+    pub(crate) fn from_public(
+        id: usize,
+        mut stream: RecordBatchStream,
+        context: Arc<QueryContext>,
+        preclaim_bytes: usize,
+        owner: &'static str,
+    ) -> Self {
+        let stream = boxed_memory_batch_stream(async_stream::try_stream! {
+            loop {
+                // Acquire before polling the decoder. A returned batch is
+                // reconciled immediately and never waits while unleased.
+                let reservation = context
+                    .reserve_memory(preclaim_bytes.max(1), owner)
+                    .await?;
+                let next = tokio::select! {
+                    _ = context.control.cancelled() => Err(Error::Cancelled),
+                    next = stream.next() => Ok(next),
+                }?;
+                let Some(batch) = next else {
+                    break;
+                };
+                yield BatchEnvelope::from_reservation(batch?, reservation, owner)?;
+            }
+        });
+        Self::new(id, stream)
+    }
+
+    pub(crate) fn id(&self) -> usize {
+        self.id
+    }
+
+    pub(crate) fn into_stream(self) -> MemoryBatchStream {
+        self.stream
+    }
+}
+
 impl ScanRequest {
     pub fn new(batch_size: usize) -> Self {
         Self {
@@ -90,10 +142,23 @@ pub trait TableProvider: Send + Sync {
 
     fn statistics(&self) -> TableStatistics;
 
+    /// Returns statistics for the object set fixed in `context`. Registered
+    /// external tables override this after query preparation; the default is
+    /// suitable for immutable and query-local providers.
+    fn query_statistics(&self, _context: &QueryContext) -> TableStatistics {
+        self.statistics()
+    }
+
     /// Captures every external object this provider may scan. Execution calls
     /// this for all scans before any input stream is polled.
     async fn prepare(&self, _context: Arc<QueryContext>) -> Result<()> {
         Ok(())
+    }
+
+    /// Rebuilds a registered external table's schema and provider. Providers
+    /// that are not refreshable return `None`.
+    async fn refreshed(&self) -> Result<Option<Arc<dyn TableProvider>>> {
+        Ok(None)
     }
 
     async fn scan(
@@ -101,6 +166,26 @@ pub trait TableProvider: Send + Sync {
         request: ScanRequest,
         context: Arc<QueryContext>,
     ) -> Result<RecordBatchStream>;
+
+    /// Produces independently pollable scan work. The compatibility default is
+    /// one task; sources override this to expose file or row-group morsels.
+    async fn scan_tasks(
+        &self,
+        request: ScanRequest,
+        context: Arc<QueryContext>,
+        _target_tasks: usize,
+    ) -> Result<Vec<ScanTask>> {
+        let schema = request.projected_schema(&self.schema())?;
+        let preclaim = estimate_schema_batch_bytes(schema.as_ref(), request.batch_size);
+        let stream = self.scan(request, Arc::clone(&context)).await?;
+        Ok(vec![ScanTask::from_public(
+            0,
+            stream,
+            context,
+            preclaim,
+            "table scan task",
+        )])
+    }
 }
 
 pub(super) async fn prepare_object_sources(

@@ -104,7 +104,7 @@ if [ -n "${TPCH_IO_CONCURRENCY:-}" ]; then
   set -- "$@" --io-concurrency "$TPCH_IO_CONCURRENCY"
 fi
 if [ "$require_spill" = 1 ]; then
-  set -- "$@" --metadata-cache 0 --metrics --temp-dir "/workspace/$work_relative/spill"
+  set -- "$@" --metadata-cache 0 --metrics --spill-directory "/workspace/$work_relative/spill"
 fi
 set -- "$@" -f "/workspace/$work_relative/rustdb.sql"
 if ! "$@" > "$rustdb_csv" 2> "$rustdb_stderr"; then

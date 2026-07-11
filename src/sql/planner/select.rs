@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema};
 use sqlparser::ast::{
-    Distinct, Expr, GroupByExpr, JoinOperator, Query, Select, SelectItem,
+    Distinct, Expr, GroupByExpr, Ident, JoinOperator, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, TableFactor, TableWithJoins,
 };
 
@@ -12,6 +12,7 @@ use super::super::{
     BoundExpr, JoinType, LogicalPlan, PlanSchema,
     aggregate::{is_aggregate_query, plan_aggregate_projection},
     binder::bind_expr,
+    name_resolution::{resolve_group_by, rewrite_projection_aliases},
     relation::{CteScope, alias_plan, cte_name},
     scalar_subquery::extract as extract_scalar_subqueries,
     subquery::apply_where,
@@ -23,7 +24,12 @@ use super::{
 };
 
 impl Planner<'_> {
-    pub(super) fn plan_select(&self, select: &Select, ctes: &CteScope) -> Result<LogicalPlan> {
+    pub(super) fn plan_select(
+        &self,
+        select: &Select,
+        ctes: &CteScope,
+        hidden_projection: &[Expr],
+    ) -> Result<LogicalPlan> {
         if select.top.is_some() || select.qualify.is_some() || !select.named_window.is_empty() {
             return Err(Error::Unsupported(
                 "TOP, QUALIFY, and window clauses are not supported".into(),
@@ -50,9 +56,20 @@ impl Planner<'_> {
                 ));
             }
         };
+        let mut plan = self.plan_from(&select.from, ctes)?;
+        projection = expand_wildcards(&projection, plan.schema())?;
+        resolve_group_by(&mut group_ast, &projection, plan.schema())?;
+        if let Some(predicate) = &mut having {
+            rewrite_projection_aliases(predicate, &projection, "HAVING")?;
+        }
+        projection.extend(
+            hidden_projection
+                .iter()
+                .cloned()
+                .map(SelectItem::UnnamedExpr),
+        );
         let aggregate_query = is_aggregate_query(&group_ast, &projection, having.as_ref());
 
-        let mut plan = self.plan_from(&select.from, ctes)?;
         if let Some(predicate) = &mut selection {
             plan = self.extract_scalars(plan, predicate, None, ctes)?;
             let mut plan_subquery = |query: &Query| self.plan_query_scoped(query, ctes);
@@ -211,6 +228,7 @@ impl Planner<'_> {
                     })?;
                 let provider = Arc::clone(entry.provider());
                 let schema = provider.schema();
+                let statistics = provider.statistics();
                 let plan_schema = PlanSchema::new(
                     schema,
                     vec![Some(qualifier.clone()); provider.schema().fields().len()],
@@ -218,6 +236,7 @@ impl Planner<'_> {
                 let plan = LogicalPlan::Scan {
                     table_name,
                     provider,
+                    statistics,
                     projection: None,
                     pushed_filter: None,
                     limit: None,
@@ -302,6 +321,51 @@ impl Planner<'_> {
             &mut next_name,
             &mut plan_subquery,
         )
+    }
+}
+
+fn expand_wildcards(items: &[SelectItem], schema: &PlanSchema) -> Result<Vec<SelectItem>> {
+    let mut output = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) => output.extend(
+                (0..schema.arrow().fields().len())
+                    .map(|index| SelectItem::UnnamedExpr(column_expr(schema, index))),
+            ),
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _) => {
+                let qualifier = object_name(name);
+                let start = output.len();
+                output.extend(
+                    (0..schema.arrow().fields().len())
+                        .filter(|index| {
+                            schema.qualifier(*index).is_some_and(|value| {
+                                value.eq_ignore_ascii_case(last_name_part(&qualifier))
+                            })
+                        })
+                        .map(|index| SelectItem::UnnamedExpr(column_expr(schema, index))),
+                );
+                if output.len() == start {
+                    return Err(Error::Catalog(format!(
+                        "relation '{qualifier}' does not exist"
+                    )));
+                }
+            }
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::Expr(_), _) => {
+                return Err(Error::Unsupported(
+                    "wildcards on arbitrary expressions are not supported".into(),
+                ));
+            }
+            other => output.push(other.clone()),
+        }
+    }
+    Ok(output)
+}
+
+fn column_expr(schema: &PlanSchema, index: usize) -> Expr {
+    let column = Ident::new(schema.arrow().field(index).name());
+    match schema.qualifier(index) {
+        Some(qualifier) => Expr::CompoundIdentifier(vec![Ident::new(qualifier), column]),
+        None => Expr::Identifier(column),
     }
 }
 

@@ -29,6 +29,10 @@ class CanonicalizeTests(unittest.TestCase):
                 canonical_bytes(result),
                 b'["key","value"]\n["1","3"]\n["2","1.250000"]\n',
             )
+            self.assertEqual(
+                canonical_bytes(result, preserve_order=True),
+                b'["key","value"]\n["2","1.250000"]\n["1","3"]\n',
+            )
 
 
 if __name__ == "__main__":

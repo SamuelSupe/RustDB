@@ -1,13 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
-    array::{Array, Int64Array},
+    array::{Array, Float64Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
 use futures::TryStreamExt;
 
-use super::{join, skew, spill};
+use super::{join, sort_merge, spill};
 use crate::{
     runtime::{MemoryPool, QueryContext, QueryMetricsSnapshot, boxed_record_batch_stream},
     sql::{BoundExpr, JoinType},
@@ -15,6 +15,46 @@ use crate::{
 
 const MEMORY_LIMIT: usize = 1_536 << 10;
 const RIGHT_DUPLICATES: i64 = 12_000;
+
+#[tokio::test]
+async fn output_materialization_transfers_its_workspace_into_the_batch_lease() {
+    let (left_schema, right_schema) = schemas();
+    let left = RecordBatch::try_new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![7])),
+            Arc::new(Int64Array::from(vec![11])),
+        ],
+    )
+    .unwrap();
+    let right = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![7, 7])),
+            Arc::new(Int64Array::from(vec![21, 22])),
+        ],
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(1 << 20), temp.path()).unwrap();
+
+    let output = super::probe::build_output_envelope(
+        &left,
+        &right,
+        &[0, 0],
+        &[Some(0), Some(1)],
+        JoinType::Inner,
+        output_schema(JoinType::Inner, &left_schema, &right_schema),
+        &context,
+        0,
+        "join test output",
+    )
+    .await
+    .unwrap();
+    assert_eq!(context.memory.used(), output.memory_size());
+    drop(output);
+    assert_eq!(context.memory.used(), 0);
+}
 
 #[test]
 fn partition_spiller_coalesces_many_input_batches_into_bounded_files() {
@@ -80,10 +120,14 @@ fn partition_spiller_coalesces_many_input_batches_into_bounded_files() {
     let metrics = context.metrics.snapshot();
     assert!(metrics.spill_bytes > 0);
     assert_eq!(metrics.spill_partitions, tasks.len() as u64);
-    spill::remove_tasks(&context, &tasks);
+    spill::remove_tasks(&context, &tasks).unwrap();
     assert_eq!(
         std::fs::read_dir(context.spill.directory())
             .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "arrow")))
             .count(),
         0
     );
@@ -148,13 +192,17 @@ fn partition_spiller_chunks_one_batch_larger_than_file_target() {
     }
     assert_eq!(spilled_rows, ROWS);
     assert!(files.len() < record_batches, "chunks were not coalesced");
-    spill::remove_files(&context, &files);
+    spill::remove_files(&context, &files).unwrap();
     assert_eq!(context.memory.used(), 0);
     assert!(context.memory.peak() > 0);
     assert!(context.memory.peak() <= MEMORY_LIMIT);
     assert_eq!(
         std::fs::read_dir(context.spill.directory())
             .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "arrow")))
             .count(),
         0
     );
@@ -164,7 +212,7 @@ fn partition_spiller_chunks_one_batch_larger_than_file_target() {
 fn partition_spiller_retries_smaller_slices_with_fragmented_budget() {
     const ROWS: usize = 64;
     const MEMORY_LIMIT: usize = 64 << 10;
-    const AVAILABLE_FOR_SPILL: usize = 1_024;
+    const AVAILABLE_FOR_TEMPORARY: usize = 1_024;
 
     let temp = tempfile::tempdir().unwrap();
     let context = QueryContext::shared(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
@@ -200,7 +248,12 @@ fn partition_spiller_retries_smaller_slices_with_fragmented_budget() {
     .unwrap();
     let held = context
         .memory
-        .try_reserve(MEMORY_LIMIT - active_file_bytes - AVAILABLE_FOR_SPILL)
+        .try_reserve(
+            MEMORY_LIMIT
+                - active_file_bytes
+                - AVAILABLE_FOR_TEMPORARY
+                - context.spill.write_copy_headroom_bytes(),
+        )
         .unwrap();
     let counts = spill::spill_batch(
         batch,
@@ -232,7 +285,7 @@ fn partition_spiller_retries_smaller_slices_with_fragmented_budget() {
         spilled.len() > 4,
         "the constrained reservation did not force smaller spill slices"
     );
-    spill::remove_files(&context, &files);
+    spill::remove_files(&context, &files).unwrap();
     assert_eq!(context.memory.used(), 0);
 }
 
@@ -309,11 +362,11 @@ fn fragmented_build_batches_use_buffer_footprint_after_compaction() {
     }
     assert!(context.memory.used() <= MEMORY_LIMIT);
     reservation.try_resize(0).unwrap();
-    context.spill.remove_file(&file);
+    context.spill.remove_file(&file).unwrap();
 }
 
 #[test]
-fn build_buffer_footprint_still_rejects_an_oversized_partition() {
+fn actual_hash_footprint_rejects_an_oversized_partition() {
     const ROWS: i64 = 2_048;
     const MEMORY_LIMIT: usize = 256 << 10;
 
@@ -322,19 +375,30 @@ fn build_buffer_footprint_still_rejects_an_oversized_partition() {
     let (_, right_schema) = schemas();
     let (file, _) = fragmented_build_file(&context, &right_schema, ROWS);
     let mut reservation = context.memory.reservation();
-    match spill::load_build_partition(
+    let loaded = spill::load_build_partition(
         std::slice::from_ref(&file),
         &right_schema,
         &context,
         &mut reservation,
     )
-    .unwrap()
-    {
-        spill::BuildPartition::TooLarge { rows } => assert_eq!(rows, ROWS as usize),
-        spill::BuildPartition::Loaded(_) => panic!("oversized build partition was loaded"),
-    }
+    .unwrap();
+    let spill::BuildPartition::Loaded(batch) = loaded else {
+        panic!("the compacted batch itself should fit before hash-key accounting")
+    };
+    let keys = super::evaluate_keys(
+        &[BoundExpr::column(0, DataType::Int64, "right.key")],
+        &batch,
+    )
+    .unwrap();
+    assert!(
+        super::try_build_hash_table(&keys, batch.num_rows(), false, &mut reservation)
+            .unwrap()
+            .is_none()
+    );
     assert!(context.memory.used() > 0);
-    context.spill.remove_file(&file);
+    drop(batch);
+    reservation.try_resize(0).unwrap();
+    context.spill.remove_file(&file).unwrap();
     assert_eq!(context.memory.used(), 0);
 }
 
@@ -480,11 +544,13 @@ async fn skew_fallback_rejects_a_decoded_spill_batch_over_budget() {
         left: vec![left_file.clone()],
         right: vec![right_file.clone()],
         depth: spill::MAX_REPARTITION_DEPTH,
+        stagnant_repartitions: 0,
     };
-    let error = skew::fallback(
+    let error = sort_merge::fallback(
         task,
         vec![BoundExpr::column(0, DataType::Int64, "left.key")],
         vec![BoundExpr::column(0, DataType::Int64, "right.key")],
+        Arc::clone(&left_schema),
         Arc::clone(&right_schema),
         JoinType::Inner,
         output_schema(JoinType::Inner, &left_schema, &right_schema),
@@ -497,13 +563,369 @@ async fn skew_fallback_rejects_a_decoded_spill_batch_over_budget() {
     assert!(matches!(
         error,
         crate::Error::ResourceExhausted(message)
-            if message.contains("decoded right spill batch")
-                && message.contains("query limit 131072 bytes")
+            if message.contains("join sort right batch")
+                && message.contains("query limit 131072")
     ));
 
-    context.spill.remove_file(&left_file);
-    context.spill.remove_file(&right_file);
+    context.spill.remove_file(&left_file).unwrap();
+    context.spill.remove_file(&right_file).unwrap();
     assert_eq!(context.memory.used(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn small_frozen_build_is_probed_by_multiple_lanes() {
+    const LANES: usize = 4;
+    const KEYS: i64 = 1_024;
+    const LEFT_BATCHES: i64 = 32;
+    const ROWS_PER_BATCH: i64 = 2_048;
+
+    let (left_schema, right_schema) = schemas();
+    let left_batches = (0..LEFT_BATCHES)
+        .map(|batch| {
+            let start = batch * ROWS_PER_BATCH;
+            Ok(RecordBatch::try_new(
+                Arc::clone(&left_schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        (start..start + ROWS_PER_BATCH).map(|row| row % KEYS),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(start..start + ROWS_PER_BATCH)),
+                ],
+            )
+            .unwrap())
+        })
+        .collect::<Vec<_>>();
+    let right_batch = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..KEYS)),
+            Arc::new(Int64Array::from_iter_values(0..KEYS)),
+        ],
+    )
+    .unwrap();
+    let left = boxed_record_batch_stream(futures::stream::iter(left_batches));
+    let right = boxed_record_batch_stream(futures::stream::once(async move { Ok(right_batch) }));
+    let schema = output_schema(JoinType::Inner, &left_schema, &right_schema);
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(128 << 20), temp.path()).unwrap();
+    context.configure_compute_lanes(LANES);
+
+    let batches = join(
+        left,
+        right,
+        vec![(
+            BoundExpr::column(0, DataType::Int64, "left.key"),
+            BoundExpr::column(0, DataType::Int64, "right.key"),
+        )],
+        left_schema,
+        right_schema,
+        JoinType::Inner,
+        schema,
+        Arc::clone(&context),
+        512,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    assert_eq!(rows(&batches), (LEFT_BATCHES * ROWS_PER_BATCH) as usize);
+    let peak = context.metrics.snapshot().peak_active_lanes;
+    assert!((2..=LANES as u64).contains(&peak), "unexpected peak {peak}");
+    assert_eq!(context.memory.used(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grace_partitions_preserve_every_join_type_with_parallel_workers() {
+    for (join_type, expected_rows) in [
+        (JoinType::Inner, 12_000),
+        (JoinType::Left, 12_002),
+        (JoinType::Semi, 12_000),
+        (JoinType::Anti, 2),
+    ] {
+        let (actual_rows, metrics) = run_parallel_grace_join(join_type).await;
+        assert_eq!(actual_rows, expected_rows, "unexpected {join_type:?} rows");
+        assert!((2..=4).contains(&metrics.peak_active_lanes));
+        assert!(metrics.spill_partitions > 1);
+    }
+}
+
+#[tokio::test]
+async fn long_string_hash_keys_are_accounted_and_switch_to_grace_join() {
+    const ROWS: usize = 128;
+    const KEY_BYTES: usize = 16 << 10;
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("left_id", DataType::Int64, false),
+    ]));
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("right_id", DataType::Int64, false),
+    ]));
+    let keys = (0..ROWS)
+        .map(|row| format!("{row:04}-{}", "x".repeat(KEY_BYTES)))
+        .collect::<Vec<_>>();
+    let left_batch = RecordBatch::try_new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(StringArray::from(vec![keys[3].as_str(), keys[97].as_str()])),
+            Arc::new(Int64Array::from(vec![3, 97])),
+        ],
+    )
+    .unwrap();
+    let right_batch = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(StringArray::from(keys)),
+            Arc::new(Int64Array::from_iter_values(0..ROWS as i64)),
+        ],
+    )
+    .unwrap();
+    let memory_limit = right_batch
+        .get_array_memory_size()
+        .saturating_mul(2)
+        .saturating_add(1 << 10);
+    let left = boxed_record_batch_stream(futures::stream::once(async move { Ok(left_batch) }));
+    let right = boxed_record_batch_stream(futures::stream::once(async move { Ok(right_batch) }));
+    let output_schema = output_schema(JoinType::Inner, &left_schema, &right_schema);
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(memory_limit), temp.path()).unwrap();
+    let batches = join(
+        left,
+        right,
+        vec![(
+            BoundExpr::column(0, DataType::Utf8, "left.key"),
+            BoundExpr::column(0, DataType::Utf8, "right.key"),
+        )],
+        left_schema,
+        right_schema,
+        JoinType::Inner,
+        output_schema,
+        Arc::clone(&context),
+        64,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    assert_eq!(rows(&batches), 2);
+    assert!(context.metrics.snapshot().spill_partitions > 0);
+    assert!(context.memory.peak() <= memory_limit);
+    assert_eq!(context.memory.used(), 0);
+}
+
+#[tokio::test]
+async fn float_key_sort_merge_matches_hash_join_for_zero_and_nan() {
+    let negative_nan = f64::from_bits(0xfff8_0000_0000_0001);
+    let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+    let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Float64, false),
+        Field::new("left_id", DataType::Int64, false),
+    ]));
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Float64, false),
+        Field::new("right_id", DataType::Int64, false),
+    ]));
+    let left_batch = RecordBatch::try_new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Float64Array::from(vec![
+                negative_nan,
+                -0.0,
+                0.0,
+                nan_a,
+                nan_b,
+                1.0,
+            ])),
+            Arc::new(Int64Array::from(vec![9, 10, 11, 12, 13, 14])),
+        ],
+    )
+    .unwrap();
+    let right_batch = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Float64Array::from(vec![0.0, -0.0, nan_b, nan_a])),
+            Arc::new(Int64Array::from(vec![20, 21, 22, 23])),
+        ],
+    )
+    .unwrap();
+    let schema = output_schema(JoinType::Inner, &left_schema, &right_schema);
+
+    let hash_temp = tempfile::tempdir().unwrap();
+    let hash_context = QueryContext::shared(MemoryPool::new(64 << 20), hash_temp.path()).unwrap();
+    let hash = join(
+        boxed_record_batch_stream(futures::stream::once({
+            let left_batch = left_batch.clone();
+            async move { Ok(left_batch) }
+        })),
+        boxed_record_batch_stream(futures::stream::once({
+            let right_batch = right_batch.clone();
+            async move { Ok(right_batch) }
+        })),
+        vec![(
+            BoundExpr::column(0, DataType::Float64, "left.key"),
+            BoundExpr::column(0, DataType::Float64, "right.key"),
+        )],
+        Arc::clone(&left_schema),
+        Arc::clone(&right_schema),
+        JoinType::Inner,
+        Arc::clone(&schema),
+        hash_context,
+        4,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    let merge_temp = tempfile::tempdir().unwrap();
+    let merge_context = QueryContext::shared(MemoryPool::new(64 << 20), merge_temp.path()).unwrap();
+    let left_file = merge_context
+        .spill
+        .write_record_batches("float-left", Arc::clone(&left_schema), [left_batch])
+        .unwrap();
+    let right_file = merge_context
+        .spill
+        .write_record_batches("float-right", Arc::clone(&right_schema), [right_batch])
+        .unwrap();
+    let task = spill::PartitionTask {
+        left: vec![left_file],
+        right: vec![right_file],
+        depth: spill::MAX_REPARTITION_DEPTH,
+        stagnant_repartitions: 0,
+    };
+    let merged = sort_merge::fallback(
+        task,
+        vec![BoundExpr::column(0, DataType::Float64, "left.key")],
+        vec![BoundExpr::column(0, DataType::Float64, "right.key")],
+        left_schema,
+        right_schema,
+        JoinType::Inner,
+        schema,
+        Arc::clone(&merge_context),
+        4,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    assert_eq!(join_pairs(&merged), join_pairs(&hash));
+    assert_eq!(join_pairs(&hash).len(), 10);
+    assert_eq!(merge_context.memory.used(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoning_parallel_probe_releases_frozen_build_memory() {
+    let (left_schema, right_schema) = schemas();
+    let input_left_schema = Arc::clone(&left_schema);
+    let left_batches = (0..32_i64).map(move |batch| {
+        let start = batch * 2_048;
+        Ok(RecordBatch::try_new(
+            Arc::clone(&input_left_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 2_048])),
+                Arc::new(Int64Array::from_iter_values(start..start + 2_048)),
+            ],
+        )
+        .unwrap())
+    });
+    let right_batch = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![7])),
+        ],
+    )
+    .unwrap();
+    let left = boxed_record_batch_stream(futures::stream::iter(left_batches));
+    let right = boxed_record_batch_stream(futures::stream::once(async move { Ok(right_batch) }));
+    let schema = output_schema(JoinType::Inner, &left_schema, &right_schema);
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(128 << 20), temp.path()).unwrap();
+    context.configure_compute_lanes(4);
+    let mut output = join(
+        left,
+        right,
+        vec![(
+            BoundExpr::column(0, DataType::Int64, "left.key"),
+            BoundExpr::column(0, DataType::Int64, "right.key"),
+        )],
+        left_schema,
+        right_schema,
+        JoinType::Inner,
+        schema,
+        Arc::clone(&context),
+        64,
+    );
+
+    let first = output.try_next().await.unwrap().unwrap();
+    drop(first);
+    drop(output);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while context.memory.used() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parallel join lanes did not release their batch/build leases");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoning_parallel_grace_join_cleans_files_and_leases() {
+    const ROWS: i64 = 20_000;
+    let (left_schema, right_schema) = schemas();
+    let left_batch = RecordBatch::try_new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..ROWS)),
+            Arc::new(Int64Array::from_iter_values(0..ROWS)),
+        ],
+    )
+    .unwrap();
+    let right_batch = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..ROWS)),
+            Arc::new(Int64Array::from_iter_values(0..ROWS)),
+        ],
+    )
+    .unwrap();
+    let left = boxed_record_batch_stream(futures::stream::once(async move { Ok(left_batch) }));
+    let right = boxed_record_batch_stream(futures::stream::once(async move { Ok(right_batch) }));
+    let schema = output_schema(JoinType::Inner, &left_schema, &right_schema);
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(2 << 20), temp.path()).unwrap();
+    context.configure_compute_lanes(4);
+    let spill_directory = context.spill.directory().to_path_buf();
+    let mut output = join(
+        left,
+        right,
+        vec![(
+            BoundExpr::column(0, DataType::Int64, "left.key"),
+            BoundExpr::column(0, DataType::Int64, "right.key"),
+        )],
+        left_schema,
+        right_schema,
+        JoinType::Inner,
+        schema,
+        Arc::clone(&context),
+        64,
+    );
+
+    let first = output.try_next().await.unwrap().unwrap();
+    drop(first);
+    drop(output);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while context.memory.used() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parallel Grace join lanes did not release their reservations");
+    assert!(!spill_directory.exists());
 }
 
 async fn run_skew_join(join_type: JoinType) -> (Vec<RecordBatch>, QueryMetricsSnapshot) {
@@ -524,14 +946,90 @@ async fn run_skew_join(join_type: JoinType) -> (Vec<RecordBatch>, QueryMetricsSn
         ],
     )
     .unwrap();
-    run_join(
+    run_join_with_limit(
         join_type,
         left_schema,
         right_schema,
         left_batch,
         right_batch,
+        320 << 10,
     )
     .await
+}
+
+async fn run_parallel_grace_join(join_type: JoinType) -> (usize, QueryMetricsSnapshot) {
+    const RIGHT_ROWS: i64 = 12_000;
+    let (left_schema, right_schema) = schemas();
+    let mut left_batches = (0..RIGHT_ROWS)
+        .step_by(512)
+        .map(|start| {
+            let end = (start + 512).min(RIGHT_ROWS);
+            RecordBatch::try_new(
+                Arc::clone(&left_schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(start..end)),
+                    Arc::new(Int64Array::from_iter_values(start..end)),
+                ],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    left_batches.push(
+        RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(RIGHT_ROWS), None])),
+                Arc::new(Int64Array::from(vec![RIGHT_ROWS, RIGHT_ROWS + 1])),
+            ],
+        )
+        .unwrap(),
+    );
+    let right_batch = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..RIGHT_ROWS)),
+            Arc::new(Int64Array::from_iter_values(0..RIGHT_ROWS)),
+        ],
+    )
+    .unwrap();
+    let left = boxed_record_batch_stream(futures::stream::iter(left_batches.into_iter().map(Ok)));
+    let right = boxed_record_batch_stream(futures::stream::once(async move { Ok(right_batch) }));
+    let schema = output_schema(join_type, &left_schema, &right_schema);
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
+    context.configure_compute_lanes(4);
+    let batches = join(
+        left,
+        right,
+        vec![(
+            BoundExpr::column(0, DataType::Int64, "left.key"),
+            BoundExpr::column(0, DataType::Int64, "right.key"),
+        )],
+        left_schema,
+        right_schema,
+        join_type,
+        schema,
+        Arc::clone(&context),
+        128,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    assert_eq!(context.memory.used(), 0);
+    assert_eq!(
+        std::fs::read_dir(context.spill.directory())
+            .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "arrow")
+            }))
+            .count(),
+        0
+    );
+    (rows(&batches), context.metrics.snapshot())
 }
 
 async fn run_join(
@@ -541,11 +1039,30 @@ async fn run_join(
     left_batch: RecordBatch,
     right_batch: RecordBatch,
 ) -> (Vec<RecordBatch>, QueryMetricsSnapshot) {
+    run_join_with_limit(
+        join_type,
+        left_schema,
+        right_schema,
+        left_batch,
+        right_batch,
+        MEMORY_LIMIT,
+    )
+    .await
+}
+
+async fn run_join_with_limit(
+    join_type: JoinType,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+    left_batch: RecordBatch,
+    right_batch: RecordBatch,
+    memory_limit: usize,
+) -> (Vec<RecordBatch>, QueryMetricsSnapshot) {
     let left = boxed_record_batch_stream(futures::stream::once(async move { Ok(left_batch) }));
     let right = boxed_record_batch_stream(futures::stream::once(async move { Ok(right_batch) }));
     let schema = output_schema(join_type, &left_schema, &right_schema);
     let temp = tempfile::tempdir().unwrap();
-    let context = QueryContext::shared(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
+    let context = QueryContext::shared(MemoryPool::new(memory_limit), temp.path()).unwrap();
     let stream = join(
         left,
         right,
@@ -560,11 +1077,19 @@ async fn run_join(
         Arc::clone(&context),
         7,
     );
-    let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+    let batches = stream
+        .map_ok(|batch| batch.into_public())
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
     assert_eq!(context.memory.used(), 0);
     assert_eq!(
         std::fs::read_dir(context.spill.directory())
             .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "arrow")))
             .count(),
         0
     );
@@ -618,6 +1143,21 @@ fn left_ids(batches: &[RecordBatch]) -> Vec<i64> {
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids
+}
+
+fn join_pairs(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+    let mut pairs = batches
+        .iter()
+        .flat_map(|batch| {
+            let left = int64(batch, 1);
+            let right = int64(batch, 3);
+            (0..batch.num_rows())
+                .map(|row| (left.value(row), right.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_unstable();
+    pairs
 }
 
 fn fragmented_build_file(

@@ -1,39 +1,66 @@
 mod merge;
+mod parallel;
 mod run;
 
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::{mem::size_of, sync::Arc};
 
 use arrow::{
-    array::ArrayRef,
-    compute::SortOptions,
+    array::{ArrayRef, UInt32Array},
+    compute::{SortOptions, take_record_batch},
     datatypes::SchemaRef,
     record_batch::{RecordBatch, RecordBatchOptions},
     row::{RowConverter, SortField},
 };
 use futures::StreamExt;
 
-use crate::runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream};
+use crate::runtime::{
+    BatchEnvelope, IntoMemoryBatchStream, MemoryBatchStream, QueryContext,
+    boxed_memory_batch_stream,
+};
 use crate::sql::SortExpr;
 use crate::{Error, Result};
 
 use super::expr::evaluate;
-use merge::MergeIterator;
+use super::value::canonicalize_sort_key;
+use merge::{MemoryRun, MergeIterator, MergeRun};
 use run::{RunCleanup, compact_pending_runs, compact_runs, sort_batches, spill_run};
 
 const MERGE_FAN_IN: usize = 8;
 
-pub(crate) fn sort(
-    mut input: RecordBatchStream,
+pub(crate) fn sort<I>(
+    input: I,
     expressions: Vec<SortExpr>,
     fetch: Option<usize>,
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
-) -> RecordBatchStream {
-    boxed_record_batch_stream(async_stream::try_stream! {
+) -> MemoryBatchStream
+where
+    I: IntoMemoryBatchStream,
+{
+    let input = input.into_memory_batch_stream(Arc::clone(&context), "sort input");
+    if parallel::is_supported(&context) {
+        return parallel::sort(input, expressions, fetch, schema, context, batch_size);
+    }
+    serial_sort(input, expressions, fetch, schema, context, batch_size)
+}
+
+fn serial_sort<I>(
+    input: I,
+    expressions: Vec<SortExpr>,
+    fetch: Option<usize>,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+) -> MemoryBatchStream
+where
+    I: IntoMemoryBatchStream,
+{
+    let mut input = input.into_memory_batch_stream(Arc::clone(&context), "sort input");
+    boxed_memory_batch_stream(async_stream::try_stream! {
         if expressions.is_empty() {
             Err(Error::InvalidArgument("ORDER BY requires at least one expression".into()))?;
         }
@@ -60,19 +87,11 @@ pub(crate) fn sort(
         while let Some(batch) = input.next().await {
             context.check_cancelled()?;
             let batch = batch?;
-            if batch.num_rows() == 0 {
+            if batch.batch().num_rows() == 0 {
                 continue;
             }
-            // The stream transfers ownership of the complete batch to sort.
-            // Slices below retain all of these buffers, so keep this charge
-            // separate from the temporary concat/key/index/output workspace.
-            let input_bytes = batch.get_array_memory_size().max(1);
-            if !try_grow_input(
-                &mut input_memory,
-                input_bytes,
-                spill_headroom,
-                &context,
-            ) {
+            let input_bytes = batch.memory_size().max(1);
+            if context.memory.available() < spill_headroom {
                 if buffered.is_empty() {
                     Err(input_batch_error(input_bytes, &context))?;
                 }
@@ -101,15 +120,12 @@ pub(crate) fn sort(
                     &sort_pool,
                     spill_batch_rows,
                 )?;
-                if !try_grow_input(
-                    &mut input_memory,
-                    input_bytes,
-                    spill_headroom,
-                    &context,
-                ) {
+                if context.memory.available() < spill_headroom {
                     Err(input_batch_error(input_bytes, &context))?;
                 }
             }
+            let (batch, batch_memory) = batch.into_parts();
+            input_memory.absorb(batch_memory)?;
             let estimate = estimate_sort_bytes(&batch, expressions.len());
             if estimate > sort_pool.limit() {
                 if !buffered.is_empty() {
@@ -237,10 +253,29 @@ pub(crate) fn sort(
             reservation
                 .try_resize(sorted_bytes)
                 .map_err(|_| sort_workspace_error(sorted_bytes, &context))?;
-            for offset in (0..sorted.num_rows()).step_by(batch_size) {
+            let mut offset = 0usize;
+            while offset < sorted.num_rows() {
                 context.check_cancelled()?;
-                let length = batch_size.min(sorted.num_rows() - offset);
-                yield sorted.slice(offset, length);
+                let mut length = batch_size.min(sorted.num_rows() - offset);
+                let available = context.memory.limit().saturating_sub(reservation.size());
+                while length > 1
+                    && output_slice_workspace_bytes(&sorted, offset, length)? > available
+                {
+                    length = length.div_ceil(2);
+                }
+                let workspace = context
+                    .reserve_memory_while_holding(
+                        output_slice_workspace_bytes(&sorted, offset, length)?,
+                        reservation.size(),
+                        "sort output workspace",
+                    )
+                    .await?;
+                let indices = UInt32Array::from_iter_values(
+                    (offset..offset + length).map(|row| u32::try_from(row).unwrap_or(u32::MAX)),
+                );
+                let output = take_record_batch(&sorted, &indices)?;
+                yield BatchEnvelope::from_reservation(output, workspace, "sort output")?;
+                offset += length;
             }
             return;
         }
@@ -293,9 +328,9 @@ pub(crate) fn sort(
             sort_pool.reservation(),
             batch_size,
         )?;
-        for batch in &mut merge {
+        while let Some(batch) = merge.next_envelope().await? {
             context.check_cancelled()?;
-            yield batch?;
+            yield batch;
         }
     })
 }
@@ -335,7 +370,7 @@ fn evaluate_keys(expressions: &[SortExpr], batch: &RecordBatch) -> Result<Vec<Ar
                     expression.expr.data_type
                 )));
             }
-            Ok(array)
+            canonicalize_sort_key(array)
         })
         .collect()
 }
@@ -390,16 +425,6 @@ fn try_grow_workspace(
         && reservation.try_grow(bytes).is_ok()
 }
 
-fn try_grow_input(
-    reservation: &mut crate::runtime::MemoryReservation,
-    bytes: usize,
-    spill_headroom: usize,
-    context: &QueryContext,
-) -> bool {
-    bytes <= context.memory.available().saturating_sub(spill_headroom)
-        && reservation.try_grow(bytes).is_ok()
-}
-
 fn reserve_workspace(
     reservation: &mut crate::runtime::MemoryReservation,
     bytes: usize,
@@ -440,4 +465,17 @@ fn empty_columns_batch(schema: SchemaRef, rows: usize) -> Result<RecordBatch> {
         Vec::new(),
         &options,
     )?)
+}
+
+fn output_slice_workspace_bytes(batch: &RecordBatch, offset: usize, rows: usize) -> Result<usize> {
+    let logical = batch.columns().iter().try_fold(0usize, |bytes, column| {
+        let data = column.to_data().slice(offset, rows);
+        Ok::<_, arrow::error::ArrowError>(bytes.saturating_add(data.get_slice_memory_size()?))
+    })?;
+    Ok(logical
+        .saturating_mul(2)
+        .saturating_add(rows.saturating_mul(size_of::<u32>()).saturating_mul(2))
+        .saturating_add(batch.num_columns().saturating_mul(512))
+        .saturating_add(1_024)
+        .max(1))
 }

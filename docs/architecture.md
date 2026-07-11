@@ -7,12 +7,23 @@ SQL parser -> binder/catalog -> logical plan -> rule optimizer
            -> physical pipelines -> bounded RecordBatch stream -> caller
 ```
 
-Arrow `RecordBatch` is the only exchange batch. Scan, Filter, and Projection
-stream immediately. Aggregate, Join build, Sort, and scalar-subquery
-materialization are pipeline breakers. Engine owns a fixed-size Tokio compute
-runtime configured by `compute_threads`; a two-batch channel carries output to
-the embedding runtime and applies consumer backpressure. Object-store work is
-asynchronous, while per-source fan-out is bounded by `io_concurrency`.
+Arrow `RecordBatch` is the only public exchange batch. Internally each batch is
+a `BatchEnvelope` carrying its query-memory lease. Fused Scan/Filter/Projection
+pipelines claim independent tasks across
+`min(compute_threads, runnable Scan tasks)` lanes;
+Aggregate, Join build, Sort, and scalar-subquery materialization remain
+pipeline breakers. Bounded envelope queues apply consumer backpressure.
+Object-store work is asynchronous and source fan-out is capped by
+`io_concurrency`. `compute_threads` is an upper bound, not a promise that every
+plan has that many simultaneously runnable lanes. Without `ORDER BY`, batches
+from multiple lanes have no stable output order.
+
+Scan lanes reserve a projected-schema decode credit before polling a decoder.
+Filter/Projection and blocking-operator outputs reserve conservative workspace
+before Arrow kernels run, then transfer that reservation directly into the
+output `BatchEnvelope`. Internal and public handoff queues each retain at most
+one batch; when downstream is slow, cancellation-aware memory waiters resume on
+lease release instead of treating temporary queue pressure as out-of-memory.
 
 Parquet morsels are file plus row group and may execute concurrently. CSV
 morsels are files; one CSV remains sequential so quoted records cannot be split
@@ -21,22 +32,53 @@ applied before decoding where safe. Residual SQL filters always remain in the
 plan, so a source hint can never silently change query results.
 
 Blocking operators reserve retained state through a hierarchical engine/query
-memory pool. Sort writes LZ4 Arrow IPC runs and performs bounded-fan-in merge.
-Aggregate spills hash partitions and recursively repartitions skewed partitions
-with a new seed. Join uses in-memory hash build, Grace partitions on pressure,
-then bounded recursive repartitioning and a skew fallback when hashing cannot
-shrink a duplicate-key partition. Spill files are query-scoped, mode `0600`,
-and removed after success, failure, cancellation, or consumer abandonment.
+memory pool. When the multi-lane Aggregate path is eligible, every supported
+aggregate (`COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`) produces lane-local partial
+states and a final merge; its hash partitions can Spill and recursively
+repartition with a new seed. Join uses an immutable shared build for parallel
+probe when it fits, Grace partitions on pressure, and switches to external
+sort-merge after two seeds do not shrink a partition. Duplicate-key groups are
+replayed in bounded chunks. Sort creates lane-local memory blocks or LZ4 Arrow
+IPC runs and performs a bounded k-way merge.
+
+In the current alpha, parallel Aggregate and Sort, and the shared-build hash
+Join probe, require more than one configured lane and at least a 64 MiB query
+memory budget. The shared Join build must also fit within one quarter of that
+budget. Smaller budgets use the serial or partitioned/Spill path; Grace Join
+partitions may still run concurrently when multiple partition tasks exist.
+Spill improves bounded-memory completion but does not make an individual row,
+key group, decoder allocation, or minimum writer workspace arbitrarily small.
+
+Spill files are query-scoped, mode `0600`, and removed after success, failure,
+cancellation, or consumer abandonment.
 Active Spill paths, long-lived IPC writers, partition indices, decoded Spill
 batches, and merge state all retain reservations; file rotation or recursive
-partitioning therefore cannot grow an uncharged in-memory path list.
+partitioning therefore cannot grow an uncharged in-memory path list. Spill I/O
+runs on a fixed dedicated pool. Engine/query byte quotas and the configured
+10%/1 GiB free-space reserve are checked during writes.
+
+Each query directory contains a versioned `.rustdb-spill` marker and a private
+`.rustdb-active` file whose exclusive advisory lock is held for the lifetime
+of its `SpillManager`. Startup scavenging only considers UUID-named query
+directories with a valid marker older than the configured TTL, then acquires
+the activity lock without waiting and holds it through deletion. A held lock
+preserves an active directory even if its marker is older than the TTL; process
+exit releases the lock so a later Engine can reclaim the orphan. Unknown,
+unmarked, or invalidly marked directories are never treated as RustDB orphans.
+Valid legacy directories without `.rustdb-active` remain eligible for cleanup.
 
 The configured limit is an engine reservation budget, not a process-RSS hard
-limit. Arrow readers and kernels allocate inside `next()`/kernel calls before
-the resulting buffer size is known; RustDB reserves the complete batch as soon
-as ownership returns and rejects it before processing if it cannot fit.
-Workspaces use conservative pre-reservations, but allocator bookkeeping and
-temporary decoder buffers can still differ from the reservation estimate.
+limit. Decoder credits and kernel workspace are conservative because exact
+Arrow buffer sizes are not always known before execution; RustDB reconciles
+the reservation as soon as a batch returns and rejects a single batch that
+cannot fit. Filter/Projection kernels pre-reserve expression workspace.
+Aggregate holds
+leases for evaluated expressions and row-encoded keys, and Join key arrays keep
+their lease for as long as the evaluated keys are retained. CSV sampling is
+leased while inference runs, and the inferred query schema keeps a lease for
+the prepared provider lifetime. Workspaces use conservative pre-reservations,
+but allocator bookkeeping and temporary decoder buffers can still differ from
+the reservation estimate.
 Once a result batch is yielded, memory retained by the embedding caller is
 outside the engine's ownership and budget; benchmark reports record RSS
 separately.
@@ -57,8 +99,19 @@ query (including dynamic views), captures each object's fresh identity, and
 seals the query-wide snapshot map. Parquet footer/data ranges and the CSV
 object GET are conditional on those snapshots. A file can change between
 queries, but a mid-query change returns an error instead of mixing versions.
+The prepared providers' row/byte/file statistics are frozen into that query's
+Scan nodes before join ordering and EXPLAIN; they never overwrite the shared
+Catalog entry or another concurrent query's snapshot.
 Cancellation races outstanding object requests, and S3 metrics include logical
 resolution, metadata, snapshot, and data requests plus transferred body bytes.
+
+Registered CSV tables keep a stable logical schema between explicit refreshes
+and require every newly discovered file to match the current physical CSV
+schema. `REFRESH TABLE` re-infers the matched files and atomically installs a
+new provider: surviving logical columns keep their previous order, removed
+columns disappear, and genuinely new columns are appended in name order. Scan
+projection and predicates are mapped by name when the refreshed file header
+uses a different physical order.
 
 The stable public surface is `Engine`, `Session`, registration options,
 `QueryResult`, cancellation, and metrics. Catalog, logical/physical plan, data

@@ -94,13 +94,20 @@ fn write_table_batch(batch: &RecordBatch, header: bool) -> Result<()> {
 pub fn print_metrics(result: &QueryResult) {
     let metrics = result.metrics().snapshot();
     eprintln!(
-        "elapsed={:?} rows={} scanned_rows={} scanned_bytes={} peak_memory={} spill_bytes={} s3_requests={} s3_bytes={}",
+        "elapsed={:?} rows={} scanned_rows={} scanned_bytes={} discovered_files={} peak_memory={} peak_lanes={} scheduler_wait={:?} spill_bytes={} spill_read={} spill_write={} spill_files={} quota_rejections={} s3_requests={} s3_bytes={}",
         metrics.elapsed,
         metrics.rows_returned,
         metrics.rows_scanned,
         metrics.bytes_scanned,
+        metrics.discovered_files,
         metrics.peak_memory_bytes,
+        metrics.peak_active_lanes,
+        metrics.scheduler_wait,
         metrics.spill_bytes,
+        metrics.spill_read_bytes,
+        metrics.spill_write_bytes,
+        metrics.spill_files,
+        metrics.spill_quota_rejections,
         metrics.s3_requests,
         metrics.s3_bytes_transferred,
     );

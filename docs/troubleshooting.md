@@ -14,9 +14,19 @@ globs, unusually large Parquet footers/schemas, or a limit too small to open
 the minimum partition writers fail explicitly. Narrow the pattern or raise the
 limit; lowering `batch_size` only helps row-sized working state.
 
-Confirm the configured temporary directory exists on a filesystem with enough
-free space and supports owner-only permissions. Spill files are LZ4-compressed
-Arrow IPC, mode `0600`, and are removed after success, error, or cancellation.
+Confirm `EngineConfig::spill.directory` exists on a filesystem with enough
+free space and supports owner-only permissions. Spill rejects writes that
+would violate its engine/query quota or leave less than both the configured
+ratio and byte reserve. Files are LZ4-compressed Arrow IPC, mode `0600`, and
+are removed after success, error, cancellation, or consumer abandonment.
+
+Do not manually remove a live query directory. Its `.rustdb-active` advisory
+lock is held for the query Spill manager's lifetime, and startup
+scavenging skips the directory while that lock is held even when the marker is
+older than the orphan TTL. Cleanup only targets UUID-named query directories
+with an old, valid `.rustdb-spill` marker; unrelated and invalidly marked
+directories are preserved. A deletion or malformed activity-lock error is
+reported instead of being silently ignored.
 
 ## S3 requests fail
 
@@ -29,10 +39,13 @@ Arrow IPC, mode `0600`, and are removed after success, error, or cancellation.
 
 ## CSV schema or UTF-8 errors
 
-CSV input is strict, UTF-8, and uncompressed in v0.1. Supply an explicit Arrow
+CSV input is strict, UTF-8, and uncompressed in v0.2. Supply an explicit Arrow
 schema when sampling would infer an unwanted type. All matched files must have
-compatible columns. Quoted newlines are supported, but one large CSV file is
-decoded sequentially; parallelism is across files.
+compatible columns; errors identify the URI and mismatched column. Use
+`REFRESH TABLE name` only when the visible schema should be re-inferred.
+Refresh keeps surviving columns in their previous order and appends new columns
+by name. Quoted newlines are supported, but one large CSV file is decoded
+sequentially; parallelism is across files.
 
 ## Reproduce a failure
 

@@ -6,7 +6,11 @@ use std::{
     },
 };
 
+use tokio::sync::Notify;
+
 use crate::{Error, Result};
+
+use super::QueryControl;
 
 #[derive(Clone)]
 pub struct MemoryPool {
@@ -19,6 +23,7 @@ struct Node {
     used: AtomicUsize,
     peak: AtomicUsize,
     parent: Option<Arc<Node>>,
+    notify: Arc<Notify>,
 }
 
 pub struct MemoryReservation {
@@ -32,6 +37,7 @@ impl MemoryPool {
     }
 
     pub fn named_root(name: impl Into<Arc<str>>, limit: usize) -> Self {
+        let notify = Arc::new(Notify::new());
         Self {
             node: Arc::new(Node {
                 name: name.into(),
@@ -39,6 +45,7 @@ impl MemoryPool {
                 used: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 parent: None,
+                notify,
             }),
         }
     }
@@ -52,6 +59,7 @@ impl MemoryPool {
                 used: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 parent: Some(Arc::clone(&self.node)),
+                notify: Arc::clone(&self.node.notify),
             }),
         }
     }
@@ -91,6 +99,48 @@ impl MemoryPool {
         })
     }
 
+    /// Waits for query memory released by downstream consumers instead of
+    /// turning temporary streaming pressure into a query failure.
+    ///
+    /// All pools in one hierarchy share a notifier, so a child blocked by the
+    /// engine root also wakes when another query releases memory. A request
+    /// larger than any node limit can never make progress and fails
+    /// immediately.
+    pub(crate) async fn reserve_wait(
+        &self,
+        bytes: usize,
+        held_bytes: usize,
+        control: &QueryControl,
+    ) -> Result<MemoryReservation> {
+        let single_operation_bytes = bytes.saturating_add(held_bytes);
+        if let Some(node) = self
+            .ancestors_root_first()
+            .into_iter()
+            .find(|node| single_operation_bytes > node.limit)
+        {
+            return Err(Error::ResourceExhausted(format!(
+                "memory pool '{}' cannot satisfy one operation requiring {bytes} workspace bytes while retaining {held_bytes} bytes (limit {})",
+                node.name, node.limit,
+            )));
+        }
+
+        loop {
+            control.check_cancelled()?;
+            // Register before trying to acquire so a concurrent release cannot
+            // be lost between the failed attempt and the await.
+            let notified = self.node.notify.notified();
+            match self.try_reserve(bytes) {
+                Ok(reservation) => return Ok(reservation),
+                Err(_) => {
+                    tokio::select! {
+                        _ = control.cancelled() => return Err(Error::Cancelled),
+                        () = notified => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn acquire(&self, bytes: usize) -> Result<()> {
         if bytes == 0 {
             return Ok(());
@@ -122,6 +172,10 @@ impl MemoryPool {
         for node in self.ancestors_root_first().iter().rev() {
             node.release(bytes);
         }
+        self.node.notify.notify_waiters();
+        // Preserve one permit for a waiter that observed the failed acquire
+        // immediately before this release but had not yet been polled.
+        self.node.notify.notify_one();
     }
 
     fn ancestors_root_first(&self) -> Vec<Arc<Node>> {
@@ -201,6 +255,22 @@ impl MemoryReservation {
         }
     }
 
+    /// Transfers an already-accounted reservation into this handle without
+    /// changing pool usage. Both handles must belong to the same pool.
+    pub(crate) fn absorb(&mut self, mut other: Self) -> Result<()> {
+        if !Arc::ptr_eq(&self.pool.node, &other.pool.node) {
+            return Err(Error::Internal(
+                "cannot transfer memory between different pools".into(),
+            ));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .ok_or_else(|| Error::Internal("memory reservation size overflow".into()))?;
+        other.bytes = 0;
+        Ok(())
+    }
+
     pub fn release(mut self) {
         self.shrink(self.bytes);
     }
@@ -236,7 +306,10 @@ impl fmt::Debug for MemoryReservation {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::MemoryPool;
+    use crate::{Error, runtime::QueryControl};
 
     #[test]
     fn hierarchical_reservations_obey_child_and_parent_limits() {
@@ -268,5 +341,70 @@ mod tests {
         assert_eq!(reservation.size(), 20);
         drop(reservation);
         assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn temporary_pressure_wakes_all_waiters_without_losing_a_release() {
+        let pool = MemoryPool::new(9);
+        let blocker = pool.try_reserve(9).expect("initial reservation");
+        let control = QueryControl::new();
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let pool = pool.clone();
+            let control = control.clone();
+            waiters.push(tokio::spawn(async move {
+                pool.reserve_wait(3, 0, &control).await
+            }));
+        }
+
+        tokio::task::yield_now().await;
+        drop(blocker);
+
+        let reservations = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut reservations = Vec::new();
+            for waiter in waiters {
+                reservations.push(waiter.await.expect("waiter task")?);
+            }
+            Ok::<_, Error>(reservations)
+        })
+        .await
+        .expect("all waiters must observe the release")
+        .expect("all reservations must succeed");
+        assert_eq!(reservations.iter().map(|r| r.size()).sum::<usize>(), 9);
+        drop(reservations);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn impossible_single_batch_request_fails_without_waiting() {
+        let pool = MemoryPool::new(100);
+        let control = QueryControl::new();
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.reserve_wait(50, 60, &control),
+        )
+        .await
+        .expect("impossible request must not wait")
+        .expect_err("workspace plus retained input exceeds the limit");
+        assert!(error.to_string().contains("one operation"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_memory_wait() {
+        let pool = MemoryPool::new(10);
+        let _blocker = pool.try_reserve(10).expect("initial reservation");
+        let control = QueryControl::new();
+        let waiting_pool = pool.clone();
+        let waiting_control = control.clone();
+        let waiter =
+            tokio::spawn(async move { waiting_pool.reserve_wait(1, 0, &waiting_control).await });
+        tokio::task::yield_now().await;
+        control.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled waiter must wake")
+            .expect("waiter task")
+            .expect_err("reservation must be cancelled");
+        assert!(matches!(error, Error::Cancelled));
     }
 }

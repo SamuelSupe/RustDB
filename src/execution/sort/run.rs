@@ -63,7 +63,18 @@ pub(super) fn spill_run(
 ) -> Result<(SpillFile, usize)> {
     context.check_cancelled()?;
     let sorted = sort_batches(batches, expressions, converter, fetch, schema)?;
-    let chunk_rows = spill_chunk_rows(&sorted, batch_size, merge_memory_limit);
+    spill_sorted_run(&sorted, schema, context, batch_size, merge_memory_limit)
+}
+
+pub(super) fn spill_sorted_run(
+    sorted: &RecordBatch,
+    schema: &SchemaRef,
+    context: &QueryContext,
+    batch_size: usize,
+    merge_memory_limit: usize,
+) -> Result<(SpillFile, usize)> {
+    context.check_cancelled()?;
+    let chunk_rows = spill_chunk_rows(sorted, batch_size, merge_memory_limit);
     let chunks = (0..sorted.num_rows())
         .step_by(chunk_rows)
         .map(|offset| Ok(sorted.slice(offset, chunk_rows.min(sorted.num_rows() - offset))));
@@ -123,7 +134,7 @@ pub(super) fn compact_runs(
                 .write_batches("sort-merge", Arc::clone(schema), merge)?;
             cleanup.add(merged.clone());
             for old in group {
-                cleanup.remove(old);
+                cleanup.remove(old)?;
             }
             next.push(merged);
         }
@@ -175,9 +186,10 @@ impl RunCleanup {
         self.files.push(file);
     }
 
-    fn remove(&mut self, file: &SpillFile) {
-        self.spill.remove_file(file);
+    fn remove(&mut self, file: &SpillFile) -> Result<()> {
+        self.spill.remove_file(file)?;
         self.files.retain(|candidate| candidate != file);
+        Ok(())
     }
 
     pub(super) fn files(&self) -> Vec<SpillFile> {
@@ -196,7 +208,9 @@ impl RunCleanup {
 impl Drop for RunCleanup {
     fn drop(&mut self) {
         for file in &self.files {
-            self.spill.remove_file(file);
+            if let Err(error) = self.spill.remove_file(file) {
+                tracing::error!(%error, path = %file.path().display(), "failed to remove spill run");
+            }
         }
     }
 }

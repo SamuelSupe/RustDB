@@ -113,13 +113,10 @@ fn estimate(plan: &LogicalPlan) -> Estimate {
             rows: Some(u64::from(*produce_one_row)),
             bytes: Some(0),
         },
-        LogicalPlan::Scan { provider, .. } => {
-            let statistics = provider.statistics();
-            Estimate {
-                rows: statistics.row_count,
-                bytes: statistics.total_byte_size,
-            }
-        }
+        LogicalPlan::Scan { statistics, .. } => Estimate {
+            rows: statistics.row_count,
+            bytes: statistics.total_byte_size,
+        },
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }

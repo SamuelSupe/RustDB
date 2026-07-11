@@ -78,6 +78,9 @@ impl SnapshotParquetReader {
             self.store.get_opts(&self.location, options).await
         }
         .map_err(|error| object_error(&self.uri, error))?;
+        self.snapshot
+            .validate_get_response(&self.uri, &response.meta)
+            .map_err(external_error)?;
 
         let bytes = if let Some(query) = &self.query {
             tokio::select! {
@@ -207,6 +210,25 @@ mod tests {
 
         assert!(error.to_string().contains("object changed during query"));
         assert!(error.to_string().contains(source.uri()));
+    }
+
+    #[tokio::test]
+    async fn range_rejects_size_change_without_an_identity_token() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("no-token.bin");
+        fs::write(&path, b"before").unwrap();
+        let source = resolve(&path).await;
+        let mut snapshot = source.head_snapshot().await.unwrap();
+        snapshot.e_tag = None;
+        snapshot.version = None;
+        let mut reader = SnapshotParquetReader::new(&source, snapshot, None);
+
+        fs::write(&path, b"after-is-a-different-size").unwrap();
+        let error = reader.get_bytes(0..1).await.unwrap_err().to_string();
+
+        assert!(error.contains("object changed during query"), "{error}");
+        assert!(error.contains(source.uri()), "{error}");
+        assert!(error.contains("expected size"), "{error}");
     }
 
     #[tokio::test]

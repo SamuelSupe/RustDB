@@ -1,8 +1,9 @@
 use std::{fs, sync::Arc};
 
+use object_store::ObjectStoreExt;
 use tempfile::tempdir;
 
-use super::{LocationResolver, literal_prefix};
+use super::{LocationResolver, ObjectSnapshot, literal_prefix};
 use crate::{
     S3Config,
     runtime::{MemoryPool, QueryContext},
@@ -40,6 +41,7 @@ async fn query_resolution_registers_the_initial_object_identity() {
         .resolve_for_query(&[path.display().to_string()], &context)
         .await
         .unwrap();
+    assert_eq!(context.metrics.snapshot().discovered_files, 1);
 
     fs::write(&path, b"value\nnew-and-different\n").unwrap();
     let current = objects[0].head_snapshot().await.unwrap();
@@ -47,6 +49,34 @@ async fn query_resolution_registers_the_initial_object_identity() {
         .register_object_snapshot(objects[0].uri(), current)
         .unwrap_err();
     assert!(error.to_string().contains("identity changed"));
+}
+
+#[tokio::test]
+async fn get_response_must_preserve_every_snapshotted_identity_token() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("identity.csv");
+    fs::write(&path, b"value\n1\n").unwrap();
+    let object = LocationResolver::new(S3Config::default())
+        .resolve(&[path.display().to_string()])
+        .await
+        .unwrap()
+        .remove(0);
+    let mut response = object.store().head(object.location()).await.unwrap();
+    response.e_tag = None;
+    response.version = None;
+    let expected = ObjectSnapshot {
+        size: response.size,
+        e_tag: Some("expected-etag".to_owned()),
+        version: Some("expected-version".to_owned()),
+    };
+
+    let error = expected
+        .validate_get_response(object.uri(), &response)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("object changed during query"), "{error}");
+    assert!(error.contains("identity.csv"), "{error}");
 }
 
 #[tokio::test]

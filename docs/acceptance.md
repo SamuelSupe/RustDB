@@ -64,6 +64,15 @@ that cache entries are immutable and must not contain secrets in its
 
 ## TPC-H correctness
 
+Run the focused DuckDB 1.4.3 SQL-semantics differential before TPC-H:
+
+```sh
+tools/sql/differential.sh
+```
+
+It compares truth predicates, projection aliases, grouping ordinals, HAVING
+aliases, and hidden sort expressions through canonicalized result checksums.
+
 The seven-query checksum gate is deliberately a separate, single Linux x64
 job. Run the fast development gate with:
 
@@ -109,6 +118,8 @@ verify:
 - Peak engine reservation stays within the configured memory limit.
 - Spill bytes are non-zero for the forced-spill cases.
 - Every query-scoped spill directory is empty after success, error, or cancel.
+- Startup orphan tests preserve an old directory while `.rustdb-active` is
+  locked, then remove it after lock release; unknown directories stay intact.
 - The suite manifest records the RustDB build identifier and generated dataset
   manifest digest.
 - Local NVMe and MinIO benchmark results record hardware, cache state,
@@ -124,22 +135,47 @@ THREADS_LIST=1 BATCH_SIZES=1024 CACHE_MODES=cold \
   --output benchmarks/results/smoke-forward
 ```
 
-The fixed-hardware SF1 local/MinIO baseline is then run explicitly:
+The release-blocking parallel performance sample is local SF10 on an Apple M5
+Max. Capture the candidate with only the required matrix dimensions (the
+baseline suite may still emit its other query cases; the gate ignores them):
 
 ```sh
-tools/tpch/upload_minio.sh 1
+THREADS_LIST="1 4" BATCH_SIZES=8192 CACHE_MODES=warm \
+MEMORY_LIMIT_BYTES=1073741824 WARMUP=2 ITERATIONS=5 START_MINIO=0 \
 benchmarks/run_baseline.sh \
-  --local-root data/tpch-sf1 \
-  --minio-root s3://rustdb-tests/tpch-sf1 \
-  --output benchmarks/results/baseline/<run>
+  --local-root data/tpch-sf10 \
+  --output benchmarks/results/baseline/<candidate-run>
+
+docker compose run --rm --no-deps --no-TTY dev \
+  python3 benchmarks/check_parallel_gate.py \
+  --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
+  --baseline benchmarks/results/baseline/<alpha2-sf10-run>/manifest.json
 ```
 
-The runner refuses an existing output directory, builds the benchmark binary
-with `-C target-cpu=native`, records that build configuration, verifies the
-remote manifest, and checksum-validates the actual output from both storage
-targets before collecting timings. Portable CI release builds do not use
-native CPU flags.
+The baseline must come from a clean `v0.1.0-alpha.2` build over the same SF10
+manifest. The gate resolves that local tag and rejects a different baseline
+build identifier. The candidate must be the exact 40-character commit of the
+current clean worktree. Each target/thread/batch configuration is checksum-run
+independently; sharing one checksum path between t1 and t4 is rejected. Runner,
+helper-library, and checksum-runner digests are stored in each manifest. The
+gate also fails on missing or duplicate matrix entries,
+unverified checksums, a dataset mismatch, non-M5-Max hardware, a non-release or
+non-native build, settings other than local metadata-warm / batch 8192 / 1 GiB
+/ warmup 2 / five measurements, or a report whose build/config does not match
+its manifest. Missing evidence is a failure, never a pass.
 
-Only SF1 correctness is a release-blocking TPC-H gate. SF10 is a separately
-recorded resource/performance acceptance run; absence of the required dataset
-or hardware must be reported as not run, never as a pass.
+For both `scan-filter` and `aggregate`, the candidate must satisfy:
+
+- `t1_p50 / t4_p50 >= 2.0` (the four-thread throughput multiplier);
+- candidate one-thread p50 no more than 10% slower than alpha.2;
+- identical result checksums for candidate/baseline at one and four threads.
+
+The runner refuses an existing output directory, builds `rustdb-bench` with
+`-C target-cpu=native`, records the build and dataset fingerprints, and
+checksum-validates results before timing. Portable CI release builds do not
+use native CPU flags, and hosted CI checks parallel correctness without using
+this hardware timing gate.
+
+SF1 remains the routine TPC-H correctness gate. SF10 is the separately recorded
+resource/performance release gate; absence of its dataset, alpha.2 baseline, or
+nominated hardware must be reported as not run, never as a pass.

@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use arrow::{datatypes::DataType, record_batch::RecordBatch};
 
 use crate::{
@@ -18,6 +20,29 @@ impl GroupState {
             key,
             aggregates: expressions.iter().map(AggregateState::new).collect(),
         }
+    }
+
+    pub(super) fn output_workspace_bytes(&self, output_columns: usize) -> usize {
+        let values = output_columns.max(self.key.len().saturating_add(self.aggregates.len()));
+        let payload = self
+            .key
+            .iter()
+            .map(cell_payload_bytes)
+            .chain(
+                self.aggregates
+                    .iter()
+                    .map(AggregateState::output_payload_bytes),
+            )
+            .fold(0usize, usize::saturating_add);
+
+        // Output materialization temporarily retains cloned CellValues, the
+        // Arrow builder inputs, and the final Arrow buffers. Keep a generous
+        // fixed allowance per value and triple variable-width payloads so no
+        // output buffer is created before query memory has been credited.
+        values
+            .saturating_mul(size_of::<CellValue>().saturating_mul(3).saturating_add(96))
+            .saturating_add(payload.saturating_mul(3))
+            .saturating_add(256)
     }
 }
 
@@ -171,6 +196,20 @@ impl AggregateState {
         Ok(())
     }
 
+    pub(super) fn add_count_star_batch(&mut self, rows: usize) -> Result<()> {
+        let Self::Count(count) = self else {
+            return Err(Error::Internal(
+                "batch COUNT(*) update reached a non-count state".into(),
+            ));
+        };
+        let rows = i64::try_from(rows)
+            .map_err(|_| Error::Execution("count input exceeded INT64".into()))?;
+        *count = count
+            .checked_add(rows)
+            .ok_or_else(|| Error::Execution("count overflowed INT64".into()))?;
+        Ok(())
+    }
+
     pub(super) fn finish(&self) -> Result<CellValue> {
         match self {
             Self::Count(value) => Ok(CellValue::Int64(*value)),
@@ -222,6 +261,17 @@ impl AggregateState {
                 Ok(vec![encode_i128(*value), CellValue::Boolean(*seen)])
             }
             _ => Ok(vec![self.finish()?]),
+        }
+    }
+
+    fn output_payload_bytes(&self) -> usize {
+        match self {
+            Self::Min(Some(value)) | Self::Max(Some(value)) => cell_payload_bytes(value),
+            Self::SumSigned { .. }
+            | Self::SumUnsigned { .. }
+            | Self::SumDecimal { .. }
+            | Self::AvgDecimal { .. } => 16,
+            _ => 0,
         }
     }
 
@@ -339,6 +389,14 @@ impl AggregateState {
     }
 }
 
+fn cell_payload_bytes(value: &CellValue) -> usize {
+    match value {
+        CellValue::Utf8(value) => value.len(),
+        CellValue::Binary(value) => value.len(),
+        _ => 0,
+    }
+}
+
 fn encode_i128(value: i128) -> CellValue {
     CellValue::Binary(value.to_le_bytes().to_vec())
 }
@@ -415,14 +473,23 @@ fn unexpected_value(expression: &AggregateExpr, value: &CellValue) -> Error {
 }
 
 pub(super) fn estimate_group_bytes(state: &GroupState) -> usize {
-    96 + state
-        .key
-        .iter()
-        .map(|value| match value {
-            CellValue::Utf8(value) => value.len(),
-            CellValue::Binary(value) => value.len(),
-            _ => 16,
-        })
-        .sum::<usize>()
-        + state.aggregates.len() * 32
+    96_usize
+        .saturating_add(state.key.capacity().saturating_mul(size_of::<CellValue>()))
+        .saturating_add(
+            state
+                .key
+                .iter()
+                .map(|value| match value {
+                    CellValue::Utf8(value) => value.capacity(),
+                    CellValue::Binary(value) => value.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            state
+                .aggregates
+                .capacity()
+                .saturating_mul(size_of::<AggregateState>()),
+        )
 }

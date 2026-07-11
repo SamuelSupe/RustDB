@@ -5,7 +5,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tempfile::tempdir;
 
@@ -32,7 +32,7 @@ fn alignment_fills_missing_union_columns_with_null() {
         Field::new("a", DataType::Int64, false),
     ]));
 
-    let aligned = align_batch(batch, &target, None, 0).unwrap();
+    let aligned = align_batch(batch, &target, None, 0, "memory://test").unwrap();
     assert_eq!(aligned.num_rows(), 2);
     assert_eq!(aligned.column(0).null_count(), 2);
     assert_eq!(aligned.schema(), target);
@@ -115,6 +115,113 @@ async fn applies_projection_limit_and_row_group_pruning() {
         .unwrap();
     assert!(batches.is_empty());
     assert_eq!(pruning_context.metrics.snapshot().row_groups_pruned, 2);
+}
+
+#[tokio::test]
+async fn empty_projection_preserves_row_counts_without_materializing_columns() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("count-only.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+        ],
+    )
+    .unwrap();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let config = EngineConfig::default();
+    let table = ParquetTable::try_new_with_cache(
+        vec![path.to_string_lossy().into_owned()],
+        ParquetOptions::default(),
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+    )
+    .await
+    .unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    table.prepare(Arc::clone(&context)).await.unwrap();
+    context.seal_object_snapshots();
+    let mut request = ScanRequest::new(2);
+    request.projection = Some(Vec::new());
+    let batches = table
+        .scan(request, Arc::clone(&context))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+    assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+    let metrics = context.metrics.snapshot();
+    assert_eq!(metrics.rows_scanned, 5);
+    assert_eq!(metrics.bytes_scanned, 0);
+}
+
+#[tokio::test]
+async fn many_row_groups_keep_scan_task_metadata_bounded_by_target_lanes() {
+    const ROW_GROUPS: usize = 128;
+    const TARGET_TASKS: usize = 4;
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("many-row-groups.parquet");
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values(
+            0..i64::try_from(ROW_GROUPS).unwrap(),
+        ))],
+    )
+    .unwrap();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let config = EngineConfig::default();
+    let table = ParquetTable::try_new_with_cache(
+        vec![path.to_string_lossy().into_owned()],
+        ParquetOptions::default(),
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+    )
+    .await
+    .unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    table.prepare(Arc::clone(&context)).await.unwrap();
+    context.seal_object_snapshots();
+
+    let tasks = table
+        .scan_tasks(ScanRequest::new(8), Arc::clone(&context), TARGET_TASKS)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), TARGET_TASKS);
+
+    let rows = futures::stream::iter(tasks.into_iter().map(|task| task.into_stream()))
+        .flatten_unordered(TARGET_TASKS)
+        .try_fold(0usize, |rows, batch| async move {
+            Ok(rows.saturating_add(batch.num_rows()))
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, ROW_GROUPS);
 }
 
 #[tokio::test]

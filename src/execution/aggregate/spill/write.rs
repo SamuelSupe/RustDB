@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem::size_of, sync::Arc};
+use std::{collections::HashMap, hash::Hash, mem::size_of, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 
@@ -56,15 +56,18 @@ impl StateSpiller {
     }
 }
 
-pub(in crate::execution::aggregate) fn spill_states(
+pub(in crate::execution::aggregate) fn spill_states<K>(
     states: &mut Vec<GroupState>,
-    group_index: &mut HashMap<Vec<CellValue>, usize>,
+    group_index: &mut HashMap<K, usize>,
     groups: &[BoundExpr],
     aggregates: &[AggregateExpr],
     schema: SchemaRef,
     spiller: &mut StateSpiller,
     context: &QueryContext,
-) -> Result<()> {
+) -> Result<()>
+where
+    K: Eq + Hash,
+{
     if states.is_empty() {
         return Ok(());
     }
@@ -288,7 +291,7 @@ mod tests {
             .flatten()
             .collect::<Vec<_>>();
         for file in &files {
-            context.spill.remove_file(file);
+            context.spill.remove_file(file).unwrap();
         }
         assert_eq!(context.memory.used(), 0);
     }

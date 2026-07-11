@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use crate::{Error, Result};
 
 use super::super::{MemoryPool, MemoryReservation};
+use super::SpillCharge;
 
 /// Fixed portion of the reservation retained for every active spill file.
 ///
@@ -22,7 +23,14 @@ const ACTIVE_FILE_PATH_COPIES: usize = 4;
 #[derive(Debug)]
 pub(super) struct ActiveFiles {
     memory: MemoryPool,
-    entries: Mutex<HashMap<PathBuf, MemoryReservation>>,
+    entries: Mutex<HashMap<PathBuf, ActiveFile>>,
+    retain_charges_on_drop: AtomicBool,
+}
+
+#[derive(Debug)]
+struct ActiveFile {
+    _memory: MemoryReservation,
+    charge: Option<SpillCharge>,
 }
 
 impl ActiveFiles {
@@ -30,6 +38,7 @@ impl ActiveFiles {
         Self {
             memory,
             entries: Mutex::new(HashMap::new()),
+            retain_charges_on_drop: AtomicBool::new(false),
         }
     }
 
@@ -52,7 +61,10 @@ impl ActiveFiles {
         }
         match entries.entry(path) {
             Entry::Vacant(entry) => {
-                entry.insert(reservation);
+                entry.insert(ActiveFile {
+                    _memory: reservation,
+                    charge: None,
+                });
                 Ok(())
             }
             Entry::Occupied(entry) => {
@@ -73,14 +85,42 @@ impl ActiveFiles {
         self.entries.lock().contains_key(path)
     }
 
+    pub(super) fn add_charge(&self, path: &Path, charge: SpillCharge) -> Result<()> {
+        let mut entries = self.entries.lock();
+        let entry = entries.get_mut(path).ok_or(Error::Cancelled)?;
+        if let Some(existing) = &mut entry.charge {
+            existing.merge(charge)?;
+        } else {
+            entry.charge = Some(charge);
+        }
+        Ok(())
+    }
+
     pub(super) fn remove(&self, path: &Path) {
-        let reservation = self.entries.lock().remove(path);
-        drop(reservation);
+        let entry = self.entries.lock().remove(path);
+        drop(entry);
     }
 
     pub(super) fn clear(&self) {
-        let reservations = std::mem::take(&mut *self.entries.lock());
-        drop(reservations);
+        let entries = std::mem::take(&mut *self.entries.lock());
+        drop(entries);
+    }
+
+    pub(super) fn retain_charges_on_drop(&self) {
+        self.retain_charges_on_drop.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ActiveFiles {
+    fn drop(&mut self) {
+        if !self.retain_charges_on_drop.load(Ordering::Acquire) {
+            return;
+        }
+        for active in self.entries.get_mut().values_mut() {
+            if let Some(charge) = active.charge.take() {
+                charge.retain_engine();
+            }
+        }
     }
 }
 

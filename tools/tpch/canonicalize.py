@@ -27,7 +27,7 @@ def canonical_value(value: str) -> str:
     return format(rounded, "f")
 
 
-def canonical_bytes(path: Path) -> bytes:
+def canonical_bytes(path: Path, preserve_order: bool = False) -> bytes:
     with path.open(newline="", encoding="utf-8") as source:
         rows = list(csv.reader(source))
     if len(rows) <= 1:
@@ -35,7 +35,9 @@ def canonical_bytes(path: Path) -> bytes:
     width = len(rows[0])
     if any(len(row) != width for row in rows):
         raise SystemExit(f"inconsistent CSV row width: {path}")
-    body = sorted([canonical_value(value) for value in row] for row in rows[1:])
+    body = [[canonical_value(value) for value in row] for row in rows[1:]]
+    if not preserve_order:
+        body.sort()
     records = [rows[0], *body]
     return b"".join(
         (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -47,8 +49,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--preserve-order",
+        action="store_true",
+        help="retain result row order while normalizing values",
+    )
     args = parser.parse_args()
-    content = canonical_bytes(args.input)
+    content = canonical_bytes(args.input, preserve_order=args.preserve_order)
     args.output.write_bytes(content)
     print(hashlib.sha256(content).hexdigest())
 

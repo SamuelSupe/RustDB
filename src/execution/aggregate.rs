@@ -7,7 +7,10 @@ use arrow::{
 use futures::StreamExt;
 
 use crate::Result;
-use crate::runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream};
+use crate::runtime::{
+    BatchEnvelope, IntoMemoryBatchStream, MemoryBatchStream, QueryContext,
+    boxed_memory_batch_stream,
+};
 use crate::sql::{AggregateExpr, AggregateFunction, BoundExpr};
 
 use super::{
@@ -15,41 +18,155 @@ use super::{
     value::{CellValue, cell, values_to_array},
 };
 
+mod key;
+mod parallel;
 mod spill;
 mod state;
 
 #[cfg(test)]
 mod tests;
 
+use key::{GroupKey, GroupKeyEncoder};
 use spill::{
     MergeOutcome, PartitionTask, SPILL_PARTITIONS, StateSpiller, merge_partition,
     repartition_partition, spill_states,
 };
 use state::{GroupState, estimate_group_bytes};
 
-pub(crate) fn aggregate(
-    mut input: RecordBatchStream,
+pub(crate) fn aggregate<I>(
+    input: I,
     groups: Vec<BoundExpr>,
     aggregates: Vec<AggregateExpr>,
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
-) -> RecordBatchStream {
-    boxed_record_batch_stream(async_stream::try_stream! {
-        let mut group_index: HashMap<Vec<CellValue>, usize> = HashMap::new();
+) -> MemoryBatchStream
+where
+    I: IntoMemoryBatchStream,
+{
+    let input = input.into_memory_batch_stream(Arc::clone(&context), "aggregate input");
+    boxed_memory_batch_stream(async_stream::try_stream! {
+        let mut output = if parallel::is_supported(&aggregates, &context) {
+            parallel::aggregate(
+                input,
+                groups,
+                aggregates,
+                schema,
+                Arc::clone(&context),
+                batch_size,
+            )
+        } else {
+            serial_aggregate(input, groups, aggregates, schema, context, batch_size)
+        };
+        while let Some(batch) = output.next().await {
+            yield batch?;
+        }
+    })
+}
+
+fn serial_aggregate(
+    input: MemoryBatchStream,
+    groups: Vec<BoundExpr>,
+    aggregates: Vec<AggregateExpr>,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+) -> MemoryBatchStream {
+    aggregate_with_modes(
+        input,
+        groups,
+        aggregates,
+        schema,
+        context,
+        batch_size,
+        InputMode::Raw,
+        OutputMode::Final,
+    )
+}
+
+fn serial_partial_aggregate(
+    input: MemoryBatchStream,
+    groups: Vec<BoundExpr>,
+    aggregates: Vec<AggregateExpr>,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+) -> MemoryBatchStream {
+    let schema = partial_schema(&groups, &aggregates);
+    aggregate_with_modes(
+        input,
+        groups,
+        aggregates,
+        schema,
+        context,
+        batch_size,
+        InputMode::Raw,
+        OutputMode::Partial,
+    )
+}
+
+fn merge_partial_aggregate(
+    input: MemoryBatchStream,
+    groups: Vec<BoundExpr>,
+    aggregates: Vec<AggregateExpr>,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+) -> MemoryBatchStream {
+    aggregate_with_modes(
+        input,
+        groups,
+        aggregates,
+        schema,
+        context,
+        batch_size,
+        InputMode::Partial,
+        OutputMode::Final,
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InputMode {
+    Raw,
+    Partial,
+}
+
+#[derive(Clone, Copy)]
+enum OutputMode {
+    Final,
+    Partial,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_with_modes(
+    mut input: MemoryBatchStream,
+    groups: Vec<BoundExpr>,
+    aggregates: Vec<AggregateExpr>,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+    input_mode: InputMode,
+    output_mode: OutputMode,
+) -> MemoryBatchStream {
+    boxed_memory_batch_stream(async_stream::try_stream! {
+        let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
         let mut states = Vec::<GroupState>::new();
+        let key_encoder = GroupKeyEncoder::new(&groups);
         // Keep a bounded part of the query budget available for decoding and
         // repartitioning spill batches while aggregate states are resident.
         let state_pool = context.memory.child(
             format!("aggregate-{}", context.query_id),
-            aggregate_state_limit(context.memory.limit()),
+            aggregate_state_limit(
+                context.memory.limit(),
+                output_mode,
+                context.scheduler.configured_lanes(),
+            ),
         );
         let mut reservation = state_pool.reservation();
         let partial_schema = partial_schema(&groups, &aggregates);
         let mut spilled: Option<StateSpiller> = None;
 
         if groups.is_empty() {
-            group_index.insert(Vec::new(), 0);
+            group_index.insert(GroupKey::Encoded(Vec::new()), 0);
             states.push(GroupState::new(Vec::new(), &aggregates));
             reservation.try_grow(estimate_group_bytes(&states[0]))?;
         }
@@ -57,25 +174,71 @@ pub(crate) fn aggregate(
         while let Some(batch) = input.next().await {
             context.check_cancelled()?;
             let batch = batch?;
-            let group_arrays = groups
-                .iter()
-                .map(|expr| evaluate(expr, &batch))
-                .collect::<Result<Vec<_>>>()?;
-            let aggregate_arrays = aggregates
-                .iter()
-                .map(|aggregate| aggregate.expr.as_ref().map(|expr| evaluate(expr, &batch)).transpose())
-                .collect::<Result<Vec<_>>>()?;
-
-            for row in 0..batch.num_rows() {
-                let key = group_arrays
+            if input_mode == InputMode::Raw
+                && groups.is_empty()
+                && count_star_only(&aggregates)
+            {
+                let state = states
+                    .first_mut()
+                    .ok_or_else(|| crate::Error::Internal("global aggregate state is missing".into()))?;
+                for aggregate in &mut state.aggregates {
+                    aggregate.add_count_star_batch(batch.batch().num_rows())?;
+                }
+                continue;
+            }
+            // Expression kernels and Arrow row encoding retain derived arrays
+            // for the complete batch loop. Reserve their workspace before
+            // allocating, then resize to the buffers actually retained.
+            let workspace_estimate = aggregate_workspace_estimate(batch.batch(), &groups);
+            let mut workspace = context.memory.try_reserve(workspace_estimate)?;
+            let group_arrays = if input_mode == InputMode::Raw {
+                groups
                     .iter()
-                    .map(|array| cell(array, row))
-                    .collect::<Result<Vec<_>>>()?;
-                let index = if let Some(index) = group_index.get(&key) {
+                    .map(|expr| evaluate(expr, batch.batch()))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                (0..groups.len())
+                    .map(|index| Arc::clone(batch.batch().column(index)))
+                    .collect()
+            };
+            let encoded_groups = key_encoder.encode(&group_arrays)?;
+            let aggregate_arrays = if input_mode == InputMode::Raw {
+                Some(
+                    aggregates
+                        .iter()
+                        .map(|aggregate| {
+                            aggregate
+                                .expr
+                                .as_ref()
+                                .map(|expr| evaluate(expr, batch.batch()))
+                                .transpose()
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            } else {
+                None
+            };
+            let workspace_bytes = retained_workspace_bytes(
+                batch.batch(),
+                &group_arrays,
+                aggregate_arrays.as_deref(),
+                &encoded_groups,
+            );
+            workspace.try_resize(workspace_bytes)?;
+            context.metrics.observe_memory(context.memory.used());
+
+            for row in 0..batch.batch().num_rows() {
+                let index_key = key_encoder.key(&encoded_groups, &group_arrays, row)?;
+                let index = if let Some(index) = group_index.get(&index_key) {
                     *index
                 } else {
-                    let state = GroupState::new(key.clone(), &aggregates);
-                    let bytes = estimate_group_bytes(&state);
+                    let state_key = group_arrays
+                        .iter()
+                        .map(|array| cell(array, row))
+                        .collect::<Result<Vec<_>>>()?;
+                    let state = GroupState::new(state_key, &aggregates);
+                    let bytes = estimate_group_bytes(&state)
+                        .saturating_add(index_key.memory_size());
                     if reservation.try_grow(bytes).is_err() {
                         let spiller = spilled.get_or_insert_with(|| {
                             StateSpiller::new(&context, SPILL_PARTITIONS)
@@ -98,16 +261,28 @@ pub(crate) fn aggregate(
                     }
                     let index = states.len();
                     states.push(state);
-                    group_index.insert(key, index);
+                    group_index.insert(index_key, index);
                     index
                 };
                 let state = &mut states[index];
-                for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
-                    let value = aggregate_arrays[aggregate_index]
-                        .as_ref()
-                        .map(|array| cell(array, row))
-                        .transpose()?;
-                    state.aggregates[aggregate_index].update(aggregate, value)?;
+                if let Some(aggregate_arrays) = &aggregate_arrays {
+                    for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
+                        let value = aggregate_arrays[aggregate_index]
+                            .as_ref()
+                            .map(|array| cell(array, row))
+                            .transpose()?;
+                        state.aggregates[aggregate_index].update(aggregate, value)?;
+                    }
+                } else {
+                    let mut column = groups.len();
+                    for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
+                        state.aggregates[aggregate_index].merge_partial(
+                            aggregate,
+                            batch.batch(),
+                            row,
+                            &mut column,
+                        )?;
+                    }
                 }
             }
         }
@@ -140,10 +315,18 @@ pub(crate) fn aggregate(
                     &mut reservation,
                 )? {
                     MergeOutcome::Merged(partition_states) => {
-                        spill::remove_files(&context, &task.files);
+                        spill::remove_files(&context, &task.files)?;
                         for chunk in partition_states.chunks(batch_size.max(1)) {
                             context.check_cancelled()?;
-                            yield build_batch(chunk, &groups, &aggregates, Arc::clone(&schema))?;
+                            yield build_output_envelope(
+                                chunk,
+                                &groups,
+                                &aggregates,
+                                Arc::clone(&schema),
+                                output_mode,
+                                &context,
+                                reservation.size(),
+                            ).await?;
                         }
                         reservation.try_resize(0)?;
                     }
@@ -156,7 +339,7 @@ pub(crate) fn aggregate(
                             next_depth,
                             &context,
                         )?;
-                        spill::remove_files(&context, &task.files);
+                        spill::remove_files(&context, &task.files)?;
                         for files in child_partitions.into_iter().rev() {
                             if !files.is_empty() {
                                 pending.push(PartitionTask::child(files, next_depth));
@@ -168,18 +351,115 @@ pub(crate) fn aggregate(
         } else {
             for chunk in states.chunks(batch_size.max(1)) {
                 context.check_cancelled()?;
-                yield build_batch(chunk, &groups, &aggregates, Arc::clone(&schema))?;
+                yield build_output_envelope(
+                    chunk,
+                    &groups,
+                    &aggregates,
+                    Arc::clone(&schema),
+                    output_mode,
+                    &context,
+                    reservation.size(),
+                ).await?;
             }
         }
     })
 }
 
-fn aggregate_state_limit(query_limit: usize) -> usize {
-    query_limit
-        .checked_div(2)
-        .unwrap_or(0)
+fn aggregate_workspace_estimate(batch: &RecordBatch, groups: &[BoundExpr]) -> usize {
+    batch
+        .get_array_memory_size()
+        .saturating_add(
+            batch
+                .num_rows()
+                .saturating_mul(groups.len().saturating_mul(16).saturating_add(8)),
+        )
         .max(1)
-        .min(query_limit)
+}
+
+fn retained_workspace_bytes(
+    input: &RecordBatch,
+    groups: &[arrow::array::ArrayRef],
+    aggregates: Option<&[Option<arrow::array::ArrayRef>]>,
+    encoded: &key::EncodedGroupRows,
+) -> usize {
+    groups
+        .iter()
+        .map(|array| derived_array_bytes(input, array))
+        .chain(
+            aggregates
+                .into_iter()
+                .flatten()
+                .filter_map(Option::as_ref)
+                .map(|array| derived_array_bytes(input, array)),
+        )
+        .fold(encoded.memory_size(), usize::saturating_add)
+        .max(1)
+}
+
+fn derived_array_bytes(input: &RecordBatch, array: &arrow::array::ArrayRef) -> usize {
+    if input
+        .columns()
+        .iter()
+        .any(|column| Arc::ptr_eq(column, array))
+    {
+        0
+    } else {
+        array.get_array_memory_size()
+    }
+}
+
+fn build_output_batch(
+    states: &[GroupState],
+    groups: &[BoundExpr],
+    aggregates: &[AggregateExpr],
+    schema: SchemaRef,
+    mode: OutputMode,
+) -> Result<RecordBatch> {
+    match mode {
+        OutputMode::Final => build_batch(states, groups, aggregates, schema),
+        OutputMode::Partial => build_partial_batch(states, groups, aggregates, schema),
+    }
+}
+
+async fn build_output_envelope(
+    states: &[GroupState],
+    groups: &[BoundExpr],
+    aggregates: &[AggregateExpr],
+    schema: SchemaRef,
+    mode: OutputMode,
+    context: &QueryContext,
+    held_bytes: usize,
+) -> Result<BatchEnvelope> {
+    let estimate = states
+        .iter()
+        .map(|state| state.output_workspace_bytes(schema.fields().len()))
+        .fold(
+            schema.fields().len().saturating_mul(512).saturating_add(1),
+            usize::saturating_add,
+        );
+    let workspace = context
+        .reserve_memory_while_holding(estimate, held_bytes, "aggregate output workspace")
+        .await?;
+    let batch = build_output_batch(states, groups, aggregates, schema, mode)?;
+    BatchEnvelope::from_reservation(batch, workspace, "aggregate output")
+}
+
+fn count_star_only(aggregates: &[AggregateExpr]) -> bool {
+    !aggregates.is_empty()
+        && aggregates.iter().all(|aggregate| {
+            aggregate.function == AggregateFunction::Count && aggregate.expr.is_none()
+        })
+}
+
+fn aggregate_state_limit(query_limit: usize, output_mode: OutputMode, lanes: usize) -> usize {
+    // Keep enough room for one leased input/workspace batch and the active
+    // partition writers while resident states are serialized.
+    let divisor = if matches!(output_mode, OutputMode::Partial) {
+        lanes.max(1).saturating_mul(2)
+    } else {
+        3
+    };
+    query_limit.checked_div(divisor).unwrap_or(0).max(1)
 }
 
 fn build_batch(

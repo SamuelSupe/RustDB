@@ -59,17 +59,24 @@ while let Some(batch) = result.stream().next().await {
 - Read-only external CSV and Parquet data.
 - Local paths, globs, `file://`, AWS S3, and custom S3 endpoints.
 - Vectorized projection, filter, aggregation, sort, limit, and equi-joins.
-- Query cancellation, execution metrics, bounded memory, and local spill.
+- Query-time file discovery, atomic schema refresh with stable CSV column order,
+  and safe Parquet widening.
+- Multi-lane pipelines, cancellation-aware memory backpressure, query-scoped
+  optimizer statistics, workspace-aware accounting, and
+  quota/free-space-governed Spill.
 
 RustDB does not currently provide managed tables, transactions, DML, a server
 protocol, distributed execution, or DuckDB compatibility. CSV is streamed and
 parallelized across files; a single compressed or multiline CSV is not split
-into byte ranges.
+into byte ranges. `compute_threads` is an execution upper bound: actual lanes
+also depend on available Scan tasks, operator eligibility, and memory budget.
+Result order is unspecified without `ORDER BY`.
 
 See [architecture.md](docs/architecture.md) for the execution model and
 [compatibility.md](docs/compatibility.md) for the SQL and format contract.
 [s3.md](docs/s3.md) covers AWS and MinIO configuration, and
 [troubleshooting.md](docs/troubleshooting.md) covers resource, spill, and input
-errors. The repeatable benchmark workflow is documented in
+errors. [migration-v0.2.md](docs/migration-v0.2.md) covers alpha API changes.
+The repeatable benchmark workflow is documented in
 [benchmarks/README.md](benchmarks/README.md), and the release gates are listed
 in [acceptance.md](docs/acceptance.md).

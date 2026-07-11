@@ -38,6 +38,31 @@ impl From<&ObjectMeta> for ObjectSnapshot {
     }
 }
 
+impl ObjectSnapshot {
+    /// Verifies that an object GET still refers to the identity captured for
+    /// this query. Some S3-compatible stores omit ETag and version values, so
+    /// size remains a required fallback identity check.
+    pub(crate) fn validate_get_response(&self, uri: &str, meta: &ObjectMeta) -> Result<()> {
+        let actual = Self::from(meta);
+        let e_tag_changed = self
+            .e_tag
+            .as_deref()
+            .is_some_and(|expected| actual.e_tag.as_deref() != Some(expected));
+        let version_changed = self
+            .version
+            .as_deref()
+            .is_some_and(|expected| actual.version.as_deref() != Some(expected));
+        if self.size != actual.size || e_tag_changed || version_changed {
+            return Err(Error::Execution(format!(
+                "object changed during query: {uri}: expected size {}, ETag {:?}, version {:?}; \
+                 GET returned size {}, ETag {:?}, version {:?}",
+                self.size, self.e_tag, self.version, actual.size, actual.e_tag, actual.version,
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct ObjectSource {
     uri: String,
@@ -181,6 +206,9 @@ impl LocationResolver {
             )));
         }
         if let Some(context) = context {
+            context
+                .metrics
+                .add_discovered_files(u64::try_from(objects.len()).unwrap_or(u64::MAX));
             for object in &objects {
                 context.register_object_snapshot(object.uri(), object.snapshot().clone())?;
             }

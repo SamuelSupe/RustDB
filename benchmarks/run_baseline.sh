@@ -172,31 +172,35 @@ run_target() {
     rendered_container=/workspace/$rendered_relative
     render_query "$template" "$target_root" "$rendered_host"
 
-    checksum_relative=
-    if [ "$skip_checksum" = 0 ]; then
-      checksum_relative=$output_relative/reports/$target_kind-$case_name.checksum.txt
-      echo "checksum: target=$target_kind case=$case_name" >&2
-      TPCH_S3_ENDPOINT=$MINIO_ENDPOINT \
-      TPCH_S3_REGION=$MINIO_REGION \
-      TPCH_S3_PATH_STYLE=1 \
-      TPCH_RUSTFLAGS=$BENCHMARK_RUSTFLAGS \
-        "$checksum_runner" "$template" "$local_relative" "$checksum_root" \
-        < /dev/null > "$WORKSPACE/$checksum_relative"
-      assert_sha256_file "$WORKSPACE/$checksum_relative"
-    fi
+    for threads in $threads_list; do
+      for batch_size in $batch_sizes; do
+        checksum_relative=
+        if [ "$skip_checksum" = 0 ]; then
+          checksum_relative=$output_relative/reports/$target_kind-$case_name-t$threads-b$batch_size.checksum.txt
+          echo "checksum: target=$target_kind case=$case_name threads=$threads batch=$batch_size" >&2
+          TPCH_S3_ENDPOINT=$MINIO_ENDPOINT \
+          TPCH_S3_REGION=$MINIO_REGION \
+          TPCH_S3_PATH_STYLE=1 \
+          TPCH_MEMORY_LIMIT_BYTES=$memory_limit \
+          TPCH_THREADS=$threads \
+          TPCH_BATCH_SIZE=$batch_size \
+          TPCH_IO_CONCURRENCY=$io_concurrency \
+          TPCH_RUSTFLAGS=$BENCHMARK_RUSTFLAGS \
+            "$checksum_runner" "$template" "$local_relative" "$checksum_root" \
+            < /dev/null > "$WORKSPACE/$checksum_relative"
+          assert_sha256_file "$WORKSPACE/$checksum_relative"
+        fi
 
-    for cache_mode in $cache_modes; do
-      if [ "$cache_mode" = cold ]; then
-        run_warmup=0
-        run_iterations=$cold_iterations
-        run_cache_bytes=0
-      else
-        run_warmup=$warmup_iterations
-        run_iterations=$measured_iterations
-        run_cache_bytes=$metadata_cache_bytes
-      fi
-      for threads in $threads_list; do
-        for batch_size in $batch_sizes; do
+        for cache_mode in $cache_modes; do
+          if [ "$cache_mode" = cold ]; then
+            run_warmup=0
+            run_iterations=$cold_iterations
+            run_cache_bytes=0
+          else
+            run_warmup=$warmup_iterations
+            run_iterations=$measured_iterations
+            run_cache_bytes=$metadata_cache_bytes
+          fi
           report_name=$target_kind-$cache_mode-$case_name-t$threads-b$batch_size.json
           report_relative=$output_relative/reports/$report_name
           report_host=$WORKSPACE/$report_relative
@@ -245,6 +249,10 @@ fi
   printf '  "build":{"cargo_profile":"%s","rustflags":"%s","rustc_version":"%s"},\n' \
     "$(json_escape "$BENCHMARK_BUILD_PROFILE")" "$(json_escape "$BENCHMARK_RUSTFLAGS")" \
     "$(json_escape "$BENCHMARK_RUSTC_VERSION")"
+  printf '  "harness":{"runner_sha256":"%s","library_sha256":"%s","checksum_runner_sha256":"%s"},\n' \
+    "$(sha256_file "$SCRIPT_DIR/run_baseline.sh")" \
+    "$(sha256_file "$SCRIPT_DIR/suites/lib.sh")" \
+    "$(sha256_file "$checksum_runner")"
   printf '  "dataset":%s,\n' "$dataset_json"
   if [ -n "$minio_argument" ]; then
     case "$MINIO_ENDPOINT" in http://*) allow_http=true ;; *) allow_http=false ;; esac
@@ -255,7 +263,7 @@ fi
   fi
   if [ "$skip_checksum" = 0 ]; then
     if [ -n "$minio_argument" ]; then correctness_targets='["local","minio"]'; else correctness_targets='["local"]'; fi
-    printf '  "correctness":{"verified":true,"scope":"every benchmark target","targets":%s,"runner":"%s","reference_root":"%s","remote_manifest_verified":%s},\n' \
+    printf '  "correctness":{"verified":true,"scope":"every benchmark target/thread/batch configuration","targets":%s,"runner":"%s","reference_root":"%s","remote_manifest_verified":%s},\n' \
       "$correctness_targets" "$(json_escape "$checksum_runner")" \
       "$(json_escape "$local_root")" "$remote_manifest_verified"
   else

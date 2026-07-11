@@ -10,22 +10,39 @@ use arrow::{
     datatypes::{Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use parking_lot::Mutex;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::config::SpillConfig;
 use crate::{Error, Result};
 
 use super::{MemoryPool, QueryControl, QueryMetrics};
 #[cfg(test)]
 use super::{RecordBatchStream, boxed_record_batch_stream};
 
+mod activity;
 mod io;
+mod io_pool;
 mod metadata;
+#[allow(dead_code)]
+mod quota;
+#[allow(dead_code)]
+mod scavenger;
 
-use io::SpillReader;
 pub(crate) use io::SpillWriter;
 #[cfg(test)]
 use io::writer_memory_bytes;
+use io::{SpillReader, copy_memory_bytes};
+pub(crate) use io_pool::SpillIoPool;
 use metadata::ActiveFiles;
+#[allow(unused_imports)]
+pub(crate) use quota::{
+    DiskSpace, DiskSpaceProbe, QuerySpillQuota, SpillCharge, SpillQuotaPool, SpillReservation,
+    SystemDiskSpaceProbe,
+};
+#[allow(unused_imports)]
+pub(crate) use scavenger::{ScavengeReport, scavenge_orphans};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SpillFile {
@@ -46,19 +63,35 @@ pub struct SpillManager {
 #[derive(Debug)]
 struct State {
     directory: PathBuf,
+    _activity_lock: activity::QueryActivityLock,
+    control: QueryControl,
     memory: MemoryPool,
-    files: ActiveFiles,
+    files: Arc<ActiveFiles>,
+    quota: QuerySpillQuota,
+    io_pool: SpillIoPool,
     next_file: AtomicU64,
     cleaned: AtomicBool,
+    cleanup_lock: Mutex<()>,
     metrics: Option<QueryMetrics>,
 }
 
 impl SpillManager {
     #[cfg(test)]
     pub fn new(spill_root: impl AsRef<Path>, memory: MemoryPool) -> Result<Self> {
-        Self::create(spill_root, Uuid::new_v4(), memory, None)
+        let root = spill_root.as_ref().to_path_buf();
+        let (quota, io_pool) = compatibility_resources(&root)?;
+        Self::create(
+            root,
+            Uuid::new_v4(),
+            QueryControl::new(),
+            memory,
+            None,
+            quota,
+            io_pool,
+        )
     }
 
+    #[cfg(test)]
     pub fn for_query(
         spill_root: impl AsRef<Path>,
         query_id: Uuid,
@@ -66,7 +99,31 @@ impl SpillManager {
         memory: MemoryPool,
         metrics: Option<QueryMetrics>,
     ) -> Result<Self> {
-        let manager = Self::create(spill_root, query_id, memory, metrics)?;
+        let root = spill_root.as_ref().to_path_buf();
+        let (quota, io_pool) = compatibility_resources(&root)?;
+        Self::for_query_with_resources(root, query_id, control, memory, metrics, quota, io_pool)
+    }
+
+    /// Production constructor. Engine owns one `SpillQuotaPool` and one
+    /// `SpillIoPool`, then starts a query quota and passes both resources here.
+    pub(crate) fn for_query_with_resources(
+        spill_root: impl AsRef<Path>,
+        query_id: Uuid,
+        control: &QueryControl,
+        memory: MemoryPool,
+        metrics: Option<QueryMetrics>,
+        quota: QuerySpillQuota,
+        io_pool: SpillIoPool,
+    ) -> Result<Self> {
+        let manager = Self::create(
+            spill_root,
+            query_id,
+            control.clone(),
+            memory,
+            metrics,
+            quota,
+            io_pool,
+        )?;
         let state = Arc::downgrade(&manager.state);
         control.register_cleanup(move || cleanup_weak(state));
         control.check_cancelled()?;
@@ -76,26 +133,71 @@ impl SpillManager {
     fn create(
         spill_root: impl AsRef<Path>,
         query_id: Uuid,
+        control: QueryControl,
         memory: MemoryPool,
         metrics: Option<QueryMetrics>,
+        quota: QuerySpillQuota,
+        io_pool: SpillIoPool,
     ) -> Result<Self> {
-        let root = spill_root.as_ref();
-        std::fs::create_dir_all(root)
-            .map_err(|error| Error::io(Some(root.to_path_buf()), error))?;
+        let root = spill_root.as_ref().to_path_buf();
+        let create_root = root.clone();
+        io_pool.run(move || {
+            std::fs::create_dir_all(&create_root)
+                .map_err(|error| Error::io(Some(create_root), error))
+        })?;
         let directory = root.join(format!("query-{query_id}"));
-        io::create_query_directory(&directory)?;
-        if let Err(error) = io::set_directory_permissions(&directory) {
-            let _ = std::fs::remove_dir_all(&directory);
-            return Err(error);
-        }
+        let create_directory = directory.clone();
+        let activity_lock = io_pool.run(move || {
+            io::create_query_directory(&create_directory)?;
+            if let Err(error) = io::set_directory_permissions(&create_directory) {
+                let cleanup = std::fs::remove_dir_all(&create_directory);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(Error::Execution(format!(
+                        "{error}; additionally failed to remove spill directory '{}': {cleanup}",
+                        create_directory.display()
+                    ))),
+                };
+            }
+            let activity_lock = match activity::QueryActivityLock::create(&create_directory) {
+                Ok(activity_lock) => activity_lock,
+                Err(error) => {
+                    let cleanup = std::fs::remove_dir_all(&create_directory);
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(Error::Execution(format!(
+                            "{error}; additionally failed to remove spill directory '{}': {cleanup}",
+                            create_directory.display()
+                        ))),
+                    };
+                }
+            };
+            if let Err(error) = scavenger::write_query_marker(&create_directory) {
+                drop(activity_lock);
+                let cleanup = std::fs::remove_dir_all(&create_directory);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(Error::Execution(format!(
+                        "{error}; additionally failed to remove spill directory '{}': {cleanup}",
+                        create_directory.display()
+                    ))),
+                };
+            }
+            Ok(activity_lock)
+        })?;
 
         Ok(Self {
             state: Arc::new(State {
                 directory,
+                _activity_lock: activity_lock,
+                control,
                 memory: memory.clone(),
-                files: ActiveFiles::new(memory),
+                files: Arc::new(ActiveFiles::new(memory)),
+                quota,
+                io_pool,
                 next_file: AtomicU64::new(0),
                 cleaned: AtomicBool::new(false),
+                cleanup_lock: Mutex::new(()),
                 metrics,
             }),
         })
@@ -132,14 +234,23 @@ impl SpillManager {
     pub(crate) fn writer(&self, label: &str, schema: SchemaRef) -> Result<SpillWriter> {
         self.ensure_active()?;
         let writer_memory = io::reserve_writer_memory(&self.state.memory, schema.as_ref())?;
+        if let Some(metrics) = &self.state.metrics {
+            metrics.observe_memory(self.state.memory.used());
+        }
         let spill_file = self.allocate_file(label)?;
         SpillWriter::create(Arc::clone(&self.state), spill_file, schema, writer_memory)
     }
 
     pub(crate) fn writer_headroom_bytes(&self, label: &str, schema: &Schema) -> usize {
-        io::writer_memory_bytes(schema).saturating_add(metadata::active_file_metadata_bytes(
-            &self.spill_path(u64::MAX, label),
-        ))
+        io::writer_memory_bytes(schema)
+            .saturating_add(self.write_copy_headroom_bytes())
+            .saturating_add(metadata::active_file_metadata_bytes(
+                &self.spill_path(u64::MAX, label),
+            ))
+    }
+
+    pub(crate) fn write_copy_headroom_bytes(&self) -> usize {
+        copy_memory_bytes(self.state.memory.limit())
     }
 
     #[cfg(test)]
@@ -166,8 +277,8 @@ impl SpillManager {
         }))
     }
 
-    pub fn remove_file(&self, spill_file: &SpillFile) {
-        self.state.remove_file(spill_file);
+    pub fn remove_file(&self, spill_file: &SpillFile) -> Result<()> {
+        self.state.remove_file(spill_file)
     }
 
     pub fn cleanup(&self) -> Result<()> {
@@ -220,53 +331,96 @@ impl State {
         }
     }
 
-    fn remove_file(&self, spill_file: &SpillFile) {
-        self.files.remove(spill_file.path());
-        match std::fs::remove_file(spill_file.path()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {}
+    fn record_spill_read(&self, bytes: u64) {
+        if let Some(metrics) = &self.metrics {
+            metrics.add_spill_read_bytes(bytes);
         }
     }
 
+    fn record_spill_file(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.add_spill_file();
+        }
+    }
+
+    fn remove_file(&self, spill_file: &SpillFile) -> Result<()> {
+        let path = spill_file.path().to_path_buf();
+        let remove_path = path.clone();
+        self.io_pool.run_cancelable(&self.control, move || {
+            match std::fs::remove_file(&remove_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(Error::io(Some(remove_path), error)),
+            }
+        })?;
+        // Retained quota charges are released only after physical deletion has
+        // succeeded (or the path was already absent).
+        self.files.remove(&path);
+        Ok(())
+    }
+
     fn cleanup(&self) -> Result<()> {
+        let _cleanup = self.cleanup_lock.lock();
         self.cleaned.store(true, Ordering::Release);
+        let directory = self.directory.clone();
+        let verify = directory.clone();
+        let sync_path = directory.clone();
+        self.io_pool.run_cleanup(move || {
+            match std::fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::io(Some(directory), error)),
+            }
+            // Some shared filesystems can expose an empty directory briefly
+            // after remove_dir_all reports success.
+            match std::fs::remove_dir(&verify) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::io(Some(verify), error)),
+            }
+            match std::fs::symlink_metadata(&verify) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(Error::io(Some(verify), error)),
+                Ok(_) => Err(Error::Execution(format!(
+                    "spill directory '{}' remained after cleanup",
+                    verify.display()
+                ))),
+            }
+        })?;
         self.files.clear();
-        match std::fs::remove_dir_all(&self.directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::io(Some(self.directory.clone()), error)),
-        }
-        // Some shared filesystems can expose an empty directory briefly after
-        // remove_dir_all reports success. A second root removal plus a parent
-        // directory sync makes query completion a durable cleanup boundary.
-        match std::fs::remove_dir(&self.directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::io(Some(self.directory.clone()), error)),
-        }
-        io::sync_parent_directory(&self.directory)?;
-        match std::fs::symlink_metadata(&self.directory) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Error::io(Some(self.directory.clone()), error)),
-            Ok(_) => Err(Error::Execution(format!(
-                "spill directory '{}' remained after cleanup",
-                self.directory.display()
-            ))),
-        }
+        self.io_pool
+            .run_cleanup(move || io::sync_parent_directory(&sync_path))
     }
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if let Err(error) = self.cleanup() {
+            self.files.retain_charges_on_drop();
+            tracing::error!(%error, directory = %self.directory.display(), "spill cleanup failed");
+        }
     }
 }
 
 fn cleanup_weak(state: Weak<State>) {
-    if let Some(state) = state.upgrade() {
-        let _ = state.cleanup();
+    if let Some(state) = state.upgrade()
+        && let Err(error) = state.cleanup()
+    {
+        tracing::error!(%error, directory = %state.directory.display(), "spill cleanup failed");
     }
+}
+
+#[cfg(test)]
+fn compatibility_resources(root: &Path) -> Result<(QuerySpillQuota, SpillIoPool)> {
+    let config = SpillConfig {
+        directory: root.to_path_buf(),
+        min_free_ratio: 0.0,
+        min_free_bytes: 0,
+        ..SpillConfig::default()
+    };
+    let io_pool = SpillIoPool::new(config.io_threads)?;
+    let quota = SpillQuotaPool::new(config)?.start_query();
+    Ok((quota, io_pool))
 }
 
 #[cfg(test)]

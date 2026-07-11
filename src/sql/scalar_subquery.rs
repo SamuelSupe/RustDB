@@ -93,7 +93,11 @@ where
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
         | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
         | Expr::Cast { expr, .. } => rewrite(plan, expr, hidden_groups, next_name, plan_subquery),
         Expr::Between {
             expr, low, high, ..

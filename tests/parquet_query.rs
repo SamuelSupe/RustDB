@@ -7,7 +7,11 @@ use arrow::{
 };
 use futures::StreamExt;
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
-use rustdb::{Engine, EngineConfig, ParquetOptions, Result};
+use rustdb::{Engine, EngineConfig, ParquetOptions, ParquetSchemaMode, Result};
+
+mod support;
+
+use support::parquet_evolution;
 
 fn write_fixture(path: &std::path::Path) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
@@ -82,6 +86,7 @@ async fn queries_parquet_file_function() -> Result<()> {
     let session = Engine::new(EngineConfig::default())?.session();
     let sql = format!("SELECT count(*) FROM read_parquet('{}')", path.display());
     let mut result = session.execute(&sql).await?;
+    let metrics = result.metrics();
     let batch = result.stream().next().await.unwrap()?;
     let count = batch
         .column(0)
@@ -89,6 +94,24 @@ async fn queries_parquet_file_function() -> Result<()> {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(count.value(0), 6);
+    drop(result);
+    let metrics = metrics.snapshot();
+    assert_eq!(metrics.rows_scanned, 6);
+    assert_eq!(metrics.bytes_scanned, 0);
+
+    let explain_sql = format!(
+        "EXPLAIN SELECT count(*) FROM read_parquet('{}')",
+        path.display()
+    );
+    let mut explain = session.execute(&explain_sql).await?;
+    let batch = explain.stream().next().await.unwrap()?;
+    let text = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+    assert!(text.contains("projection=Some([])"), "{text}");
     Ok(())
 }
 
@@ -133,15 +156,140 @@ async fn registered_table_rejects_an_incompatible_schema_change() -> Result<()> 
         .await?;
     write_id_fixture(&path, &[1, 2, 3])?;
 
-    let mut result = session.execute("SELECT value FROM changing_schema").await?;
-    let error = result
-        .stream()
-        .next()
-        .await
-        .expect("scan should report a schema error")
-        .unwrap_err();
-    assert!(error.to_string().contains("schema changed"));
+    let error = match session.execute("SELECT value FROM changing_schema").await {
+        Err(error) => error,
+        Ok(mut result) => result
+            .stream()
+            .next()
+            .await
+            .expect("scan should report a schema error")
+            .unwrap_err(),
+    };
+    assert!(error.to_string().contains("schema"));
     assert!(error.to_string().contains("schema-change.parquet"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_parquet_discovers_files_and_refreshes_schema() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("parts");
+    std::fs::create_dir(&data).unwrap();
+    let first = data.join("a.parquet");
+    write_id_fixture(&first, &[1])?;
+    let session = Engine::new(EngineConfig::default())?.session();
+    session
+        .register_parquet(
+            "dynamic_parquet",
+            [format!("{}/*.parquet", data.display())],
+            ParquetOptions::default(),
+        )
+        .await?;
+
+    let second = data.join("b.parquet");
+    write_id_extra_fixture(&second, &[2, 3], &["two", "three"])?;
+    assert_eq!(
+        query_count(&session, "SELECT count(*) FROM dynamic_parquet").await?,
+        3
+    );
+
+    std::fs::remove_file(first).unwrap();
+    assert_eq!(
+        query_count(&session, "SELECT count(*) FROM dynamic_parquet").await?,
+        2
+    );
+    let schema = session.refresh_table("dynamic_parquet").await?;
+    assert_eq!(schema.fields().len(), 2);
+    assert_eq!(schema.field(1).name(), "extra");
+
+    let mut result = session
+        .execute("SELECT extra FROM dynamic_parquet ORDER BY extra")
+        .await?;
+    let batch = result.stream().next().await.unwrap()?;
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.value(0), "three");
+    assert_eq!(values.value(1), "two");
+    Ok(())
+}
+
+#[tokio::test]
+async fn safe_widening_reads_real_files_and_refreshes_missing_and_new_columns() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("evolution");
+    std::fs::create_dir(&data).unwrap();
+    let first = data.join("a.parquet");
+    let second = data.join("b.parquet");
+    parquet_evolution::write_i32(&first, &[1, 2], "label", &["one", "two"])?;
+    parquet_evolution::write_i64(&second, &[3, 4], "label", &["three", "four"])?;
+
+    let session = Engine::new(EngineConfig::default())?.session();
+    session
+        .register_parquet(
+            "widening",
+            [format!("{}/*.parquet", data.display())],
+            ParquetOptions {
+                schema_mode: ParquetSchemaMode::SafeWidening,
+                ..ParquetOptions::default()
+            },
+        )
+        .await?;
+    let mut widened = session
+        .execute("SELECT id FROM widening ORDER BY id")
+        .await?;
+    let mut widened_ids = Vec::new();
+    while let Some(batch) = widened.stream().next().await {
+        let batch = batch?;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("SafeWidening must expose Int64");
+        widened_ids.extend(ids.values().iter().copied());
+    }
+    assert_eq!(widened_ids, [1, 2, 3, 4]);
+
+    std::fs::remove_file(first).unwrap();
+    std::fs::remove_file(second).unwrap();
+    parquet_evolution::write_i64(&data.join("c.parquet"), &[10], "new_value", &["ten"])?;
+    parquet_evolution::write_i64(&data.join("d.parquet"), &[20], "new_value", &["twenty"])?;
+
+    let error = match session.execute("SELECT count(*) FROM widening").await {
+        Err(error) => error,
+        Ok(_) => panic!("a missing registered column must require REFRESH TABLE"),
+    };
+    assert!(error.to_string().contains("label"), "{error}");
+
+    let schema = session.refresh_table("widening").await?;
+    assert_eq!(schema.fields().len(), 2);
+    assert_eq!(schema.field(0).name(), "id");
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(1).name(), "new_value");
+
+    let mut result = session
+        .execute("SELECT id, new_value FROM widening ORDER BY id")
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = result.stream().next().await {
+        let batch = batch?;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        rows.extend(
+            (0..batch.num_rows()).map(|row| (ids.value(row), values.value(row).to_owned())),
+        );
+    }
+    assert_eq!(rows, [(10, "ten".to_owned()), (20, "twenty".to_owned())]);
     Ok(())
 }
 
@@ -149,7 +297,9 @@ async fn registered_table_rejects_an_incompatible_schema_change() -> Result<()> 
 async fn reads_all_row_group_morsels_with_bounded_concurrency() -> Result<()> {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("morsels.parquet");
-    let values = (0_i64..64).collect::<Vec<_>>();
+    // Four physical row groups should expose exactly four schedulable scan
+    // lanes when the engine is configured with four compute threads.
+    let values = (0_i64..16).collect::<Vec<_>>();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let properties = WriterProperties::builder()
         .set_max_row_group_row_count(Some(4))
@@ -162,11 +312,12 @@ async fn reads_all_row_group_morsels_with_bounded_concurrency() -> Result<()> {
     )?)?;
     writer.close()?;
 
-    let config = EngineConfig {
-        io_concurrency: 3,
-        batch_size: 3,
-        ..EngineConfig::default()
-    };
+    let config = EngineConfig::builder()
+        .memory_limit(128 << 20)
+        .compute_threads(4)
+        .io_concurrency(3)
+        .batch_size(3)
+        .build();
     let session = Engine::new(config)?.session();
     session
         .register_parquet(
@@ -176,6 +327,7 @@ async fn reads_all_row_group_morsels_with_bounded_concurrency() -> Result<()> {
         )
         .await?;
     let mut result = session.execute("SELECT id FROM morsels").await?;
+    let metrics = result.metrics();
     let mut actual = Vec::new();
     while let Some(batch) = result.stream().next().await {
         let batch = batch?;
@@ -188,6 +340,48 @@ async fn reads_all_row_group_morsels_with_bounded_concurrency() -> Result<()> {
     }
     actual.sort_unstable();
     assert_eq!(actual, values);
+    let metrics = metrics.snapshot();
+    assert_eq!(metrics.peak_active_lanes, 4);
+    assert!(metrics.scheduler_wait > std::time::Duration::ZERO);
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_parquet_row_group_uses_one_scan_lane() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("one-morsel.parquet");
+    let values = (0_i64..16).collect::<Vec<_>>();
+    write_id_fixture(&path, &values)?;
+
+    let config = EngineConfig::builder()
+        .memory_limit(128 << 20)
+        .compute_threads(4)
+        .batch_size(3)
+        .build();
+    let session = Engine::new(config)?.session();
+    session
+        .register_parquet(
+            "one_morsel",
+            [path.to_string_lossy().into_owned()],
+            ParquetOptions::default(),
+        )
+        .await?;
+
+    let mut result = session.execute("SELECT id FROM one_morsel").await?;
+    let metrics = result.metrics();
+    let mut actual = Vec::new();
+    while let Some(batch) = result.stream().next().await {
+        let batch = batch?;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        actual.extend(ids.values().iter().copied());
+    }
+    actual.sort_unstable();
+    assert_eq!(actual, values);
+    assert_eq!(metrics.snapshot().peak_active_lanes, 1);
     Ok(())
 }
 
@@ -198,6 +392,24 @@ fn write_id_fixture(path: &std::path::Path, values: &[i64]) -> Result<()> {
     writer.write(&RecordBatch::try_new(
         schema,
         vec![Arc::new(Int64Array::from(values.to_vec()))],
+    )?)?;
+    writer.close()?;
+    Ok(())
+}
+
+fn write_id_extra_fixture(path: &std::path::Path, ids: &[i64], extra: &[&str]) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("extra", DataType::Utf8, false),
+    ]));
+    let file = File::create(path).map_err(|error| rustdb::Error::io(Some(path.into()), error))?;
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)?;
+    writer.write(&RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(extra.to_vec())),
+        ],
     )?)?;
     writer.close()?;
     Ok(())

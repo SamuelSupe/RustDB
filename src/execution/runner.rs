@@ -8,21 +8,21 @@ use arrow::{
 use futures::{StreamExt, stream};
 
 use crate::Result;
-use crate::runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream};
+use crate::runtime::{BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream};
 use crate::sql::{LogicalPlan, StatementPlan};
 
-use super::{aggregate, expr, join, scalar, scan, sort};
+use super::{aggregate, expr, join, pipeline, scalar, scan, sort};
 
 pub(super) async fn execute(
     plan: StatementPlan,
     context: Arc<QueryContext>,
-) -> Result<RecordBatchStream> {
+) -> Result<MemoryBatchStream> {
     match plan {
         StatementPlan::Query(plan) => {
             prepare_plan_if_needed(&plan, Arc::clone(&context)).await?;
             Ok(execute_plan(plan, context))
         }
-        StatementPlan::Explain(plan) => explain_stream(plan.explain()),
+        StatementPlan::Explain(plan) => explain_stream(plan.explain_for_query(&context), context),
         StatementPlan::ExplainAnalyze(plan) => {
             prepare_plan_if_needed(&plan, Arc::clone(&context)).await?;
             explain_analyze_stream(plan, context)
@@ -49,7 +49,11 @@ pub(super) async fn prepare_plan(plan: &LogicalPlan, context: Arc<QueryContext>)
     Ok(())
 }
 
-fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> RecordBatchStream {
+fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> MemoryBatchStream {
+    let plan = match pipeline::try_execute(plan, Arc::clone(&context)) {
+        Ok(stream) => return stream,
+        Err(plan) => *plan,
+    };
     let batch_size = context.batch_size;
     match plan {
         LogicalPlan::Empty {
@@ -57,7 +61,10 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> RecordBatchStr
             schema,
         } => {
             let result = empty_batch(Arc::clone(schema.arrow()), produce_one_row);
-            boxed_record_batch_stream(stream::once(async move { result }))
+            boxed_memory_batch_stream(stream::once(async move {
+                let batch = result?;
+                BatchEnvelope::try_new(batch, &context.memory, "empty input")
+            }))
         }
         LogicalPlan::Scan {
             provider,
@@ -66,7 +73,7 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> RecordBatchStr
             limit,
             schema,
             ..
-        } => boxed_record_batch_stream(async_stream::try_stream! {
+        } => boxed_memory_batch_stream(async_stream::try_stream! {
             let mut input = scan::scan(
                 provider,
                 projection,
@@ -85,12 +92,20 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> RecordBatchStr
             input, predicate, ..
         } => {
             let mut input = execute_plan(*input, Arc::clone(&context));
-            boxed_record_batch_stream(async_stream::try_stream! {
+            boxed_memory_batch_stream(async_stream::try_stream! {
                 while let Some(batch) = input.next().await {
                     context.check_cancelled()?;
-                    let filtered = expr::filter(&predicate, &batch?)?;
+                    let batch = batch?;
+                    let workspace = context
+                        .reserve_memory_while_holding(
+                            expr::filter_workspace_bytes(&predicate, batch.batch()),
+                            batch.memory_size(),
+                            "filter workspace",
+                        )
+                        .await?;
+                    let filtered = expr::filter(&predicate, batch.batch())?;
                     if filtered.num_rows() != 0 {
-                        yield filtered;
+                        yield batch.replace_with_reservation(filtered, workspace, "filter")?;
                     }
                 }
             })
@@ -101,10 +116,23 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> RecordBatchStr
             schema,
         } => {
             let mut input = execute_plan(*input, Arc::clone(&context));
-            boxed_record_batch_stream(async_stream::try_stream! {
+            boxed_memory_batch_stream(async_stream::try_stream! {
                 while let Some(batch) = input.next().await {
                     context.check_cancelled()?;
-                    yield expr::project(&expressions, Arc::clone(schema.arrow()), &batch?)?;
+                    let batch = batch?;
+                    let workspace = context
+                        .reserve_memory_while_holding(
+                            expr::projection_workspace_bytes(&expressions, batch.batch()),
+                            batch.memory_size(),
+                            "projection workspace",
+                        )
+                        .await?;
+                    let projected = expr::project(
+                        &expressions,
+                        Arc::clone(schema.arrow()),
+                        batch.batch(),
+                    )?;
+                    yield batch.replace_with_reservation(projected, workspace, "projection")?;
                 }
             })
         }
@@ -175,26 +203,36 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> RecordBatchStr
 }
 
 fn limit_stream(
-    mut input: RecordBatchStream,
+    input: MemoryBatchStream,
     mut offset: usize,
     limit: Option<usize>,
     context: Arc<QueryContext>,
-) -> RecordBatchStream {
-    boxed_record_batch_stream(async_stream::try_stream! {
+) -> MemoryBatchStream {
+    boxed_memory_batch_stream(async_stream::try_stream! {
+        let mut input = Some(input);
         let mut remaining = limit.unwrap_or(usize::MAX);
         while remaining != 0 {
-            let Some(batch) = input.next().await else { break };
+            let Some(batch) = input.as_mut().expect("LIMIT input is live").next().await else {
+                break;
+            };
             context.check_cancelled()?;
             let batch = batch?;
-            if offset >= batch.num_rows() {
-                offset -= batch.num_rows();
+            if offset >= batch.batch().num_rows() {
+                offset -= batch.batch().num_rows();
                 continue;
             }
-            let available = batch.num_rows() - offset;
+            let available = batch.batch().num_rows() - offset;
             let length = available.min(remaining);
-            yield batch.slice(offset, length);
+            let sliced = batch.batch().slice(offset, length);
+            let output = batch.replace(sliced, "limit")?;
             offset = 0;
             remaining -= length;
+            if remaining == 0 {
+                // Drop the fused pipeline and its local cancellation guard
+                // before exposing the terminal batch to a slow consumer.
+                drop(input.take());
+            }
+            yield output;
         }
     })
 }
@@ -208,39 +246,42 @@ fn empty_batch(schema: Arc<Schema>, one_row: bool) -> Result<RecordBatch> {
     )?)
 }
 
-fn explain_stream(explain: String) -> Result<RecordBatchStream> {
+fn explain_stream(explain: String, context: Arc<QueryContext>) -> Result<MemoryBatchStream> {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "explain_value",
         arrow::datatypes::DataType::Utf8,
         false,
     )]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![explain]))])?;
-    Ok(boxed_record_batch_stream(stream::once(
-        async move { Ok(batch) },
-    )))
+    Ok(boxed_memory_batch_stream(stream::once(async move {
+        BatchEnvelope::try_new(batch, &context.memory, "explain")
+    })))
 }
 
 fn explain_analyze_stream(
     plan: LogicalPlan,
     context: Arc<QueryContext>,
-) -> Result<RecordBatchStream> {
-    let explain = plan.explain();
+) -> Result<MemoryBatchStream> {
+    let explain = plan.explain_for_query(&context);
     let mut input = execute_plan(plan, Arc::clone(&context));
     let schema = explain_schema();
-    Ok(boxed_record_batch_stream(async_stream::try_stream! {
+    Ok(boxed_memory_batch_stream(async_stream::try_stream! {
         while let Some(batch) = input.next().await {
             context.check_cancelled()?;
             let batch = batch?;
             context.metrics.record_output(
-                u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
+                u64::try_from(batch.batch().num_rows()).unwrap_or(u64::MAX),
                 1,
-                u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX),
+                u64::try_from(batch.batch().get_array_memory_size()).unwrap_or(u64::MAX),
             );
         }
+        // The public EXPLAIN row describes the analyzed query; it is not part
+        // of that query's result metrics.
+        context.metrics.seal_output();
         context.metrics.finish();
         let metrics = context.metrics.snapshot();
         let summary = format!(
-            "{explain}\nGlobal Metrics\n  elapsed={:?}\n  scanned_rows={} scanned_batches={} scanned_bytes={}\n  returned_rows={} returned_batches={} returned_bytes={}\n  files_pruned={} row_groups_pruned={}\n  s3_requests={} s3_bytes={}\n  peak_memory_bytes={} spill_bytes={} spill_partitions={}\n",
+            "{explain}\nGlobal Metrics\n  elapsed={:?}\n  scanned_rows={} scanned_batches={} scanned_bytes={}\n  returned_rows={} returned_batches={} returned_bytes={}\n  discovered_files={} files_pruned={} row_groups_pruned={}\n  s3_requests={} s3_bytes={}\n  peak_memory_bytes={} peak_active_lanes={} scheduler_wait={:?}\n  spill_bytes={} spill_read_bytes={} spill_write_bytes={} spill_files={} spill_partitions={} quota_rejections={}\n",
             metrics.elapsed,
             metrics.rows_scanned,
             metrics.batches_scanned,
@@ -248,18 +289,26 @@ fn explain_analyze_stream(
             metrics.rows_returned,
             metrics.batches_returned,
             metrics.bytes_returned,
+            metrics.discovered_files,
             metrics.files_pruned,
             metrics.row_groups_pruned,
             metrics.s3_requests,
             metrics.s3_bytes_transferred,
             metrics.peak_memory_bytes,
+            metrics.peak_active_lanes,
+            metrics.scheduler_wait,
             metrics.spill_bytes,
+            metrics.spill_read_bytes,
+            metrics.spill_write_bytes,
+            metrics.spill_files,
             metrics.spill_partitions,
+            metrics.spill_quota_rejections,
         );
-        yield RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(StringArray::from(vec![summary]))],
         )?;
+        yield BatchEnvelope::try_new(batch, &context.memory, "explain analyze")?;
     }))
 }
 

@@ -155,9 +155,10 @@ fn referenced_columns(expressions: &[BoundExpr]) -> Vec<usize> {
 fn set_projection(target: &mut Option<Vec<usize>>, mut columns: Vec<usize>) {
     columns.sort_unstable();
     columns.dedup();
-    if !columns.is_empty() {
-        *target = Some(columns);
-    }
+    // `None` means the provider must read every column.  Preserve an explicit
+    // empty projection so metadata-only plans such as Parquet COUNT(*) do not
+    // accidentally decode the full physical schema.
+    *target = Some(columns);
 }
 
 #[cfg(test)]
@@ -169,5 +170,12 @@ mod tests {
         let mut target = None;
         set_projection(&mut target, vec![3, 1, 3, 2]);
         assert_eq!(target, Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn preserves_an_explicit_zero_column_projection() {
+        let mut target = None;
+        set_projection(&mut target, Vec::new());
+        assert_eq!(target, Some(Vec::new()));
     }
 }

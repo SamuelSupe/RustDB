@@ -313,7 +313,7 @@ mod tests {
                     .unwrap();
                 actual.extend((0..values.len()).map(|row| values.value(row)));
             }
-            context.spill.remove_file(file);
+            context.spill.remove_file(file).unwrap();
         }
         assert_eq!(actual, vec![0, 2, 3]);
         assert_eq!(context.memory.used(), 0);
@@ -350,7 +350,7 @@ mod tests {
                     && message.contains("query limit 131072 bytes")
         ));
 
-        context.spill.remove_file(&file);
+        context.spill.remove_file(&file).unwrap();
         assert_eq!(context.memory.used(), 0);
     }
 }

@@ -54,8 +54,24 @@ pub struct Args {
     pub max_concurrent_queries: Option<usize>,
 
     /// Directory used for query spill files.
+    #[arg(long = "spill-directory", alias = "temp-dir")]
+    pub spill_directory: Option<PathBuf>,
+
+    /// Maximum Spill bytes retained by all active queries.
+    #[arg(long, value_parser = parse_bytes)]
+    pub spill_engine_limit: Option<usize>,
+
+    /// Maximum Spill bytes retained by one query.
+    #[arg(long, value_parser = parse_bytes)]
+    pub spill_query_limit: Option<usize>,
+
+    /// Minimum free bytes that Spill must leave on its filesystem.
+    #[arg(long, value_parser = parse_bytes)]
+    pub spill_min_free_bytes: Option<usize>,
+
+    /// Number of dedicated blocking Spill I/O threads.
     #[arg(long)]
-    pub temp_dir: Option<PathBuf>,
+    pub spill_io_threads: Option<usize>,
 
     /// AWS region override.
     #[arg(long)]

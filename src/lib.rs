@@ -15,7 +15,10 @@ mod table_function;
 
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub(crate) use catalog::{Catalog, TableEntry};
-pub use config::{CsvHeader, CsvOptions, EngineConfig, ParquetOptions, S3Config};
+pub use config::{
+    CsvHeader, CsvOptions, EngineConfig, EngineConfigBuilder, ParquetOptions, S3Config, SpillConfig,
+};
+pub use datasource::ParquetSchemaMode;
 pub use engine::{Engine, QueryCancellation, QueryResult, Session};
 pub use error::{Error, Result};
 pub use runtime::{QueryMetrics, QueryMetricsSnapshot, RecordBatchStream};

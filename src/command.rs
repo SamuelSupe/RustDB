@@ -16,14 +16,20 @@ use sqlparser::{
     parser::Parser,
 };
 
-use crate::datasource::{MetadataCache, ScanRequest, TableProvider, TableStatistics};
-use crate::runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream};
+use crate::datasource::{MetadataCache, ScanRequest, ScanTask, TableProvider, TableStatistics};
+use crate::runtime::{
+    MemoryBatchStream, QueryContext, RecordBatchStream, boxed_memory_batch_stream,
+    boxed_record_batch_stream,
+};
 use crate::sql::{LogicalPlan, StatementPlan};
 use crate::{Catalog, EngineConfig, Error, Result};
 
 pub(crate) enum SessionCommand {
     ShowTables,
     Describe {
+        name: String,
+    },
+    RefreshTable {
         name: String,
     },
     CreateTempView {
@@ -38,6 +44,9 @@ pub(crate) enum SessionCommand {
 }
 
 pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
+    if let Some(command) = parse_refresh_table(sql)? {
+        return Ok(Some(command));
+    }
     let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql)?;
     if statements.len() != 1 {
         return Err(Error::InvalidArgument(
@@ -134,6 +143,55 @@ pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
         _ => None,
     };
     Ok(command)
+}
+
+fn parse_refresh_table(sql: &str) -> Result<Option<SessionCommand>> {
+    let trimmed = sql.trim();
+    let Some((first, rest)) = take_word(trimmed) else {
+        return Ok(None);
+    };
+    if !first.eq_ignore_ascii_case("refresh") {
+        return Ok(None);
+    }
+    let Some((second, table)) = take_word(rest) else {
+        return Err(Error::InvalidArgument(
+            "REFRESH TABLE requires a table name".to_owned(),
+        ));
+    };
+    if !second.eq_ignore_ascii_case("table") {
+        return Err(Error::Unsupported(
+            "only REFRESH TABLE is supported".to_owned(),
+        ));
+    }
+    let table = table.trim();
+    if table.is_empty() {
+        return Err(Error::InvalidArgument(
+            "REFRESH TABLE requires a table name".to_owned(),
+        ));
+    }
+    let mut statements = Parser::parse_sql(&DuckDbDialect {}, &format!("DESCRIBE {table}"))?;
+    if statements.len() != 1 {
+        return Err(Error::InvalidArgument(
+            "REFRESH TABLE accepts exactly one table name".to_owned(),
+        ));
+    }
+    let Statement::ExplainTable { table_name, .. } = statements.remove(0) else {
+        return Err(Error::InvalidArgument(
+            "invalid REFRESH TABLE name".to_owned(),
+        ));
+    };
+    Ok(Some(SessionCommand::RefreshTable {
+        name: simple_name(&table_name, "table")?,
+    }))
+}
+
+fn take_word(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    if input.is_empty() {
+        return None;
+    }
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    Some((&input[..end], &input[end..]))
 }
 
 fn simple_name(name: &ObjectName, kind: &str) -> Result<String> {
@@ -247,10 +305,10 @@ impl ViewTable {
             &self.config,
             &self.metadata_cache,
             &self.query,
-            context,
+            context.clone(),
         )
         .await?;
-        let planned = crate::sql::plan_sql(&self.catalog, &prepared.sql);
+        let planned = crate::sql::bind_sql(&self.catalog, &prepared.sql);
         for name in prepared.generated_tables {
             self.catalog.unregister(&name);
         }
@@ -267,6 +325,48 @@ impl ViewTable {
         }
         Ok(plan)
     }
+
+    async fn scan_internal(
+        &self,
+        request: ScanRequest,
+        context: Arc<QueryContext>,
+    ) -> Result<MemoryBatchStream> {
+        let expansion = context.enter_view(&self.name)?;
+        let plan = context.view_plan(&self.name).ok_or_else(|| {
+            Error::Internal(format!(
+                "temporary view '{}' was not prepared before execution",
+                self.name
+            ))
+        })?;
+        let output_schema = request.projected_schema(&self.schema)?;
+        let projection = request.projection;
+        let mut remaining = request.limit.unwrap_or(usize::MAX);
+        let mut input =
+            crate::execution::execute_internal(StatementPlan::Query(plan), Arc::clone(&context))
+                .await?;
+        Ok(boxed_memory_batch_stream(async_stream::try_stream! {
+            let _expansion = expansion;
+            while remaining != 0 {
+                let Some(batch) = input.next().await else { break };
+                context.check_cancelled()?;
+                let mut batch = batch?;
+                if let Some(projection) = projection.as_deref() {
+                    let projected = project_batch(
+                        batch.batch().clone(),
+                        Some(projection),
+                        &output_schema,
+                    )?;
+                    batch = batch.replace(projected, "view projection")?;
+                }
+                if batch.num_rows() > remaining {
+                    let sliced = batch.batch().slice(0, remaining);
+                    batch = batch.replace(sliced, "view limit")?;
+                }
+                remaining = remaining.saturating_sub(batch.num_rows());
+                yield batch;
+            }
+        }))
+    }
 }
 
 #[async_trait]
@@ -281,15 +381,18 @@ impl TableProvider for ViewTable {
 
     async fn prepare(&self, context: Arc<QueryContext>) -> Result<()> {
         let _expansion = context.enter_view(&self.name)?;
-        let plan = match context.view_plan(&self.name) {
-            Some(plan) => plan,
-            None => {
-                let plan = self.current_plan(Some(Arc::clone(&context))).await?;
-                context.cache_view_plan(&self.name, plan.clone())?;
-                plan
-            }
+        if let Some(plan) = context.view_plan(&self.name) {
+            return crate::execution::prepare_plan(&plan, context).await;
+        }
+
+        let plan = self.current_plan(Some(Arc::clone(&context))).await?;
+        crate::execution::prepare_plan(&plan, Arc::clone(&context)).await?;
+        let StatementPlan::Query(plan) =
+            crate::sql::optimize_statement(StatementPlan::Query(plan), Some(context.as_ref()))?
+        else {
+            unreachable!("view planning preserves statement kind")
         };
-        crate::execution::prepare_plan(&plan, context).await
+        context.cache_view_plan(&self.name, plan)
     }
 
     async fn scan(
@@ -297,36 +400,24 @@ impl TableProvider for ViewTable {
         request: ScanRequest,
         context: Arc<QueryContext>,
     ) -> Result<RecordBatchStream> {
-        let expansion = context.enter_view(&self.name)?;
-        let plan = context.view_plan(&self.name).ok_or_else(|| {
-            Error::Internal(format!(
-                "temporary view '{}' was not prepared before execution",
-                self.name
-            ))
-        })?;
-        let output_schema = request.projected_schema(&self.schema)?;
-        let projection = request.projection;
-        let mut remaining = request.limit.unwrap_or(usize::MAX);
-        let mut input =
-            crate::execution::execute(StatementPlan::Query(plan), Arc::clone(&context)).await?;
-        let stream = async_stream::try_stream! {
-            let _expansion = expansion;
-            while remaining != 0 {
-                let Some(batch) = input.next().await else {
-                    break;
-                };
-                context.check_cancelled()?;
-                let batch = project_batch(batch?, projection.as_deref(), &output_schema)?;
-                let batch = if batch.num_rows() > remaining {
-                    batch.slice(0, remaining)
-                } else {
-                    batch
-                };
-                remaining = remaining.saturating_sub(batch.num_rows());
-                yield batch;
+        let mut input = self.scan_internal(request, context).await?;
+        Ok(boxed_record_batch_stream(async_stream::try_stream! {
+            while let Some(batch) = input.next().await {
+                yield batch?.into_public();
             }
-        };
-        Ok(boxed_record_batch_stream(stream))
+        }))
+    }
+
+    async fn scan_tasks(
+        &self,
+        request: ScanRequest,
+        context: Arc<QueryContext>,
+        _target_tasks: usize,
+    ) -> Result<Vec<ScanTask>> {
+        Ok(vec![ScanTask::new(
+            0,
+            self.scan_internal(request, context).await?,
+        )])
     }
 }
 
@@ -379,6 +470,15 @@ mod tests {
                 if_exists: true
             } if name == "v"
         ));
+    }
+
+    #[test]
+    fn parses_refresh_table_and_rejects_qualified_names() {
+        assert!(matches!(
+            parse("REFRESH TABLE dynamic_data;").unwrap().unwrap(),
+            SessionCommand::RefreshTable { name } if name == "dynamic_data"
+        ));
+        assert!(parse("REFRESH TABLE catalog.dynamic_data").is_err());
     }
 
     #[test]

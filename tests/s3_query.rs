@@ -9,8 +9,15 @@ use bytes::Bytes;
 use futures::StreamExt;
 use object_store::{ObjectStoreExt, aws::AmazonS3Builder, path::Path};
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
-use rustdb::{Engine, EngineConfig, Error, Result, S3Config};
+use rustdb::{
+    CsvHeader, CsvOptions, Engine, EngineConfig, Error, ParquetOptions, ParquetSchemaMode, Result,
+    S3Config,
+};
 use uuid::Uuid;
+
+mod support;
+
+use support::parquet_evolution;
 
 const BUCKET: &str = "rustdb-tests";
 const PUBLIC_BUCKET: &str = "rustdb-public";
@@ -41,6 +48,7 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
         )
         .await?;
     let parquet_bytes = parquet_fixture()?;
+    let parquet_object_size = parquet_bytes.len();
     store
         .put(&parquet_path, Bytes::from(parquet_bytes).into())
         .await?;
@@ -54,21 +62,176 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
         .put(&pruning_path, Bytes::from(pruning_bytes).into())
         .await?;
 
-    let config = EngineConfig {
-        batch_size: 128,
-        io_concurrency: 1,
-        s3: S3Config {
+    let config = EngineConfig::builder()
+        .batch_size(128)
+        .io_concurrency(1)
+        .s3(S3Config {
             endpoint: Some(endpoint.clone()),
             region: Some("us-east-1".to_owned()),
             force_path_style: true,
             allow_http: true,
             ..S3Config::default()
-        },
-        ..EngineConfig::default()
-    };
+        })
+        .build();
     let mut uncached_config = config.clone();
     uncached_config.metadata_cache_bytes = 0;
     let session = Engine::new(config)?.session();
+
+    let dynamic_a = Path::from(format!("{prefix}dynamic/a.csv"));
+    let dynamic_b = Path::from(format!("{prefix}dynamic/b.csv"));
+    store
+        .put(&dynamic_a, Bytes::from_static(b"id\n1\n").into())
+        .await?;
+    session
+        .register_csv(
+            "dynamic_s3",
+            [format!("s3://{BUCKET}/{prefix}dynamic/*.csv")],
+            CsvOptions {
+                header: CsvHeader::Present,
+                ..CsvOptions::default()
+            },
+        )
+        .await?;
+    assert_eq!(query_count(&session, "dynamic_s3").await?, 1);
+    store
+        .put(&dynamic_b, Bytes::from_static(b"id\n2\n").into())
+        .await?;
+    assert_eq!(query_count(&session, "dynamic_s3").await?, 2);
+    store.delete(&dynamic_a).await?;
+    assert_eq!(query_count(&session, "dynamic_s3").await?, 1);
+    store
+        .put(
+            &dynamic_b,
+            Bytes::from_static(b"id,note\n2,refreshed\n").into(),
+        )
+        .await?;
+    let strict_error = match session.execute("SELECT * FROM dynamic_s3").await {
+        Err(error) => error,
+        Ok(mut result) => result
+            .stream()
+            .next()
+            .await
+            .expect("strict CSV schema result")
+            .expect_err("strict CSV schema change must fail"),
+    };
+    assert!(
+        strict_error.to_string().contains("header does not match"),
+        "unexpected strict-schema error: {strict_error}"
+    );
+    let refreshed = session.refresh_table("dynamic_s3").await?;
+    assert_eq!(refreshed.fields().len(), 2);
+    assert_eq!(query_count(&session, "dynamic_s3").await?, 1);
+
+    let widening_a = Path::from(format!("{prefix}widening/a.parquet"));
+    let widening_b = Path::from(format!("{prefix}widening/b.parquet"));
+    let widening_c = Path::from(format!("{prefix}widening/c.parquet"));
+    let widening_d = Path::from(format!("{prefix}widening/d.parquet"));
+    store
+        .put(
+            &widening_a,
+            Bytes::from(parquet_evolution::bytes_i32(
+                &[1, 2],
+                "label",
+                &["one", "two"],
+            )?)
+            .into(),
+        )
+        .await?;
+    store
+        .put(
+            &widening_b,
+            Bytes::from(parquet_evolution::bytes_i64(
+                &[3, 4],
+                "label",
+                &["three", "four"],
+            )?)
+            .into(),
+        )
+        .await?;
+    session
+        .register_parquet(
+            "widening_s3",
+            [format!("s3://{BUCKET}/{prefix}widening/*.parquet")],
+            ParquetOptions {
+                schema_mode: ParquetSchemaMode::SafeWidening,
+                ..ParquetOptions::default()
+            },
+        )
+        .await?;
+    let mut widened = session
+        .execute("SELECT id FROM widening_s3 ORDER BY id")
+        .await?;
+    let mut widened_ids = Vec::new();
+    while let Some(batch) = widened.stream().next().await {
+        let batch = batch?;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("SafeWidening must expose Int64");
+        widened_ids.extend(ids.values().iter().copied());
+    }
+    assert_eq!(widened_ids, [1, 2, 3, 4]);
+
+    store.delete(&widening_a).await?;
+    store.delete(&widening_b).await?;
+    store
+        .put(
+            &widening_c,
+            Bytes::from(parquet_evolution::bytes_i64(&[10], "new_value", &["ten"])?).into(),
+        )
+        .await?;
+    store
+        .put(
+            &widening_d,
+            Bytes::from(parquet_evolution::bytes_i64(
+                &[20],
+                "new_value",
+                &["twenty"],
+            )?)
+            .into(),
+        )
+        .await?;
+    let widening_error = match session.execute("SELECT count(*) FROM widening_s3").await {
+        Err(error) => error,
+        Ok(mut result) => result
+            .stream()
+            .next()
+            .await
+            .expect("schema mismatch must produce a terminal result")
+            .expect_err("a missing registered column must require REFRESH TABLE"),
+    };
+    assert!(widening_error.to_string().contains("label"));
+
+    let widening_schema = session.refresh_table("widening_s3").await?;
+    assert_eq!(widening_schema.fields().len(), 2);
+    assert_eq!(widening_schema.field(0).name(), "id");
+    assert_eq!(widening_schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(widening_schema.field(1).name(), "new_value");
+    let mut refreshed_result = session
+        .execute("SELECT id, new_value FROM widening_s3 ORDER BY id")
+        .await?;
+    let mut refreshed_rows = Vec::new();
+    while let Some(batch) = refreshed_result.stream().next().await {
+        let batch = batch?;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        refreshed_rows.extend(
+            (0..batch.num_rows()).map(|row| (ids.value(row), values.value(row).to_owned())),
+        );
+    }
+    assert_eq!(
+        refreshed_rows,
+        [(10, "ten".to_owned()), (20, "twenty".to_owned())]
+    );
 
     let csv_sql = format!(
         "SELECT count(*) FROM read_csv('s3://{BUCKET}/{csv_path}', header = true) WHERE kind = 'a'"
@@ -84,6 +247,44 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
         "location HEAD, schema sample, query snapshot, and data GET must be accounted: {csv_metrics:?}"
     );
     assert!(csv_metrics.s3_bytes_transferred > 0);
+
+    let count_sql = format!("SELECT count(*) FROM read_parquet('s3://{BUCKET}/{parquet_path}')");
+    let mut count_result = session.execute(&count_sql).await?;
+    let count_metrics = count_result.metrics();
+    assert_eq!(
+        int64_value(&count_result.stream().next().await.unwrap()?),
+        3
+    );
+    drop(count_result);
+    let count_metrics = count_metrics.snapshot();
+    assert_eq!(
+        count_metrics.bytes_scanned, 0,
+        "COUNT(*) decoded data pages"
+    );
+    assert!(
+        count_metrics.s3_bytes_transferred > 0
+            && count_metrics.s3_bytes_transferred <= parquet_object_size as u64,
+        "metadata-only COUNT transferred invalid byte volume: {count_metrics:?}"
+    );
+
+    let large_count_sql =
+        format!("SELECT count(*) FROM read_parquet('s3://{BUCKET}/{pruning_path}')");
+    let mut large_count_result = session.execute(&large_count_sql).await?;
+    let large_count_metrics = large_count_result.metrics();
+    assert_eq!(
+        int64_value(&large_count_result.stream().next().await.unwrap()?),
+        i64::try_from(ROW_GROUP_ROWS * ROW_GROUPS).unwrap()
+    );
+    drop(large_count_result);
+    let large_count_metrics = large_count_metrics.snapshot();
+    assert_eq!(large_count_metrics.bytes_scanned, 0);
+    assert!(
+        large_count_metrics.s3_bytes_transferred > 0
+            && large_count_metrics.s3_bytes_transferred < pruning_object_size / 4,
+        "metadata-only COUNT transferred {} bytes from a {} byte object",
+        large_count_metrics.s3_bytes_transferred,
+        pruning_object_size,
+    );
 
     let parquet_sql =
         format!("SELECT count(*) FROM read_parquet('s3://{BUCKET}/{parquet_path}') WHERE id >= 2");
@@ -196,17 +397,16 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
     public_store
         .put(&public_path, Bytes::from_static(b"id\n1\n2\n").into())
         .await?;
-    let anonymous = EngineConfig {
-        s3: S3Config {
+    let anonymous = EngineConfig::builder()
+        .s3(S3Config {
             endpoint: Some(endpoint.clone()),
             region: Some("us-east-1".to_owned()),
             force_path_style: true,
             anonymous: true,
             allow_http: true,
             ..S3Config::default()
-        },
-        ..EngineConfig::default()
-    };
+        })
+        .build();
     let anonymous_session = Engine::new(anonymous)?.session();
     let mut anonymous_result = anonymous_session
         .execute(&format!(
@@ -222,6 +422,8 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
     store.delete(&csv_path).await?;
     store.delete(&parquet_path).await?;
     store.delete(&pruning_path).await?;
+    store.delete(&widening_c).await?;
+    store.delete(&widening_d).await?;
     public_store.delete(&public_path).await?;
     Ok(())
 }
@@ -305,6 +507,14 @@ fn pruning_fixture(marker: char) -> Result<Vec<u8>> {
 
 fn int64_value(batch: &RecordBatch) -> i64 {
     int64_value_at(batch, 0)
+}
+
+async fn query_count(session: &rustdb::Session, table: &str) -> Result<i64> {
+    let mut result = session
+        .execute(&format!("SELECT count(*) FROM {table}"))
+        .await?;
+    let batch = result.stream().next().await.expect("count batch")?;
+    Ok(int64_value(&batch))
 }
 
 fn int64_value_at(batch: &RecordBatch, column: usize) -> i64 {

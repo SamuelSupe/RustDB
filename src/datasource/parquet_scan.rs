@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{ArrayRef, new_null_array},
+    array::ArrayRef,
     datatypes::SchemaRef,
     record_batch::{RecordBatch, RecordBatchOptions},
 };
@@ -13,9 +13,10 @@ use super::{
     hive::HivePartitions,
     parquet_metadata::ParquetMetadata,
     parquet_reader::{QueryIo, SnapshotParquetReader},
+    schema_evolution::align_batch_to_schema,
 };
 use crate::{
-    Error, Result,
+    Result,
     runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream},
     storage::{ObjectSnapshot, ObjectSource},
 };
@@ -78,7 +79,7 @@ pub(super) fn scan_morsels(
     })
 }
 
-fn morsel_stream(
+pub(super) fn morsel_stream(
     morsel: ParquetMorsel,
     output_schema: SchemaRef,
     hive: Option<Arc<HivePartitions>>,
@@ -119,6 +120,7 @@ fn morsel_stream(
                 &output_schema,
                 hive.as_deref(),
                 morsel.file_index,
+                morsel.file.uri(),
             )?;
             context.metrics.record_scan(
                 u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
@@ -136,33 +138,26 @@ pub(super) fn align_batch(
     schema: &SchemaRef,
     hive: Option<&HivePartitions>,
     file: usize,
+    uri: &str,
 ) -> Result<RecordBatch> {
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let column = match batch.schema().index_of(field.name()) {
-            Ok(index) => {
-                let column = Arc::clone(batch.column(index));
-                if column.data_type() != field.data_type() {
-                    return Err(Error::Execution(format!(
-                        "Parquet column {} changed type during scan",
-                        field.name()
-                    )));
-                }
-                column
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    let mut fields = batch.schema().fields().to_vec();
+    if let Some(hive) = hive {
+        for field in schema.fields() {
+            if batch.schema().field_with_name(field.name()).is_ok() {
+                continue;
             }
-            Err(_) => match hive {
-                Some(hive) => hive
-                    .array(file, field.name(), batch.num_rows())?
-                    .unwrap_or_else(|| new_null_array(field.data_type(), batch.num_rows())),
-                None => new_null_array(field.data_type(), batch.num_rows()),
-            },
-        };
-        columns.push(column);
+            if let Some(column) = hive.array(file, field.name(), batch.num_rows())? {
+                fields.push(Arc::clone(field));
+                columns.push(column);
+            }
+        }
     }
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    Ok(RecordBatch::try_new_with_options(
-        Arc::clone(schema),
+    let augmented = RecordBatch::try_new_with_options(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
         columns,
         &options,
-    )?)
+    )?;
+    align_batch_to_schema(augmented, Arc::clone(schema), uri)
 }
