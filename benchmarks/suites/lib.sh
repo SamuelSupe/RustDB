@@ -173,7 +173,57 @@ benchmark_cpu_model() {
   printf '%s\n' "${model:-unknown}"
 }
 
-run_benchmark_report() {
+assert_benchmark_report_config() (
+  report=$1
+  memory_limit=$2
+  threads=$3
+  batch_size=$4
+  io_concurrency=$5
+  metadata_cache_bytes=$6
+
+  python3 - "$report" "$memory_limit" "$threads" "$batch_size" \
+    "$io_concurrency" "$metadata_cache_bytes" <<'PY'
+import json
+import sys
+
+report = sys.argv[1]
+expected = dict(
+    zip(
+        (
+            "memory_limit_bytes",
+            "compute_threads",
+            "batch_size",
+            "io_concurrency",
+            "metadata_cache_bytes",
+        ),
+        map(int, sys.argv[2:]),
+    )
+)
+
+try:
+    with open(report, encoding="utf-8") as handle:
+        document = json.load(handle)
+    config = document["config"]
+except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+    print(f"error: invalid benchmark report {report}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+mismatches = []
+for field, expected_value in expected.items():
+    actual = config.get(field) if isinstance(config, dict) else None
+    if type(actual) is not int or actual != expected_value:
+        mismatches.append(f"{field}: expected {expected_value}, got {actual!r}")
+if mismatches:
+    print(
+        f"error: benchmark report config mismatch in {report}: "
+        + "; ".join(mismatches),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+)
+
+run_benchmark_report() (
   query=$1
   report=$2
   memory_limit=$3
@@ -221,10 +271,16 @@ run_benchmark_report() {
   if ! docker compose run --rm --no-deps --no-TTY dev "$@" \
       < /dev/null > "$temporary_report"; then
     rm -f "$temporary_report"
-    return 1
+    exit 1
+  fi
+  if ! assert_benchmark_report_config \
+      "$temporary_report" "$memory_limit" "$threads" "$batch_size" \
+      "$io_concurrency" "$metadata_cache_bytes"; then
+    rm -f "$temporary_report"
+    exit 1
   fi
   mv "$temporary_report" "$report"
-}
+)
 
 assert_no_query_directories() {
   spill_root=$1

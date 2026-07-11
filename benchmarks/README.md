@@ -24,8 +24,9 @@ docker compose run --rm dev cargo run --release --bin rustdb-bench -- \
 The suite entrypoints build `rustdb-bench` separately with
 `RUSTFLAGS="-C target-cpu=native"`; portable CI release builds remain generic.
 Every suite manifest and report records the Cargo profile, Rust flags, and
-compiler version. Do not compare a warm run from one engine with a cold run
-from another.
+compiler version. The runners reject a report unless its memory, thread,
+batch, I/O, and metadata-cache configuration matches the requested matrix
+entry. Do not compare a warm run from one engine with a cold run from another.
 
 ## DuckDB correctness checksum
 
