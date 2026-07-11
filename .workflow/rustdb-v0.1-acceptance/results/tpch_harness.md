@@ -24,6 +24,8 @@ Evidence:
 
 - `tools/tpch/compare.sh 0.001`: all seven checksums matched.
 - `tools/tpch/compare.sh 1`: all seven checksums matched.
+- The final SF1 run was repeated on accepted implementation
+  `a9688d65d792d683fa899491b2b8e4118cb8df0b`.
 - SF1 canonical checksums:
   - Q1 `488b66ccd595fb84bc6ab9decdb1ee469d7398cd206222ded10cf5365f77a532`
   - Q3 `90f24d9edaedbb9912f9c0a09a65e527cb4e5812f8722a714dcba9503339e0c8`

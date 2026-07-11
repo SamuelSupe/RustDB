@@ -11,6 +11,8 @@ Delivered:
 - GitHub Actions jobs for authoritative Linux x64 quality/MinIO and native
   Linux arm64/macOS arm64 portability, plus a separate cached TPC-H SF1 gate.
 - Acceptance, TPC-H, benchmark, S3 upload, and troubleshooting instructions.
+- Benchmark report self-validation for memory, threads, batch size, I/O
+  concurrency, and metadata-cache mode before a result is accepted.
 
 Packet verification before integration passed shell syntax, Compose config,
 Action YAML parsing/actionlint, OrbStack fmt and strict Clippy, 112 all-target

@@ -1,41 +1,38 @@
 # SF10 low-memory result
 
-Status: superseded diagnostic; clean-commit acceptance rerun pending.
+Status: clean-commit acceptance completed.
 
-The strict suite was run from a clean output directory with checksum validation
-enabled. Candidate artifact:
-`benchmarks/results/low-memory/20260710T225721Z/manifest.json`.
+The accepted artifact is
+`benchmarks/results/low-memory/20260711-alpha2-clean-r2/manifest.json`. It was
+created by native release build
+`a9688d65d792d683fa899491b2b8e4118cb8df0b` against the SF10 manifest digest
+`016ecef9f79a6dde2cd1f2b88ad12aac8ebfa283f6d357f174bcb51c48c98ade`.
 
 Final results:
 
-| Case | Limit | Rows | Peak bytes | Spill bytes | Reported spill units | Cleanup |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Sort | 64 MiB | 15,000,000 | 67,096,896 | 421,182,364 | 34 | yes |
-| Sort | 128 MiB | 15,000,000 | 134,193,792 | 419,653,882 | 17 | yes |
-| Aggregate | 64 MiB | 999,982 | 67,108,800 | 133,519,168 | 992 | yes |
-| Aggregate | 128 MiB | 999,982 | 134,217,600 | 91,544,064 | 320 | yes |
-| Inner Join | 64 MiB | 1 | 67,076,032 | 383,545,856 | 64 | yes |
-| Inner Join | 128 MiB | 1 | 120,237,952 | 383,545,856 | 64 | yes |
-| Left Join | 64 MiB | 1 | 67,076,064 | 219,765,312 | 64 | yes |
-| Left Join | 128 MiB | 1 | 134,151,968 | 219,765,312 | 64 | yes |
+| Case | Limit | Rows | Peak bytes | Spill bytes | Reported spill units | p50 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Sort | 64 MiB | 15,000,000 | 42,471,943 | 1,139,983,840 | 68 | 14,010.499 |
+| Sort | 128 MiB | 15,000,000 | 84,155,783 | 736,513,360 | 34 | 9,435.195 |
+| Aggregate | 64 MiB | 999,982 | 38,271,121 | 200,878,592 | 32 | 20,975.964 |
+| Aggregate | 128 MiB | 999,982 | 72,733,585 | 181,443,904 | 32 | 22,335.486 |
+| Inner Join | 64 MiB | 1 | 67,049,050 | 369,454,848 | 64 | 16,671.058 |
+| Inner Join | 128 MiB | 1 | 120,736,026 | 369,454,848 | 64 | 14,842.823 |
+| Left Join | 64 MiB | 1 | 67,046,961 | 216,636,224 | 64 | 3,869.440 |
+| Left Join | 128 MiB | 1 | 134,122,865 | 216,636,224 | 64 | 3,838.247 |
 
-All four query checksums matched DuckDB. The candidate manifest has eight runs and
-`correctness.verified=true`; every peak is within its configured limit, every
-run spilled, and the final Spill root contains no `query-*` directory.
+All eight measured runs matched pinned DuckDB 1.4.3, stayed within their
+configured reservation limit, produced non-zero Spill, reported cleanup, and
+left both the Spill root and query directories empty. Reported spill units are
+the engine metric count; they are not asserted to equal unique logical
+partitions.
 
-Defects found and fixed before accepting the run:
+Checksums are stable across the two memory limits:
 
-- Join originally created one IPC file for every input-batch/partition pair,
-  reaching more than 625,000 files. Incremental partition writers now coalesce
-  batches and rotate at a bounded uncompressed size.
-- Array object overhead from fragmented IPC batches was counted as persistent
-  build data, causing 64/128 MiB runs to write 123 GB/50 GB recursively. Build
-  estimation now uses logical Arrow buffers plus explicit concat, hash-table,
-  reader-window, and metadata allowances, and compacts batches hierarchically.
-- Join benchmark inputs use derived projections so only required keys/payloads
-  enter physical Join and Spill state.
-- Spill cleanup now verifies removal after syncing the parent directory.
+- Aggregate: `d597b8f2ce31ca231687e56ed345cb92a2dd366ee352bdab0385f62b84f7f854`
+- Inner Join: `1ac51e10c9327361ca02dd90fcde096dacedc4e3ffe6f1d5029dd175a273f4c0`
+- Left Join: `b8cf836ae92efe2b126b20fe5c4455b5541e5247f34a20549d57a0e0351261b7`
+- Sort: `8190c49c5e8ae3528df0907474bbae2d8975da859f762bbb2347ac12fdb0ac84`
 
-This run predates the implementation commit and later memory-accounting fixes,
-so it is retained only as diagnostic history. A new run from the exact clean
-implementation commit is required before acceptance is complete.
+Earlier low-memory output directories are retained only as ignored diagnostic
+history and are superseded by this exact-build artifact.

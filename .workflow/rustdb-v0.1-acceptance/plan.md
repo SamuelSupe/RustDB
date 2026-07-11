@@ -26,4 +26,7 @@ Constraints:
 - Full SF10 generation is a resource gate: inspect disk/time first and do not
   fabricate a completed baseline when only the harness was exercised.
 
-Current baseline: commit `74194ab`, tag `v0.1.0-alpha.1`.
+Frozen initial baseline: commit `74194ab`, tag `v0.1.0-alpha.1`.
+Accepted implementation: commit
+`a9688d65d792d683fa899491b2b8e4118cb8df0b`.
+Acceptance evidence tag: `v0.1.0-alpha.2`.
