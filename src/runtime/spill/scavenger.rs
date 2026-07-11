@@ -290,10 +290,11 @@ mod tests {
     }
 
     #[test]
-    fn spill_manager_holds_the_activity_lock_for_its_lifetime() {
+    fn spill_manager_holds_the_activity_lock_until_cleanup() {
         let root = tempfile::tempdir().expect("tempdir");
         let manager = SpillManager::new(root.path(), MemoryPool::new(1 << 20)).unwrap();
         let directory = manager.directory().to_path_buf();
+        assert!(manager.activity_lock_held());
         let modified = std::fs::metadata(directory.join(MARKER_FILE_NAME))
             .unwrap()
             .modified()
@@ -310,6 +311,7 @@ mod tests {
         assert!(directory.exists());
 
         manager.cleanup().unwrap();
+        assert!(!manager.activity_lock_held());
         assert!(!directory.exists());
     }
 

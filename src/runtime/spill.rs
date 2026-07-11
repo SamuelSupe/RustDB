@@ -63,7 +63,7 @@ pub struct SpillManager {
 #[derive(Debug)]
 struct State {
     directory: PathBuf,
-    _activity_lock: activity::QueryActivityLock,
+    activity_lock: Mutex<Option<activity::QueryActivityLock>>,
     control: QueryControl,
     memory: MemoryPool,
     files: Arc<ActiveFiles>,
@@ -189,7 +189,7 @@ impl SpillManager {
         Ok(Self {
             state: Arc::new(State {
                 directory,
-                _activity_lock: activity_lock,
+                activity_lock: Mutex::new(Some(activity_lock)),
                 control,
                 memory: memory.clone(),
                 files: Arc::new(ActiveFiles::new(memory)),
@@ -285,6 +285,11 @@ impl SpillManager {
         self.state.cleanup()
     }
 
+    #[cfg(test)]
+    fn activity_lock_held(&self) -> bool {
+        self.state.activity_lock.lock().is_some()
+    }
+
     fn allocate_file(&self, label: &str) -> Result<SpillFile> {
         self.ensure_active()?;
         let sequence = self.state.next_file.fetch_add(1, Ordering::Relaxed);
@@ -362,10 +367,16 @@ impl State {
     fn cleanup(&self) -> Result<()> {
         let _cleanup = self.cleanup_lock.lock();
         self.cleaned.store(true, Ordering::Release);
+        // Do not unlink a directory while its advisory-lock file is still
+        // open. That is legal on local Unix filesystems, but shared macOS/Linux
+        // mounts can expose an empty ghost directory when the handle closes
+        // later. Cleanup owns the lifecycle lock, so release it before removal.
+        let activity_lock = self.activity_lock.lock().take();
         let directory = self.directory.clone();
         let verify = directory.clone();
         let sync_path = directory.clone();
         self.io_pool.run_cleanup(move || {
+            drop(activity_lock);
             match std::fs::remove_dir_all(&directory) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
