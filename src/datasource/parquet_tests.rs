@@ -274,6 +274,58 @@ async fn query_schema_reservation_lives_with_table() {
 }
 
 #[tokio::test]
+async fn multi_file_schema_reservation_covers_every_retained_schema() {
+    let directory = tempdir().unwrap();
+    let first_directory = directory.path().join("year=2025");
+    let second_directory = directory.path().join("year=2026");
+    std::fs::create_dir_all(&first_directory).unwrap();
+    std::fs::create_dir_all(&second_directory).unwrap();
+    let first = first_directory.join("part-0.parquet");
+    let second = second_directory.join("part-1.parquet");
+    write_ids(&first, &[1]);
+    write_ids(&second, &[2]);
+
+    let config = EngineConfig::default();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    let table = ParquetTable::try_new_with_cache_for_query(
+        vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ],
+        ParquetOptions {
+            hive_partitioning: true,
+            ..ParquetOptions::default()
+        },
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+        Some(Arc::clone(&context)),
+    )
+    .await
+    .unwrap();
+
+    assert!(table.hive.is_some());
+    assert!(!Arc::ptr_eq(&table.schema, &table.physical_schema));
+    let file_schema_bytes = table.file_schemas.iter().fold(0_usize, |bytes, file| {
+        bytes.saturating_add(super::schema_memory_size(&file.schema))
+    });
+    let retained_schema_floor = file_schema_bytes
+        .saturating_add(super::schema_memory_size(&table.physical_schema))
+        .saturating_add(super::schema_memory_size(&table.schema))
+        .saturating_add(table.hive.as_deref().unwrap().memory_size());
+    let held = table
+        ._schema_reservation
+        .as_ref()
+        .expect("query schema reservation")
+        .size();
+
+    assert!(held >= retained_schema_floor);
+    let before_drop = context.memory.used();
+    drop(table);
+    assert_eq!(context.memory.used(), before_drop - held);
+}
+
+#[tokio::test]
 async fn registration_rejects_schema_over_derived_limit() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("bounded-schema.parquet");

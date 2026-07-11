@@ -1,9 +1,10 @@
-use std::{hint::black_box, path::PathBuf, time::Instant};
+use std::{fs::File, hint::black_box, io::Read, path::PathBuf, time::Instant};
 
 use clap::Parser;
 use futures::StreamExt;
 use rustdb::{Engine, EngineConfig, Error, Result};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 #[derive(Debug, Parser)]
@@ -80,6 +81,7 @@ struct Args {
 struct BenchmarkReport {
     engine_version: &'static str,
     build_id: String,
+    binary_sha256: String,
     build: BuildReport,
     query_file: String,
     warmup: usize,
@@ -165,6 +167,7 @@ async fn run(args: Args) -> Result<()> {
             "iterations must be greater than zero".to_owned(),
         ));
     }
+    let binary_sha256 = executable_sha256()?;
     let sql = tokio::fs::read_to_string(&args.query)
         .await
         .map_err(|error| Error::io(Some(args.query.clone()), error))?;
@@ -215,6 +218,7 @@ async fn run(args: Args) -> Result<()> {
     let report = BenchmarkReport {
         engine_version: env!("CARGO_PKG_VERSION"),
         build_id: args.build_id,
+        binary_sha256,
         build: BuildReport {
             cargo_profile: args.build_profile,
             rustflags: args.build_rustflags,
@@ -236,6 +240,28 @@ async fn run(args: Args) -> Result<()> {
         })?
     );
     Ok(())
+}
+
+fn executable_sha256() -> Result<String> {
+    let path = std::env::current_exe().map_err(|error| Error::io(None, error))?;
+    file_sha256(&path)
+}
+
+fn file_sha256(path: &std::path::Path) -> Result<String> {
+    let mut executable =
+        File::open(path).map_err(|error| Error::io(Some(path.to_path_buf()), error))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes = executable
+            .read(&mut buffer)
+            .map_err(|error| Error::io(Some(path.to_path_buf()), error))?;
+        if bytes == 0 {
+            break;
+        }
+        digest.update(&buffer[..bytes]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 async fn run_once(
@@ -345,11 +371,22 @@ fn percentile(sorted: &[f64], percentile: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::percentile;
+    use super::{file_sha256, percentile};
 
     #[test]
     fn percentile_uses_nearest_rank() {
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.50), 3.0);
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.95), 4.0);
+    }
+
+    #[test]
+    fn file_digest_is_lowercase_sha256() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            file_sha256(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

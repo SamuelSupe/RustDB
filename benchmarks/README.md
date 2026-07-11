@@ -75,8 +75,9 @@ Results are written below `benchmarks/results/low-memory/<timestamp>/` as a
 suite `manifest.json`, rendered SQL, checksum records, and one benchmark JSON
 per case and memory limit. `MEMORY_LIMITS_BYTES`, `THREADS`, `BATCH_SIZE`,
 `IO_CONCURRENCY`, `WARMUP`, and `ITERATIONS` are available for deliberate
-non-release experiments. Manifests include the RustDB build identifier and
-dataset-manifest digest; reports include the host CPU model and engine config.
+non-release experiments. Manifests include the RustDB build identifier,
+benchmark executable SHA-256, and dataset-manifest digest; reports include the
+same executable digest, host CPU model, and engine config.
 An output directory must not already exist, preventing a failed rerun from
 leaving an older successful manifest in place.
 
@@ -102,7 +103,9 @@ the remote and local dataset manifests. Before timing, every distinct
 target/thread/batch configuration is executed independently and compared with
 DuckDB; t1 and t4 entries therefore reference different checksum artifacts.
 The manifest records SHA-256 digests of the runner, helper library, and
-checksum runner used to produce the evidence.
+checksum runner used to produce the evidence. An explicitly supplied build ID
+or CPU model is accepted only when it matches the current worktree or detected
+host, so an environment override cannot silently relabel a run.
 
 For the v0.2 M5 Max gate, capture the local SF10 candidate and compare it with
 the clean `v0.1.0-alpha.2` SF10 manifest:
@@ -113,8 +116,7 @@ MEMORY_LIMIT_BYTES=1073741824 WARMUP=2 ITERATIONS=5 START_MINIO=0 \
 benchmarks/run_baseline.sh --local-root data/tpch-sf10 \
   --output benchmarks/results/baseline/<candidate-run>
 
-docker compose run --rm --no-deps --no-TTY dev \
-  python3 benchmarks/check_parallel_gate.py \
+python3 -B benchmarks/check_parallel_gate.py \
   --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
   --baseline benchmarks/results/baseline/<alpha2-sf10-run>/manifest.json
 ```
@@ -126,7 +128,10 @@ fingerprints and checksums, at least 2.0x four-thread throughput, and no more
 than 10% one-thread regression. The candidate manifest must name the exact
 40-character commit of the current clean worktree, and every selected thread
 configuration must have its own checksum path. Any missing or inconsistent
-field fails.
+field fails. The host-side checker reads the CPU model from `sysctl`, rebuilds
+the candidate native-release executable in OrbStack, compares its digest with
+every candidate report, and re-hashes both repositories' harness and dataset
+manifest files rather than trusting stored digest strings.
 
 For the repository-generated TPC-H datasets, upload the matching scale first:
 

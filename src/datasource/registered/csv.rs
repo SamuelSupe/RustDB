@@ -19,6 +19,7 @@ pub(crate) struct RegisteredCsvTable {
     locations: Arc<[String]>,
     refresh_options: CsvOptions,
     query_options: CsvOptions,
+    schema_was_inferred: bool,
     config: EngineConfig,
     schema: SchemaRef,
     statistics: TableStatistics,
@@ -44,6 +45,7 @@ impl RegisteredCsvTable {
         let physical_schema = discovered.schema();
         let schema = reorder_schema(&physical_schema, previous_schema)?;
         let statistics = discovered.statistics();
+        let schema_was_inferred = refresh_options.schema.is_none();
         let mut query_options = refresh_options.clone();
         query_options.schema = Some(Arc::clone(&physical_schema));
         query_options.header = if discovered.has_header() {
@@ -56,6 +58,7 @@ impl RegisteredCsvTable {
             locations: locations.into(),
             refresh_options,
             query_options,
+            schema_was_inferred,
             config: config.clone(),
             schema,
             statistics,
@@ -66,13 +69,27 @@ impl RegisteredCsvTable {
         &self,
         context: Arc<QueryContext>,
     ) -> Result<Arc<dyn TableProvider>> {
-        let table = CsvTable::try_new_for_query(
-            self.locations.to_vec(),
-            self.query_options.clone(),
-            &self.config,
-            Some(Arc::clone(&context)),
-        )
-        .await?;
+        let table = if self.schema_was_inferred {
+            let registered_schema = self.query_options.schema.as_ref().ok_or_else(|| {
+                Error::Internal("registered CSV table is missing its physical schema".to_owned())
+            })?;
+            CsvTable::try_new_for_query_with_registered_schema(
+                self.locations.to_vec(),
+                self.refresh_options.clone(),
+                Arc::clone(registered_schema),
+                &self.config,
+                Some(Arc::clone(&context)),
+            )
+            .await?
+        } else {
+            CsvTable::try_new_for_query(
+                self.locations.to_vec(),
+                self.query_options.clone(),
+                &self.config,
+                Some(Arc::clone(&context)),
+            )
+            .await?
+        };
         Ok(Arc::new(table))
     }
 

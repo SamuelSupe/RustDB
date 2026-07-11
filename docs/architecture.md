@@ -76,7 +76,10 @@ Aggregate holds
 leases for evaluated expressions and row-encoded keys, and Join key arrays keep
 their lease for as long as the evaluated keys are retained. CSV sampling is
 leased while inference runs, and the inferred query schema keeps a lease for
-the prepared provider lifetime. Workspaces use conservative pre-reservations,
+the prepared provider lifetime. Prepared Parquet providers retain leases for
+every per-file schema, the merged physical/public schemas, and Hive partition
+metadata (including partition strings) for their full lifetime. Workspaces use
+conservative pre-reservations,
 but allocator bookkeeping and temporary decoder buffers can still differ from
 the reservation estimate.
 Once a result batch is yielded, memory retained by the embedding caller is

@@ -114,8 +114,9 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
             .expect("strict CSV schema result")
             .expect_err("strict CSV schema change must fail"),
     };
+    let strict_message = strict_error.to_string();
     assert!(
-        strict_error.to_string().contains("header does not match"),
+        strict_message.contains("CSV schema mismatch") && strict_message.contains("dynamic/b.csv"),
         "unexpected strict-schema error: {strict_error}"
     );
     let refreshed = session.refresh_table("dynamic_s3").await?;

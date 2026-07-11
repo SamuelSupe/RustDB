@@ -146,8 +146,7 @@ benchmarks/run_baseline.sh \
   --local-root data/tpch-sf10 \
   --output benchmarks/results/baseline/<candidate-run>
 
-docker compose run --rm --no-deps --no-TTY dev \
-  python3 benchmarks/check_parallel_gate.py \
+python3 -B benchmarks/check_parallel_gate.py \
   --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
   --baseline benchmarks/results/baseline/<alpha2-sf10-run>/manifest.json
 ```
@@ -157,8 +156,13 @@ manifest. The gate resolves that local tag and rejects a different baseline
 build identifier. The candidate must be the exact 40-character commit of the
 current clean worktree. Each target/thread/batch configuration is checksum-run
 independently; sharing one checksum path between t1 and t4 is rejected. Runner,
-helper-library, and checksum-runner digests are stored in each manifest. The
-gate also fails on missing or duplicate matrix entries,
+helper-library, and checksum-runner digests are stored in each manifest and
+recomputed from the corresponding candidate/baseline worktree. The dataset
+manifest digest is also recomputed. Candidate reports contain a SHA-256 of the
+running executable; the host-side gate detects the actual CPU with `sysctl`,
+rebuilds `rustdb-bench` from the clean HEAD in OrbStack with native flags, and
+requires its digest to match every selected report. The gate also fails on
+missing or duplicate matrix entries,
 unverified checksums, a dataset mismatch, non-M5-Max hardware, a non-release or
 non-native build, settings other than local metadata-warm / batch 8192 / 1 GiB
 / warmup 2 / five measurements, or a report whose build/config does not match
@@ -171,8 +175,9 @@ For both `scan-filter` and `aggregate`, the candidate must satisfy:
 - identical result checksums for candidate/baseline at one and four threads.
 
 The runner refuses an existing output directory, builds `rustdb-bench` with
-`-C target-cpu=native`, records the build and dataset fingerprints, and
-checksum-validates results before timing. Portable CI release builds do not
+`-C target-cpu=native`, rejects mismatched build-ID/CPU overrides, records the
+executable, build, and dataset fingerprints, and checksum-validates results
+before timing. Portable CI release builds do not
 use native CPU flags, and hosted CI checks parallel correctness without using
 this hardware timing gate.
 

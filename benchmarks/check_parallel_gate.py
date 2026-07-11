@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import json
 import subprocess
 import sys
@@ -12,6 +13,9 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from parallel_gate import GateError, evaluate
+
+
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def alpha2_build_id() -> str:
@@ -51,6 +55,63 @@ def clean_candidate_build_id(root: Path | None = None) -> str:
     return commit
 
 
+def actual_cpu_model() -> str:
+    commands = (
+        ["sysctl", "-n", "machdep.cpu.brand_string"],
+        ["sh", "-c", "lscpu | awk -F: '/^Model name:/ {sub(/^[ \\t]+/, \"\", $2); print $2; exit}'"],
+    )
+    for command in commands:
+        try:
+            model = subprocess.run(
+                command, check=True, capture_output=True, text=True
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        if model and model != "-":
+            if "M5 Max" not in model:
+                raise GateError(
+                    f"fixed-hardware gate requires an Apple M5 Max, detected {model!r}"
+                )
+            return model
+    raise GateError("cannot detect the host CPU model for the fixed-hardware gate")
+
+
+def rebuild_candidate_binary_sha256(root: Path | None = None) -> str:
+    root = root or Path(__file__).resolve().parent.parent
+    command = [
+        "docker",
+        "compose",
+        "run",
+        "--rm",
+        "--no-deps",
+        "--no-TTY",
+        "--env",
+        "RUSTFLAGS=-C target-cpu=native",
+        "dev",
+        "sh",
+        "-c",
+        "cargo build --quiet --release --bin rustdb-bench && "
+        "sha256sum target/release/rustdb-bench",
+    ]
+    try:
+        output = subprocess.run(
+            command,
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = getattr(error, "stderr", "") or str(error)
+        raise GateError(f"cannot rebuild the candidate benchmark executable: {detail}") from error
+    digests = [line.split()[0] for line in output if line.split() and SHA256.fullmatch(line.split()[0])]
+    if len(digests) != 1:
+        raise GateError(
+            "candidate rebuild did not emit exactly one benchmark executable SHA-256"
+        )
+    return digests[0]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", type=Path, required=True, help="candidate manifest.json")
@@ -58,11 +119,17 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="emit machine-readable results")
     args = parser.parse_args()
     try:
+        root = Path(__file__).resolve().parent.parent
+        candidate_build_id = clean_candidate_build_id(root)
+        cpu_model = actual_cpu_model()
+        binary_sha256 = rebuild_candidate_binary_sha256(root)
         result = evaluate(
             args.candidate.resolve(),
             args.baseline.resolve(),
             alpha2_build_id(),
-            clean_candidate_build_id(),
+            candidate_build_id,
+            binary_sha256,
+            cpu_model,
         )
     except GateError as error:
         print(f"parallel performance gate: FAIL: {error}", file=sys.stderr)

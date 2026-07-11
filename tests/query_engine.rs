@@ -1,6 +1,9 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::{
+    array::{Array, Int64Array, StringArray},
+    datatypes::DataType,
+};
 use futures::StreamExt;
 use rustdb::{CsvHeader, CsvOptions, Engine, EngineConfig, QueryResult, Result};
 
@@ -281,6 +284,91 @@ async fn csv_refresh_reports_incompatible_file_uri_and_column() -> Result<()> {
     assert!(message.contains("b.csv"), "{message}");
     assert!(message.contains("column id"), "{message}");
     assert!(message.contains("Int64"), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn inferred_csv_schema_rejects_dynamic_type_drift_until_refresh() -> Result<()> {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("parts");
+    fs::create_dir(&data).unwrap();
+    let first = data.join("a.csv");
+    let second = data.join("b.csv");
+    fs::write(&first, "value\n1.5\n2.5\n").unwrap();
+
+    let session = Engine::new(
+        EngineConfig::builder()
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )?
+    .session();
+    session
+        .register_csv(
+            "dynamic_types",
+            [format!("{}/*.csv", data.display())],
+            CsvOptions::default(),
+        )
+        .await?;
+
+    fs::write(&second, "value\n9007199254740993\n").unwrap();
+    let error = match session.execute("SELECT value FROM dynamic_types").await {
+        Err(error) => error,
+        Ok(mut result) => result
+            .stream()
+            .next()
+            .await
+            .expect("schema drift must produce a terminal result")
+            .expect_err("dynamic Int64 file must not use the registered Float64 schema"),
+    };
+    let message = error.to_string();
+    assert!(message.contains("b.csv"), "{message}");
+    assert!(message.contains("column value"), "{message}");
+    assert!(message.contains("Float64"), "{message}");
+    assert!(message.contains("Int64"), "{message}");
+
+    let refresh_error = session.refresh_table("dynamic_types").await.unwrap_err();
+    assert!(refresh_error.to_string().contains("b.csv"));
+
+    // A failed refresh leaves the old provider visible atomically.
+    fs::remove_file(&second).unwrap();
+    let old = session
+        .execute("SELECT value FROM dynamic_types ORDER BY value")
+        .await?;
+    assert_eq!(old.schema().field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        collect(old)
+            .await?
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        2
+    );
+
+    fs::write(&first, "value\n9007199254740993\n").unwrap();
+    fs::write(&second, "value\n9007199254740995\n").unwrap();
+    let refreshed = session.refresh_table("dynamic_types").await?;
+    assert_eq!(refreshed.field(0).data_type(), &DataType::Int64);
+
+    let batches = collect(
+        session
+            .execute("SELECT value FROM dynamic_types ORDER BY value")
+            .await?,
+    )
+    .await?;
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, [9_007_199_254_740_993, 9_007_199_254_740_995]);
     Ok(())
 }
 

@@ -142,11 +142,29 @@ sha256_file() {
 build_benchmark_binary() {
   BENCHMARK_BUILD_PROFILE=release
   BENCHMARK_RUSTFLAGS=${RUSTDB_BENCH_RUSTFLAGS:--C target-cpu=native}
+  BENCHMARK_BUILD_ID=$(benchmark_build_id)
+  if [ -n "${RUSTDB_BUILD_ID:-}" ] && [ "$RUSTDB_BUILD_ID" != "$BENCHMARK_BUILD_ID" ]; then
+    die "RUSTDB_BUILD_ID does not match the current worktree: expected $BENCHMARK_BUILD_ID, got $RUSTDB_BUILD_ID"
+  fi
+  detected_cpu=$(benchmark_cpu_model)
+  if [ -n "${RUSTDB_CPU_MODEL:-}" ] && [ "$detected_cpu" != unknown ] && \
+      [ "$detected_cpu" != "-" ] && [ "$RUSTDB_CPU_MODEL" != "$detected_cpu" ]; then
+    die "RUSTDB_CPU_MODEL does not match the detected host CPU: expected $detected_cpu, got $RUSTDB_CPU_MODEL"
+  fi
+  if [ "$detected_cpu" = unknown ] || [ "$detected_cpu" = "-" ]; then
+    BENCHMARK_CPU_MODEL=${RUSTDB_CPU_MODEL:-$detected_cpu}
+  else
+    BENCHMARK_CPU_MODEL=$detected_cpu
+  fi
   BENCHMARK_RUSTC_VERSION=$(docker compose run --rm --no-deps --no-TTY dev \
     rustc --version)
   docker compose run --rm --no-deps \
     --env "RUSTFLAGS=$BENCHMARK_RUSTFLAGS" dev \
     cargo build --quiet --release --bin rustdb-bench
+  BENCHMARK_BINARY_SHA256=$(docker compose run --rm --no-deps --no-TTY dev \
+    sha256sum target/release/rustdb-bench | awk '/^[0-9a-f]{64}[[:space:]]/ {print $1; exit}')
+  printf '%s\n' "$BENCHMARK_BINARY_SHA256" | grep -Eq '^[0-9a-f]{64}$' || \
+    die "cannot determine the benchmark executable SHA-256"
 }
 
 benchmark_build_id() {
@@ -180,9 +198,10 @@ assert_benchmark_report_config() (
   batch_size=$4
   io_concurrency=$5
   metadata_cache_bytes=$6
+  binary_sha256=$7
 
   python3 - "$report" "$memory_limit" "$threads" "$batch_size" \
-    "$io_concurrency" "$metadata_cache_bytes" <<'PY'
+    "$io_concurrency" "$metadata_cache_bytes" "$binary_sha256" <<'PY'
 import json
 import sys
 
@@ -196,9 +215,10 @@ expected = dict(
             "io_concurrency",
             "metadata_cache_bytes",
         ),
-        map(int, sys.argv[2:]),
+        map(int, sys.argv[2:7]),
     )
 )
+expected_binary_sha256 = sys.argv[7]
 
 try:
     with open(report, encoding="utf-8") as handle:
@@ -217,6 +237,13 @@ if mismatches:
     print(
         f"error: benchmark report config mismatch in {report}: "
         + "; ".join(mismatches),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if document.get("binary_sha256") != expected_binary_sha256:
+    print(
+        f"error: benchmark binary digest mismatch in {report}: "
+        f"expected {expected_binary_sha256}, got {document.get('binary_sha256')!r}",
         file=sys.stderr,
     )
     raise SystemExit(1)
@@ -240,11 +267,11 @@ run_benchmark_report() (
 
   set -- target/release/rustdb-bench \
     --query "$query" \
-    --build-id "${RUSTDB_BUILD_ID:-$(benchmark_build_id)}" \
+    --build-id "$BENCHMARK_BUILD_ID" \
     --build-profile "$BENCHMARK_BUILD_PROFILE" \
     "--build-rustflags=$BENCHMARK_RUSTFLAGS" \
     --rustc-version "$BENCHMARK_RUSTC_VERSION" \
-    --cpu-model "${RUSTDB_CPU_MODEL:-$(benchmark_cpu_model)}" \
+    --cpu-model "$BENCHMARK_CPU_MODEL" \
     --warmup "$warmup" \
     --iterations "$iterations" \
     --memory-limit "$memory_limit" \
@@ -275,7 +302,7 @@ run_benchmark_report() (
   fi
   if ! assert_benchmark_report_config \
       "$temporary_report" "$memory_limit" "$threads" "$batch_size" \
-      "$io_concurrency" "$metadata_cache_bytes"; then
+      "$io_concurrency" "$metadata_cache_bytes" "$BENCHMARK_BINARY_SHA256"; then
     rm -f "$temporary_report"
     exit 1
   fi

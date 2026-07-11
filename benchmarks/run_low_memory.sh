@@ -166,7 +166,8 @@ done < "$SCRIPT_DIR/suites/low-memory/cases.tsv"
   printf '  "suite":"rustdb-low-memory-v1",\n'
   printf '  "generated_at_utc":"%s",\n' "$(utc_timestamp)"
   printf '  "dataset_root":"%s",\n' "$(json_escape "$dataset_root")"
-  printf '  "rustdb_build_id":"%s",\n' "$(json_escape "${RUSTDB_BUILD_ID:-$(benchmark_build_id)}")"
+  printf '  "rustdb_build_id":"%s",\n' "$(json_escape "$BENCHMARK_BUILD_ID")"
+  printf '  "benchmark_binary_sha256":"%s",\n' "$BENCHMARK_BINARY_SHA256"
   printf '  "build":{"cargo_profile":"%s","rustflags":"%s","rustc_version":"%s"},\n' \
     "$(json_escape "$BENCHMARK_BUILD_PROFILE")" "$(json_escape "$BENCHMARK_RUSTFLAGS")" \
     "$(json_escape "$BENCHMARK_RUSTC_VERSION")"

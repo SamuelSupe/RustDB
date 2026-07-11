@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -13,6 +14,11 @@ from check_parallel_gate import clean_candidate_build_id  # noqa: E402
 
 SHA = "a" * 64
 CANDIDATE = "c" * 40
+CANDIDATE_BINARY = "9" * 64
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class GateFixture:
@@ -38,6 +44,19 @@ class GateFixture:
 
     def _write_variant(self, variant, build_id, engine_version, timings):
         directory = self.root / variant
+        directory.mkdir(parents=True)
+        (directory / "Cargo.toml").write_text("[package]\nname='gate-fixture'\n", encoding="utf-8")
+        harness_paths = {
+            "runner_sha256": directory / "benchmarks/run_baseline.sh",
+            "library_sha256": directory / "benchmarks/suites/lib.sh",
+            "checksum_runner_sha256": directory / "tools/tpch/compare_query.sh",
+        }
+        for field, path in harness_paths.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{variant}:{field}\n", encoding="utf-8")
+        dataset_manifest = directory / "data/tpch-sf10/manifest.sha256"
+        dataset_manifest.parent.mkdir(parents=True)
+        dataset_manifest.write_text("identical sf10 fixture\n", encoding="utf-8")
         reports = directory / "reports"
         reports.mkdir(parents=True)
         build = {
@@ -66,6 +85,8 @@ class GateFixture:
                 "p50_ms": p50,
                 "runs": [{"elapsed_ms": p50} for _ in range(5)],
             }
+            if variant == "candidate":
+                report["binary_sha256"] = CANDIDATE_BINARY
             report_path.write_text(json.dumps(report), encoding="utf-8")
             checksum_path.write_text(f"{SHA}\n", encoding="utf-8")
             entry = {
@@ -88,18 +109,18 @@ class GateFixture:
             "rustdb_build_id": build_id,
             "build": build,
             "harness": {
-                "runner_sha256": "d" * 64,
-                "library_sha256": "e" * 64,
-                "checksum_runner_sha256": "f" * 64,
+                field: file_sha256(path) for field, path in harness_paths.items()
             },
             "dataset": {
                 "generation": {"duckdb": "1.4.3", "scale_factor": "10"},
                 "manifest": "data/tpch-sf10/manifest.sha256",
-                "manifest_sha256": "b" * 64,
+                "manifest_sha256": file_sha256(dataset_manifest),
             },
             "correctness": {"verified": True, "targets": ["local"]},
             "runs": entries,
         }
+        if variant == "candidate":
+            manifest["benchmark_binary_sha256"] = CANDIDATE_BINARY
         manifest_path = directory / "manifest.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         self.manifests[variant] = manifest_path
@@ -150,6 +171,35 @@ class ParallelGateTests(unittest.TestCase):
         path.write_text(json.dumps(report), encoding="utf-8")
         with self.assertRaisesRegex(GateError, "build_id"):
             self.evaluate()
+
+    def test_candidate_binary_digest_must_match_every_report(self):
+        path = self.fixture.reports[("candidate", "scan-filter", 1)]
+        report = json.loads(path.read_text(encoding="utf-8"))
+        report["binary_sha256"] = "8" * 64
+        path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaisesRegex(GateError, "binary_sha256"):
+            self.evaluate()
+
+    def test_candidate_binary_must_match_clean_rebuild(self):
+        with self.assertRaisesRegex(GateError, "rebuilt from the current clean HEAD"):
+            evaluate(
+                self.fixture.manifests["candidate"],
+                self.fixture.manifests["baseline"],
+                "alpha2-id",
+                CANDIDATE,
+                "8" * 64,
+            )
+
+    def test_host_cpu_must_match_reports(self):
+        with self.assertRaisesRegex(GateError, "detected host CPU"):
+            evaluate(
+                self.fixture.manifests["candidate"],
+                self.fixture.manifests["baseline"],
+                "alpha2-id",
+                CANDIDATE,
+                CANDIDATE_BINARY,
+                "Apple M5 Max (different fixture)",
+            )
 
     def test_checksum_mismatch_fails(self):
         entry = self.fixture.entries[("candidate", "scan-filter", 4)]
@@ -214,7 +264,13 @@ class ParallelGateTests(unittest.TestCase):
         manifest = json.loads(path.read_text(encoding="utf-8"))
         manifest["dataset"]["manifest_sha256"] = "d" * 64
         path.write_text(json.dumps(manifest), encoding="utf-8")
-        with self.assertRaisesRegex(GateError, "dataset fingerprints differ"):
+        with self.assertRaisesRegex(GateError, "dataset.manifest_sha256 does not match"):
+            self.evaluate()
+
+    def test_harness_tampering_fails(self):
+        runner = self.fixture.manifests["candidate"].parent / "benchmarks/run_baseline.sh"
+        runner.write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(GateError, "runner_sha256 does not match"):
             self.evaluate()
 
     def test_threshold_failure_is_not_a_pass(self):

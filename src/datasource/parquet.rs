@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{mem::size_of, sync::Arc};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use async_stream::try_stream;
@@ -164,12 +164,9 @@ impl ParquetTable {
         if !has_explicit_schema && schema_mode == ParquetSchemaMode::UnionByName {
             physical_schema = nullable_schema(&physical_schema);
         }
+        let file_schema_bytes = file_schemas_memory_size(&file_schemas);
         resize_schema_budget(
-            file_schemas
-                .iter()
-                .fold(schema_memory_size(&physical_schema), |bytes, file| {
-                    bytes.saturating_add(schema_memory_size(&file.schema))
-                }),
+            file_schema_bytes.saturating_add(schema_memory_size(&physical_schema)),
             context.as_deref(),
             registration_limit,
             schema_reservation.as_mut(),
@@ -179,23 +176,18 @@ impl ParquetTable {
         } else {
             None
         };
-        if hive.is_some() {
-            resize_schema_budget(
-                schema_memory_size(&physical_schema).saturating_mul(2),
-                context.as_deref(),
-                registration_limit,
-                schema_reservation.as_mut(),
-            )?;
-        }
         let schema = hive.as_ref().map_or_else(
             || Arc::clone(&physical_schema),
             |hive| hive.append_schema(&physical_schema),
         );
-        let retained_schema_bytes = if Arc::ptr_eq(&schema, &physical_schema) {
-            schema_memory_size(&schema)
-        } else {
-            schema_memory_size(&schema).saturating_add(schema_memory_size(&physical_schema))
-        };
+        let retained_schema_bytes = file_schema_bytes
+            .saturating_add(schema_memory_size(&schema))
+            .saturating_add(if Arc::ptr_eq(&schema, &physical_schema) {
+                0
+            } else {
+                schema_memory_size(&physical_schema)
+            })
+            .saturating_add(hive.as_deref().map_or(0, HivePartitions::memory_size));
         resize_schema_budget(
             retained_schema_bytes,
             context.as_deref(),
@@ -240,6 +232,17 @@ impl ParquetTable {
         }
         Ok(())
     }
+}
+
+fn file_schemas_memory_size(file_schemas: &[FileSchema]) -> usize {
+    file_schemas.iter().fold(
+        size_of::<FileSchema>().saturating_mul(file_schemas.len()),
+        |bytes, file| {
+            bytes
+                .saturating_add(file.uri.capacity())
+                .saturating_add(schema_memory_size(&file.schema))
+        },
+    )
 }
 
 #[async_trait]

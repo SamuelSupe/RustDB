@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, mem::size_of, sync::Arc};
 
 use arrow::{
     array::{ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray, new_null_array},
@@ -9,6 +9,7 @@ use super::{ComparisonOp, PredicateValue, ScanPredicate};
 use crate::{Error, Result, storage::ObjectSource};
 
 const NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+const ARC_ALLOCATION_OVERHEAD: usize = size_of::<usize>() * 2;
 
 #[derive(Clone, Debug)]
 pub(super) struct HivePartitions {
@@ -126,6 +127,41 @@ impl HivePartitions {
             fields,
             physical.metadata().clone(),
         ))
+    }
+
+    pub(super) fn memory_size(&self) -> usize {
+        let columns = self
+            .columns
+            .iter()
+            .fold(ARC_ALLOCATION_OVERHEAD, |bytes, column| {
+                bytes
+                    .saturating_add(
+                        size_of::<PartitionColumn>().saturating_sub(size_of::<DataType>()),
+                    )
+                    .saturating_add(column.data_type.size())
+                    .saturating_add(column.name.capacity())
+            });
+        let files = self
+            .files
+            .iter()
+            .fold(ARC_ALLOCATION_OVERHEAD, |bytes, file| {
+                file.values.iter().fold(
+                    bytes
+                        .saturating_add(size_of::<FilePartition>())
+                        .saturating_add(
+                            file.values
+                                .capacity()
+                                .saturating_mul(size_of::<Option<String>>()),
+                        ),
+                    |bytes, value| {
+                        bytes.saturating_add(value.as_ref().map_or(0, |value| value.capacity()))
+                    },
+                )
+            });
+        ARC_ALLOCATION_OVERHEAD
+            .saturating_add(size_of::<Self>())
+            .saturating_add(columns)
+            .saturating_add(files)
     }
 
     pub(super) fn validate_physical_schema(&self, physical: &Schema) -> Result<()> {

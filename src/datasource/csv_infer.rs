@@ -26,6 +26,31 @@ pub(super) async fn infer_table_schema(
     sample_byte_cap: usize,
     context: Option<&QueryContext>,
 ) -> Result<(SchemaRef, bool)> {
+    infer_table_schema_impl(files, options, None, sample_byte_cap, context).await
+}
+
+pub(super) async fn infer_table_schema_against(
+    files: &[ObjectSource],
+    options: &CsvOptions,
+    expected: &SchemaRef,
+    sample_byte_cap: usize,
+    context: Option<&QueryContext>,
+) -> Result<(SchemaRef, bool)> {
+    if options.schema.is_some() {
+        return Err(Error::Internal(
+            "registered CSV inference options unexpectedly contain a schema".to_owned(),
+        ));
+    }
+    infer_table_schema_impl(files, options, Some(expected), sample_byte_cap, context).await
+}
+
+async fn infer_table_schema_impl(
+    files: &[ObjectSource],
+    options: &CsvOptions,
+    expected: Option<&SchemaRef>,
+    sample_byte_cap: usize,
+    context: Option<&QueryContext>,
+) -> Result<(SchemaRef, bool)> {
     let first = files
         .first()
         .ok_or_else(|| Error::InvalidArgument("CSV table requires at least one file".to_owned()))?;
@@ -84,15 +109,25 @@ pub(super) async fn infer_table_schema(
             first.uri()
         )));
     }
+    if let Some(expected) = expected {
+        validate_schema(&schema, expected, first.uri())?;
+    }
     drop(first_sample);
     for file in files.iter().skip(1) {
         let required_records = if has_header { 2 } else { 1 };
         let sample = read_sample(file, options, sample_byte_cap, required_records, context).await?;
         let actual = infer(&sample, options, has_header)
             .map_err(|error| csv_schema_error(file.uri(), error))?;
-        validate_schema(&actual, &schema, file.uri())?;
+        validate_schema(
+            &actual,
+            expected.map_or(&schema, |expected| expected.as_ref()),
+            file.uri(),
+        )?;
     }
-    Ok((Arc::new(schema), has_header))
+    Ok((
+        expected.map_or_else(|| Arc::new(schema), Arc::clone),
+        has_header,
+    ))
 }
 
 pub(super) fn format(options: &CsvOptions, has_header: bool) -> Format {

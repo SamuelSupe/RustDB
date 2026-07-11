@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import statistics
@@ -35,6 +36,49 @@ def load_json(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         fail(f"{label} must be a JSON object: {path}")
     return value
+
+
+def sha256_file(path: Path, label: str) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        fail(f"cannot read {label} {path}: {error}")
+    return digest.hexdigest()
+
+
+def repository_root(manifest_path: Path, label: str) -> Path:
+    for parent in manifest_path.parents:
+        if (parent / "Cargo.toml").is_file():
+            return parent
+    fail(f"cannot locate the repository root for {label} manifest {manifest_path}")
+
+
+def validate_harness(
+    manifest: dict[str, Any], manifest_path: Path, label: str
+) -> Path:
+    harness = manifest.get("harness")
+    if not isinstance(harness, dict):
+        fail(f"{label}.harness must be an object")
+    root = repository_root(manifest_path, label)
+    artifacts = {
+        "runner_sha256": root / "benchmarks/run_baseline.sh",
+        "library_sha256": root / "benchmarks/suites/lib.sh",
+        "checksum_runner_sha256": root / "tools/tpch/compare_query.sh",
+    }
+    for field, path in artifacts.items():
+        expected = harness.get(field)
+        if not isinstance(expected, str) or SHA256.fullmatch(expected) is None:
+            fail(f"{label}.harness.{field} must be a lowercase SHA-256")
+        actual = sha256_file(path, f"{label} harness artifact")
+        if actual != expected:
+            fail(
+                f"{label}.harness.{field} does not match {path}: "
+                f"expected {expected}, got {actual}"
+            )
+    return root
 
 
 def expect(document: dict[str, Any], key: str, expected: Any, label: str) -> None:
@@ -87,10 +131,14 @@ def validate_report(
     build: dict[str, Any],
     threads: int,
     engine_version: str,
+    binary_sha256: str | None,
+    actual_cpu_model: str | None,
 ) -> float:
     report = load_json(path, f"{label} report")
     expect(report, "engine_version", engine_version, label)
     expect(report, "build_id", build_id, label)
+    if binary_sha256 is not None:
+        expect(report, "binary_sha256", binary_sha256, label)
     if report.get("build") != build:
         fail(f"{label}.build does not match its manifest")
     expect(report, "warmup", 2, label)
@@ -115,6 +163,11 @@ def validate_report(
     cpu = environment.get("cpu_model")
     if not isinstance(cpu, str) or "M5 Max" not in cpu:
         fail(f"{label}.environment.cpu_model must identify an M5 Max, got {cpu!r}")
+    if actual_cpu_model is not None and cpu != actual_cpu_model:
+        fail(
+            f"{label}.environment.cpu_model does not match the detected host CPU: "
+            f"expected {actual_cpu_model!r}, got {cpu!r}"
+        )
 
     p50 = report.get("p50_ms")
     runs = report.get("runs")
@@ -134,7 +187,11 @@ def validate_report(
 
 
 def inspect_manifest(
-    path: Path, *, label: str, engine_version: str
+    path: Path,
+    *,
+    label: str,
+    engine_version: str,
+    actual_cpu_model: str | None = None,
 ) -> dict[str, Any]:
     manifest = load_json(path, f"{label} manifest")
     expect(manifest, "suite", "rustdb-baseline-v1", label)
@@ -148,13 +205,15 @@ def inspect_manifest(
             f"got {build_id!r}"
         )
     build = validate_build(manifest.get("build"), label)
-    harness = manifest.get("harness")
-    if not isinstance(harness, dict):
-        fail(f"{label}.harness must be an object")
-    for field in ("runner_sha256", "library_sha256", "checksum_runner_sha256"):
-        digest = harness.get(field)
-        if not isinstance(digest, str) or SHA256.fullmatch(digest) is None:
-            fail(f"{label}.harness.{field} must be a lowercase SHA-256")
+    validate_harness(manifest, path, label)
+    binary_sha256 = manifest.get("benchmark_binary_sha256")
+    if label == "candidate":
+        if not isinstance(binary_sha256, str) or SHA256.fullmatch(binary_sha256) is None:
+            fail(f"{label}.benchmark_binary_sha256 must be a lowercase SHA-256")
+    elif binary_sha256 is not None and (
+        not isinstance(binary_sha256, str) or SHA256.fullmatch(binary_sha256) is None
+    ):
+        fail(f"{label}.benchmark_binary_sha256 must be a lowercase SHA-256 when present")
 
     dataset = manifest.get("dataset")
     if not isinstance(dataset, dict) or not isinstance(dataset.get("generation"), dict):
@@ -164,6 +223,15 @@ def inspect_manifest(
     digest = dataset.get("manifest_sha256")
     if not isinstance(digest, str) or SHA256.fullmatch(digest) is None:
         fail(f"{label}.dataset.manifest_sha256 must be a lowercase SHA-256")
+    dataset_manifest = resolve_artifact(
+        path, dataset.get("manifest"), f"{label} dataset manifest"
+    )
+    actual_dataset_digest = sha256_file(dataset_manifest, f"{label} dataset manifest")
+    if actual_dataset_digest != digest:
+        fail(
+            f"{label}.dataset.manifest_sha256 does not match {dataset_manifest}: "
+            f"expected {digest}, got {actual_dataset_digest}"
+        )
 
     correctness = manifest.get("correctness")
     if not isinstance(correctness, dict) or correctness.get("verified") is not True:
@@ -211,6 +279,8 @@ def inspect_manifest(
                 build=build,
                 threads=threads,
                 engine_version=engine_version,
+                binary_sha256=binary_sha256 if label == "candidate" else None,
+                actual_cpu_model=actual_cpu_model,
             )
             checksum_path = resolve_artifact(
                 path, entry.get("checksum_report"), f"{label} checksum"
@@ -227,6 +297,7 @@ def inspect_manifest(
 
     return {
         "build_id": build_id,
+        "binary_sha256": binary_sha256,
         "dataset": {
             "generation": dataset["generation"],
             "manifest_sha256": digest,
@@ -241,10 +312,20 @@ def evaluate(
     baseline_path: Path,
     alpha2_build_id: str,
     candidate_build_id: str | None = None,
+    candidate_binary_sha256: str | None = None,
+    actual_cpu_model: str | None = None,
 ) -> dict[str, Any]:
-    baseline = inspect_manifest(baseline_path, label="baseline", engine_version="0.1.0")
+    baseline = inspect_manifest(
+        baseline_path,
+        label="baseline",
+        engine_version="0.1.0",
+        actual_cpu_model=actual_cpu_model,
+    )
     candidate = inspect_manifest(
-        candidate_path, label="candidate", engine_version="0.2.0-alpha.1"
+        candidate_path,
+        label="candidate",
+        engine_version="0.2.0-alpha.1",
+        actual_cpu_model=actual_cpu_model,
     )
     if baseline["build_id"] != alpha2_build_id:
         fail(
@@ -256,6 +337,15 @@ def evaluate(
         fail(
             "candidate build id does not match the current clean HEAD: "
             f"expected {candidate_build_id}, got {actual_candidate_id}"
+        )
+    if (
+        candidate_binary_sha256 is not None
+        and candidate["binary_sha256"] != candidate_binary_sha256
+    ):
+        fail(
+            "candidate benchmark executable does not match the executable rebuilt from "
+            f"the current clean HEAD: expected {candidate_binary_sha256}, "
+            f"got {candidate['binary_sha256']}"
         )
     if candidate["dataset"] != baseline["dataset"]:
         fail("candidate and alpha.2 baseline dataset fingerprints differ")

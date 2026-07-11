@@ -11,7 +11,7 @@ use futures::{StreamExt, stream};
 
 use super::{
     ScanRequest, ScanTask, TableProvider, TableStatistics,
-    csv_infer::{format, infer_table_schema, sample_byte_cap},
+    csv_infer::{format, infer_table_schema, infer_table_schema_against, sample_byte_cap},
     parquet_metadata::schema_memory_size,
     provider::prepare_object_sources,
 };
@@ -65,9 +65,56 @@ impl CsvTable {
         .await
     }
 
+    pub(crate) async fn try_new_for_query_with_registered_schema(
+        locations: Vec<String>,
+        inference_options: CsvOptions,
+        registered_schema: SchemaRef,
+        config: &EngineConfig,
+        context: Option<Arc<QueryContext>>,
+    ) -> Result<Self> {
+        if inference_options.schema.is_some() {
+            return Err(Error::Internal(
+                "registered CSV inference options unexpectedly contain a schema".to_owned(),
+            ));
+        }
+        let resolver = LocationResolver::with_memory_limit(config.s3.clone(), config.memory_limit);
+        let files = match context.as_deref() {
+            Some(context) => resolver.resolve_for_query(&locations, context).await?,
+            None => resolver.resolve(&locations).await?,
+        };
+        Self::from_files_checked(
+            files,
+            inference_options,
+            Some(registered_schema),
+            config.io_concurrency,
+            sample_byte_cap(config.memory_limit),
+            context,
+        )
+        .await
+    }
+
     pub async fn from_files(
         files: Vec<ObjectSource>,
         options: CsvOptions,
+        io_concurrency: usize,
+        sample_byte_cap: usize,
+        context: Option<Arc<QueryContext>>,
+    ) -> Result<Self> {
+        Self::from_files_checked(
+            files,
+            options,
+            None,
+            io_concurrency,
+            sample_byte_cap,
+            context,
+        )
+        .await
+    }
+
+    async fn from_files_checked(
+        files: Vec<ObjectSource>,
+        options: CsvOptions,
+        registered_schema: Option<SchemaRef>,
         io_concurrency: usize,
         sample_byte_cap: usize,
         context: Option<Arc<QueryContext>>,
@@ -92,8 +139,18 @@ impl CsvTable {
             }
         }
 
-        let (schema, has_header) =
-            infer_table_schema(&files, &options, sample_byte_cap, context.as_deref()).await?;
+        let (schema, has_header) = if let Some(registered_schema) = registered_schema {
+            infer_table_schema_against(
+                &files,
+                &options,
+                &registered_schema,
+                sample_byte_cap,
+                context.as_deref(),
+            )
+            .await?
+        } else {
+            infer_table_schema(&files, &options, sample_byte_cap, context.as_deref()).await?
+        };
         let schema_reservation = context
             .as_ref()
             .map(|context| {
