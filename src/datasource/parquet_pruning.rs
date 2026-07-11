@@ -8,34 +8,24 @@ use parquet::{
 
 use super::{ComparisonOp, PredicateValue, ScanPredicate};
 
-pub(super) fn row_groups_for_predicate(
+pub(super) fn can_prune_row_group(
     metadata: &ParquetMetaData,
     parquet_schema: &SchemaDescriptor,
     file_schema: &Schema,
     table_schema: &Schema,
+    row_group: usize,
     predicate: Option<&ScanPredicate>,
-) -> (Vec<usize>, u64) {
-    let Some(predicate) = predicate else {
-        return ((0..metadata.num_row_groups()).collect(), 0);
-    };
-
-    let mut selected = Vec::with_capacity(metadata.num_row_groups());
-    let mut pruned = 0_u64;
-    for index in 0..metadata.num_row_groups() {
-        if can_prune(
+) -> bool {
+    predicate.is_some_and(|predicate| {
+        can_prune(
             metadata,
             parquet_schema,
             file_schema,
             table_schema,
-            index,
+            row_group,
             predicate,
-        ) {
-            pruned = pruned.saturating_add(1);
-        } else {
-            selected.push(index);
-        }
-    }
-    (selected, pruned)
+        )
+    })
 }
 
 fn can_prune(
@@ -99,15 +89,15 @@ fn column_statistics<'a>(
 ) -> Option<(&'a Statistics, &'a DataType, u64)> {
     let table_field = table_schema.fields().get(table_column)?;
     let file_column = file_schema.index_of(table_field.name()).ok()?;
-    let leaves: Vec<_> = (0..parquet_schema.num_columns())
-        .filter(|leaf| parquet_schema.get_column_root_idx(*leaf) == file_column)
-        .collect();
-    let [leaf] = leaves.as_slice() else {
+    let mut leaves = (0..parquet_schema.num_columns())
+        .filter(|leaf| parquet_schema.get_column_root_idx(*leaf) == file_column);
+    let leaf = leaves.next()?;
+    if leaves.next().is_some() {
         return None;
-    };
+    }
     let group = metadata.row_group(row_group);
     let rows = u64::try_from(group.num_rows()).ok()?;
-    let statistics = group.column(*leaf).statistics()?;
+    let statistics = group.column(leaf).statistics()?;
     Some((statistics, file_schema.field(file_column).data_type(), rows))
 }
 

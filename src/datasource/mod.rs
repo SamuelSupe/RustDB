@@ -3,6 +3,7 @@ mod csv_infer;
 mod hive;
 mod metadata_cache;
 mod parquet;
+mod parquet_metadata;
 mod parquet_pruning;
 mod parquet_reader;
 mod parquet_scan;

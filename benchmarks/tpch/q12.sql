@@ -5,10 +5,10 @@ SELECT l_shipmode,
        sum(CASE WHEN o_orderpriority <> '1-URGENT'
                       AND o_orderpriority <> '2-HIGH'
                 THEN 1 ELSE 0 END) AS low_line_count
-FROM read_parquet('__TPCH_ROOT__/orders/*.parquet') AS orders,
-     read_parquet('__TPCH_ROOT__/lineitem/*.parquet') AS lineitem
-WHERE o_orderkey = l_orderkey
-  AND l_shipmode IN ('MAIL', 'SHIP')
+FROM read_parquet('__TPCH_ROOT__/orders/*.parquet') AS orders
+JOIN read_parquet('__TPCH_ROOT__/lineitem/*.parquet') AS lineitem
+  ON o_orderkey = l_orderkey
+WHERE l_shipmode IN ('MAIL', 'SHIP')
   AND l_commitdate < l_receiptdate
   AND l_shipdate < l_commitdate
   AND l_receiptdate >= DATE '1994-01-01'

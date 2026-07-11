@@ -1,0 +1,231 @@
+use std::{fs::File, sync::Arc};
+
+use arrow::{
+    array::{Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
+use futures::TryStreamExt;
+use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+use tempfile::tempdir;
+
+use super::ParquetTable;
+use crate::{
+    EngineConfig, Error, ParquetOptions,
+    datasource::parquet_scan::align_batch,
+    datasource::{
+        ComparisonOp, MetadataCache, PredicateValue, ScanPredicate, ScanRequest, TableProvider,
+    },
+    runtime::{MemoryPool, QueryContext},
+};
+
+#[test]
+fn alignment_fills_missing_union_columns_with_null() {
+    let source_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+    )
+    .unwrap();
+    let target = Arc::new(Schema::new(vec![
+        Field::new("missing", DataType::Utf8, true),
+        Field::new("a", DataType::Int64, false),
+    ]));
+
+    let aligned = align_batch(batch, &target, None, 0).unwrap();
+    assert_eq!(aligned.num_rows(), 2);
+    assert_eq!(aligned.column(0).null_count(), 2);
+    assert_eq!(aligned.schema(), target);
+}
+
+#[tokio::test]
+async fn applies_projection_limit_and_row_group_pruning() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("events.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+        ],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let config = EngineConfig::default();
+    let table = ParquetTable::try_new_with_cache(
+        vec![path.to_string_lossy().into_owned()],
+        ParquetOptions::default(),
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+    )
+    .await
+    .unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    let mut request = ScanRequest::new(2);
+    request.projection = Some(vec![1]);
+    request.limit = Some(3);
+    table.prepare(Arc::clone(&context)).await.unwrap();
+    context.seal_object_snapshots();
+    let batches = table
+        .scan(request, Arc::clone(&context))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        3
+    );
+    assert!(
+        batches
+            .iter()
+            .all(|batch| batch.schema().field(0).name() == "name")
+    );
+    assert_eq!(context.metrics.snapshot().rows_scanned, 3);
+
+    let pruning_context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    let mut request = ScanRequest::new(2);
+    request.predicate = Some(ScanPredicate::Comparison {
+        column: 0,
+        op: ComparisonOp::Gt,
+        value: PredicateValue::Int64(10),
+    });
+    table.prepare(Arc::clone(&pruning_context)).await.unwrap();
+    pruning_context.seal_object_snapshots();
+    let batches = table
+        .scan(request, Arc::clone(&pruning_context))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(batches.is_empty());
+    assert_eq!(pruning_context.metrics.snapshot().row_groups_pruned, 2);
+}
+
+#[tokio::test]
+async fn refreshes_object_identity_between_queries() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("changing.parquet");
+    write_ids(&path, &[1]);
+    let config = EngineConfig::default();
+    let table = ParquetTable::try_new_with_cache(
+        vec![path.to_string_lossy().into_owned()],
+        ParquetOptions::default(),
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(scan_rows(&table, directory.path()).await, 1);
+    write_ids(&path, &[1, 2, 3]);
+    assert_eq!(scan_rows(&table, directory.path()).await, 3);
+}
+
+#[tokio::test]
+async fn query_schema_reservation_lives_with_table() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("schema-lease.parquet");
+    write_ids(&path, &[1, 2]);
+    let config = EngineConfig::default();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    let table = ParquetTable::try_new_with_cache_for_query(
+        vec![path.to_string_lossy().into_owned()],
+        ParquetOptions::default(),
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+        Some(Arc::clone(&context)),
+    )
+    .await
+    .unwrap();
+
+    let held = table
+        ._schema_reservation
+        .as_ref()
+        .expect("query schema reservation")
+        .size();
+    let before_drop = context.memory.used();
+    assert!(held > 0);
+    drop(table);
+    assert_eq!(context.memory.used(), before_drop - held);
+}
+
+#[tokio::test]
+async fn registration_rejects_schema_over_derived_limit() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("bounded-schema.parquet");
+    write_ids(&path, &[1]);
+    let config = EngineConfig {
+        memory_limit: 1024 * 1024,
+        ..EngineConfig::default()
+    };
+    let options = ParquetOptions {
+        schema: Some(Arc::new(Schema::new(vec![Field::new(
+            "x".repeat(100_000),
+            DataType::Int64,
+            false,
+        )]))),
+        ..ParquetOptions::default()
+    };
+    let result = ParquetTable::try_new_with_cache(
+        vec![path.to_string_lossy().into_owned()],
+        options,
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+    )
+    .await;
+
+    let message = match result {
+        Err(Error::ResourceExhausted(message)) => message,
+        Err(error) => panic!("expected a resource exhausted error, got {error}"),
+        Ok(_) => panic!("schema must be rejected"),
+    };
+    assert!(message.contains("table schema"));
+    assert!(message.contains("requires"));
+    assert!(message.contains("available"));
+}
+
+fn write_ids(path: &std::path::Path, values: &[i64]) {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(values.to_vec()))],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+async fn scan_rows(table: &ParquetTable, spill_root: &std::path::Path) -> usize {
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), spill_root).unwrap());
+    table.prepare(Arc::clone(&context)).await.unwrap();
+    context.seal_object_snapshots();
+    table
+        .scan(ScanRequest::new(2), context)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum()
+}

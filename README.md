@@ -71,4 +71,5 @@ See [architecture.md](docs/architecture.md) for the execution model and
 [s3.md](docs/s3.md) covers AWS and MinIO configuration, and
 [troubleshooting.md](docs/troubleshooting.md) covers resource, spill, and input
 errors. The repeatable benchmark workflow is documented in
-[benchmarks/README.md](benchmarks/README.md).
+[benchmarks/README.md](benchmarks/README.md), and the release gates are listed
+in [acceptance.md](docs/acceptance.md).

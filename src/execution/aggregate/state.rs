@@ -49,7 +49,7 @@ pub(super) enum AggregateState {
     AvgDecimal {
         sum: i128,
         count: u64,
-        precision: u8,
+        scale: i8,
     },
 }
 
@@ -78,14 +78,16 @@ impl AggregateState {
             },
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg => match expression.data_type {
-                DataType::Decimal128(precision, _) => Self::AvgDecimal {
-                    sum: 0,
-                    count: 0,
-                    precision,
-                },
-                _ => Self::Avg { sum: 0.0, count: 0 },
-            },
+            AggregateFunction::Avg => {
+                match expression.expr.as_ref().map(|input| &input.data_type) {
+                    Some(DataType::Decimal128(_, scale)) => Self::AvgDecimal {
+                        sum: 0,
+                        count: 0,
+                        scale: *scale,
+                    },
+                    _ => Self::Avg { sum: 0.0, count: 0 },
+                }
+            }
         }
     }
 
@@ -193,11 +195,9 @@ impl AggregateState {
             }
             Self::Avg { sum, count } => Ok(CellValue::Float64(*sum / *count as f64)),
             Self::AvgDecimal { count: 0, .. } => Ok(CellValue::Null),
-            Self::AvgDecimal {
-                sum,
-                count,
-                precision,
-            } => decimal_value(*sum / i128::from(*count), *precision, "average"),
+            Self::AvgDecimal { sum, count, scale } => Ok(CellValue::Float64(
+                (*sum as f64 / *count as f64) * 10_f64.powi(-i32::from(*scale)),
+            )),
         }
     }
 
@@ -206,35 +206,21 @@ impl AggregateState {
             Self::Avg { sum, count } => {
                 Ok(vec![CellValue::Float64(*sum), CellValue::UInt64(*count)])
             }
-            Self::AvgDecimal { sum, count, .. } => Ok(vec![
-                decimal_value(*sum, 38, "partial average sum")?,
-                CellValue::UInt64(*count),
-            ]),
-            Self::SumSigned { value, seen } => Ok(vec![
-                CellValue::Int64(
-                    i64::try_from(*value)
-                        .map_err(|_| Error::Execution("partial sum overflowed INT64".into()))?,
-                ),
-                CellValue::Boolean(*seen),
-            ]),
-            Self::SumUnsigned { value, seen } => Ok(vec![
-                CellValue::UInt64(
-                    u64::try_from(*value)
-                        .map_err(|_| Error::Execution("partial sum overflowed UINT64".into()))?,
-                ),
-                CellValue::Boolean(*seen),
-            ]),
+            Self::AvgDecimal { sum, count, .. } => {
+                Ok(vec![encode_i128(*sum), CellValue::UInt64(*count)])
+            }
+            Self::SumSigned { value, seen } => {
+                Ok(vec![encode_i128(*value), CellValue::Boolean(*seen)])
+            }
+            Self::SumUnsigned { value, seen } => {
+                Ok(vec![encode_u128(*value), CellValue::Boolean(*seen)])
+            }
             Self::SumFloat { value, seen } => {
                 Ok(vec![CellValue::Float64(*value), CellValue::Boolean(*seen)])
             }
-            Self::SumDecimal {
-                value,
-                seen,
-                precision,
-            } => Ok(vec![
-                decimal_value(*value, *precision, "partial sum")?,
-                CellValue::Boolean(*seen),
-            ]),
+            Self::SumDecimal { value, seen, .. } => {
+                Ok(vec![encode_i128(*value), CellValue::Boolean(*seen)])
+            }
             _ => Ok(vec![self.finish()?]),
         }
     }
@@ -276,9 +262,7 @@ impl AggregateState {
                 let partial_sum = cell(batch.column(*column), row)?;
                 let partial_count = cell(batch.column(*column + 1), row)?;
                 *column += 2;
-                let CellValue::Decimal128(partial_sum) = partial_sum else {
-                    return Err(unexpected_value(expression, &partial_sum));
-                };
+                let partial_sum = decode_i128(expression, partial_sum)?;
                 let CellValue::UInt64(partial_count) = partial_count else {
                     return Err(unexpected_value(expression, &partial_count));
                 };
@@ -297,13 +281,11 @@ impl AggregateState {
                 let partial = cell(batch.column(*column), row)?;
                 let partial_seen = cell(batch.column(*column + 1), row)?;
                 *column += 2;
-                let CellValue::Int64(partial) = partial else {
-                    return Err(unexpected_value(expression, &partial));
-                };
+                let partial = decode_i128(expression, partial)?;
                 let CellValue::Boolean(partial_seen) = partial_seen else {
                     return Err(unexpected_value(expression, &partial_seen));
                 };
-                *value = value.checked_add(i128::from(partial)).ok_or_else(|| {
+                *value = value.checked_add(partial).ok_or_else(|| {
                     Error::Execution("sum overflow while merging spill partitions".into())
                 })?;
                 *seen |= partial_seen;
@@ -312,13 +294,11 @@ impl AggregateState {
                 let partial = cell(batch.column(*column), row)?;
                 let partial_seen = cell(batch.column(*column + 1), row)?;
                 *column += 2;
-                let CellValue::UInt64(partial) = partial else {
-                    return Err(unexpected_value(expression, &partial));
-                };
+                let partial = decode_u128(expression, partial)?;
                 let CellValue::Boolean(partial_seen) = partial_seen else {
                     return Err(unexpected_value(expression, &partial_seen));
                 };
-                *value = value.checked_add(u128::from(partial)).ok_or_else(|| {
+                *value = value.checked_add(partial).ok_or_else(|| {
                     Error::Execution("sum overflow while merging spill partitions".into())
                 })?;
                 *seen |= partial_seen;
@@ -340,9 +320,7 @@ impl AggregateState {
                 let partial = cell(batch.column(*column), row)?;
                 let partial_seen = cell(batch.column(*column + 1), row)?;
                 *column += 2;
-                let CellValue::Decimal128(partial) = partial else {
-                    return Err(unexpected_value(expression, &partial));
-                };
+                let partial = decode_i128(expression, partial)?;
                 let CellValue::Boolean(partial_seen) = partial_seen else {
                     return Err(unexpected_value(expression, &partial_seen));
                 };
@@ -359,6 +337,35 @@ impl AggregateState {
         }
         Ok(())
     }
+}
+
+fn encode_i128(value: i128) -> CellValue {
+    CellValue::Binary(value.to_le_bytes().to_vec())
+}
+
+fn encode_u128(value: u128) -> CellValue {
+    CellValue::Binary(value.to_le_bytes().to_vec())
+}
+
+fn decode_i128(expression: &AggregateExpr, value: CellValue) -> Result<i128> {
+    decode_128(expression, value).map(i128::from_le_bytes)
+}
+
+fn decode_u128(expression: &AggregateExpr, value: CellValue) -> Result<u128> {
+    decode_128(expression, value).map(u128::from_le_bytes)
+}
+
+fn decode_128(expression: &AggregateExpr, value: CellValue) -> Result<[u8; 16]> {
+    let CellValue::Binary(bytes) = value else {
+        return Err(unexpected_value(expression, &value));
+    };
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        Error::Execution(format!(
+            "aggregate {} found a {}-byte 128-bit spill partial",
+            expression.display_name,
+            bytes.len()
+        ))
+    })
 }
 
 fn update_extreme(

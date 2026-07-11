@@ -8,7 +8,7 @@ use std::{
 use arrow::{
     compute::interleave_record_batch,
     datatypes::SchemaRef,
-    ipc::reader::FileReader,
+    ipc::reader::StreamReader,
     record_batch::RecordBatch,
     row::{RowConverter, Rows},
 };
@@ -32,7 +32,7 @@ impl RunCursor {
     fn open(file: &SpillFile) -> Result<Self> {
         let input = File::open(file.path())
             .map_err(|error| Error::io(Some(file.path().to_path_buf()), error))?;
-        let reader = FileReader::try_new_buffered(input, None)?;
+        let reader = StreamReader::try_new_buffered(input, None)?;
         Ok(Self {
             reader: Box::new(reader),
             batch: None,

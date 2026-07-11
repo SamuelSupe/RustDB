@@ -1,7 +1,4 @@
 use std::{
-    collections::HashSet,
-    fs::{File, OpenOptions},
-    io::BufWriter,
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
@@ -10,22 +7,25 @@ use std::{
 };
 
 use arrow::{
-    datatypes::SchemaRef,
-    ipc::{
-        CompressionType,
-        reader::FileReader,
-        writer::{FileWriter, IpcWriteOptions},
-    },
+    datatypes::{Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::{Error, Result};
 
-use super::{QueryControl, QueryMetrics};
+use super::{MemoryPool, QueryControl, QueryMetrics};
 #[cfg(test)]
 use super::{RecordBatchStream, boxed_record_batch_stream};
+
+mod io;
+mod metadata;
+
+use io::SpillReader;
+pub(crate) use io::SpillWriter;
+#[cfg(test)]
+use io::writer_memory_bytes;
+use metadata::ActiveFiles;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SpillFile {
@@ -46,7 +46,8 @@ pub struct SpillManager {
 #[derive(Debug)]
 struct State {
     directory: PathBuf,
-    files: Mutex<HashSet<PathBuf>>,
+    memory: MemoryPool,
+    files: ActiveFiles,
     next_file: AtomicU64,
     cleaned: AtomicBool,
     metrics: Option<QueryMetrics>,
@@ -54,17 +55,18 @@ struct State {
 
 impl SpillManager {
     #[cfg(test)]
-    pub fn new(spill_root: impl AsRef<Path>) -> Result<Self> {
-        Self::create(spill_root, Uuid::new_v4(), None)
+    pub fn new(spill_root: impl AsRef<Path>, memory: MemoryPool) -> Result<Self> {
+        Self::create(spill_root, Uuid::new_v4(), memory, None)
     }
 
     pub fn for_query(
         spill_root: impl AsRef<Path>,
         query_id: Uuid,
         control: &QueryControl,
+        memory: MemoryPool,
         metrics: Option<QueryMetrics>,
     ) -> Result<Self> {
-        let manager = Self::create(spill_root, query_id, metrics)?;
+        let manager = Self::create(spill_root, query_id, memory, metrics)?;
         let state = Arc::downgrade(&manager.state);
         control.register_cleanup(move || cleanup_weak(state));
         control.check_cancelled()?;
@@ -74,14 +76,15 @@ impl SpillManager {
     fn create(
         spill_root: impl AsRef<Path>,
         query_id: Uuid,
+        memory: MemoryPool,
         metrics: Option<QueryMetrics>,
     ) -> Result<Self> {
         let root = spill_root.as_ref();
         std::fs::create_dir_all(root)
             .map_err(|error| Error::io(Some(root.to_path_buf()), error))?;
         let directory = root.join(format!("query-{query_id}"));
-        create_query_directory(&directory)?;
-        if let Err(error) = set_directory_permissions(&directory) {
+        io::create_query_directory(&directory)?;
+        if let Err(error) = io::set_directory_permissions(&directory) {
             let _ = std::fs::remove_dir_all(&directory);
             return Err(error);
         }
@@ -89,7 +92,8 @@ impl SpillManager {
         Ok(Self {
             state: Arc::new(State {
                 directory,
-                files: Mutex::new(HashSet::new()),
+                memory: memory.clone(),
+                files: ActiveFiles::new(memory),
                 next_file: AtomicU64::new(0),
                 cleaned: AtomicBool::new(false),
                 metrics,
@@ -105,27 +109,14 @@ impl SpillManager {
     where
         I: IntoIterator<Item = Result<RecordBatch>>,
     {
-        self.ensure_active()?;
-        let spill_file = self.allocate_file(label)?;
-        let result = self.write_batches_to(&spill_file, schema, batches);
-        if let Err(error) = result {
-            self.remove_file(&spill_file);
-            return Err(error);
+        let mut writer = self.writer(label, schema)?;
+        for batch in batches {
+            writer.write_batch(&batch?)?;
         }
-
-        let bytes = match std::fs::metadata(spill_file.path()) {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                self.remove_file(&spill_file);
-                return Err(Error::io(Some(spill_file.path.clone()), error));
-            }
-        };
-        if let Some(metrics) = &self.state.metrics {
-            metrics.record_spill(bytes, 1);
-        }
-        Ok(spill_file)
+        writer.finish(1)
     }
 
+    #[cfg(test)]
     pub fn write_record_batches<I>(
         &self,
         label: &str,
@@ -138,68 +129,45 @@ impl SpillManager {
         self.write_batches(label, schema, batches.into_iter().map(Ok))
     }
 
-    fn write_batches_to<I>(
-        &self,
-        spill_file: &SpillFile,
-        schema: SchemaRef,
-        batches: I,
-    ) -> Result<()>
-    where
-        I: IntoIterator<Item = Result<RecordBatch>>,
-    {
-        let file = secure_create(spill_file.path())?;
-        let options =
-            IpcWriteOptions::default().try_with_compression(Some(CompressionType::LZ4_FRAME))?;
-        let mut writer =
-            FileWriter::try_new_with_options(BufWriter::new(file), schema.as_ref(), options)?;
-        for batch in batches {
-            self.ensure_active()?;
-            writer.write(&batch?)?;
-        }
-        writer.finish()?;
-        Ok(())
+    pub(crate) fn writer(&self, label: &str, schema: SchemaRef) -> Result<SpillWriter> {
+        self.ensure_active()?;
+        let writer_memory = io::reserve_writer_memory(&self.state.memory, schema.as_ref())?;
+        let spill_file = self.allocate_file(label)?;
+        SpillWriter::create(Arc::clone(&self.state), spill_file, schema, writer_memory)
     }
 
+    pub(crate) fn writer_headroom_bytes(&self, label: &str, schema: &Schema) -> usize {
+        io::writer_memory_bytes(schema).saturating_add(metadata::active_file_metadata_bytes(
+            &self.spill_path(u64::MAX, label),
+        ))
+    }
+
+    #[cfg(test)]
     pub fn read_batches(&self, spill_file: &SpillFile) -> Result<Vec<RecordBatch>> {
+        self.read_file(spill_file)?.collect()
+    }
+
+    pub(crate) fn read_file(
+        &self,
+        spill_file: &SpillFile,
+    ) -> Result<impl Iterator<Item = Result<RecordBatch>> + use<>> {
         self.ensure_active()?;
         self.validate_file(spill_file)?;
-        let file = File::open(spill_file.path())
-            .map_err(|error| Error::io(Some(spill_file.path.clone()), error))?;
-        let reader = FileReader::try_new_buffered(file, None)?;
-        let mut batches = Vec::new();
-        for batch in reader {
-            self.ensure_active()?;
-            batches.push(batch?);
-        }
-        Ok(batches)
+        SpillReader::open(Arc::clone(&self.state), spill_file)
     }
 
     #[cfg(test)]
     pub fn read_stream(&self, spill_file: &SpillFile) -> Result<RecordBatchStream> {
-        self.ensure_active()?;
-        self.validate_file(spill_file)?;
-        let file = File::open(spill_file.path())
-            .map_err(|error| Error::io(Some(spill_file.path.clone()), error))?;
-        let reader = FileReader::try_new_buffered(file, None)?;
-        let state = Arc::downgrade(&self.state);
+        let reader = self.read_file(spill_file)?;
         Ok(boxed_record_batch_stream(async_stream::try_stream! {
             for batch in reader {
-                match state.upgrade() {
-                    Some(state) if !state.cleaned.load(Ordering::Acquire) => {}
-                    _ => Err(Error::Cancelled)?,
-                }
                 yield batch?;
             }
         }))
     }
 
     pub fn remove_file(&self, spill_file: &SpillFile) {
-        self.state.files.lock().remove(spill_file.path());
-        match std::fs::remove_file(spill_file.path()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {}
-        }
+        self.state.remove_file(spill_file);
     }
 
     pub fn cleanup(&self) -> Result<()> {
@@ -209,17 +177,20 @@ impl SpillManager {
     fn allocate_file(&self, label: &str) -> Result<SpillFile> {
         self.ensure_active()?;
         let sequence = self.state.next_file.fetch_add(1, Ordering::Relaxed);
-        let label = safe_label(label);
-        let path = self
-            .state
-            .directory
-            .join(format!("{sequence:08}-{label}.arrow"));
-        self.state.files.lock().insert(path.clone());
+        let path = self.spill_path(sequence, label);
+        self.state.files.insert(path.clone(), &self.state.cleaned)?;
         Ok(SpillFile { path })
     }
 
+    fn spill_path(&self, sequence: u64, label: &str) -> PathBuf {
+        let label = io::safe_label(label);
+        self.state
+            .directory
+            .join(format!("{sequence:08}-{label}.arrow"))
+    }
+
     fn validate_file(&self, spill_file: &SpillFile) -> Result<()> {
-        if self.state.files.lock().contains(spill_file.path())
+        if self.state.files.contains(spill_file.path())
             && spill_file.path().parent() == Some(self.directory())
         {
             Ok(())
@@ -241,13 +212,47 @@ impl SpillManager {
 }
 
 impl State {
+    fn ensure_active(&self) -> Result<()> {
+        if self.cleaned.load(Ordering::Acquire) {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remove_file(&self, spill_file: &SpillFile) {
+        self.files.remove(spill_file.path());
+        match std::fs::remove_file(spill_file.path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+
     fn cleanup(&self) -> Result<()> {
         self.cleaned.store(true, Ordering::Release);
-        self.files.lock().clear();
+        self.files.clear();
         match std::fs::remove_dir_all(&self.directory) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::io(Some(self.directory.clone()), error)),
+        }
+        // Some shared filesystems can expose an empty directory briefly after
+        // remove_dir_all reports success. A second root removal plus a parent
+        // directory sync makes query completion a durable cleanup boundary.
+        match std::fs::remove_dir(&self.directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::io(Some(self.directory.clone()), error)),
+        }
+        io::sync_parent_directory(&self.directory)?;
+        match std::fs::symlink_metadata(&self.directory) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::io(Some(self.directory.clone()), error)),
+            Ok(_) => Err(Error::Execution(format!(
+                "spill directory '{}' remained after cleanup",
+                self.directory.display()
+            ))),
         }
     }
 }
@@ -262,55 +267,6 @@ fn cleanup_weak(state: Weak<State>) {
     if let Some(state) = state.upgrade() {
         let _ = state.cleanup();
     }
-}
-
-fn safe_label(label: &str) -> String {
-    let label: String = label
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        .take(48)
-        .collect();
-    if label.is_empty() {
-        "spill".to_owned()
-    } else {
-        label
-    }
-}
-
-fn secure_create(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|error| Error::io(Some(path.to_path_buf()), error))
-}
-
-fn create_query_directory(path: &Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(path)
-        .map_err(|error| Error::io(Some(path.to_path_buf()), error))
-}
-
-fn set_directory_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(path, permissions)
-            .map_err(|error| Error::io(Some(path.to_path_buf()), error))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

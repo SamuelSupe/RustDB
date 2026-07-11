@@ -56,16 +56,14 @@ pub(crate) fn join(
             let bytes = batch.get_array_memory_size();
             if reservation.try_grow(bytes).is_err() {
                 reservation.try_resize(0)?;
-                let mut partitions = spill::empty_partitions();
+                let mut spiller = spill::PartitionSpiller::new(&context, "join-right");
                 for buffered in right_batches.drain(..) {
                     spill::spill_batch(
                         buffered,
                         &right_key_expressions,
                         Side::Right,
                         join_type,
-                        &mut partitions,
-                        &context,
-                        "join-right",
+                        &mut spiller,
                         0,
                     )?;
                 }
@@ -74,9 +72,7 @@ pub(crate) fn join(
                     &right_key_expressions,
                     Side::Right,
                     join_type,
-                    &mut partitions,
-                    &context,
-                    "join-right",
+                    &mut spiller,
                     0,
                 )?;
                 while let Some(batch) = right.next().await {
@@ -85,13 +81,11 @@ pub(crate) fn join(
                         &right_key_expressions,
                         Side::Right,
                         join_type,
-                        &mut partitions,
-                        &context,
-                        "join-right",
+                        &mut spiller,
                         0,
                     )?;
                 }
-                right_partitions = Some(partitions);
+                right_partitions = Some(spiller.finish()?);
                 break;
             }
             right_bytes = right_bytes.saturating_add(bytes);
@@ -106,20 +100,18 @@ pub(crate) fn join(
                 .is_err()
             {
                 reservation.try_resize(0)?;
-                let mut partitions = spill::empty_partitions();
+                let mut spiller = spill::PartitionSpiller::new(&context, "join-right");
                 for batch in right_batches.drain(..) {
                     spill::spill_batch(
                         batch,
                         &right_key_expressions,
                         Side::Right,
                         join_type,
-                        &mut partitions,
-                        &context,
-                        "join-right",
+                        &mut spiller,
                         0,
                     )?;
                 }
-                right_partitions = Some(partitions);
+                right_partitions = Some(spiller.finish()?);
             }
         }
 
@@ -132,10 +124,12 @@ pub(crate) fn join(
                 &context,
                 "join-left",
             ).await?;
-            let mut pending = spill::initial_tasks(left_partitions, right_partitions)
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>();
+            let initial = spill::initial_tasks(left_partitions, right_partitions);
+            context.metrics.record_spill(
+                0,
+                u64::try_from(initial.len()).unwrap_or(u64::MAX),
+            );
+            let mut pending = initial.into_iter().rev().collect::<Vec<_>>();
             while let Some(task) = pending.pop() {
                 context.check_cancelled()?;
                 match spill::load_build_partition(
@@ -152,7 +146,8 @@ pub(crate) fn join(
                             matches!(join_type, JoinType::Semi | JoinType::Anti),
                         )?;
                         for file in &task.left {
-                            for left_batch in context.spill.read_batches(file)? {
+                            for left_batch in context.spill.read_file(file)? {
+                                let left_batch = left_batch?;
                                 let left_keys = evaluate_keys(&left_key_expressions, &left_batch)?;
                                 let mut probe = ProbeCursor::new(
                                     &left_batch,

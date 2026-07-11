@@ -11,5 +11,6 @@ pub use context::QueryContext;
 pub use control::QueryControl;
 pub use memory::{MemoryPool, MemoryReservation};
 pub use metrics::{QueryMetrics, QueryMetricsSnapshot};
+pub(crate) use spill::SpillWriter;
 pub use spill::{SpillFile, SpillManager};
 pub use stream::{RecordBatchStream, boxed_record_batch_stream};

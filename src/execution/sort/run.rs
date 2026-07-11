@@ -15,6 +15,8 @@ use crate::{Error, Result};
 use super::merge::MergeIterator;
 use super::{MERGE_FAN_IN, empty_columns_batch, evaluate_keys};
 
+pub(super) const MAX_PENDING_RUNS: usize = MERGE_FAN_IN;
+
 pub(super) fn sort_batches(
     batches: &[RecordBatch],
     expressions: &[SortExpr],
@@ -57,10 +59,11 @@ pub(super) fn spill_run(
     schema: &SchemaRef,
     context: &QueryContext,
     batch_size: usize,
+    merge_memory_limit: usize,
 ) -> Result<(SpillFile, usize)> {
     context.check_cancelled()?;
     let sorted = sort_batches(batches, expressions, converter, fetch, schema)?;
-    let chunk_rows = spill_chunk_rows(&sorted, batch_size, context.memory.limit());
+    let chunk_rows = spill_chunk_rows(&sorted, batch_size, merge_memory_limit);
     let chunks = (0..sorted.num_rows())
         .step_by(chunk_rows)
         .map(|offset| Ok(sorted.slice(offset, chunk_rows.min(sorted.num_rows() - offset))));
@@ -78,8 +81,10 @@ fn spill_chunk_rows(batch: &RecordBatch, batch_size: usize, memory_limit: usize)
         .get_array_memory_size()
         .saturating_add(batch.num_rows() - 1)
         / batch.num_rows();
+    // A merge keeps one decoded batch and its row keys per input run. Leave
+    // another half of the merge pool for those keys and the output batch.
     let target = memory_limit
-        .checked_div(MERGE_FAN_IN.saturating_mul(4))
+        .checked_div(MERGE_FAN_IN.saturating_mul(8))
         .unwrap_or(0)
         .max(bytes_per_row);
     batch_size.min(target / bytes_per_row.max(1)).max(1)
@@ -127,6 +132,32 @@ pub(super) fn compact_runs(
     Ok(runs)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compact_pending_runs(
+    cleanup: &mut RunCleanup,
+    expressions: &[SortExpr],
+    fetch: Option<usize>,
+    schema: &SchemaRef,
+    context: &Arc<QueryContext>,
+    pool: &MemoryPool,
+    batch_size: usize,
+) -> Result<()> {
+    if cleanup.len() <= MAX_PENDING_RUNS {
+        return Ok(());
+    }
+    compact_runs(
+        cleanup.files(),
+        cleanup,
+        expressions,
+        fetch,
+        schema,
+        context,
+        pool,
+        batch_size,
+    )?;
+    Ok(())
+}
+
 pub(super) struct RunCleanup {
     spill: SpillManager,
     files: Vec<SpillFile>,
@@ -151,6 +182,10 @@ impl RunCleanup {
 
     pub(super) fn files(&self) -> Vec<SpillFile> {
         self.files.clone()
+    }
+
+    fn len(&self) -> usize {
+        self.files.len()
     }
 
     pub(super) fn is_empty(&self) -> bool {

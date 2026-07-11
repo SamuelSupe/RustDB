@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality-linux-x64:
+    name: Quality and MinIO (Linux x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: scripts/ci/install-rust.sh
+      - name: Cache Cargo sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+      - name: Formatting and strict Clippy
+        run: scripts/ci/check.sh lint
+      - name: All-target tests with live MinIO
+        run: scripts/ci/with_minio.sh scripts/ci/check.sh test
+      - name: Release build
+        run: scripts/ci/check.sh release
+
+  native-portability:
+    name: Native portability (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+          - name: macOS arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: scripts/ci/install-rust.sh
+      - name: Cache Cargo sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+      - name: Native all-target tests
+        run: scripts/ci/check.sh portable
+      - name: Native release build
+        run: scripts/ci/check.sh release

@@ -7,12 +7,11 @@ use arrow::{
 };
 use async_stream::try_stream;
 use futures::{StreamExt, stream::BoxStream};
-use parquet::arrow::{
-    ParquetRecordBatchStreamBuilder, ProjectionMask, arrow_reader::ArrowReaderMetadata,
-};
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 
 use super::{
     hive::HivePartitions,
+    parquet_metadata::ParquetMetadata,
     parquet_reader::{QueryIo, SnapshotParquetReader},
 };
 use crate::{
@@ -25,7 +24,7 @@ pub(super) struct ParquetMorsel {
     pub(super) file_index: usize,
     pub(super) file: ObjectSource,
     pub(super) snapshot: ObjectSnapshot,
-    pub(super) metadata: ArrowReaderMetadata,
+    pub(super) metadata: ParquetMetadata,
     pub(super) projection: Vec<usize>,
     pub(super) row_group: usize,
     pub(super) row_limit: Option<usize>,
@@ -88,6 +87,7 @@ fn morsel_stream(
 ) -> RecordBatchStream {
     boxed_record_batch_stream(try_stream! {
         context.check_cancelled()?;
+        let metadata = morsel.metadata;
         let reader = SnapshotParquetReader::new(
             &morsel.file,
             morsel.snapshot,
@@ -97,12 +97,12 @@ fn morsel_stream(
             )),
         );
         let mask = ProjectionMask::roots(
-            morsel.metadata.parquet_schema(),
+            metadata.reader_metadata().parquet_schema(),
             morsel.projection,
         );
         let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
             reader,
-            morsel.metadata,
+            metadata.reader_metadata().clone(),
         )
         .with_batch_size(batch_size)
         .with_projection(mask)
@@ -127,6 +127,7 @@ fn morsel_stream(
             );
             yield batch;
         }
+        drop(metadata);
     })
 }
 

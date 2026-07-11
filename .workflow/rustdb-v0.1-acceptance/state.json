@@ -1,0 +1,16 @@
+{
+  "title": "RustDB v0.1 acceptance and baseline",
+  "slug": "rustdb-v0.1-acceptance",
+  "status": "in_progress",
+  "approval": "user_requested_execution",
+  "baseline_commit": "74194ab",
+  "baseline_tag": "v0.1.0-alpha.1",
+  "packets": {
+    "baseline_git": "completed",
+    "tpch_harness": "completed",
+    "low_memory": "completed",
+    "ci_docs": "completed",
+    "integration": "completed"
+  },
+  "verification": "engineering_and_audit_passed_clean_evidence_pending"
+}

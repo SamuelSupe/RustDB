@@ -7,7 +7,7 @@ use arrow::{
 use futures::StreamExt;
 
 use crate::Result;
-use crate::runtime::{QueryContext, RecordBatchStream, SpillFile, boxed_record_batch_stream};
+use crate::runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream};
 use crate::sql::{AggregateExpr, AggregateFunction, BoundExpr};
 
 use super::{
@@ -22,8 +22,8 @@ mod state;
 mod tests;
 
 use spill::{
-    MergeOutcome, PartitionTask, SPILL_PARTITIONS, merge_partition, repartition_partition,
-    spill_states,
+    MergeOutcome, PartitionTask, SPILL_PARTITIONS, StateSpiller, merge_partition,
+    repartition_partition, spill_states,
 };
 use state::{GroupState, estimate_group_bytes};
 
@@ -38,9 +38,15 @@ pub(crate) fn aggregate(
     boxed_record_batch_stream(async_stream::try_stream! {
         let mut group_index: HashMap<Vec<CellValue>, usize> = HashMap::new();
         let mut states = Vec::<GroupState>::new();
-        let mut reservation = context.memory.reservation();
+        // Keep a bounded part of the query budget available for decoding and
+        // repartitioning spill batches while aggregate states are resident.
+        let state_pool = context.memory.child(
+            format!("aggregate-{}", context.query_id),
+            aggregate_state_limit(context.memory.limit()),
+        );
+        let mut reservation = state_pool.reservation();
         let partial_schema = partial_schema(&groups, &aggregates);
-        let mut spilled: Option<Vec<Vec<SpillFile>>> = None;
+        let mut spilled: Option<StateSpiller> = None;
 
         if groups.is_empty() {
             group_index.insert(Vec::new(), 0);
@@ -71,8 +77,8 @@ pub(crate) fn aggregate(
                     let state = GroupState::new(key.clone(), &aggregates);
                     let bytes = estimate_group_bytes(&state);
                     if reservation.try_grow(bytes).is_err() {
-                        let partitions = spilled.get_or_insert_with(|| {
-                            (0..SPILL_PARTITIONS).map(|_| Vec::new()).collect()
+                        let spiller = spilled.get_or_insert_with(|| {
+                            StateSpiller::new(&context, SPILL_PARTITIONS)
                         });
                         spill_states(
                             &mut states,
@@ -80,13 +86,15 @@ pub(crate) fn aggregate(
                             &groups,
                             &aggregates,
                             Arc::clone(&partial_schema),
-                            partitions,
+                            spiller,
                             &context,
                         )?;
                         reservation.try_resize(0)?;
                         reservation
                             .try_grow(bytes)
-                            .map_err(|_| spill::single_group_error(bytes, &context))?;
+                            .map_err(|_| {
+                                spill::single_group_error(bytes, &context, reservation.pool().limit())
+                            })?;
                     }
                     let index = states.len();
                     states.push(state);
@@ -104,18 +112,19 @@ pub(crate) fn aggregate(
             }
         }
 
-        if let Some(mut partitions) = spilled {
+        if let Some(mut spiller) = spilled {
             spill_states(
                 &mut states,
                 &mut group_index,
                 &groups,
                 &aggregates,
                 Arc::clone(&partial_schema),
-                &mut partitions,
+                &mut spiller,
                 &context,
             )?;
             reservation.try_resize(0)?;
-            let mut pending = partitions
+            let mut pending = spiller
+                .finish()?
                 .into_iter()
                 .rev()
                 .filter(|files| !files.is_empty())
@@ -165,6 +174,14 @@ pub(crate) fn aggregate(
     })
 }
 
+fn aggregate_state_limit(query_limit: usize) -> usize {
+    query_limit
+        .checked_div(2)
+        .unwrap_or(0)
+        .max(1)
+        .min(query_limit)
+}
+
 fn build_batch(
     states: &[GroupState],
     groups: &[BoundExpr],
@@ -205,8 +222,8 @@ fn partial_schema(groups: &[BoundExpr], aggregates: &[AggregateExpr]) -> SchemaR
         if expression.function == AggregateFunction::Avg {
             fields.push(Field::new(
                 format!("__agg_{index}_sum"),
-                match expression.data_type {
-                    DataType::Decimal128(_, scale) => DataType::Decimal128(38, scale),
+                match expression.expr.as_ref().map(|input| &input.data_type) {
+                    Some(DataType::Decimal128(_, _)) => DataType::Binary,
                     _ => DataType::Float64,
                 },
                 false,
@@ -219,7 +236,11 @@ fn partial_schema(groups: &[BoundExpr], aggregates: &[AggregateExpr]) -> SchemaR
         } else if expression.function == AggregateFunction::Sum {
             fields.push(Field::new(
                 format!("__agg_{index}_sum"),
-                expression.data_type.clone(),
+                if expression.data_type == DataType::Float64 {
+                    DataType::Float64
+                } else {
+                    DataType::Binary
+                },
                 false,
             ));
             fields.push(Field::new(

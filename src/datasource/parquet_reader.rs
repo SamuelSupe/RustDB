@@ -98,6 +98,47 @@ impl SnapshotParquetReader {
         }
         Ok(bytes)
     }
+
+    /// Reads only the fixed Parquet trailer and returns the encoded metadata
+    /// length. Callers can reserve a conservative amount before decoding the
+    /// footer into Arrow/Parquet objects.
+    pub(super) async fn footer_metadata_len(&self) -> ParquetResult<usize> {
+        const TRAILER_LEN: u64 = 8;
+        if self.snapshot.size < TRAILER_LEN {
+            return Err(external_error(Error::Execution(format!(
+                "invalid Parquet file {}: file is shorter than the 8-byte trailer",
+                self.uri
+            ))));
+        }
+
+        let start = self.snapshot.size - TRAILER_LEN;
+        let trailer = self.read_range(start..self.snapshot.size).await?;
+        if trailer.len() != 8 || &trailer[4..] != b"PAR1" {
+            return Err(external_error(Error::Execution(format!(
+                "invalid Parquet footer for {}: missing PAR1 trailer magic",
+                self.uri
+            ))));
+        }
+
+        let encoded =
+            u32::from_le_bytes(trailer[..4].try_into().map_err(|_| {
+                external_error(Error::Internal("invalid trailer slice".to_owned()))
+            })?);
+        let metadata_len = usize::try_from(encoded).map_err(|_| {
+            external_error(Error::ResourceExhausted(format!(
+                "Parquet footer for {} is too large for this platform: {encoded} bytes",
+                self.uri
+            )))
+        })?;
+        let encoded_len = u64::from(encoded);
+        if encoded_len > self.snapshot.size - TRAILER_LEN {
+            return Err(external_error(Error::Execution(format!(
+                "invalid Parquet footer for {}: footer length {encoded_len} exceeds file size {}",
+                self.uri, self.snapshot.size
+            ))));
+        }
+        Ok(metadata_len)
+    }
 }
 
 impl AsyncFileReader for SnapshotParquetReader {

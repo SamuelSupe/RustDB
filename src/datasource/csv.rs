@@ -4,7 +4,7 @@ use arrow::{csv::ReaderBuilder, datatypes::SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use futures::StreamExt;
+use futures::{StreamExt, stream};
 
 use super::{
     ScanRequest, TableProvider, TableStatistics,
@@ -14,7 +14,7 @@ use super::{
 use crate::{
     CsvOptions, EngineConfig, Error, Result,
     runtime::{QueryContext, RecordBatchStream, boxed_record_batch_stream},
-    storage::{LocationResolver, ObjectSnapshot, ObjectSource},
+    storage::{LocationResolver, ObjectSource},
 };
 
 #[derive(Clone, Debug)]
@@ -42,7 +42,7 @@ impl CsvTable {
         config: &EngineConfig,
         context: Option<Arc<QueryContext>>,
     ) -> Result<Self> {
-        let resolver = LocationResolver::new(config.s3.clone());
+        let resolver = LocationResolver::with_memory_limit(config.s3.clone(), config.memory_limit);
         let files = match context.as_deref() {
             Some(context) => resolver.resolve_for_query(&locations, context).await?,
             None => resolver.resolve(&locations).await?,
@@ -120,15 +120,7 @@ impl TableProvider for CsvTable {
         let has_header = self.has_header;
         let batch_size = request.batch_size;
         let io_concurrency = self.io_concurrency;
-        let files = self
-            .files
-            .iter()
-            .cloned()
-            .map(|file| {
-                let snapshot = context.object_snapshot(file.uri())?;
-                Ok((file, snapshot))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let files = Arc::clone(&self.files);
         let file_scan = CsvFileScan {
             schema: Arc::clone(&self.schema),
             options: self.options.clone(),
@@ -136,11 +128,16 @@ impl TableProvider for CsvTable {
             projection,
             batch_size,
         };
-        let streams = futures::stream::iter(files).map({
+        let streams = stream::iter(0..files.len()).map({
             let context = Arc::clone(&context);
             let file_scan = file_scan.clone();
-            move |(file, snapshot)| {
-                csv_file_stream(file, snapshot, file_scan.clone(), Arc::clone(&context))
+            move |index| {
+                csv_file_stream(
+                    Arc::clone(&files),
+                    index,
+                    file_scan.clone(),
+                    Arc::clone(&context),
+                )
             }
         });
         let mut merged = streams.flatten_unordered(io_concurrency);
@@ -177,13 +174,15 @@ struct CsvFileScan {
 }
 
 fn csv_file_stream(
-    file: ObjectSource,
-    snapshot: ObjectSnapshot,
+    files: Arc<[ObjectSource]>,
+    file_index: usize,
     scan: CsvFileScan,
     context: Arc<QueryContext>,
 ) -> RecordBatchStream {
     let stream = try_stream! {
         context.check_cancelled()?;
+        let file = files[file_index].clone();
+        let snapshot = context.object_snapshot(file.uri())?;
         if file.is_s3() {
             context.metrics.add_s3_requests(1);
         }
@@ -426,5 +425,46 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(values.value(0), "new");
+    }
+
+    #[tokio::test]
+    async fn resolves_file_snapshots_lazily_without_a_scan_wide_collect() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.csv"), b"value\nfirst\n").unwrap();
+        fs::write(directory.path().join("b.csv"), b"value\nsecond\n").unwrap();
+        let config = EngineConfig {
+            io_concurrency: 1,
+            ..EngineConfig::default()
+        };
+        let table = CsvTable::try_new(
+            vec![format!("{}/*.csv", directory.path().display())],
+            CsvOptions::default(),
+            &config,
+        )
+        .await
+        .unwrap();
+        let context = Arc::new(
+            QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap(),
+        );
+        let first = &table.files[0];
+        context
+            .register_object_snapshot(first.uri(), first.head_snapshot().await.unwrap())
+            .unwrap();
+        context.seal_object_snapshots();
+
+        let mut stream = table
+            .scan(ScanRequest::new(8), Arc::clone(&context))
+            .await
+            .expect("scan construction must not resolve every snapshot");
+        let first_batch = stream.try_next().await.unwrap().unwrap();
+        let values = first_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "first");
+
+        let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+        assert!(error.to_string().contains("not present"));
     }
 }

@@ -1,0 +1,29 @@
+SET threads = 1;
+SET preserve_insertion_order = true;
+LOAD tpch;
+CALL dbgen(sf = __SCALE__);
+
+COPY (SELECT * FROM region ORDER BY r_regionkey)
+  TO '__OUTPUT__/region/part-00000.parquet'
+  (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 122880);
+COPY (SELECT * FROM nation ORDER BY n_nationkey)
+  TO '__OUTPUT__/nation/part-00000.parquet'
+  (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 122880);
+COPY (SELECT * FROM supplier ORDER BY s_suppkey)
+  TO '__OUTPUT__/supplier/part-00000.parquet'
+  (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 122880);
+COPY (SELECT * FROM customer ORDER BY c_custkey)
+  TO '__OUTPUT__/customer/part-00000.parquet'
+  (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 122880);
+COPY (SELECT * FROM part ORDER BY p_partkey)
+  TO '__OUTPUT__/part/part-00000.parquet'
+  (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 122880);
+COPY (SELECT * FROM partsupp ORDER BY ps_partkey, ps_suppkey)
+  TO '__OUTPUT__/partsupp/part-00000.parquet'
+  (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 122880);
+COPY (SELECT * FROM orders ORDER BY o_orderkey)
+  TO '__OUTPUT__/orders/part-00000.parquet'
+  (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 122880);
+COPY (SELECT * FROM lineitem ORDER BY l_orderkey, l_linenumber)
+  TO '__OUTPUT__/lineitem/part-00000.parquet'
+  (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 122880);

@@ -1,0 +1,5 @@
+# case|query template
+scan-filter|scan_filter.sql
+aggregate|aggregate.sql
+inner-join|inner_join.sql
+top-k|top_k.sql

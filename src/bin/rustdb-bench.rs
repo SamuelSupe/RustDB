@@ -50,20 +50,75 @@ struct Args {
 
     #[arg(long)]
     s3_allow_http: bool,
+
+    /// Fail the run unless every measured query spills at least one byte.
+    #[arg(long)]
+    require_spill: bool,
+
+    /// Source/build identifier recorded in the JSON report.
+    #[arg(long, default_value = "unrecorded")]
+    build_id: String,
+
+    /// Cargo profile used to compile this benchmark executable.
+    #[arg(long, default_value = "unrecorded")]
+    build_profile: String,
+
+    /// RUSTFLAGS used to compile this benchmark executable.
+    #[arg(long, default_value = "unrecorded", allow_hyphen_values = true)]
+    build_rustflags: String,
+
+    /// Rust compiler version used to compile this benchmark executable.
+    #[arg(long, default_value = "unrecorded")]
+    rustc_version: String,
+
+    /// Host CPU model supplied by the benchmark harness.
+    #[arg(long)]
+    cpu_model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct BenchmarkReport {
+    engine_version: &'static str,
+    build_id: String,
+    build: BuildReport,
     query_file: String,
     warmup: usize,
     iterations: usize,
+    config: ConfigReport,
+    environment: EnvironmentReport,
     p50_ms: f64,
     p95_ms: f64,
     runs: Vec<RunReport>,
 }
 
 #[derive(Debug, Serialize)]
+struct BuildReport {
+    cargo_profile: String,
+    rustflags: String,
+    rustc_version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigReport {
+    memory_limit_bytes: usize,
+    compute_threads: usize,
+    batch_size: usize,
+    io_concurrency: usize,
+    metadata_cache_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EnvironmentReport {
+    os: &'static str,
+    arch: &'static str,
+    cpu_model: String,
+    logical_cpus: usize,
+    total_memory_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct RunReport {
+    query_id: String,
     elapsed_ms: f64,
     first_batch_ms: Option<f64>,
     rows: u64,
@@ -77,6 +132,7 @@ struct RunReport {
     spill_partitions: u64,
     s3_requests: u64,
     s3_bytes_transferred: u64,
+    spill_cleaned: bool,
 }
 
 fn main() {
@@ -129,21 +185,40 @@ async fn run(args: Args) -> Result<()> {
     config.s3.region = args.s3_region;
     config.s3.force_path_style = args.s3_path_style;
     config.s3.allow_http = args.s3_allow_http;
+    let report_config = ConfigReport {
+        memory_limit_bytes: config.memory_limit,
+        compute_threads: config.compute_threads,
+        batch_size: config.batch_size,
+        io_concurrency: config.io_concurrency,
+        metadata_cache_bytes: config.metadata_cache_bytes,
+    };
+    let temp_dir = config.temp_dir.clone();
+    let memory_limit = config.memory_limit;
     let session = Engine::new(config)?.session();
 
     for _ in 0..args.warmup {
-        black_box(run_once(&session, &sql).await?);
+        black_box(run_once(&session, &sql, &temp_dir, memory_limit, args.require_spill).await?);
     }
     let mut runs = Vec::with_capacity(args.iterations);
     for _ in 0..args.iterations {
-        runs.push(run_once(&session, &sql).await?);
+        runs.push(run_once(&session, &sql, &temp_dir, memory_limit, args.require_spill).await?);
     }
     let mut elapsed: Vec<_> = runs.iter().map(|run| run.elapsed_ms).collect();
     elapsed.sort_by(f64::total_cmp);
+    let environment = environment_report(args.cpu_model);
     let report = BenchmarkReport {
+        engine_version: env!("CARGO_PKG_VERSION"),
+        build_id: args.build_id,
+        build: BuildReport {
+            cargo_profile: args.build_profile,
+            rustflags: args.build_rustflags,
+            rustc_version: args.rustc_version,
+        },
         query_file: args.query.display().to_string(),
         warmup: args.warmup,
         iterations: args.iterations,
+        config: report_config,
+        environment,
         p50_ms: percentile(&elapsed, 0.50),
         p95_ms: percentile(&elapsed, 0.95),
         runs,
@@ -157,9 +232,17 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-async fn run_once(session: &rustdb::Session, sql: &str) -> Result<RunReport> {
+async fn run_once(
+    session: &rustdb::Session,
+    sql: &str,
+    temp_dir: &std::path::Path,
+    memory_limit: usize,
+    require_spill: bool,
+) -> Result<RunReport> {
     let started = Instant::now();
     let mut result = session.execute(sql).await?;
+    let query_id = result.query_id();
+    let query_dir = temp_dir.join(format!("query-{query_id}"));
     let metrics = result.metrics();
     let mut rows = 0_u64;
     let mut batches = 0_u64;
@@ -173,7 +256,26 @@ async fn run_once(session: &rustdb::Session, sql: &str) -> Result<RunReport> {
     }
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let metrics = metrics.snapshot();
+    drop(result);
+    if metrics.peak_memory_bytes > u64::try_from(memory_limit).unwrap_or(u64::MAX) {
+        return Err(Error::ResourceExhausted(format!(
+            "query {query_id} reserved {} bytes above the configured {} byte limit",
+            metrics.peak_memory_bytes, memory_limit
+        )));
+    }
+    if require_spill && metrics.spill_bytes == 0 {
+        return Err(Error::Execution(format!(
+            "query {query_id} completed without spilling while --require-spill was set"
+        )));
+    }
+    if query_dir.exists() {
+        return Err(Error::Execution(format!(
+            "query {query_id} left spill directory {} behind",
+            query_dir.display()
+        )));
+    }
     Ok(RunReport {
+        query_id: query_id.to_string(),
         elapsed_ms,
         first_batch_ms,
         rows,
@@ -191,7 +293,30 @@ async fn run_once(session: &rustdb::Session, sql: &str) -> Result<RunReport> {
         spill_partitions: metrics.spill_partitions,
         s3_requests: metrics.s3_requests,
         s3_bytes_transferred: metrics.s3_bytes_transferred,
+        spill_cleaned: true,
     })
+}
+
+fn environment_report(cpu_model: Option<String>) -> EnvironmentReport {
+    let system = System::new_all();
+    EnvironmentReport {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        cpu_model: cpu_model
+            .filter(|model| !model.trim().is_empty())
+            .or_else(|| {
+                system
+                    .cpus()
+                    .first()
+                    .map(|cpu| cpu.brand().to_owned())
+                    .filter(|model| !model.trim().is_empty())
+            })
+            .unwrap_or_else(|| "unknown".to_owned()),
+        logical_cpus: std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+        total_memory_bytes: system.total_memory(),
+    }
 }
 
 fn current_rss_bytes() -> Option<u64> {

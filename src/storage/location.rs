@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
@@ -8,12 +8,18 @@ use std::{
 use futures::TryStreamExt;
 use glob::{MatchOptions, Pattern, glob};
 use object_store::{
-    GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, aws::AmazonS3Builder,
-    local::LocalFileSystem, path::Path,
+    GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, local::LocalFileSystem, path::Path,
 };
 use url::Url;
 
 use crate::{Error, Result, S3Config, runtime::QueryContext};
+
+mod endpoint;
+mod source_list;
+
+use endpoint::builder_from_env;
+pub(crate) use endpoint::validate_endpoint;
+use source_list::SourceList;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectSnapshot {
@@ -107,11 +113,28 @@ impl fmt::Debug for ObjectSource {
 #[derive(Clone, Debug)]
 pub struct LocationResolver {
     s3: S3Config,
+    metadata_limit: usize,
 }
 
 impl LocationResolver {
+    #[cfg(test)]
     pub fn new(s3: S3Config) -> Self {
-        Self { s3 }
+        Self {
+            s3,
+            metadata_limit: 64 * 1024 * 1024,
+        }
+    }
+
+    pub(crate) fn with_memory_limit(s3: S3Config, memory_limit: usize) -> Self {
+        Self {
+            s3,
+            metadata_limit: (memory_limit / 64).clamp(1, 64 * 1024 * 1024),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_metadata_limit(s3: S3Config, metadata_limit: usize) -> Self {
+        Self { s3, metadata_limit }
     }
 
     pub async fn resolve(&self, locations: &[String]) -> Result<Vec<ObjectSource>> {
@@ -139,7 +162,7 @@ impl LocationResolver {
 
         let local_store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
         let mut s3_stores: HashMap<String, Arc<dyn ObjectStore>> = HashMap::new();
-        let mut objects = Vec::new();
+        let mut objects = SourceList::new(self.metadata_limit);
 
         for location in locations {
             if location.starts_with("s3://") {
@@ -150,9 +173,7 @@ impl LocationResolver {
             }
         }
 
-        objects.sort_by(|left, right| left.uri.cmp(&right.uri));
-        let mut seen = HashSet::new();
-        objects.retain(|object| seen.insert(object.uri.clone()));
+        let objects = objects.finish()?;
         if objects.is_empty() {
             return Err(Error::InvalidArgument(format!(
                 "no files matched: {}",
@@ -171,7 +192,7 @@ impl LocationResolver {
         &self,
         location: &str,
         stores: &mut HashMap<String, Arc<dyn ObjectStore>>,
-        objects: &mut Vec<ObjectSource>,
+        objects: &mut SourceList,
         context: Option<&QueryContext>,
     ) -> Result<()> {
         let url = Url::parse(location).map_err(|error| {
@@ -217,27 +238,25 @@ impl LocationResolver {
                     Error::InvalidArgument(format!("invalid S3 prefix in {location}: {error}"))
                 })?)
             };
-            let listing = store
-                .list(prefix.as_ref())
-                .try_filter(|meta| {
-                    futures::future::ready(pattern_matches(&pattern, meta.location.as_ref()))
-                })
-                .try_collect::<Vec<_>>();
-            let matches = match context {
-                Some(context) => {
-                    context.check_cancelled()?;
-                    context.metrics.add_s3_requests(1);
-                    tokio::select! {
+            let mut listing = store.list(prefix.as_ref()).try_filter(|meta| {
+                futures::future::ready(pattern_matches(&pattern, meta.location.as_ref()))
+            });
+            if let Some(context) = context {
+                context.check_cancelled()?;
+                context.metrics.add_s3_requests(1);
+            }
+            loop {
+                let next = match context {
+                    Some(context) => tokio::select! {
                         _ = context.control.cancelled() => Err(Error::Cancelled),
-                        result = listing => result.map_err(Error::from),
-                    }?
-                }
-                None => listing.await?,
-            };
-            objects.extend(matches.into_iter().map(|meta| {
+                        result = listing.try_next() => result.map_err(Error::from),
+                    }?,
+                    None => listing.try_next().await?,
+                };
+                let Some(meta) = next else { break };
                 let uri = format!("s3://{bucket}/{}", meta.location);
-                ObjectSource::new(uri, Arc::clone(&store), meta, true)
-            }));
+                objects.push(ObjectSource::new(uri, Arc::clone(&store), meta, true))?;
+            }
         } else {
             let head = store.head(&path);
             let meta = match context {
@@ -256,22 +275,18 @@ impl LocationResolver {
                 Arc::clone(&store),
                 meta,
                 true,
-            ));
+            ))?;
         }
         Ok(())
     }
 
     fn build_s3_store(&self, bucket: &str) -> Result<Arc<dyn ObjectStore>> {
-        let mut builder = AmazonS3Builder::from_env()
+        let mut builder = builder_from_env(self.s3.endpoint.as_deref(), self.s3.allow_http)?
             .with_bucket_name(bucket)
             .with_allow_http(self.s3.allow_http);
 
         if let Some(region) = &self.s3.region {
             builder = builder.with_region(region);
-        }
-        if let Some(endpoint) = &self.s3.endpoint {
-            validate_endpoint(endpoint, self.s3.allow_http)?;
-            builder = builder.with_endpoint(endpoint);
         }
         if self.s3.force_path_style {
             builder = builder.with_virtual_hosted_style_request(false);
@@ -290,7 +305,7 @@ impl LocationResolver {
 async fn resolve_local(
     location: &str,
     store: Arc<dyn ObjectStore>,
-    objects: &mut Vec<ObjectSource>,
+    objects: &mut SourceList,
 ) -> Result<()> {
     let pattern = local_pattern(location)?;
     let entries = glob(pattern.to_string_lossy().as_ref()).map_err(|error| {
@@ -324,7 +339,7 @@ async fn resolve_local(
                 ))
             })?
             .to_string();
-        objects.push(ObjectSource::new(uri, Arc::clone(&store), meta, false));
+        objects.push(ObjectSource::new(uri, Arc::clone(&store), meta, false))?;
     }
     Ok(())
 }
@@ -372,100 +387,5 @@ fn pattern_matches(pattern: &Pattern, value: &str) -> bool {
     )
 }
 
-pub(crate) fn validate_endpoint(endpoint: &str, allow_http: bool) -> Result<()> {
-    let url = Url::parse(endpoint)
-        .map_err(|error| Error::InvalidArgument(format!("invalid S3 endpoint: {error}")))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(Error::InvalidArgument(
-            "S3 endpoint must not contain credentials; use a credential provider".to_owned(),
-        ));
-    }
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if allow_http => Ok(()),
-        "http" => Err(Error::InvalidArgument(
-            "S3 endpoint uses HTTP but allow_http is false".to_owned(),
-        )),
-        scheme => Err(Error::InvalidArgument(format!(
-            "unsupported S3 endpoint scheme {scheme}"
-        ))),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use std::{fs, sync::Arc};
-
-    use tempfile::tempdir;
-
-    use super::{LocationResolver, literal_prefix, validate_endpoint};
-    use crate::{
-        S3Config,
-        runtime::{MemoryPool, QueryContext},
-    };
-
-    #[tokio::test]
-    async fn expands_local_globs_in_stable_order() {
-        let directory = tempdir().unwrap();
-        fs::write(directory.path().join("b.csv"), b"b\n2\n").unwrap();
-        fs::write(directory.path().join("a.csv"), b"a\n1\n").unwrap();
-        let locations = vec![format!("{}/*.csv", directory.path().display())];
-
-        let objects = LocationResolver::new(S3Config::default())
-            .resolve(&locations)
-            .await
-            .unwrap();
-
-        assert_eq!(objects.len(), 2);
-        assert!(objects[0].uri().ends_with("a.csv"));
-        assert!(objects[1].uri().ends_with("b.csv"));
-        assert_eq!(
-            objects[0].head_snapshot().await.unwrap(),
-            objects[0].snapshot().clone()
-        );
-    }
-
-    #[tokio::test]
-    async fn query_resolution_registers_the_initial_object_identity() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("changing.csv");
-        fs::write(&path, b"value\nold\n").unwrap();
-        let context =
-            Arc::new(QueryContext::new(MemoryPool::new(1 << 20), directory.path()).unwrap());
-        let objects = LocationResolver::new(S3Config::default())
-            .resolve_for_query(&[path.display().to_string()], &context)
-            .await
-            .unwrap();
-
-        fs::write(&path, b"value\nnew-and-different\n").unwrap();
-        let current = objects[0].head_snapshot().await.unwrap();
-        let error = context
-            .register_object_snapshot(objects[0].uri(), current)
-            .unwrap_err();
-        assert!(error.to_string().contains("identity changed"));
-    }
-
-    #[test]
-    fn rejects_insecure_endpoint_by_default() {
-        let error = validate_endpoint("http://minio:9000", false).unwrap_err();
-        assert!(error.to_string().contains("allow_http is false"));
-    }
-
-    #[test]
-    fn rejects_and_redacts_endpoint_userinfo() {
-        let error = validate_endpoint("https://alice:super-secret@example.test", false)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("must not contain credentials"));
-        assert!(!error.contains("super-secret"));
-    }
-
-    #[test]
-    fn extracts_listing_prefix_before_glob_segment() {
-        assert_eq!(
-            literal_prefix("events/year=2026/*.parquet"),
-            "events/year=2026"
-        );
-        assert_eq!(literal_prefix("*.parquet"), "");
-    }
-}
+mod tests;

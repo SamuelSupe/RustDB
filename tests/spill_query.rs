@@ -10,6 +10,7 @@ use futures::StreamExt;
 use rustdb::{CsvHeader, CsvOptions, Engine, EngineConfig, QueryResult, Result};
 
 const KIB: usize = 1024;
+const MIB: usize = 1024 * KIB;
 
 fn low_memory_config(temp_dir: &Path, memory_limit: usize) -> EngineConfig {
     EngineConfig {
@@ -92,9 +93,9 @@ fn assert_multichunk_fixture(path: &Path) {
 
 #[tokio::test]
 async fn high_cardinality_aggregate_spills_and_cleans_query_directory() -> Result<()> {
-    const GROUPS: i64 = 3_000;
+    const GROUPS: i64 = 12_000;
     const REPEATS: i64 = 3;
-    const MEMORY_LIMIT: usize = 128 * KIB;
+    const MEMORY_LIMIT: usize = 2 * MIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let csv = temp.path().join("aggregate.csv");
@@ -166,8 +167,8 @@ async fn high_cardinality_aggregate_spills_and_cleans_query_directory() -> Resul
 
 #[tokio::test]
 async fn hash_join_spills_and_cleans_query_directory() -> Result<()> {
-    const ROWS: i64 = 8_192;
-    const MEMORY_LIMIT: usize = 256 * KIB;
+    const ROWS: i64 = 20_000;
+    const MEMORY_LIMIT: usize = 2 * MIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let left_csv = temp.path().join("left.csv");
@@ -256,9 +257,9 @@ async fn hash_join_spills_and_cleans_query_directory() -> Result<()> {
 
 #[tokio::test]
 async fn left_hash_join_spills_preserves_unmatched_rows_and_cleans_up() -> Result<()> {
-    const LEFT_ROWS: i64 = 10_240;
-    const RIGHT_ROWS: i64 = 8_192;
-    const MEMORY_LIMIT: usize = 256 * KIB;
+    const LEFT_ROWS: i64 = 24_000;
+    const RIGHT_ROWS: i64 = 20_000;
+    const MEMORY_LIMIT: usize = 2 * MIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let left_csv = temp.path().join("left-outer.csv");
@@ -361,12 +362,12 @@ async fn left_hash_join_spills_preserves_unmatched_rows_and_cleans_up() -> Resul
 
 #[tokio::test]
 async fn order_by_top_k_and_full_sort_spill_and_cleanup() -> Result<()> {
-    const ROWS: i64 = 6_000;
+    const ROWS: i64 = 40_000;
     const TOP_K: i64 = 257;
-    const MEMORY_LIMIT: usize = 256 * KIB;
+    const MEMORY_LIMIT: usize = 512 * KIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let csv_files = write_sort_inputs(temp.path(), ROWS, 250);
+    let csv_files = write_sort_inputs(temp.path(), ROWS, ROWS);
 
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
     let spill_root = config.temp_dir.clone();
@@ -450,11 +451,11 @@ async fn order_by_top_k_and_full_sort_spill_and_cleanup() -> Result<()> {
 
 #[tokio::test]
 async fn dropping_a_partially_consumed_spilling_query_cleans_up_immediately() -> Result<()> {
-    const ROWS: i64 = 8_000;
-    const MEMORY_LIMIT: usize = 256 * KIB;
+    const ROWS: i64 = 40_000;
+    const MEMORY_LIMIT: usize = 512 * KIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let csv_files = write_sort_inputs(temp.path(), ROWS, 250);
+    let csv_files = write_sort_inputs(temp.path(), ROWS, ROWS);
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
     let spill_root = config.temp_dir.clone();
     let session = Engine::new(config)?.session();

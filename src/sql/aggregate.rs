@@ -404,12 +404,7 @@ fn aggregate_type(
     let input = expr.map(|expr| &expr.data_type);
     Ok(match aggregate {
         AggregateFunction::Count => DataType::Int64,
-        AggregateFunction::Avg => match input {
-            Some(DataType::Decimal128(precision, scale)) => {
-                DataType::Decimal128(*precision, *scale)
-            }
-            _ => DataType::Float64,
-        },
+        AggregateFunction::Avg => DataType::Float64,
         AggregateFunction::Sum => match input {
             Some(DataType::Decimal128(precision, scale)) => {
                 DataType::Decimal128(*precision, *scale)

@@ -1,0 +1,39 @@
+name: TPC-H acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: TPC-H scale factor (SF1 is the release gate)
+        required: true
+        default: "0.01"
+        type: choice
+        options:
+          - "0.01"
+          - "1"
+  schedule:
+    - cron: "17 3 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tpch-${{ github.event_name == 'schedule' && '1' || inputs.scale }}
+  cancel-in-progress: false
+
+jobs:
+  checksum:
+    name: Seven-query checksum
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      TPCH_SCALE: ${{ github.event_name == 'schedule' && '1' || inputs.scale || '0.01' }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Restore generated Parquet dataset
+        uses: actions/cache@v5
+        with:
+          path: data/tpch-sf${{ env.TPCH_SCALE }}
+          key: tpch-parquet-duckdb-1.4.3-sf${{ env.TPCH_SCALE }}-${{ hashFiles('tools/tpch/**', 'benchmarks/tpch/**') }}
+      - name: Generate, validate, and compare checksums
+        run: tools/tpch/run.sh "$TPCH_SCALE"

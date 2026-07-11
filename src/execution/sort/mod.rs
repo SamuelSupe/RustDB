@@ -21,7 +21,7 @@ use crate::{Error, Result};
 
 use super::expr::evaluate;
 use merge::MergeIterator;
-use run::{RunCleanup, compact_runs, sort_batches, spill_run};
+use run::{RunCleanup, compact_pending_runs, compact_runs, sort_batches, spill_run};
 
 const MERGE_FAN_IN: usize = 8;
 
@@ -43,11 +43,16 @@ pub(crate) fn sort(
 
         let batch_size = batch_size.max(1);
         let converter = make_converter(&expressions)?;
+        let spill_headroom = context
+            .spill
+            .writer_headroom_bytes("sort-merge", schema.as_ref());
         let sort_pool = context.memory.child(
             format!("sort-{}", context.query_id),
-            context.memory.limit(),
+            sort_state_limit(context.memory.limit()),
         );
         let mut reservation = sort_pool.reservation();
+        let mut input_memory = context.memory.reservation();
+        let mut buffered_input_bytes = 0usize;
         let mut buffered = Vec::new();
         let mut cleanup = RunCleanup::new(context.spill.clone());
         let mut spill_batch_rows = batch_size;
@@ -57,6 +62,53 @@ pub(crate) fn sort(
             let batch = batch?;
             if batch.num_rows() == 0 {
                 continue;
+            }
+            // The stream transfers ownership of the complete batch to sort.
+            // Slices below retain all of these buffers, so keep this charge
+            // separate from the temporary concat/key/index/output workspace.
+            let input_bytes = batch.get_array_memory_size().max(1);
+            if !try_grow_input(
+                &mut input_memory,
+                input_bytes,
+                spill_headroom,
+                &context,
+            ) {
+                if buffered.is_empty() {
+                    Err(input_batch_error(input_bytes, &context))?;
+                }
+                let (run, rows) = spill_run(
+                    &buffered,
+                    &expressions,
+                    &converter,
+                    fetch,
+                    &schema,
+                    &context,
+                    batch_size,
+                    sort_pool.limit(),
+                )?;
+                cleanup.add(run);
+                spill_batch_rows = spill_batch_rows.min(rows);
+                buffered = Vec::new();
+                input_memory.shrink(buffered_input_bytes);
+                buffered_input_bytes = 0;
+                reservation.try_resize(0)?;
+                compact_pending_runs(
+                    &mut cleanup,
+                    &expressions,
+                    fetch,
+                    &schema,
+                    &context,
+                    &sort_pool,
+                    spill_batch_rows,
+                )?;
+                if !try_grow_input(
+                    &mut input_memory,
+                    input_bytes,
+                    spill_headroom,
+                    &context,
+                ) {
+                    Err(input_batch_error(input_bytes, &context))?;
+                }
             }
             let estimate = estimate_sort_bytes(&batch, expressions.len());
             if estimate > sort_pool.limit() {
@@ -69,24 +121,45 @@ pub(crate) fn sort(
                         &schema,
                         &context,
                         batch_size,
+                        sort_pool.limit(),
                     )?;
                     cleanup.add(run);
                     spill_batch_rows = spill_batch_rows.min(rows);
-                    buffered.clear();
+                    buffered = Vec::new();
+                    input_memory.shrink(buffered_input_bytes);
+                    buffered_input_bytes = 0;
                     reservation.try_resize(0)?;
+                    compact_pending_runs(
+                        &mut cleanup,
+                        &expressions,
+                        fetch,
+                        &schema,
+                        &context,
+                        &sort_pool,
+                        spill_batch_rows,
+                    )?;
                 }
 
-                let rows_per_run = rows_within_limit(
-                    &batch,
-                    expressions.len(),
-                    sort_pool.limit(),
-                )?;
-                for offset in (0..batch.num_rows()).step_by(rows_per_run) {
+                let mut offset = 0usize;
+                while offset < batch.num_rows() {
                     context.check_cancelled()?;
+                    // Every completed run adds active-file metadata. Recompute
+                    // the next slice against the remaining budget instead of
+                    // reusing the first run's larger allowance.
+                    let rows_per_run = rows_within_limit(
+                        &batch,
+                        expressions.len(),
+                        available_workspace(&sort_pool, spill_headroom, &context),
+                    )?;
                     let length = rows_per_run.min(batch.num_rows() - offset);
                     let slice = batch.slice(offset, length);
                     let slice_estimate = estimate_sort_rows(&batch, expressions.len(), length);
-                    reservation.try_resize(slice_estimate)?;
+                    reserve_workspace(
+                        &mut reservation,
+                        slice_estimate,
+                        spill_headroom,
+                        &context,
+                    )?;
                     let (run, rows) = spill_run(
                         &[slice],
                         &expressions,
@@ -95,18 +168,29 @@ pub(crate) fn sort(
                         &schema,
                         &context,
                         batch_size,
+                        sort_pool.limit(),
                     )?;
                     cleanup.add(run);
                     spill_batch_rows = spill_batch_rows.min(rows);
                     reservation.try_resize(0)?;
+                    compact_pending_runs(
+                        &mut cleanup,
+                        &expressions,
+                        fetch,
+                        &schema,
+                        &context,
+                        &sort_pool,
+                        spill_batch_rows,
+                    )?;
+                    offset += length;
                 }
+                drop(batch);
+                input_memory.shrink(input_bytes);
                 continue;
             }
-            if reservation.try_grow(estimate).is_err() {
+            if !try_grow_workspace(&mut reservation, estimate, spill_headroom, &context) {
                 if buffered.is_empty() {
-                    reservation.try_grow(estimate)?;
-                    buffered.push(batch);
-                    continue;
+                    Err(sort_workspace_error(estimate, &context))?;
                 }
                 let (run, rows) = spill_run(
                     &buffered,
@@ -116,14 +200,29 @@ pub(crate) fn sort(
                     &schema,
                     &context,
                     batch_size,
+                    sort_pool.limit(),
                 )?;
                 cleanup.add(run);
                 spill_batch_rows = spill_batch_rows.min(rows);
-                buffered.clear();
+                buffered = Vec::new();
+                input_memory.shrink(buffered_input_bytes);
+                buffered_input_bytes = 0;
                 reservation.try_resize(0)?;
-                reservation.try_grow(estimate)?;
+                compact_pending_runs(
+                    &mut cleanup,
+                    &expressions,
+                    fetch,
+                    &schema,
+                    &context,
+                    &sort_pool,
+                    spill_batch_rows,
+                )?;
+                if !try_grow_workspace(&mut reservation, estimate, spill_headroom, &context) {
+                    Err(sort_workspace_error(estimate, &context))?;
+                }
             }
             context.metrics.observe_memory(context.memory.used());
+            buffered_input_bytes = buffered_input_bytes.saturating_add(input_bytes);
             buffered.push(batch);
         }
 
@@ -132,6 +231,12 @@ pub(crate) fn sort(
                 return;
             }
             let sorted = sort_batches(&buffered, &expressions, &converter, fetch, &schema)?;
+            drop(buffered);
+            input_memory.shrink(buffered_input_bytes);
+            let sorted_bytes = sorted.get_array_memory_size().max(1);
+            reservation
+                .try_resize(sorted_bytes)
+                .map_err(|_| sort_workspace_error(sorted_bytes, &context))?;
             for offset in (0..sorted.num_rows()).step_by(batch_size) {
                 context.check_cancelled()?;
                 let length = batch_size.min(sorted.num_rows() - offset);
@@ -149,12 +254,24 @@ pub(crate) fn sort(
                 &schema,
                 &context,
                 batch_size,
+                sort_pool.limit(),
             )?;
             cleanup.add(run);
             spill_batch_rows = spill_batch_rows.min(rows);
-            buffered.clear();
+            drop(buffered);
+            input_memory.shrink(buffered_input_bytes);
         }
         reservation.try_resize(0)?;
+        drop(input_memory);
+        compact_pending_runs(
+            &mut cleanup,
+            &expressions,
+            fetch,
+            &schema,
+            &context,
+            &sort_pool,
+            spill_batch_rows,
+        )?;
         drop(reservation);
 
         let runs = compact_runs(
@@ -181,6 +298,12 @@ pub(crate) fn sort(
             yield batch?;
         }
     })
+}
+
+fn sort_state_limit(query_limit: usize) -> usize {
+    // The other half remains available for active spill-file metadata and for
+    // merge cursors/output while a buffered run is being written.
+    query_limit.checked_div(2).unwrap_or(0).max(1)
 }
 
 fn make_converter(expressions: &[SortExpr]) -> Result<RowConverter> {
@@ -246,6 +369,68 @@ fn rows_within_limit(batch: &RecordBatch, key_count: usize, memory_limit: usize)
         )));
     }
     Ok((memory_limit / one_row).max(1).min(batch.num_rows()))
+}
+
+fn available_workspace(
+    pool: &crate::runtime::MemoryPool,
+    spill_headroom: usize,
+    context: &QueryContext,
+) -> usize {
+    pool.available()
+        .min(context.memory.available().saturating_sub(spill_headroom))
+}
+
+fn try_grow_workspace(
+    reservation: &mut crate::runtime::MemoryReservation,
+    bytes: usize,
+    spill_headroom: usize,
+    context: &QueryContext,
+) -> bool {
+    bytes <= context.memory.available().saturating_sub(spill_headroom)
+        && reservation.try_grow(bytes).is_ok()
+}
+
+fn try_grow_input(
+    reservation: &mut crate::runtime::MemoryReservation,
+    bytes: usize,
+    spill_headroom: usize,
+    context: &QueryContext,
+) -> bool {
+    bytes <= context.memory.available().saturating_sub(spill_headroom)
+        && reservation.try_grow(bytes).is_ok()
+}
+
+fn reserve_workspace(
+    reservation: &mut crate::runtime::MemoryReservation,
+    bytes: usize,
+    spill_headroom: usize,
+    context: &QueryContext,
+) -> Result<()> {
+    let growth = bytes.saturating_sub(reservation.size());
+    if growth > context.memory.available().saturating_sub(spill_headroom) {
+        return Err(sort_workspace_error(bytes, context));
+    }
+    reservation
+        .try_resize(bytes)
+        .map_err(|_| sort_workspace_error(bytes, context))
+}
+
+fn input_batch_error(bytes: usize, context: &QueryContext) -> Error {
+    Error::ResourceExhausted(format!(
+        "sort cannot reserve the complete input batch: {bytes} bytes required, query limit {} \
+         bytes, currently available {} bytes",
+        context.memory.limit(),
+        context.memory.available()
+    ))
+}
+
+fn sort_workspace_error(bytes: usize, context: &QueryContext) -> Error {
+    Error::ResourceExhausted(format!(
+        "sort cannot reserve {bytes} bytes of run workspace while retaining its input batch \
+         and spill I/O state (query limit {} bytes, currently available {} bytes)",
+        context.memory.limit(),
+        context.memory.available()
+    ))
 }
 
 fn empty_columns_batch(schema: SchemaRef, rows: usize) -> Result<RecordBatch> {

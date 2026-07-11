@@ -319,7 +319,9 @@ async fn fixes_all_join_snapshots_before_build_side_is_consumed() {
 #[tokio::test]
 async fn aggregate_and_join_spill_under_small_memory_limit() {
     let catalog = Catalog::default();
-    let values: Vec<i64> = (0..160).collect();
+    const ROWS: usize = 16_384;
+    const MEMORY_LIMIT: usize = 2 << 20;
+    let values: Vec<i64> = (0..ROWS as i64).collect();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
         vec![Arc::new(Int64Array::from(values.clone()))],
@@ -328,17 +330,28 @@ async fn aggregate_and_join_spill_under_small_memory_limit() {
     register(&catalog, "a", batch.clone());
     register(&catalog, "b", batch);
 
-    let (grouped, grouped_metrics) =
-        run_with_metrics(&catalog, "SELECT id, count(*) FROM a GROUP BY id", 2_048).await;
+    let (grouped, grouped_metrics) = run_with_metrics(
+        &catalog,
+        "SELECT id, count(*) FROM a GROUP BY id",
+        MEMORY_LIMIT,
+    )
+    .await;
     assert_eq!(
         grouped.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        160
+        ROWS
     );
     assert!(grouped_metrics.spill_partitions > 0);
 
-    let (joined, joined_metrics) =
-        run_with_metrics(&catalog, "SELECT a.id FROM a JOIN b ON a.id = b.id", 2_048).await;
-    assert_eq!(joined.iter().map(RecordBatch::num_rows).sum::<usize>(), 160);
+    let (joined, joined_metrics) = run_with_metrics(
+        &catalog,
+        "SELECT a.id FROM a JOIN b ON a.id = b.id",
+        MEMORY_LIMIT,
+    )
+    .await;
+    assert_eq!(
+        joined.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        ROWS
+    );
     assert!(joined_metrics.spill_partitions > 0);
 }
 

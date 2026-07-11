@@ -8,6 +8,12 @@ Hash Join first uses Grace partitioning. A single row or group that cannot fit
 the minimum operator state returns the required and available memory instead
 of retrying forever.
 
+The same budget also covers resolved file metadata, query snapshots, active
+Parquet footers, Spill file paths, and buffered Spill writers. Very broad
+globs, unusually large Parquet footers/schemas, or a limit too small to open
+the minimum partition writers fail explicitly. Narrow the pattern or raise the
+limit; lowering `batch_size` only helps row-sized working state.
+
 Confirm the configured temporary directory exists on a filesystem with enough
 free space and supports owner-only permissions. Spill files are LZ4-compressed
 Arrow IPC, mode `0600`, and are removed after success, error, or cancellation.

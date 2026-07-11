@@ -21,26 +21,107 @@ docker compose run --rm dev cargo run --release --bin rustdb-bench -- \
   > benchmarks/results/scan-aggregate.json
 ```
 
-For CPU-specific local comparisons, build both RustDB and the fixed DuckDB
-version with the same thread count and run RustDB with
-`RUSTFLAGS="-C target-cpu=native"`. Record the input files, compression,
-row-group size, hardware, cache state, and exact executable versions beside the
-result. Do not compare a warm run from one engine with a cold run from another.
+The suite entrypoints build `rustdb-bench` separately with
+`RUSTFLAGS="-C target-cpu=native"`; portable CI release builds remain generic.
+Every suite manifest and report records the Cargo profile, Rust flags, and
+compiler version. Do not compare a warm run from one engine with a cold run
+from another.
 
 ## DuckDB correctness checksum
 
-`compare_duckdb.sh` renders a query template containing `__TPCH_ROOT__`, runs
-RustDB in the pinned OrbStack development image and DuckDB v1.4.3, sorts the
-CSV result rows, and compares SHA-256 checksums:
+`compare_duckdb.sh` is a compatibility wrapper around the pinned TPC-H
+reference container. It renders a query template containing `__TPCH_ROOT__`,
+runs RustDB and DuckDB 1.4.3, canonicalizes and sorts the result rows, and
+compares SHA-256 checksums:
 
 ```sh
 benchmarks/compare_duckdb.sh benchmarks/tpch/q06.sql data/tpch-sf1
 ```
 
-Override the expected reference version only when deliberately updating the
-baseline: `DUCKDB_VERSION=vX.Y.Z`. Keep the DuckDB version, dataset checksum,
-Parquet compression/row-group settings, hardware, thread count, memory limit,
-and cache state beside stored benchmark JSON. Use SF1 for daily correctness
-and SF10 with a 64/128 MiB memory cap for spill and parallelism checks.
-The dataset argument is workspace-relative so the script can render the host
-path for DuckDB and the `/workspace/...` bind-mounted path for RustDB.
+The host does not need a DuckDB installation. Updating the reference version
+requires changing the checked-in image asset checksums and acceptance docs.
+Use SF1 for daily correctness and SF10 with a 64/128 MiB memory cap for Spill
+and parallelism checks.
+
+## Low-memory acceptance suite
+
+The SF10 resource gate runs full Sort, high-cardinality Aggregate, Inner Join,
+and Left Join workloads at both 64 MiB and 128 MiB:
+
+```sh
+benchmarks/run_low_memory.sh data/tpch-sf10
+```
+
+Every measured query is fully consumed. `rustdb-bench` fails the run when peak
+engine reservation exceeds the configured limit, no Spill occurs, or the
+query-scoped Spill directory remains. For each 64/128 MiB setting, the suite
+first reruns the same query with the same thread, batch, and I/O settings,
+requires non-zero Spill, and compares its complete result with DuckDB. The
+limit is an engine reservation limit, not a
+claim that allocator-retained process RSS equals 64/128 MiB; RSS after each
+run is recorded separately. Join inputs use explicit derived projections so
+the Spill state contains only required keys and payload columns. Only plumbing
+diagnostics may opt out explicitly
+with `SKIP_CHECKSUM=1`; the generated manifest then records
+`"verified": false`. For an S3 dataset, supply the matching local reference:
+
+```sh
+REFERENCE_DATASET_ROOT=data/tpch-sf10 \
+  benchmarks/run_low_memory.sh s3://rustdb-tests/tpch-sf10
+```
+
+Results are written below `benchmarks/results/low-memory/<timestamp>/` as a
+suite `manifest.json`, rendered SQL, checksum records, and one benchmark JSON
+per case and memory limit. `MEMORY_LIMITS_BYTES`, `THREADS`, `BATCH_SIZE`,
+`IO_CONCURRENCY`, `WARMUP`, and `ITERATIONS` are available for deliberate
+non-release experiments. Manifests include the RustDB build identifier and
+dataset-manifest digest; reports include the host CPU model and engine config.
+An output directory must not already exist, preventing a failed rerun from
+leaving an older successful manifest in place.
+
+## Local and MinIO baseline matrix
+
+Run the fixed-hardware local/MinIO matrix with matching datasets:
+
+```sh
+benchmarks/run_baseline.sh \
+  --local-root data/tpch-sf1 \
+  --minio-root s3://rustdb-tests/tpch-sf1 \
+  --output benchmarks/results/baseline/my-machine
+```
+
+The default matrix covers one and four compute threads, 4096/8192-row batches,
+and metadata-cold/warm runs. `THREADS_LIST`, `BATCH_SIZES`, and `CACHE_MODES`
+override those dimensions. “Cold” deliberately means a new engine with a zero
+metadata cache and no warmup; the runner does not claim to flush the OS page
+cache, and records that fact in its manifest. MinIO data must already be
+uploaded at `--minio-root`; the runner starts and initializes the repository's
+MinIO service by default (`START_MINIO=0` disables that behavior). It compares
+the remote and local dataset manifests, then checksum-validates the actual
+local and MinIO query outputs independently before timing either target.
+
+For the repository-generated TPC-H datasets, upload the matching scale first:
+
+```sh
+tools/tpch/upload_minio.sh 1
+```
+
+The uploader verifies the local dataset manifest and replaces the matching
+prefix in the test-only `rustdb-tests` bucket. It reads both remote manifest
+files back and compares them byte-for-byte. Benchmark manifests contain the S3
+URI and run parameters, but never the fixed MinIO test credentials.
+
+Before a long matrix, verify the runner and JSON output with the checked-in CSV
+fixture:
+
+```sh
+THREADS_LIST=1 BATCH_SIZES=1024 CACHE_MODES=cold \
+  benchmarks/run_baseline.sh --smoke \
+  --output benchmarks/results/smoke-forward
+```
+
+Both runners invoke `tools/tpch/compare_query.sh` by default. Override
+`CHECKSUM_RUNNER` only with another executable accepting three arguments: the
+query template, a workspace-relative local DuckDB reference root, and the
+actual RustDB root (workspace-relative or `s3://`). It must fail on a mismatch
+and emit exactly one lowercase SHA-256 on standard output.

@@ -18,10 +18,10 @@ pub(super) const Q3: &str = r#"
 SELECT l_orderkey,
        sum(l_extendedprice * (1 - l_discount)) AS revenue,
        o_orderdate, o_shippriority
-FROM customer, orders, lineitem
+FROM customer
+JOIN orders ON c_custkey = o_custkey
+JOIN lineitem ON o_orderkey = l_orderkey
 WHERE c_mktsegment = 'BUILDING'
-  AND c_custkey = o_custkey
-  AND l_orderkey = o_orderkey
   AND o_orderdate < DATE '1995-03-15'
   AND l_shipdate > DATE '1995-03-15'
 GROUP BY l_orderkey, o_orderdate, o_shippriority
@@ -40,17 +40,17 @@ WHERE l_shipdate >= DATE '1994-01-01'
 
 pub(super) const Q11: &str = r#"
 SELECT ps_partkey, sum(ps_supplycost * ps_availqty) AS value
-FROM partsupp, supplier, nation
-WHERE ps_suppkey = s_suppkey
-  AND s_nationkey = n_nationkey
-  AND n_name = 'GERMANY'
+FROM partsupp
+JOIN supplier ON ps_suppkey = s_suppkey
+JOIN nation ON s_nationkey = n_nationkey
+WHERE n_name = 'GERMANY'
 GROUP BY ps_partkey
 HAVING sum(ps_supplycost * ps_availqty) > (
     SELECT sum(ps_supplycost * ps_availqty) * 0.0001
-    FROM partsupp, supplier, nation
-    WHERE ps_suppkey = s_suppkey
-      AND s_nationkey = n_nationkey
-      AND n_name = 'GERMANY'
+    FROM partsupp
+    JOIN supplier ON ps_suppkey = s_suppkey
+    JOIN nation ON s_nationkey = n_nationkey
+    WHERE n_name = 'GERMANY'
 )
 ORDER BY value DESC
 "#;
@@ -63,9 +63,9 @@ SELECT l_shipmode,
        sum(CASE WHEN o_orderpriority <> '1-URGENT'
                       AND o_orderpriority <> '2-HIGH'
                 THEN 1 ELSE 0 END) AS low_line_count
-FROM orders, lineitem
-WHERE o_orderkey = l_orderkey
-  AND l_shipmode IN ('MAIL', 'SHIP')
+FROM orders
+JOIN lineitem ON o_orderkey = l_orderkey
+WHERE l_shipmode IN ('MAIL', 'SHIP')
   AND l_commitdate < l_receiptdate
   AND l_shipdate < l_commitdate
   AND l_receiptdate >= DATE '1994-01-01'
@@ -93,9 +93,9 @@ SELECT 100.00 *
                 THEN l_extendedprice * (1 - l_discount)
                 ELSE 0 END)
        / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue
-FROM lineitem, part
-WHERE l_partkey = p_partkey
-  AND l_shipdate >= DATE '1995-09-01'
+FROM lineitem
+JOIN part ON l_partkey = p_partkey
+WHERE l_shipdate >= DATE '1995-09-01'
   AND l_shipdate < DATE '1995-09-01' + INTERVAL '1' MONTH
 "#;
 

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use arrow::{
     array::{
@@ -93,6 +93,27 @@ fn evaluate_binary(op: BinaryOp, left: ArrayRef, right: ArrayRef) -> Result<Arra
     if matches!(op, BinaryOp::Divide | BinaryOp::Modulo) {
         ensure_non_zero(&right)?;
     }
+    if left.data_type() != right.data_type()
+        && matches!(
+            left.data_type(),
+            arrow::datatypes::DataType::Decimal128(_, _)
+        )
+        && matches!(
+            right.data_type(),
+            arrow::datatypes::DataType::Decimal128(_, _)
+        )
+        && matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        )
+    {
+        return Ok(Arc::new(compare_decimals(op, &left, &right)?));
+    }
     let result: ArrayRef = match op {
         BinaryOp::Eq => Arc::new(cmp::eq(&left, &right)?),
         BinaryOp::NotEq => Arc::new(cmp::neq(&left, &right)?),
@@ -112,6 +133,100 @@ fn evaluate_binary(op: BinaryOp, left: ArrayRef, right: ArrayRef) -> Result<Arra
         BinaryOp::Modulo => numeric::rem(&left, &right)?,
     };
     Ok(result)
+}
+
+fn compare_decimals(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Result<BooleanArray> {
+    let left = left
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| {
+            Error::Internal("left DECIMAL comparison operand is not Decimal128".into())
+        })?;
+    let right = right
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| {
+            Error::Internal("right DECIMAL comparison operand is not Decimal128".into())
+        })?;
+    if left.len() != right.len() {
+        return Err(Error::Internal(
+            "DECIMAL comparison operands have different lengths".into(),
+        ));
+    }
+    let left_scale = decimal_scale(left.data_type())?;
+    let right_scale = decimal_scale(right.data_type())?;
+    Ok(BooleanArray::from_iter((0..left.len()).map(|row| {
+        if left.is_null(row) || right.is_null(row) {
+            return None;
+        }
+        let ordering =
+            compare_decimal_values(left.value(row), left_scale, right.value(row), right_scale);
+        Some(match op {
+            BinaryOp::Eq => ordering.is_eq(),
+            BinaryOp::NotEq => !ordering.is_eq(),
+            BinaryOp::Lt => ordering.is_lt(),
+            BinaryOp::LtEq => !ordering.is_gt(),
+            BinaryOp::Gt => ordering.is_gt(),
+            BinaryOp::GtEq => !ordering.is_lt(),
+            _ => unreachable!("caller only passes comparison operators"),
+        })
+    })))
+}
+
+fn decimal_scale(data_type: &arrow::datatypes::DataType) -> Result<i8> {
+    match data_type {
+        arrow::datatypes::DataType::Decimal128(_, scale) => Ok(*scale),
+        other => Err(Error::Internal(format!(
+            "expected Decimal128 comparison operand, got {other}"
+        ))),
+    }
+}
+
+fn compare_decimal_values(left: i128, left_scale: i8, right: i128, right_scale: i8) -> Ordering {
+    match (left.is_negative(), right.is_negative()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => compare_decimal_magnitudes(
+            left.unsigned_abs(),
+            left_scale,
+            right.unsigned_abs(),
+            right_scale,
+        ),
+        (true, true) => compare_decimal_magnitudes(
+            left.unsigned_abs(),
+            left_scale,
+            right.unsigned_abs(),
+            right_scale,
+        )
+        .reverse(),
+    }
+}
+
+fn compare_decimal_magnitudes(
+    left: u128,
+    left_scale: i8,
+    right: u128,
+    right_scale: i8,
+) -> Ordering {
+    if left == 0 || right == 0 {
+        return left.cmp(&right);
+    }
+    let left_digits = left.to_string();
+    let right_digits = right.to_string();
+    let left_exponent = left_digits.len() as i16 - i16::from(left_scale);
+    let right_exponent = right_digits.len() as i16 - i16::from(right_scale);
+    match left_exponent.cmp(&right_exponent) {
+        Ordering::Equal => {
+            let width = left_digits.len().max(right_digits.len());
+            let left = left_digits.bytes().chain(std::iter::repeat(b'0'));
+            let right = right_digits.bytes().chain(std::iter::repeat(b'0'));
+            left.zip(right)
+                .take(width)
+                .find_map(|(left, right)| (left != right).then(|| left.cmp(&right)))
+                .unwrap_or(Ordering::Equal)
+        }
+        ordering => ordering,
+    }
 }
 
 fn ensure_non_zero(array: &ArrayRef) -> Result<()> {
@@ -283,7 +398,8 @@ mod tests {
 
     use arrow::{
         array::{
-            Array, BooleanArray, Date32Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
+            Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
+            RecordBatch, StringArray,
         },
         datatypes::{DataType, Field, Schema},
     };
@@ -315,6 +431,66 @@ mod tests {
         assert_eq!(
             result.as_any().downcast_ref::<Int64Array>().unwrap(),
             &Int64Array::from(vec![11, 12, 13])
+        );
+    }
+
+    #[test]
+    fn compares_wide_decimals_with_different_scales_exactly() {
+        let left = Decimal128Array::from(vec![
+            Some(100),
+            Some(100),
+            Some(10_i128.pow(35) - 1),
+            None,
+            Some(-100),
+            Some(-100),
+            Some(0),
+            Some(1),
+        ])
+        .with_precision_and_scale(35, 2)
+        .unwrap();
+        let right = Decimal128Array::from(vec![
+            Some(999_999),
+            Some(1_000_001),
+            Some(10_i128.pow(38) - 1),
+            Some(0),
+            Some(-999_999),
+            Some(-1_000_001),
+            Some(0),
+            Some(10_000),
+        ])
+        .with_precision_and_scale(38, 6)
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("left", DataType::Decimal128(35, 2), true),
+                Field::new("right", DataType::Decimal128(38, 6), true),
+            ])),
+            vec![Arc::new(left), Arc::new(right)],
+        )
+        .unwrap();
+        let expression = BoundExpr {
+            kind: ExprKind::Binary {
+                left: Box::new(BoundExpr::column(0, DataType::Decimal128(35, 2), "left")),
+                op: BinaryOp::Gt,
+                right: Box::new(BoundExpr::column(1, DataType::Decimal128(38, 6), "right")),
+            },
+            data_type: DataType::Boolean,
+            display_name: "left > right".into(),
+        };
+
+        let actual = evaluate(&expression, &batch).unwrap();
+        assert_eq!(
+            actual.as_any().downcast_ref::<BooleanArray>().unwrap(),
+            &BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                Some(true),
+                None,
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+            ])
         );
     }
 
@@ -390,7 +566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executes_decimal_aggregates_without_float_coercion() {
+    async fn executes_decimal_sum_and_average_semantics() {
         let catalog = Catalog::default();
         let plan = crate::sql::plan_sql(
             &catalog,
@@ -409,15 +585,20 @@ mod tests {
             .await
             .unwrap();
 
-        for index in 0..=1 {
-            let decimal = batches[0]
-                .column(index)
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .unwrap();
-            assert_eq!(decimal.data_type(), &DataType::Decimal128(5, 2));
-            assert_eq!(decimal.value(0), 125);
-        }
+        let sum = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(sum.data_type(), &DataType::Decimal128(5, 2));
+        assert_eq!(sum.value(0), 125);
+
+        let average = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(average.value(0), 1.25);
         assert!(batches[0].column(2).is_null(0));
         assert_eq!(
             batches[0].column(2).data_type(),

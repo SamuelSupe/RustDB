@@ -260,10 +260,14 @@ impl LogicalPlan {
                 on,
                 ..
             } => {
-                output.push_str(&format!(
-                    "{indent}{join_type:?}Join keys={} build=right\n",
-                    on.len()
-                ));
+                if on.is_empty() && matches!(right.as_ref(), Self::Scalarize { .. }) {
+                    output.push_str(&format!("{indent}ScalarBroadcast build=right\n"));
+                } else {
+                    output.push_str(&format!(
+                        "{indent}{join_type:?}Join keys={} build=right\n",
+                        on.len()
+                    ));
+                }
                 left.write_explain(depth + 1, output);
                 right.write_explain(depth + 1, output);
             }

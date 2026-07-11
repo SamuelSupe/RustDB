@@ -1,0 +1,5 @@
+# case|query template
+sort|sort.sql
+aggregate|aggregate.sql
+inner-join|inner_join.sql
+left-join|left_join.sql

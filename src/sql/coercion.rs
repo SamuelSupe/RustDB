@@ -49,11 +49,13 @@ pub(super) fn coerce_comparison(
     if is_decimal(&left.data_type) || is_decimal(&right.data_type) {
         let left = decimal_operand(left)?;
         let right = decimal_operand(right)?;
-        let target = common_decimal(&left.data_type, &right.data_type)?;
-        return Ok((
-            cast_if_needed(left, &target),
-            cast_if_needed(right, &target),
-        ));
+        return match lossless_common_decimal(&left.data_type, &right.data_type)? {
+            Some(target) => Ok((
+                cast_if_needed(left, &target),
+                cast_if_needed(right, &target),
+            )),
+            None => Ok((left, right)),
+        };
     }
     if is_numeric(&left.data_type) && is_numeric(&right.data_type) {
         let target = if is_float(&left.data_type) || is_float(&right.data_type) {
@@ -355,6 +357,14 @@ fn decimal_arithmetic_type(left: &DataType, right: &DataType, op: BinaryOp) -> R
 }
 
 fn common_decimal(left: &DataType, right: &DataType) -> Result<DataType> {
+    lossless_common_decimal(left, right)?.ok_or_else(|| {
+        Error::InvalidArgument(
+            "DECIMAL values require more than 38 digits for a lossless common type".into(),
+        )
+    })
+}
+
+fn lossless_common_decimal(left: &DataType, right: &DataType) -> Result<Option<DataType>> {
     let (left_precision, left_scale) = decimal_parts(left)?;
     let (right_precision, right_scale) = decimal_parts(right)?;
     let scale = left_scale.max(right_scale);
@@ -362,11 +372,9 @@ fn common_decimal(left: &DataType, right: &DataType) -> Result<DataType> {
         .max(right_precision as i16 - i16::from(right_scale));
     let precision = i16::from(scale) + integer;
     if precision > 38 {
-        return Err(Error::InvalidArgument(
-            "DECIMAL values require more than 38 digits for a lossless common type".into(),
-        ));
+        return Ok(None);
     }
-    Ok(DataType::Decimal128(precision.max(1) as u8, scale))
+    Ok(Some(DataType::Decimal128(precision.max(1) as u8, scale)))
 }
 
 fn decimal_parts(data_type: &DataType) -> Result<(u8, i8)> {

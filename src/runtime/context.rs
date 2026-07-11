@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    mem::size_of,
     path::Path,
     sync::{
         Arc,
@@ -12,9 +13,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result, sql::LogicalPlan, storage::ObjectSnapshot};
 
-#[cfg(test)]
-use super::MemoryReservation;
-use super::{MemoryPool, QueryControl, QueryMetrics, SpillManager};
+use super::{MemoryPool, MemoryReservation, QueryControl, QueryMetrics, SpillManager};
 
 pub struct QueryContext {
     pub query_id: Uuid,
@@ -24,7 +23,7 @@ pub struct QueryContext {
     pub memory: MemoryPool,
     pub spill: SpillManager,
     view_depth: Arc<AtomicUsize>,
-    object_snapshots: RwLock<HashMap<String, ObjectSnapshot>>,
+    object_snapshots: RwLock<ObjectSnapshots>,
     object_snapshots_sealed: AtomicBool,
     view_plans: RwLock<HashMap<String, LogicalPlan>>,
 }
@@ -56,7 +55,14 @@ impl QueryContext {
     ) -> Result<Self> {
         let control = QueryControl::new();
         let metrics = QueryMetrics::with_memory_pool(memory.clone());
-        let spill = SpillManager::for_query(spill_root, query_id, &control, Some(metrics.clone()))?;
+        let spill = SpillManager::for_query(
+            spill_root,
+            query_id,
+            &control,
+            memory.clone(),
+            Some(metrics.clone()),
+        )?;
+        let snapshot_memory = memory.reservation();
         Ok(Self {
             query_id,
             batch_size,
@@ -65,7 +71,10 @@ impl QueryContext {
             memory,
             spill,
             view_depth: Arc::new(AtomicUsize::new(0)),
-            object_snapshots: RwLock::new(HashMap::new()),
+            object_snapshots: RwLock::new(ObjectSnapshots {
+                entries: HashMap::new(),
+                memory: snapshot_memory,
+            }),
             object_snapshots_sealed: AtomicBool::new(false),
             view_plans: RwLock::new(HashMap::new()),
         })
@@ -112,7 +121,7 @@ impl QueryContext {
         snapshot: ObjectSnapshot,
     ) -> Result<()> {
         let mut snapshots = self.object_snapshots.write();
-        if let Some(existing) = snapshots.get(uri) {
+        if let Some(existing) = snapshots.entries.get(uri) {
             if existing == &snapshot {
                 return Ok(());
             }
@@ -125,7 +134,17 @@ impl QueryContext {
                 "object was not present when the query snapshot was fixed: {uri}"
             )));
         }
-        snapshots.insert(uri.to_owned(), snapshot);
+        let bytes = snapshot_entry_bytes(uri, &snapshot);
+        snapshots.memory.try_grow(bytes).map_err(|_| {
+            Error::ResourceExhausted(format!(
+                "object snapshot metadata for '{uri}' requires {bytes} bytes, but the query \
+                 memory limit is {} bytes with {} bytes currently available; narrow the file \
+                 pattern or increase the memory limit",
+                self.memory.limit(),
+                self.memory.available()
+            ))
+        })?;
+        snapshots.entries.insert(uri.to_owned(), snapshot);
         Ok(())
     }
 
@@ -145,6 +164,7 @@ impl QueryContext {
         }
         self.object_snapshots
             .read()
+            .entries
             .get(uri)
             .cloned()
             .ok_or_else(|| {
@@ -173,6 +193,22 @@ impl QueryContext {
             .get(&name.to_ascii_lowercase())
             .cloned()
     }
+}
+
+struct ObjectSnapshots {
+    entries: HashMap<String, ObjectSnapshot>,
+    memory: MemoryReservation,
+}
+
+fn snapshot_entry_bytes(uri: &str, snapshot: &ObjectSnapshot) -> usize {
+    size_of::<(String, ObjectSnapshot)>()
+        .saturating_mul(3)
+        .saturating_add(uri.len())
+        .saturating_add(snapshot.e_tag.as_ref().map_or(0, String::capacity))
+        .saturating_add(snapshot.version.as_ref().map_or(0, String::capacity))
+        // Covers the HashMap bucket plus per-file provider/Hive/query-plan
+        // handles that remain live alongside the snapshot.
+        .saturating_add(512)
 }
 
 pub(crate) struct ViewExpansion {
@@ -217,7 +253,7 @@ mod tests {
     #[test]
     fn query_snapshot_rejects_identity_changes_and_late_objects() {
         let root = tempfile::tempdir().expect("tempdir");
-        let context = QueryContext::new(MemoryPool::new(128), root.path()).expect("context");
+        let context = QueryContext::new(MemoryPool::new(4_096), root.path()).expect("context");
         let first = ObjectSnapshot {
             size: 10,
             e_tag: Some("v1".to_owned()),
@@ -261,5 +297,48 @@ mod tests {
                 .to_string()
                 .contains("not present")
         );
+    }
+
+    #[test]
+    fn snapshot_metadata_is_reserved_once_and_released_with_the_query() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let memory = MemoryPool::new(1_200);
+        let context = QueryContext::new(memory.clone(), root.path()).expect("context");
+        let first = ObjectSnapshot {
+            size: 10,
+            e_tag: Some("etag-1".to_owned()),
+            version: Some("version-1".to_owned()),
+        };
+        context
+            .register_object_snapshot("s3://bucket/first.parquet", first.clone())
+            .unwrap();
+        let charged = memory.used();
+        assert!(charged > 0);
+        assert!(charged <= memory.limit());
+
+        context
+            .register_object_snapshot("s3://bucket/first.parquet", first)
+            .unwrap();
+        assert_eq!(memory.used(), charged);
+
+        let failed_uri = "s3://bucket/second-object-with-a-long-name.parquet";
+        let error = context
+            .register_object_snapshot(
+                failed_uri,
+                ObjectSnapshot {
+                    size: 20,
+                    e_tag: Some("x".repeat(128)),
+                    version: Some("y".repeat(128)),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, crate::Error::ResourceExhausted(_)));
+        assert_eq!(memory.used(), charged);
+        assert!(memory.peak() <= memory.limit());
+
+        context.seal_object_snapshots();
+        assert!(context.object_snapshot(failed_uri).is_err());
+        drop(context);
+        assert_eq!(memory.used(), 0);
     }
 }

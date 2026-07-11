@@ -27,10 +27,30 @@ with a new seed. Join uses in-memory hash build, Grace partitions on pressure,
 then bounded recursive repartitioning and a skew fallback when hashing cannot
 shrink a duplicate-key partition. Spill files are query-scoped, mode `0600`,
 and removed after success, failure, cancellation, or consumer abandonment.
+Active Spill paths, long-lived IPC writers, partition indices, decoded Spill
+batches, and merge state all retain reservations; file rotation or recursive
+partitioning therefore cannot grow an uncharged in-memory path list.
+
+The configured limit is an engine reservation budget, not a process-RSS hard
+limit. Arrow readers and kernels allocate inside `next()`/kernel calls before
+the resulting buffer size is known; RustDB reserves the complete batch as soon
+as ownership returns and rejects it before processing if it cannot fit.
+Workspaces use conservative pre-reservations, but allocator bookkeeping and
+temporary decoder buffers can still differ from the reservation estimate.
+Once a result batch is yielded, memory retained by the embedding caller is
+outside the engine's ownership and budget; benchmark reports record RSS
+separately.
 
 Local contents rely on the operating-system page cache. The only engine cache
 holds Parquet schema/footer metadata under an approximate byte-bounded LRU.
 Keys contain URI, size, ETag, and version; no decoded data page is retained.
+File discovery has a separate Engine-memory-derived metadata cap and avoids a
+second de-duplication set. Query snapshot entries retain memory reservations.
+Parquet reads its fixed trailer and reserves a conservative footer expansion
+before decoding; the resulting lease stays live through every row-group
+morsel. Row-group pruning iterates indices directly instead of materializing a
+file-sized selected list. Decoder and public output batches remain
+structurally bounded by `io_concurrency`, channel capacity, and `batch_size`.
 
 Before any physical input stream is polled, RustDB walks every Scan in the
 query (including dynamic views), captures each object's fresh identity, and

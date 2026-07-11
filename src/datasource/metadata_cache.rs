@@ -72,8 +72,8 @@ impl MetadataCache {
         snapshot: &ObjectSnapshot,
         metadata: ArrowReaderMetadata,
     ) {
+        let weight = metadata_weight(source, snapshot, &metadata);
         let key = MetadataKey::new(source, snapshot);
-        let weight = entry_weight(&key, &metadata);
         let mut state = self.inner.lock();
         if state.max_bytes == 0 || weight > state.max_bytes {
             return;
@@ -104,6 +104,17 @@ impl MetadataCache {
     }
 }
 
+/// Conservative live weight used both by the cache and by query-scoped
+/// metadata reservations. Keeping the calculation in one place prevents a
+/// cached footer from bypassing the query memory budget.
+pub(super) fn metadata_weight(
+    source: &ObjectSource,
+    snapshot: &ObjectSnapshot,
+    metadata: &ArrowReaderMetadata,
+) -> usize {
+    entry_weight(&MetadataKey::new(source, snapshot), metadata)
+}
+
 impl MetadataKey {
     fn new(source: &ObjectSource, snapshot: &ObjectSnapshot) -> Self {
         Self {
@@ -124,11 +135,14 @@ fn entry_weight(key: &MetadataKey, metadata: &ArrowReaderMetadata) -> usize {
         .schema()
         .fields()
         .size()
+        .saturating_mul(2)
         .saturating_add(size_of::<arrow::datatypes::Schema>());
     key_bytes
         .saturating_add(metadata.metadata().memory_size())
         .saturating_add(schema_bytes)
+        .saturating_add(size_of::<ArrowReaderMetadata>())
         .saturating_add(size_of::<CacheEntry>())
+        .saturating_add(4 * 1024)
 }
 
 impl fmt::Debug for MetadataCache {

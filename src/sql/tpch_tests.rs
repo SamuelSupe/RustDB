@@ -22,6 +22,21 @@ async fn plans_and_executes_tpch_smoke_queries() {
     let catalog = tpch_catalog();
     for (name, sql) in ALL {
         let plan = plan_sql(&catalog, sql).unwrap_or_else(|error| panic!("{name} plan: {error}"));
+        let expected_hash_joins = match name {
+            "Q3" => 2,
+            "Q11" => 4,
+            "Q12" | "Q14" => 1,
+            _ => 0,
+        };
+        let explain = format!("{plan:?}");
+        assert!(
+            !explain.contains("Join keys=0"),
+            "{name} must not plan a Cartesian join:\n{explain}"
+        );
+        assert!(
+            explain.matches("InnerJoin keys=1").count() >= expected_hash_joins,
+            "{name} should plan at least {expected_hash_joins} keyed hash joins:\n{explain}"
+        );
         let temp = tempfile::tempdir().unwrap();
         let context = QueryContext::shared(MemoryPool::new(8 << 20), temp.path()).unwrap();
         let batches = execute(plan, context)
@@ -101,13 +116,13 @@ fn tpch_catalog() -> Catalog {
             vec![
                 i64_field("ps_partkey"),
                 i64_field("ps_suppkey"),
-                decimal_field("ps_supplycost", 8, 2),
+                decimal_field("ps_supplycost", 15, 2),
                 i64_field("ps_availqty"),
             ],
             vec![
                 i64s(&[100]),
                 i64s(&[200]),
-                decimals(&[200], 8, 2),
+                decimals(&[200], 15, 2),
                 i64s(&[100]),
             ],
         ),

@@ -1,16 +1,19 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
-    array::{Array, Int64Array, StringArray},
+    array::{Array, ArrayRef, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
 use futures::{TryStreamExt, stream};
 use tempfile::tempdir;
 
-use super::{MERGE_FAN_IN, sort};
-use crate::runtime::{MemoryPool, QueryContext, boxed_record_batch_stream};
+use super::{MERGE_FAN_IN, run::MAX_PENDING_RUNS, sort};
 use crate::sql::{BoundExpr, SortExpr};
+use crate::{
+    Error,
+    runtime::{MemoryPool, QueryContext, boxed_record_batch_stream},
+};
 
 #[tokio::test]
 async fn orders_multiple_keys_with_explicit_null_placement() {
@@ -93,10 +96,10 @@ async fn spills_and_merges_top_k_with_bounded_memory() {
         false,
     )]));
     let mut input_batches = Vec::new();
-    for chunk in (0_i64..24).rev() {
-        let values: Vec<_> = (0_i64..128)
+    for chunk in (0_i64..96).rev() {
+        let values: Vec<_> = (0_i64..256)
             .rev()
-            .map(|offset| chunk * 128 + offset)
+            .map(|offset| chunk * 256 + offset)
             .collect();
         input_batches.push(Ok(RecordBatch::try_new(
             Arc::clone(&schema),
@@ -106,7 +109,7 @@ async fn spills_and_merges_top_k_with_bounded_memory() {
     }
     let directory = tempdir().unwrap();
     let context =
-        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024), directory.path()).unwrap());
+        Arc::new(QueryContext::new(MemoryPool::new(128 * 1024), directory.path()).unwrap());
     let input = boxed_record_batch_stream(stream::iter(input_batches));
     let expression = SortExpr {
         expr: BoundExpr::column(0, DataType::Int64, "value"),
@@ -139,7 +142,7 @@ async fn spills_and_merges_top_k_with_bounded_memory() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    assert_eq!(values, (3022_i64..3072).rev().collect::<Vec<_>>());
+    assert_eq!(values, (24_526_i64..24_576).rev().collect::<Vec<_>>());
     let metrics = context.metrics.snapshot();
     assert!(metrics.spill_bytes > 0);
     assert!(metrics.spill_partitions > MERGE_FAN_IN as u64);
@@ -159,14 +162,15 @@ async fn slices_a_single_input_batch_that_exceeds_the_sort_budget() {
         DataType::Int64,
         false,
     )]));
-    let values = (0_i64..1_024).rev().collect::<Vec<_>>();
+    let values = (0_i64..8_192).rev().collect::<Vec<_>>();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![Arc::new(Int64Array::from(values))],
     )
     .unwrap();
     let directory = tempdir().unwrap();
-    let context = Arc::new(QueryContext::new(MemoryPool::new(8 * 1024), directory.path()).unwrap());
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(128 * 1024), directory.path()).unwrap());
     let input = boxed_record_batch_stream(stream::iter([Ok(batch)]));
     let expression = SortExpr {
         expr: BoundExpr::column(0, DataType::Int64, "value"),
@@ -198,7 +202,256 @@ async fn slices_a_single_input_batch_that_exceeds_the_sort_budget() {
                 .copied()
         })
         .collect::<Vec<_>>();
-    assert_eq!(values, (0_i64..1_024).collect::<Vec<_>>());
+    assert_eq!(values, (0_i64..8_192).collect::<Vec<_>>());
     assert!(context.metrics.snapshot().spill_bytes > 0);
+    assert!(context.memory.peak() <= context.memory.limit());
+}
+
+#[tokio::test]
+async fn rejects_an_input_batch_whose_retained_buffers_exceed_the_budget() {
+    const MEMORY_LIMIT: usize = 32 << 10;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values(0_i64..8_192))],
+    )
+    .unwrap();
+    assert!(batch.get_array_memory_size() > MEMORY_LIMIT);
+    let directory = tempdir().unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(MEMORY_LIMIT), directory.path()).unwrap());
+    let input = boxed_record_batch_stream(stream::iter([Ok(batch)]));
+    let expression = SortExpr {
+        expr: BoundExpr::column(0, DataType::Int64, "value"),
+        descending: false,
+        nulls_first: false,
+    };
+
+    let error = sort(
+        input,
+        vec![expression],
+        None,
+        schema,
+        Arc::clone(&context),
+        128,
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::ResourceExhausted(message)
+            if message.contains("complete input batch")
+                && message.contains("query limit 32768 bytes")
+    ));
+    assert_eq!(context.memory.used(), 0);
+}
+
+#[tokio::test]
+async fn spills_buffered_input_before_retrying_the_next_batch_reservation() {
+    const MEMORY_LIMIT: usize = 128 << 10;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values(7_200_i64..8_224))],
+    )
+    .unwrap();
+    let second = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values(0_i64..7_200))],
+    )
+    .unwrap();
+    assert!(second.get_array_memory_size() > 56 << 10);
+    let directory = tempdir().unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(MEMORY_LIMIT), directory.path()).unwrap());
+    let input = boxed_record_batch_stream(stream::iter([Ok(first), Ok(second)]));
+    let expression = SortExpr {
+        expr: BoundExpr::column(0, DataType::Int64, "value"),
+        descending: false,
+        nulls_first: false,
+    };
+
+    let batches = sort(
+        input,
+        vec![expression],
+        None,
+        schema,
+        Arc::clone(&context),
+        128,
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, (0_i64..8_224).collect::<Vec<_>>());
+    assert!(context.metrics.snapshot().spill_bytes > 0);
+    assert!(context.memory.peak() <= MEMORY_LIMIT);
+}
+
+#[tokio::test]
+async fn wide_metadata_schema_uses_dynamic_spill_headroom_under_low_memory() {
+    const MEMORY_LIMIT: usize = 256 << 10;
+    const COLUMNS: usize = 8;
+    const ROWS: i64 = 1_024;
+    let fields = (0..COLUMNS)
+        .map(|column| Field::new(format!("column_{column}"), DataType::Int64, false))
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        HashMap::from([("wide-metadata".into(), "m".repeat(32 << 10))]),
+    ));
+    let columns = (0..COLUMNS)
+        .map(|column| {
+            Arc::new(Int64Array::from_iter_values(
+                (0_i64..ROWS).rev().map(|value| value + column as i64),
+            )) as ArrayRef
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let directory = tempdir().unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(MEMORY_LIMIT), directory.path()).unwrap());
+    let spill_headroom = context
+        .spill
+        .writer_headroom_bytes("sort-merge", schema.as_ref());
+    assert!(spill_headroom > 80 << 10);
+    let input = boxed_record_batch_stream(stream::iter([Ok(batch)]));
+    let expression = SortExpr {
+        expr: BoundExpr::column(0, DataType::Int64, "column_0"),
+        descending: false,
+        nulls_first: false,
+    };
+
+    let batches = sort(
+        input,
+        vec![expression],
+        None,
+        schema,
+        Arc::clone(&context),
+        64,
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, (0_i64..ROWS).collect::<Vec<_>>());
+    assert!(context.metrics.snapshot().spill_bytes > 0);
+    assert!(context.memory.peak() <= MEMORY_LIMIT);
+}
+
+#[tokio::test]
+async fn dropping_after_one_output_cleans_sort_runs_and_reservations() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values((0_i64..8_192).rev()))],
+    )
+    .unwrap();
+    let directory = tempdir().unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(128 << 10), directory.path()).unwrap());
+    let input = boxed_record_batch_stream(stream::iter([Ok(batch)]));
+    let expression = SortExpr {
+        expr: BoundExpr::column(0, DataType::Int64, "value"),
+        descending: false,
+        nulls_first: false,
+    };
+    let mut output = sort(
+        input,
+        vec![expression],
+        None,
+        schema,
+        Arc::clone(&context),
+        128,
+    );
+
+    assert!(output.try_next().await.unwrap().is_some());
+    drop(output);
+    assert_eq!(context.memory.used(), 0);
+    assert_eq!(
+        std::fs::read_dir(context.spill.directory())
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn compacts_run_metadata_during_a_long_spilling_input() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let input_batches = (0..160)
+        .rev()
+        .map(|value| {
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![value as i64; 256]))],
+            )
+            .unwrap())
+        })
+        .collect::<Vec<_>>();
+    let directory = tempdir().unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(128 * 1024), directory.path()).unwrap());
+    let input = boxed_record_batch_stream(stream::iter(input_batches));
+    let expression = SortExpr {
+        expr: BoundExpr::column(0, DataType::Int64, "value"),
+        descending: false,
+        nulls_first: false,
+    };
+
+    let batches = sort(
+        input,
+        vec![expression],
+        Some(8),
+        Arc::clone(&schema),
+        Arc::clone(&context),
+        16,
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
+    assert!(context.metrics.snapshot().spill_partitions > MAX_PENDING_RUNS as u64);
     assert!(context.memory.peak() <= context.memory.limit());
 }
