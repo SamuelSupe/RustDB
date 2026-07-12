@@ -486,11 +486,15 @@ impl State {
         // mounts can expose an empty ghost directory when the handle closes
         // later. Cleanup owns the lifecycle lock, so release it before removal.
         let activity_lock = self.activity_lock.lock().take();
+        // Close the activity-file descriptor before dispatching directory
+        // deletion. On macOS-hosted shared mounts, closing and unlinking the
+        // lock back-to-back on the same worker can leave an empty ghost
+        // directory visible after the container exits.
+        drop(activity_lock);
         let directory = self.directory.clone();
         let verify = directory.clone();
         let sync_path = directory.clone();
         self.io_pool.run_cleanup(move || {
-            drop(activity_lock);
             match std::fs::remove_dir_all(&directory) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
