@@ -16,7 +16,6 @@ use crate::execution::{expr, scan};
 
 enum LaneMessage {
     Batch(BatchEnvelope),
-    Error(crate::Error),
     Done,
 }
 
@@ -65,29 +64,31 @@ pub(super) fn execute(pipeline: FusedPipeline, context: Arc<QueryContext>) -> Me
         let (sender, mut receiver) = mpsc::channel(lanes);
 
         for _ in 0..lanes {
-            tokio::spawn(run_lane(
+            context.tasks.spawn("scan-pipeline-lane", run_lane(
                 Arc::clone(&pending),
                 sender.clone(),
                 cancellation.clone(),
                 Arc::clone(&lane_plan),
                 Arc::clone(&context),
-            ));
+            ))?;
         }
-        drop(sender);
+        // Keep the coordinator sender alive until every lane reports Done.
+        // A worker sender is dropped during panic unwinding before TaskGroup
+        // records the panic; closing the channel here would race that record
+        // and could expose the generic stopped error instead.
 
         let mut completed = 0;
         while completed < lanes {
             let message: Result<Option<LaneMessage>> = tokio::select! {
-                _ = context.control.cancelled() => Err(crate::Error::Cancelled),
+                biased;
+                _ = context.control.cancelled() => Err(context
+                    .check_cancelled()
+                    .expect_err("cancelled query has a terminal error")),
                 message = receiver.recv() => Ok(message),
             };
             let message = message?;
             match message {
                 Some(LaneMessage::Batch(batch)) => yield batch,
-                Some(LaneMessage::Error(error)) => {
-                    cancellation.cancel();
-                    Err(error)?;
-                }
                 Some(LaneMessage::Done) => completed += 1,
                 None => {
                     cancellation.cancel();
@@ -97,6 +98,7 @@ pub(super) fn execute(pipeline: FusedPipeline, context: Arc<QueryContext>) -> Me
                 }
             }
         }
+        drop(sender);
     })
 }
 
@@ -106,17 +108,12 @@ async fn run_lane(
     cancellation: CancellationToken,
     plan: Arc<LanePlan>,
     context: Arc<QueryContext>,
-) {
-    let result = run_lane_inner(pending, &sender, &cancellation, &plan, &context).await;
-
-    if let Err(error) = result
-        && !cancellation.is_cancelled()
-        && !context.control.is_cancelled()
-    {
-        let _ = sender.send(LaneMessage::Error(error)).await;
-        cancellation.cancel();
-    }
-    let _ = sender.send(LaneMessage::Done).await;
+) -> Result<()> {
+    run_lane_inner(pending, &sender, &cancellation, &plan, &context).await?;
+    sender
+        .send(LaneMessage::Done)
+        .await
+        .map_err(|_| crate::Error::Cancelled)
 }
 
 async fn run_lane_inner(

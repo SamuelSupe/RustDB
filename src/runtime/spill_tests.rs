@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io,
     path::Path,
-    sync::{Arc, mpsc},
+    sync::{Arc, atomic::Ordering, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -112,6 +112,62 @@ fn round_trips_lz4_ipc_and_cleans_on_drop() {
     assert!(!directory.exists());
     assert_eq!(memory.used(), 0);
     assert!(memory.peak() <= memory.limit());
+}
+
+#[test]
+fn cleanup_waits_for_cancelled_in_flight_io_and_its_reservation() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let control = QueryControl::new();
+    let memory = MemoryPool::new(1 << 20);
+    let manager = SpillManager::for_task_group_query(
+        root.path(),
+        uuid::Uuid::new_v4(),
+        &control,
+        memory.clone(),
+        None,
+    )
+    .unwrap();
+    let directory = manager.directory().to_path_buf();
+    let reservation = memory.try_reserve(4_096).unwrap();
+    let (started_sender, started_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let running_manager = manager.clone();
+    let io_thread = thread::spawn(move || {
+        running_manager.run_tracked_io_for_test(move || {
+            let _reservation = reservation;
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            Ok(())
+        })
+    });
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("tracked I/O must start");
+
+    control.cancel();
+    let cleanup_manager = manager.clone();
+    let (cleaned_sender, cleaned_receiver) = mpsc::sync_channel(1);
+    let cleanup_thread = thread::spawn(move || {
+        cleaned_sender.send(cleanup_manager.cleanup()).unwrap();
+    });
+
+    assert!(
+        cleaned_receiver
+            .recv_timeout(Duration::from_millis(20))
+            .is_err()
+    );
+    assert_eq!(memory.used(), 4_096);
+    assert!(directory.exists());
+
+    release_sender.send(()).unwrap();
+    assert!(matches!(io_thread.join().unwrap(), Err(Error::Cancelled)));
+    cleaned_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("cleanup must finish after I/O quiesces")
+        .unwrap();
+    cleanup_thread.join().unwrap();
+    assert_eq!(memory.used(), 0);
+    assert!(!directory.exists());
 }
 
 #[test]
@@ -278,37 +334,54 @@ fn write_copy_reserves_before_allocation_and_cancel_releases_a_queued_copy() {
 }
 
 #[test]
-fn write_copy_budget_failure_is_reported_before_arrow_writer_is_called() {
+fn write_copy_uses_protected_headroom_when_ordinary_budget_is_full() {
     let root = tempfile::tempdir().unwrap();
     let batch = binary_batch(128 << 10);
-    let query_id = uuid::Uuid::nil();
-    let path = root
-        .path()
-        .join(format!("query-{query_id}"))
-        .join("00000000-copy-budget.arrow");
-    let writer_bytes = writer_memory_bytes(batch.schema().as_ref());
-    let copy_bytes = copy_memory_bytes(32 << 10);
-    let memory = MemoryPool::new(
-        writer_bytes + active_file_metadata_bytes(&path) + copy_bytes.saturating_sub(1),
-    );
-    let manager = SpillManager::for_query(
-        root.path(),
-        query_id,
-        &QueryControl::new(),
-        memory.clone(),
-        None,
-    )
-    .unwrap();
-    let error = match manager.writer("copy-budget", batch.schema()) {
-        Ok(_) => panic!("writer unexpectedly retained an unbudgeted copy buffer"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        error,
-        Error::ResourceExhausted(message) if message.contains("spill I/O queue copy")
-    ));
+    let memory = MemoryPool::new(1 << 20);
+    let manager = SpillManager::new(root.path(), memory.clone()).unwrap();
+    let mut writer = manager.writer("copy-budget", batch.schema()).unwrap();
+    let ordinary = memory.try_reserve(memory.available()).unwrap();
+
+    writer.write_batch(&batch).unwrap();
+    let file = writer.finish(1).unwrap();
+    manager.remove_file(&file).unwrap();
+
+    drop(ordinary);
     assert_eq!(memory.used(), 0);
     assert_eq!(spill_file_count(&manager), 0);
+}
+
+#[test]
+fn query_manager_protects_one_forward_progress_copy_slot() {
+    let root = tempfile::tempdir().unwrap();
+    let memory = MemoryPool::new(1 << 20);
+    let manager = SpillManager::new(root.path(), memory.clone()).unwrap();
+    let copy_bytes = copy_memory_bytes(memory.limit());
+
+    assert_eq!(memory.emergency_headroom(), copy_bytes);
+    let normal = memory.try_reserve(memory.available()).unwrap();
+    assert_eq!(memory.available(), 0);
+    let copy = memory.try_reserve_emergency(copy_bytes).unwrap();
+    assert!(memory.used() <= memory.limit());
+
+    drop(copy);
+    drop(normal);
+    drop(manager);
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn engine_pool_protects_one_copy_slot_per_io_worker() {
+    let memory = MemoryPool::new(1 << 20);
+    let copy_bytes = copy_memory_bytes(memory.limit());
+    let io_threads = SpillConfig::default().io_threads;
+
+    SpillManager::protect_io_headroom(&memory, io_threads).unwrap();
+
+    assert_eq!(
+        memory.emergency_headroom(),
+        copy_bytes.saturating_mul(io_threads)
+    );
 }
 
 #[test]
@@ -689,4 +762,65 @@ fn permanent_cleanup_failure_retains_engine_quota_after_manager_drop() {
     assert_eq!(quota_pool.committed_bytes(), charged);
 
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn production_drop_leaves_cleanup_to_the_reaper() {
+    let root = tempfile::tempdir().unwrap();
+    let config = SpillConfig {
+        directory: root.path().to_path_buf(),
+        min_free_ratio: 0.0,
+        min_free_bytes: 0,
+        io_threads: 1,
+        ..SpillConfig::default()
+    };
+    let quota = SpillQuotaPool::new(config).unwrap().start_query();
+    let control = QueryControl::new();
+    let manager = SpillManager::for_query_with_resources(
+        root.path(),
+        uuid::Uuid::new_v4(),
+        &control,
+        MemoryPool::new(1 << 20),
+        None,
+        quota,
+        SpillIoPool::new(1).unwrap(),
+    )
+    .unwrap();
+    let directory = manager.directory().to_path_buf();
+
+    drop(manager);
+
+    assert!(directory.exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn completed_cleanup_is_a_no_io_fast_path() {
+    let root = tempfile::tempdir().unwrap();
+    let config = SpillConfig {
+        directory: root.path().to_path_buf(),
+        min_free_ratio: 0.0,
+        min_free_bytes: 0,
+        io_threads: 1,
+        ..SpillConfig::default()
+    };
+    let quota = SpillQuotaPool::new(config).unwrap().start_query();
+    let control = QueryControl::new();
+    let io_pool = SpillIoPool::new(1).unwrap();
+    let manager = SpillManager::for_query_with_resources(
+        root.path(),
+        uuid::Uuid::new_v4(),
+        &control,
+        MemoryPool::new(1 << 20),
+        None,
+        quota,
+        io_pool.clone(),
+    )
+    .unwrap();
+
+    manager.cleanup().unwrap();
+    assert!(manager.state.cleanup_completed.load(Ordering::Acquire));
+    io_pool.shutdown_for_test();
+    manager.cleanup().unwrap();
+    drop(manager);
 }

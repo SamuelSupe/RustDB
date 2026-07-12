@@ -102,6 +102,15 @@ impl Planner<'_> {
     }
 
     fn plan_query_scoped(&self, query: &Query, inherited_ctes: &CteScope) -> Result<LogicalPlan> {
+        self.plan_query_with_outer(query, inherited_ctes, None)
+    }
+
+    fn plan_query_with_outer(
+        &self,
+        query: &Query,
+        inherited_ctes: &CteScope,
+        outer: Option<&PlanSchema>,
+    ) -> Result<LogicalPlan> {
         if !query.pipe_operators.is_empty() {
             return Err(Error::Unsupported("pipe queries are not supported".into()));
         }
@@ -126,7 +135,7 @@ impl Planner<'_> {
                         cte.alias.name.value
                     )));
                 }
-                let plan = self.plan_query_scoped(&cte.query, &ctes)?;
+                let plan = self.plan_query_with_outer(&cte.query, &ctes, outer)?;
                 let plan = alias_plan(plan, Some(&cte.alias.name.value), &cte.alias.columns)?;
                 ctes.insert(name, plan);
             }
@@ -175,7 +184,7 @@ impl Planner<'_> {
             }
         }
 
-        let mut plan = self.plan_select(select, &ctes, &hidden_order)?;
+        let mut plan = self.plan_select(select, &ctes, &hidden_order, outer)?;
         if !prepared_order.is_empty() {
             let visible_width = plan
                 .schema()

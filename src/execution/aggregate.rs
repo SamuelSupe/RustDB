@@ -18,6 +18,7 @@ use super::{
     value::{CellValue, cell, values_to_array},
 };
 
+mod distinct;
 mod key;
 mod parallel;
 mod spill;
@@ -46,7 +47,16 @@ where
 {
     let input = input.into_memory_batch_stream(Arc::clone(&context), "aggregate input");
     boxed_memory_batch_stream(async_stream::try_stream! {
-        let mut output = if parallel::is_supported(&aggregates, &context) {
+        let mut output = if aggregates.iter().any(|aggregate| aggregate.distinct) {
+            distinct::aggregate(
+                input,
+                groups,
+                aggregates,
+                schema,
+                Arc::clone(&context),
+                batch_size,
+            )
+        } else if parallel::is_supported(&aggregates, &context) {
             parallel::aggregate(
                 input,
                 groups,
@@ -131,7 +141,7 @@ enum InputMode {
 }
 
 #[derive(Clone, Copy)]
-enum OutputMode {
+pub(super) enum OutputMode {
     Final,
     Partial,
 }
@@ -486,7 +496,7 @@ fn build_batch(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn partial_schema(groups: &[BoundExpr], aggregates: &[AggregateExpr]) -> SchemaRef {
+pub(super) fn partial_schema(groups: &[BoundExpr], aggregates: &[AggregateExpr]) -> SchemaRef {
     let mut fields = groups
         .iter()
         .enumerate()

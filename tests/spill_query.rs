@@ -452,7 +452,7 @@ async fn order_by_top_k_and_full_sort_spill_and_cleanup() -> Result<()> {
 }
 
 #[tokio::test]
-async fn dropping_a_partially_consumed_spilling_query_cleans_up_immediately() -> Result<()> {
+async fn dropping_a_partially_consumed_spilling_query_reaps_after_quiescence() -> Result<()> {
     const ROWS: i64 = 40_000;
     const MEMORY_LIMIT: usize = 2 * MIB;
 
@@ -493,13 +493,78 @@ async fn dropping_a_partially_consumed_spilling_query_cleans_up_immediately() ->
     let metrics = result.metrics();
     drop(result);
 
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while query_dir.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("query reaper must remove abandoned spill after workers quiesce");
     assert!(
         !query_dir.exists(),
-        "abandoned query did not synchronously remove its spill directory"
+        "abandoned query reaper left its spill directory behind"
     );
     assert!(
         !metrics.snapshot().elapsed.is_zero(),
         "abandoned query metrics were not finalized"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_a_spilling_distinct_query_releases_its_directory() -> Result<()> {
+    const GROUPS: i64 = 150_000;
+    const REPEATS: i64 = 4;
+    const MEMORY_LIMIT: usize = 4 * MIB;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let csv = temp.path().join("distinct-cancel.csv");
+    write_aggregate_input(&csv, GROUPS, REPEATS);
+    let config = low_memory_config(temp.path(), MEMORY_LIMIT);
+    let spill_root = config.spill.directory.clone();
+    let session = Engine::new(config)?.session();
+    session
+        .register_csv(
+            "distinct_cancel",
+            [csv.to_string_lossy().into_owned()],
+            CsvOptions {
+                header: CsvHeader::Present,
+                ..CsvOptions::default()
+            },
+        )
+        .await?;
+
+    let result = session
+        .execute(
+            "SELECT count(DISTINCT key), sum(DISTINCT value) \
+             FROM distinct_cancel",
+        )
+        .await?;
+    let query_dir = spill_root.join(format!("query-{}", result.query_id()));
+    let metrics = result.metrics();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while metrics.snapshot().spill_files == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("DISTINCT query must begin spilling before cancellation");
+    assert!(query_dir.is_dir());
+
+    result.cancel();
+    drop(result);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while query_dir.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("DISTINCT cancellation must reap its Spill directory");
+
+    let snapshot = metrics.snapshot();
+    assert!(snapshot.spill_files > 0);
+    assert!(snapshot.peak_memory_bytes <= MEMORY_LIMIT as u64);
+    assert!(!snapshot.elapsed.is_zero());
+    assert!(!query_dir.exists());
     Ok(())
 }

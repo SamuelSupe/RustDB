@@ -1,11 +1,6 @@
 use std::{collections::HashMap, mem::size_of, sync::Arc};
 
-use arrow::{
-    array::{ArrayRef, UInt32Array, new_null_array},
-    compute::take,
-    datatypes::SchemaRef,
-    record_batch::{RecordBatch, RecordBatchOptions},
-};
+use arrow::{array::ArrayRef, datatypes::SchemaRef, record_batch::RecordBatch};
 
 use crate::{
     Error, Result,
@@ -13,7 +8,27 @@ use crate::{
     sql::JoinType,
 };
 
-use super::{CellValue, row_key};
+use super::{
+    CellValue, cell,
+    condition::{JoinPredicates, SqlTruth},
+    output::{build_output, candidate_workspace_bytes, grow_workspace, output_workspace_bytes},
+    row_key,
+};
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GlobalMembershipState {
+    rhs_nonempty: bool,
+    rhs_has_null: bool,
+}
+
+impl GlobalMembershipState {
+    pub(super) fn new(rhs_rows: usize, right_values: &ArrayRef) -> Self {
+        Self {
+            rhs_nonempty: rhs_rows != 0,
+            rhs_has_null: right_values.null_count() != 0,
+        }
+    }
+}
 
 pub(super) fn try_build_hash_table(
     key_arrays: &[ArrayRef],
@@ -175,12 +190,32 @@ pub(super) struct ProbeCursor<'a> {
     right: &'a RecordBatch,
     left_keys: &'a [ArrayRef],
     hash_table: &'a HashMap<Vec<CellValue>, Vec<u32>>,
+    predicates: &'a JoinPredicates,
+    left_values: Option<&'a ArrayRef>,
+    right_values: Option<&'a ArrayRef>,
+    global_membership: Option<GlobalMembershipState>,
     join_type: JoinType,
     schema: SchemaRef,
     batch_size: usize,
     held_bytes: usize,
     row: usize,
     match_index: usize,
+    current_state: RowState,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RowState {
+    matches: usize,
+    first_right: Option<u32>,
+    unknown: bool,
+}
+
+struct CandidateGroup {
+    left_row: usize,
+    start: usize,
+    end: usize,
+    complete: bool,
+    state: RowState,
 }
 
 impl<'a> ProbeCursor<'a> {
@@ -190,6 +225,10 @@ impl<'a> ProbeCursor<'a> {
         right: &'a RecordBatch,
         left_keys: &'a [ArrayRef],
         hash_table: &'a HashMap<Vec<CellValue>, Vec<u32>>,
+        predicates: &'a JoinPredicates,
+        left_values: Option<&'a ArrayRef>,
+        right_values: Option<&'a ArrayRef>,
+        global_membership: Option<GlobalMembershipState>,
         join_type: JoinType,
         schema: SchemaRef,
         batch_size: usize,
@@ -200,12 +239,17 @@ impl<'a> ProbeCursor<'a> {
             right,
             left_keys,
             hash_table,
+            predicates,
+            left_values,
+            right_values,
+            global_membership,
             join_type,
             schema,
             batch_size: batch_size.max(1),
             held_bytes,
             row: 0,
             match_index: 0,
+            current_state: RowState::default(),
         }
     }
 
@@ -216,7 +260,13 @@ impl<'a> ProbeCursor<'a> {
         context.check_cancelled()?;
         let index_bytes = self
             .batch_size
-            .saturating_mul(size_of::<u32>().saturating_add(size_of::<Option<u32>>()))
+            .saturating_mul(
+                size_of::<u32>()
+                    .saturating_mul(3)
+                    .saturating_add(size_of::<Option<u32>>())
+                    .saturating_add(size_of::<CandidateGroup>()),
+            )
+            .saturating_add(size_of::<RowState>())
             .saturating_add(1_024)
             .max(1);
         let mut workspace = context
@@ -228,78 +278,173 @@ impl<'a> ProbeCursor<'a> {
             .await?;
         let mut left_indices = Vec::with_capacity(self.batch_size);
         let mut right_indices = Vec::with_capacity(self.batch_size);
-        {
-            let _active = context.scheduler.enter_lane();
-            while self.row < self.left.num_rows() && left_indices.len() < self.batch_size {
-                let key = row_key(self.left_keys, self.row)?;
-                let matches = if key.iter().any(CellValue::is_null) {
-                    None
-                } else {
-                    self.hash_table.get(&key)
-                };
-                if matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
-                    let emit = match self.join_type {
-                        JoinType::Semi => matches.is_some(),
-                        JoinType::Anti => matches.is_none(),
-                        _ => unreachable!("checked semi/anti join"),
+        let mut markers = Vec::with_capacity(self.batch_size);
+
+        while self.row < self.left.num_rows() && left_indices.len() < self.batch_size {
+            let mut candidate_left = Vec::with_capacity(self.batch_size);
+            let mut candidate_right = Vec::with_capacity(self.batch_size);
+            let mut candidate_groups = Vec::new();
+            {
+                let _active = context.scheduler.enter_lane();
+                while self.row < self.left.num_rows()
+                    && left_indices.len().saturating_add(candidate_left.len()) < self.batch_size
+                {
+                    let left_row = self.row;
+                    let key = row_key(self.left_keys, left_row)?;
+                    let matches = if key.iter().any(CellValue::is_null) {
+                        None
+                    } else {
+                        self.hash_table.get(&key)
                     };
-                    if emit {
-                        left_indices.push(u32::try_from(self.row).map_err(|_| {
-                            Error::ResourceExhausted(
-                                "join probe batch exceeds UINT32_MAX rows".into(),
-                            )
-                        })?);
-                        right_indices.push(None);
-                    }
-                    self.row += 1;
-                    self.match_index = 0;
-                    continue;
-                }
-                if let Some(matches) = matches {
-                    let left_row = u32::try_from(self.row).map_err(|_| {
-                        Error::ResourceExhausted("join probe batch exceeds UINT32_MAX rows".into())
-                    })?;
-                    while self.match_index < matches.len() && left_indices.len() < self.batch_size {
-                        let right_row = matches[self.match_index];
-                        self.match_index += 1;
-                        left_indices.push(left_row);
-                        right_indices.push(Some(right_row));
-                    }
-                    if self.match_index == matches.len() {
+                    let Some(matches) = matches.filter(|matches| !matches.is_empty()) else {
+                        let state = self.initial_state(left_row)?;
+                        finish_row(
+                            left_row,
+                            self.join_type,
+                            &state,
+                            &mut left_indices,
+                            &mut right_indices,
+                            &mut markers,
+                        )?;
                         self.row += 1;
                         self.match_index = 0;
-                    }
-                } else {
-                    if self.join_type == JoinType::Left {
-                        left_indices.push(u32::try_from(self.row).map_err(|_| {
+                        self.current_state = RowState::default();
+                        continue;
+                    };
+
+                    let available = self
+                        .batch_size
+                        .saturating_sub(left_indices.len())
+                        .saturating_sub(candidate_left.len());
+                    let take = available.min(matches.len().saturating_sub(self.match_index));
+                    let start = candidate_left.len();
+                    let state = if self.match_index == 0 {
+                        self.initial_state(left_row)?
+                    } else {
+                        self.current_state
+                    };
+                    let end = self.match_index + take;
+                    for right_row in &matches[self.match_index..end] {
+                        candidate_left.push(u32::try_from(left_row).map_err(|_| {
                             Error::ResourceExhausted(
                                 "join probe batch exceeds UINT32_MAX rows".into(),
                             )
                         })?);
-                        right_indices.push(None);
+                        candidate_right.push(*right_row);
                     }
-                    self.row += 1;
-                    self.match_index = 0;
-                }
-
-                if left_indices.len() % 1_024 == 0 {
-                    context.check_cancelled()?;
+                    let complete = end == matches.len();
+                    candidate_groups.push(CandidateGroup {
+                        left_row,
+                        start,
+                        end: candidate_left.len(),
+                        complete,
+                        state,
+                    });
+                    self.match_index = end;
+                    if complete {
+                        self.row += 1;
+                        self.match_index = 0;
+                        self.current_state = RowState::default();
+                    }
                 }
             }
+
+            let had_candidates = !candidate_left.is_empty();
+            if had_candidates {
+                grow_workspace(
+                    &mut workspace,
+                    index_bytes.saturating_add(candidate_workspace_bytes(
+                        self.left,
+                        self.right,
+                        &candidate_left,
+                        &candidate_right,
+                    )?),
+                    context,
+                    self.held_bytes,
+                )
+                .await?;
+                let outcomes = {
+                    let _active = context.scheduler.enter_lane();
+                    self.predicates.evaluate_candidates(
+                        self.left,
+                        self.right,
+                        &candidate_left,
+                        &candidate_right,
+                        self.left_values,
+                        self.right_values,
+                    )?
+                };
+                for group in &candidate_groups {
+                    let mut state = group.state;
+                    for candidate in group.start..group.end {
+                        let right_row = candidate_right[candidate];
+                        let outcome = outcomes[candidate];
+                        if outcome.qualifies {
+                            if self.predicates.is_null_aware() {
+                                match outcome.membership.expect("null-aware outcome") {
+                                    SqlTruth::True => {
+                                        state.matches = 1;
+                                        state.first_right.get_or_insert(right_row);
+                                    }
+                                    SqlTruth::False => {}
+                                    SqlTruth::Unknown => state.unknown = true,
+                                }
+                            } else {
+                                state.matches = state.matches.saturating_add(1);
+                                state.first_right.get_or_insert(right_row);
+                                if self.join_type == JoinType::LeftSingle && state.matches > 1 {
+                                    return Err(Error::Execution(
+                                        "scalar subquery returned more than one row".into(),
+                                    ));
+                                }
+                                if matches!(self.join_type, JoinType::Inner | JoinType::Left) {
+                                    left_indices.push(group.left_row as u32);
+                                    right_indices.push(Some(right_row));
+                                }
+                            }
+                        }
+                    }
+                    if group.complete {
+                        finish_row(
+                            group.left_row,
+                            self.join_type,
+                            &state,
+                            &mut left_indices,
+                            &mut right_indices,
+                            &mut markers,
+                        )?;
+                    } else {
+                        self.current_state = state;
+                    }
+                }
+                drop(outcomes);
+                drop(candidate_groups);
+                drop(candidate_left);
+                drop(candidate_right);
+                workspace.try_resize(index_bytes)?;
+            }
+
+            if left_indices.len() >= self.batch_size {
+                break;
+            }
+            if !had_candidates && self.row >= self.left.num_rows() {
+                break;
+            }
+            context.check_cancelled()?;
         }
 
         if left_indices.is_empty() {
             Ok(None)
         } else {
-            grow_output_workspace(
+            grow_workspace(
                 &mut workspace,
-                output_workspace_bytes(
+                index_bytes.saturating_add(output_workspace_bytes(
                     self.left,
                     self.right,
                     &left_indices,
                     &right_indices,
                     self.join_type,
-                )?,
+                )?),
                 context,
                 self.held_bytes,
             )
@@ -311,6 +456,7 @@ impl<'a> ProbeCursor<'a> {
                     self.right,
                     &left_indices,
                     &right_indices,
+                    marker_slice(self.join_type, &markers),
                     self.join_type,
                     Arc::clone(&self.schema),
                 )?
@@ -322,139 +468,65 @@ impl<'a> ProbeCursor<'a> {
             )?))
         }
     }
+
+    fn initial_state(&self, left_row: usize) -> Result<RowState> {
+        let Some(global) = self.global_membership else {
+            return Ok(RowState::default());
+        };
+        let left_values = self.left_values.ok_or_else(|| {
+            Error::Internal("global membership hash is missing its left value array".into())
+        })?;
+        let left_is_null = cell(left_values, left_row)?.is_null();
+        Ok(RowState {
+            unknown: if left_is_null {
+                global.rhs_nonempty
+            } else {
+                global.rhs_has_null
+            },
+            ..RowState::default()
+        })
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn build_output_envelope(
-    left: &RecordBatch,
-    right: &RecordBatch,
-    left_indices: &[u32],
-    right_indices: &[Option<u32>],
+fn finish_row(
+    row: usize,
     join_type: JoinType,
-    schema: SchemaRef,
-    context: &QueryContext,
-    held_bytes: usize,
-    owner: &'static str,
-) -> Result<BatchEnvelope> {
-    let estimate = output_workspace_bytes(left, right, left_indices, right_indices, join_type)?;
-    let workspace = context
-        .reserve_memory_while_holding(estimate, held_bytes, owner)
-        .await?;
-    let output = build_output(left, right, left_indices, right_indices, join_type, schema)?;
-    BatchEnvelope::from_reservation(output, workspace, owner)
-}
-
-async fn grow_output_workspace(
-    workspace: &mut MemoryReservation,
-    required: usize,
-    context: &QueryContext,
-    held_bytes: usize,
+    state: &RowState,
+    left_indices: &mut Vec<u32>,
+    right_indices: &mut Vec<Option<u32>>,
+    markers: &mut Vec<Option<bool>>,
 ) -> Result<()> {
-    let additional = required.saturating_sub(workspace.size());
-    if additional != 0 {
-        let more = context
-            .reserve_memory_while_holding(
-                additional,
-                held_bytes.saturating_add(workspace.size()),
-                "join output workspace",
-            )
-            .await?;
-        workspace.absorb(more)?;
+    let emit = match join_type {
+        JoinType::Inner => return Ok(()),
+        JoinType::Left => state.matches == 0,
+        JoinType::Semi => state.matches != 0,
+        JoinType::Anti => state.matches == 0,
+        JoinType::LeftSingle | JoinType::Mark => true,
+        JoinType::NullAwareAnti => state.matches == 0 && !state.unknown,
+    };
+    if !emit {
+        return Ok(());
+    }
+    left_indices.push(u32::try_from(row).map_err(|_| {
+        Error::ResourceExhausted("join probe batch exceeds UINT32_MAX rows".into())
+    })?);
+    match join_type {
+        JoinType::LeftSingle => right_indices.push(state.first_right),
+        JoinType::Mark => {
+            right_indices.push(None);
+            markers.push(if state.matches != 0 {
+                Some(true)
+            } else if state.unknown {
+                None
+            } else {
+                Some(false)
+            });
+        }
+        _ => right_indices.push(None),
     }
     Ok(())
 }
 
-fn output_workspace_bytes(
-    left: &RecordBatch,
-    right: &RecordBatch,
-    left_indices: &[u32],
-    right_indices: &[Option<u32>],
-    join_type: JoinType,
-) -> Result<usize> {
-    let left_bytes = selected_rows_bytes(left, left_indices.iter().copied().map(Some))?;
-    let right_bytes = if matches!(join_type, JoinType::Semi | JoinType::Anti) {
-        0
-    } else {
-        selected_rows_bytes(right, right_indices.iter().copied())?
-    };
-    let rows = left_indices.len();
-    let columns = left.num_columns().saturating_add(
-        if matches!(join_type, JoinType::Semi | JoinType::Anti) {
-            0
-        } else {
-            right.num_columns()
-        },
-    );
-    let indices = rows.saturating_mul(size_of::<u32>().saturating_add(size_of::<Option<u32>>()));
-    Ok(left_bytes
-        .saturating_add(right_bytes)
-        // Arrow take retains builder buffers beside the final output briefly.
-        .saturating_mul(2)
-        .saturating_add(indices.saturating_mul(2))
-        .saturating_add(columns.saturating_mul(512))
-        .saturating_add(1_024)
-        .max(1))
-}
-
-fn selected_rows_bytes<I>(batch: &RecordBatch, rows: I) -> Result<usize>
-where
-    I: IntoIterator<Item = Option<u32>>,
-{
-    rows.into_iter().try_fold(0usize, |total, row| {
-        let row_bytes = match row {
-            Some(row) => batch.columns().iter().try_fold(0usize, |bytes, column| {
-                let data = column.to_data().slice(row as usize, 1);
-                Ok::<_, arrow::error::ArrowError>(
-                    bytes.saturating_add(data.get_slice_memory_size()?),
-                )
-            })?,
-            None => batch.num_columns().saturating_mul(64),
-        };
-        Ok(total.saturating_add(row_bytes))
-    })
-}
-
-pub(super) fn build_output(
-    left: &RecordBatch,
-    right: &RecordBatch,
-    left_indices: &[u32],
-    right_indices: &[Option<u32>],
-    join_type: JoinType,
-    schema: SchemaRef,
-) -> Result<RecordBatch> {
-    let left_indices = UInt32Array::from(left_indices.to_vec());
-    let mut columns = Vec::with_capacity(left.num_columns() + right.num_columns());
-    for column in left.columns() {
-        columns.push(take(column.as_ref(), &left_indices, None)?);
-    }
-    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
-        return build_record_batch(schema, columns, left_indices.len());
-    }
-    let right_indices = UInt32Array::from(right_indices.to_vec());
-    for (index, column) in right.columns().iter().enumerate() {
-        if right.num_rows() == 0 {
-            columns.push(new_null_array(
-                schema.field(left.num_columns() + index).data_type(),
-                left_indices.len(),
-            ));
-        } else {
-            columns.push(take(column.as_ref(), &right_indices, None)?);
-        }
-    }
-    build_record_batch(schema, columns, left_indices.len())
-}
-
-fn build_record_batch(
-    schema: SchemaRef,
-    columns: Vec<ArrayRef>,
-    rows: usize,
-) -> Result<RecordBatch> {
-    if columns.is_empty() {
-        let options = RecordBatchOptions::new().with_row_count(Some(rows));
-        Ok(RecordBatch::try_new_with_options(
-            schema, columns, &options,
-        )?)
-    } else {
-        Ok(RecordBatch::try_new(schema, columns)?)
-    }
+fn marker_slice(join_type: JoinType, markers: &[Option<bool>]) -> Option<&[Option<bool>]> {
+    (join_type == JoinType::Mark).then_some(markers)
 }

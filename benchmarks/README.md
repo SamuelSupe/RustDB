@@ -107,8 +107,8 @@ checksum runner used to produce the evidence. An explicitly supplied build ID
 or CPU model is accepted only when it matches the current worktree or detected
 host, so an environment override cannot silently relabel a run.
 
-For the v0.2 M5 Max gate, capture the local SF10 candidate and compare it with
-the clean `v0.1.0-alpha.2` SF10 manifest:
+For the v0.3 M5 Max gate, capture the local SF10 candidate and compare it with
+the clean `v0.2.0-alpha.1` SF10 manifest:
 
 ```sh
 THREADS_LIST="1 4" BATCH_SIZES=8192 CACHE_MODES=warm \
@@ -118,7 +118,7 @@ benchmarks/run_baseline.sh --local-root data/tpch-sf10 \
 
 python3 -B benchmarks/check_parallel_gate.py \
   --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
-  --baseline benchmarks/results/baseline/<alpha2-sf10-run>/manifest.json
+  --baseline benchmarks/results/baseline/<v02-sf10-run>/manifest.json
 ```
 
 The checker reads only local, metadata-warm, batch-8192 reports for

@@ -1,5 +1,8 @@
 use sqlparser::{
-    ast::{Expr, SelectItem, Spanned, UnaryOperator, Value},
+    ast::{
+        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, Spanned, UnaryOperator,
+        Value,
+    },
     tokenizer::Span,
 };
 
@@ -109,6 +112,62 @@ pub(super) fn rewrite_projection_aliases(
             }
             if let Some(else_result) = else_result {
                 rewrite_projection_aliases(else_result, projection, clause)?;
+            }
+            Ok(())
+        }
+        Expr::Function(function) => {
+            let FunctionArguments::List(arguments) = &mut function.args else {
+                return Ok(());
+            };
+            for argument in &mut arguments.args {
+                let expression = match argument {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(expr),
+                        ..
+                    }
+                    | FunctionArg::ExprNamed {
+                        arg: FunctionArgExpr::Expr(expr),
+                        ..
+                    } => expr,
+                    _ => continue,
+                };
+                rewrite_projection_aliases(expression, projection, clause)?;
+            }
+            Ok(())
+        }
+        Expr::Extract { expr, .. } | Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
+            rewrite_projection_aliases(expr, projection, clause)
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            rewrite_projection_aliases(expr, projection, clause)?;
+            if let Some(value) = substring_from {
+                rewrite_projection_aliases(value, projection, clause)?;
+            }
+            if let Some(value) = substring_for {
+                rewrite_projection_aliases(value, projection, clause)?;
+            }
+            Ok(())
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            rewrite_projection_aliases(expr, projection, clause)?;
+            if let Some(value) = trim_what {
+                rewrite_projection_aliases(value, projection, clause)?;
+            }
+            if let Some(values) = trim_characters {
+                for value in values {
+                    rewrite_projection_aliases(value, projection, clause)?;
+                }
             }
             Ok(())
         }

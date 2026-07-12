@@ -339,7 +339,7 @@ async fn scan_tasks_run_on_multiple_named_compute_lanes() {
         schema: PlanSchema::unqualified(schema),
     };
     let temp = tempfile::tempdir().unwrap();
-    let context = Arc::new(QueryContext::new(MemoryPool::new(16 << 20), temp.path()).unwrap());
+    let context = Arc::new(QueryContext::new(MemoryPool::new(128 << 20), temp.path()).unwrap());
     let internal = super::super::runner::execute(StatementPlan::Query(plan), Arc::clone(&context))
         .await
         .unwrap();
@@ -449,7 +449,7 @@ async fn scan_lane_panic_is_a_terminal_error_not_partial_success() {
     assert!(
         error
             .to_string()
-            .contains("scan pipeline stopped after 0 of 1 lanes completed"),
+            .contains("query task 'scan-pipeline-lane' panicked: injected scan lane panic"),
         "unexpected error: {error}"
     );
 }
@@ -545,7 +545,7 @@ async fn limit_drops_all_remaining_scan_tasks() {
         schema: PlanSchema::unqualified(schema),
     };
     let temp = tempfile::tempdir().unwrap();
-    let context = Arc::new(QueryContext::new(MemoryPool::new(16 << 20), temp.path()).unwrap());
+    let context = Arc::new(QueryContext::new(MemoryPool::new(128 << 20), temp.path()).unwrap());
     let internal = super::super::runner::execute(StatementPlan::Query(plan), Arc::clone(&context))
         .await
         .unwrap();

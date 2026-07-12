@@ -22,6 +22,17 @@ tpch_validate_scale() {
   ' || tpch_die "scale factor must be a positive decimal: $1"
 }
 
+tpch_validate_s3_uri() {
+  uri=$1
+  case "$uri" in
+    s3://?*) ;;
+    *) tpch_die "S3 dataset root must be a non-empty s3:// URI" ;;
+  esac
+  bucket_and_path=${uri#s3://}
+  bucket=${bucket_and_path%%/*}
+  [ -n "$bucket" ] || tpch_die "S3 dataset root must include a bucket"
+}
+
 tpch_dataset_relative() {
   printf 'data/tpch-sf%s\n' "$1"
 }

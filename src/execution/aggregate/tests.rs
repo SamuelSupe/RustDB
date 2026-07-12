@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
-    array::{Int64Array, StringArray},
+    array::{Decimal128Array, Float64Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -25,6 +25,7 @@ async fn output_materialization_transfers_its_workspace_into_the_batch_lease() {
     let aggregates = vec![AggregateExpr {
         function: AggregateFunction::Count,
         expr: None,
+        distinct: false,
         data_type: DataType::Int64,
         display_name: "count(*)".into(),
     }];
@@ -94,6 +95,7 @@ fn decimal_average_returns_double_without_truncating_to_input_scale() {
     let expression = AggregateExpr {
         function: AggregateFunction::Avg,
         expr: Some(BoundExpr::column(0, DataType::Decimal128(15, 2), "value")),
+        distinct: false,
         data_type: DataType::Float64,
         display_name: "avg(value)".into(),
     };
@@ -123,6 +125,7 @@ fn decimal_average_partial_batch_preserves_exact_sum() {
     let expression = AggregateExpr {
         function: AggregateFunction::Avg,
         expr: Some(BoundExpr::column(0, DataType::Decimal128(15, 2), "value")),
+        distinct: false,
         data_type: DataType::Float64,
         display_name: "avg(value)".into(),
     };
@@ -270,6 +273,7 @@ fn aggregate_expr(function: AggregateFunction, data_type: DataType) -> Aggregate
     AggregateExpr {
         function,
         expr: Some(BoundExpr::column(0, data_type.clone(), "value")),
+        distinct: false,
         data_type: if function == AggregateFunction::Avg {
             DataType::Float64
         } else {
@@ -288,6 +292,7 @@ fn spill_merge_streams_and_accounts_many_batches_from_one_file() {
     let count = AggregateExpr {
         function: AggregateFunction::Count,
         expr: None,
+        distinct: false,
         data_type: DataType::Int64,
         display_name: "count(*)".into(),
     };
@@ -353,6 +358,7 @@ fn spill_merge_reports_when_one_ipc_batch_exceeds_budget() {
     let count = AggregateExpr {
         function: AggregateFunction::Count,
         expr: None,
+        distinct: false,
         data_type: DataType::Int64,
         display_name: "count(*)".into(),
     };
@@ -402,6 +408,7 @@ fn spill_merge_accounts_for_the_index_copy_of_long_string_keys() {
     let aggregates = vec![AggregateExpr {
         function: AggregateFunction::Count,
         expr: None,
+        distinct: false,
         data_type: DataType::Int64,
         display_name: "count(*)".into(),
     }];
@@ -506,6 +513,10 @@ async fn spilling_signed_sum_preserves_transient_wide_partial_and_cleans_up() {
         "aggregate left spill files after stream completion"
     );
     drop(low_context);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while spill_directory.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert!(!spill_directory.exists());
 }
 
@@ -521,6 +532,7 @@ async fn collect_grouped_sums(
     let sum = AggregateExpr {
         function: AggregateFunction::Sum,
         expr: Some(BoundExpr::column(1, DataType::Int64, "value")),
+        distinct: false,
         data_type: DataType::Int64,
         display_name: "sum(value)".into(),
     };
@@ -581,6 +593,7 @@ async fn recursively_repartitions_a_seed_skewed_spill_partition() {
     let count = AggregateExpr {
         function: AggregateFunction::Count,
         expr: None,
+        distinct: false,
         data_type: DataType::Int64,
         display_name: "count(*)".into(),
     };
@@ -635,6 +648,7 @@ async fn reports_when_one_group_cannot_fit() {
     let count = AggregateExpr {
         function: AggregateFunction::Count,
         expr: None,
+        distinct: false,
         data_type: DataType::Int64,
         display_name: "count(*)".into(),
     };
@@ -657,4 +671,304 @@ async fn reports_when_one_group_cannot_fit() {
         Error::ResourceExhausted(message)
             if message.contains("aggregate input") && message.contains("query limit")
     ));
+}
+
+#[tokio::test]
+async fn multiple_distinct_aggregates_share_group_scope_and_preserve_ordinary_rows() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("grp", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, true),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        input_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a", "a", "a", "a", "b", "b", "b"])),
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(2),
+                None,
+                None,
+                Some(3),
+                Some(3),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("x"),
+                Some("x"),
+                Some("y"),
+                Some("z"),
+                None,
+                Some("q"),
+                Some("q"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let aggregates = vec![
+        distinct_expr(
+            AggregateFunction::Count,
+            1,
+            DataType::Int64,
+            DataType::Int64,
+        ),
+        distinct_expr(AggregateFunction::Sum, 1, DataType::Int64, DataType::Int64),
+        distinct_expr(
+            AggregateFunction::Avg,
+            1,
+            DataType::Int64,
+            DataType::Float64,
+        ),
+        AggregateExpr {
+            function: AggregateFunction::Count,
+            expr: None,
+            distinct: false,
+            data_type: DataType::Int64,
+            display_name: "count(*)".into(),
+        },
+        distinct_expr(AggregateFunction::Count, 2, DataType::Utf8, DataType::Int64),
+    ];
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("grp", DataType::Utf8, false),
+        Field::new("distinct_count", DataType::Int64, false),
+        Field::new("distinct_sum", DataType::Int64, true),
+        Field::new("distinct_avg", DataType::Float64, true),
+        Field::new("all_rows", DataType::Int64, false),
+        Field::new("distinct_text", DataType::Int64, false),
+    ]));
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(64 << 20), temp.path()).unwrap();
+    context.configure_compute_lanes(4);
+    let batches = aggregate(
+        boxed_record_batch_stream(futures::stream::once(async move { Ok(batch) })),
+        vec![BoundExpr::column(0, DataType::Utf8, "grp")],
+        aggregates,
+        output_schema,
+        Arc::clone(&context),
+        64,
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    let mut rows = HashMap::new();
+    for batch in &batches {
+        let groups = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sums = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let averages = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let ordinary = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let text = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.insert(
+                groups.value(row).to_owned(),
+                (
+                    counts.value(row),
+                    sums.value(row),
+                    averages.value(row),
+                    ordinary.value(row),
+                    text.value(row),
+                ),
+            );
+        }
+    }
+    assert_eq!(rows["a"], (2, 3, 1.5, 4, 3));
+    assert_eq!(rows["b"], (1, 3, 3.0, 3, 1));
+    drop(batches);
+    assert_eq!(context.memory.used(), 0);
+}
+
+#[tokio::test]
+async fn decimal_distinct_sum_and_average_keep_exact_dedup_values() {
+    let decimal_type = DataType::Decimal128(10, 2);
+    let values = Decimal128Array::from(vec![Some(100), Some(100), Some(250), None])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+    let input_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        decimal_type.clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(input_schema, vec![Arc::new(values)]).unwrap();
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("total", decimal_type.clone(), true),
+        Field::new("average", DataType::Float64, true),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let aggregates = vec![
+        distinct_expr(
+            AggregateFunction::Sum,
+            0,
+            decimal_type.clone(),
+            decimal_type.clone(),
+        ),
+        distinct_expr(
+            AggregateFunction::Avg,
+            0,
+            decimal_type.clone(),
+            DataType::Float64,
+        ),
+        distinct_expr(AggregateFunction::Count, 0, decimal_type, DataType::Int64),
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(16 << 20), temp.path()).unwrap();
+    let batches = aggregate(
+        boxed_record_batch_stream(futures::stream::once(async move { Ok(batch) })),
+        Vec::new(),
+        aggregates,
+        output_schema,
+        Arc::clone(&context),
+        64,
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    let average = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let count = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(total.value(0), 350);
+    assert_eq!(average.value(0), 1.75);
+    assert_eq!(count.value(0), 2);
+    drop(batches);
+    assert_eq!(context.memory.used(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spilled_distinct_values_merge_once_across_bounded_task_lanes() {
+    const UNIQUE: i64 = 12_000;
+    let input_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let values = (0..UNIQUE)
+        .chain(0..UNIQUE)
+        .collect::<Vec<_>>()
+        .chunks(256)
+        .map(|values| {
+            RecordBatch::try_new(
+                Arc::clone(&input_schema),
+                vec![Arc::new(Int64Array::from(values.to_vec()))],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("unique", DataType::Int64, false),
+        Field::new("distinct_total", DataType::Int64, true),
+        Field::new("rows", DataType::Int64, false),
+    ]));
+    let aggregates = vec![
+        distinct_expr(
+            AggregateFunction::Count,
+            0,
+            DataType::Int64,
+            DataType::Int64,
+        ),
+        distinct_expr(AggregateFunction::Sum, 0, DataType::Int64, DataType::Int64),
+        AggregateExpr {
+            function: AggregateFunction::Count,
+            expr: None,
+            distinct: false,
+            data_type: DataType::Int64,
+            display_name: "count(*)".into(),
+        },
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(4 << 20), temp.path()).unwrap();
+    context.configure_compute_lanes_unbounded_for_test(4);
+    let batches = aggregate(
+        boxed_record_batch_stream(futures::stream::iter(values.into_iter().map(Ok))),
+        Vec::new(),
+        aggregates,
+        output_schema,
+        Arc::clone(&context),
+        256,
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    let unique = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let total = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let rows = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(unique.value(0), UNIQUE);
+    assert_eq!(total.value(0), UNIQUE * (UNIQUE - 1) / 2);
+    assert_eq!(rows.value(0), UNIQUE * 2);
+    let metrics = context.metrics.snapshot();
+    assert!(metrics.spill_files > 0);
+    assert!(metrics.peak_active_lanes >= 2, "metrics: {metrics:?}");
+    drop(batches);
+    assert_eq!(context.memory.used(), 0);
+    assert!(
+        std::fs::read_dir(context.spill.directory())
+            .unwrap()
+            .all(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "arrow"))
+    );
+}
+
+fn distinct_expr(
+    function: AggregateFunction,
+    column: usize,
+    input_type: DataType,
+    output_type: DataType,
+) -> AggregateExpr {
+    AggregateExpr {
+        function,
+        expr: Some(BoundExpr::column(column, input_type, "value")),
+        distinct: true,
+        data_type: output_type,
+        display_name: format!("{function}(distinct value)"),
+    }
 }

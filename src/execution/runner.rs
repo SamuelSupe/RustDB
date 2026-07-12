@@ -141,6 +141,11 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> MemoryBatchStr
             Arc::clone(schema.arrow()),
             context,
         ),
+        LogicalPlan::DependentJoin { .. } => boxed_memory_batch_stream(stream::once(async {
+            Err(crate::Error::Internal(
+                "DependentJoin reached physical execution without decorrelation".into(),
+            ))
+        })),
         LogicalPlan::Limit {
             input,
             offset,
@@ -182,6 +187,8 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> MemoryBatchStr
             left,
             right,
             on,
+            residual,
+            null_aware,
             join_type,
             schema,
         } => {
@@ -191,6 +198,8 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> MemoryBatchStr
                 execute_plan(*left, Arc::clone(&context)),
                 execute_plan(*right, Arc::clone(&context)),
                 on,
+                residual,
+                null_aware,
                 left_schema,
                 right_schema,
                 join_type,

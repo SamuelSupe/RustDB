@@ -1,7 +1,7 @@
-use std::{panic::AssertUnwindSafe, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use arrow::datatypes::SchemaRef;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -17,10 +17,10 @@ const MIN_PARALLEL_MEMORY: usize = 64 << 20;
 enum PartialEvent {
     Lane(Option<LaneEvent>),
     Batch(Option<BatchEnvelope>),
+    Error(Error),
 }
 
 enum LaneEvent {
-    Error(Error),
     Done,
 }
 
@@ -52,31 +52,29 @@ pub(super) fn aggregate(
             let groups = groups.clone();
             let aggregates = aggregates.clone();
             let context = Arc::clone(&context);
-            tokio::spawn(async move {
-                let result = AssertUnwindSafe(run_lane(
+            let tasks = context.tasks.clone();
+            tasks.spawn("aggregate-partial-lane", async move {
+                run_lane(
                     receiver,
                     partial_sender,
                     groups,
                     aggregates,
                     Arc::clone(&context),
                     batch_size,
-                ))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    Err(Error::Internal(
-                        "parallel aggregate lane panicked".to_owned(),
-                    ))
-                });
-                let event = match result {
-                    Ok(()) => LaneEvent::Done,
-                    Err(error) => LaneEvent::Error(error),
-                };
-                let _ = lane_event_sender.send(event);
-            });
+                )
+                .await?;
+                lane_event_sender
+                    .send(LaneEvent::Done)
+                    .map_err(|_| Error::Cancelled)
+            })?;
         }
         drop(partial_sender);
-        drop(lane_event_sender);
+        // Keep one coordinator sender alive until every lane has reported
+        // completion. A panicking task drops its own sender while unwinding,
+        // before TaskGroup has captured the panic and cancelled siblings. If
+        // the coordinator sender were dropped here too, the receiver could
+        // observe a closed channel first and replace the real task failure
+        // with a generic "lane stopped" error.
 
         let mut next_lane = 0;
         while let Some(batch) = input.next().await {
@@ -86,7 +84,9 @@ pub(super) fn aggregate(
             let started = Instant::now();
             let sent: Result<()> = tokio::select! {
                 biased;
-                _ = context.control.cancelled() => Err(Error::Cancelled),
+                _ = context.control.cancelled() => Err(context
+                    .check_cancelled()
+                    .expect_err("cancelled query has a terminal error")),
                 event = lane_event_receiver.recv() => Err(input_lane_error(event)),
                 result = sender.send(batch) => result.map_err(|_| {
                     match lane_event_receiver.try_recv() {
@@ -103,6 +103,7 @@ pub(super) fn aggregate(
         }
         drop(lane_senders);
 
+        let partial_context = Arc::clone(&context);
         let partial_stream = boxed_memory_batch_stream(async_stream::try_stream! {
             let mut receiver = partial_receiver;
             let mut completed = 0usize;
@@ -111,14 +112,27 @@ pub(super) fn aggregate(
                 let event = if batches_open {
                     tokio::select! {
                         biased;
+                        _ = partial_context.control.cancelled() => PartialEvent::Error(
+                            partial_context
+                                .check_cancelled()
+                                .expect_err("cancelled query has a terminal error")
+                        ),
                         lane = lane_event_receiver.recv() => PartialEvent::Lane(lane),
                         batch = receiver.recv() => PartialEvent::Batch(batch),
                     }
                 } else {
-                    PartialEvent::Lane(lane_event_receiver.recv().await)
+                    tokio::select! {
+                        biased;
+                        _ = partial_context.control.cancelled() => PartialEvent::Error(
+                            partial_context
+                                .check_cancelled()
+                                .expect_err("cancelled query has a terminal error")
+                        ),
+                        lane = lane_event_receiver.recv() => PartialEvent::Lane(lane),
+                    }
                 };
                 match event {
-                    PartialEvent::Lane(Some(LaneEvent::Error(error))) => Err(error)?,
+                    PartialEvent::Error(error) => Err(error)?,
                     PartialEvent::Lane(Some(LaneEvent::Done)) => completed += 1,
                     PartialEvent::Lane(None) => {
                         Err(Error::Execution(format!(
@@ -144,6 +158,7 @@ pub(super) fn aggregate(
         while let Some(batch) = output.next().await {
             yield batch?;
         }
+        drop(lane_event_sender);
     })
 }
 
@@ -185,7 +200,6 @@ async fn run_lane(
 
 fn input_lane_error(event: Option<LaneEvent>) -> Error {
     match event {
-        Some(LaneEvent::Error(error)) => error,
         Some(LaneEvent::Done) => {
             Error::Execution("parallel aggregate lane stopped before input completed".into())
         }
@@ -266,12 +280,14 @@ mod tests {
             AggregateExpr {
                 function: AggregateFunction::Sum,
                 expr: Some(BoundExpr::column(0, DataType::Float64, "value")),
+                distinct: false,
                 data_type: DataType::Float64,
                 display_name: "sum(value)".into(),
             },
             AggregateExpr {
                 function: AggregateFunction::Avg,
                 expr: Some(BoundExpr::column(0, DataType::Float64, "value")),
+                distinct: false,
                 data_type: DataType::Float64,
                 display_name: "avg(value)".into(),
             },
@@ -333,12 +349,14 @@ mod tests {
                 AggregateExpr {
                     function: AggregateFunction::Count,
                     expr: None,
+                    distinct: false,
                     data_type: DataType::Int64,
                     display_name: "count(*)".into(),
                 },
                 AggregateExpr {
                     function: AggregateFunction::Sum,
                     expr: Some(BoundExpr::column(0, DataType::Int64, "key")),
+                    distinct: false,
                     data_type: DataType::Int64,
                     display_name: "sum(key)".into(),
                 },
@@ -408,6 +426,7 @@ mod tests {
             vec![AggregateExpr {
                 function: AggregateFunction::Count,
                 expr: None,
+                distinct: false,
                 data_type: DataType::Int64,
                 display_name: "count(*)".into(),
             }],
@@ -450,6 +469,7 @@ mod tests {
             vec![AggregateExpr {
                 function: AggregateFunction::Sum,
                 expr: Some(BoundExpr::column(0, DataType::Int64, "value")),
+                distinct: false,
                 data_type: DataType::Int64,
                 display_name: "sum(value)".into(),
             }],
@@ -496,6 +516,7 @@ mod tests {
             vec![AggregateExpr {
                 function: AggregateFunction::Count,
                 expr: None,
+                distinct: false,
                 data_type: DataType::Int64,
                 display_name: "count(*)".into(),
             }],
@@ -510,16 +531,26 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("parallel aggregate lane panicked"),
+                .contains("query task 'aggregate-partial-lane' panicked: injected parallel aggregate lane panic"),
             "unexpected error: {error}"
         );
 
         tokio::time::timeout(Duration::from_secs(2), async {
-            while context.memory.used() != 0 {
+            while context.memory.used() != 0 || context.tasks.active_tasks() != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("all aggregate lane reservations must be released");
+        .expect("all aggregate lanes and their reservations must be released");
+        assert_eq!(context.tasks.active_tasks(), 0);
+        assert!(
+            context
+                .tasks
+                .first_failure()
+                .is_some_and(|error| error.to_string().contains(
+                    "query task 'aggregate-partial-lane' panicked: injected parallel aggregate lane panic"
+                )),
+            "TaskGroup must preserve the first lane panic"
+        );
     }
 }

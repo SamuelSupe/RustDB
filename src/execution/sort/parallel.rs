@@ -88,7 +88,7 @@ pub(super) fn sort(
                         fetch,
                         Arc::clone(&schema),
                         Arc::clone(&context),
-                    );
+                    )?;
                     outstanding += 1;
                     break;
                 }
@@ -134,8 +134,6 @@ pub(super) fn sort(
                 memory_runs.push(generated);
             }
         }
-        drop(sender);
-
         drain_runs(
             &mut receiver,
             &cancellation,
@@ -143,6 +141,11 @@ pub(super) fn sort(
             &mut outstanding,
             &mut memory_runs,
         ).await?;
+        // A panicking run task drops its sender before TaskGroup records the
+        // panic. Retain the coordinator sender through the drain so the
+        // cancellation branch returns that first failure instead of a generic
+        // closed-channel error.
+        drop(sender);
         // Keep a pure-memory sort pure while bounding its final fan-in. Small
         // sorted blocks are coalesced pairwise under workspace reservations;
         // if that cannot fit, the existing external-run path takes over.

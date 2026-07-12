@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, ArrayRef, Date32Array, Decimal128Array, Int64Array, StringArray},
+    array::{Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -70,7 +70,7 @@ fn assert_smoke_value(name: &str, batch: &RecordBatch) {
         "Q13" => assert_eq!((int64(batch, 0), int64(batch, 1)), (1, 1)),
         "Q14" => {
             assert!(!batch.column(0).is_null(0));
-            assert!(decimal(batch, 0) > 0);
+            assert!(float64(batch, 0) > 0.0);
         }
         _ => unreachable!(),
     }
@@ -243,6 +243,15 @@ fn decimal(batch: &RecordBatch, column: usize) -> i128 {
         .column(column)
         .as_any()
         .downcast_ref::<Decimal128Array>()
+        .unwrap()
+        .value(0)
+}
+
+fn float64(batch: &RecordBatch, column: usize) -> f64 {
+    batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<Float64Array>()
         .unwrap()
         .value(0)
 }

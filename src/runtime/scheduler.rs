@@ -8,6 +8,11 @@ use std::{
 
 use super::QueryMetrics;
 
+/// Each active lane may retain one batch at every nested pipeline boundary.
+/// Keeping at least 32 MiB per lane bounds that fan-out while leaving the
+/// operators' existing spill headroom available for forward progress.
+const MIN_MEMORY_PER_LANE: usize = 32 << 20;
+
 /// Query-local lane policy and scheduler instrumentation.
 #[derive(Clone, Debug)]
 pub(crate) struct QueryScheduler {
@@ -32,7 +37,14 @@ impl QueryScheduler {
         }
     }
 
-    pub(crate) fn configure(&self, lanes: usize) {
+    pub(crate) fn configure(&self, lanes: usize, memory_limit: usize) {
+        self.inner
+            .configured_lanes
+            .store(memory_bounded_lanes(lanes, memory_limit), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_unbounded(&self, lanes: usize) {
         self.inner
             .configured_lanes
             .store(lanes.max(1), Ordering::Release);
@@ -61,6 +73,11 @@ impl QueryScheduler {
     }
 }
 
+fn memory_bounded_lanes(requested: usize, memory_limit: usize) -> usize {
+    let memory_lanes = memory_limit.checked_div(MIN_MEMORY_PER_LANE).unwrap_or(0);
+    requested.max(1).min(memory_lanes.max(1))
+}
+
 pub(crate) struct ActiveLane {
     scheduler: QueryScheduler,
 }
@@ -76,19 +93,31 @@ impl Drop for ActiveLane {
 
 #[cfg(test)]
 mod tests {
-    use super::QueryScheduler;
+    use super::{QueryScheduler, memory_bounded_lanes};
     use crate::runtime::QueryMetrics;
 
     #[test]
     fn caps_lanes_and_records_peak_activity() {
         let metrics = QueryMetrics::new();
         let scheduler = QueryScheduler::new(metrics.clone());
-        scheduler.configure(4);
+        scheduler.configure(4, 128 << 20);
         assert_eq!(scheduler.lanes_for(2), 2);
 
         let first = scheduler.enter_lane();
         let second = scheduler.enter_lane();
         assert_eq!(metrics.snapshot().peak_active_lanes, 2);
         drop((first, second));
+    }
+
+    #[test]
+    fn compute_lanes_are_bounded_by_query_memory() {
+        assert_eq!(memory_bounded_lanes(18, 0), 1);
+        assert_eq!(memory_bounded_lanes(18, (32 << 20) - 1), 1);
+        assert_eq!(memory_bounded_lanes(18, 64 << 20), 2);
+        assert_eq!(memory_bounded_lanes(18, 128 << 20), 4);
+        assert_eq!(memory_bounded_lanes(8, 128 << 20), 4);
+        assert_eq!(memory_bounded_lanes(3, 128 << 20), 3);
+        assert_eq!(memory_bounded_lanes(18, 1 << 30), 18);
+        assert_eq!(memory_bounded_lanes(0, 1 << 30), 1);
     }
 }

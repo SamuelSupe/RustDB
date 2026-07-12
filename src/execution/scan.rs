@@ -190,7 +190,9 @@ fn predicate_value(value: &ScalarValue) -> Option<PredicateValue> {
         ScalarValue::Float64(value) => Some(PredicateValue::Float64(*value)),
         ScalarValue::Decimal128 { value, .. } => Some(PredicateValue::Decimal128(*value)),
         ScalarValue::Date32(value) => Some(PredicateValue::Date32(*value)),
-        ScalarValue::DayInterval(_) | ScalarValue::MonthInterval(_) => None,
+        ScalarValue::DayInterval(_)
+        | ScalarValue::MonthInterval(_)
+        | ScalarValue::TimestampMicrosecond(_) => None,
         ScalarValue::Utf8(value) => Some(PredicateValue::Utf8(value.clone())),
     }
 }

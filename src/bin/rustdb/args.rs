@@ -29,6 +29,10 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t)]
     pub format: OutputFormat,
 
+    /// Text written for SQL NULL in CSV output (empty by default).
+    #[arg(long)]
+    pub csv_null: Option<String>,
+
     /// Query memory limit, for example 512MiB, 2GiB, or a byte count.
     #[arg(long, value_parser = parse_bytes)]
     pub memory_limit: Option<usize>,

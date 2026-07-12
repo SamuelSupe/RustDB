@@ -42,17 +42,39 @@ impl StateSpiller {
     }
 
     pub(in crate::execution::aggregate) fn finish(mut self) -> Result<Vec<Vec<SpillFile>>> {
+        self.close_writers()?;
+        Ok(self
+            .partitions
+            .into_iter()
+            .map(|partition| partition.files)
+            .collect())
+    }
+
+    pub(in crate::execution::aggregate) fn close_writers(&mut self) -> Result<()> {
         for sink in &mut self.partitions {
             if let Some(writer) = sink.writer.take() {
                 sink.files.push(writer.finish(1)?);
             }
             sink.metadata.try_resize(0)?;
         }
-        Ok(self
-            .partitions
-            .into_iter()
-            .map(|partition| partition.files)
-            .collect())
+        Ok(())
+    }
+
+    pub(in crate::execution::aggregate) fn extend_files(
+        &mut self,
+        files: Vec<Vec<SpillFile>>,
+    ) -> Result<()> {
+        if files.len() != self.partitions.len() {
+            return Err(Error::Internal(format!(
+                "aggregate spill partition count changed from {} to {}",
+                self.partitions.len(),
+                files.len()
+            )));
+        }
+        for (partition, files) in self.partitions.iter_mut().zip(files) {
+            partition.files.extend(files);
+        }
+        Ok(())
     }
 }
 
@@ -250,6 +272,7 @@ mod tests {
         let aggregates = vec![AggregateExpr {
             function: AggregateFunction::Count,
             expr: None,
+            distinct: false,
             data_type: DataType::Int64,
             display_name: "count(*)".into(),
         }];

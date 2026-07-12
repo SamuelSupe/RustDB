@@ -20,6 +20,7 @@ pub struct MemoryPool {
 struct Node {
     name: Arc<str>,
     limit: usize,
+    emergency_headroom: AtomicUsize,
     used: AtomicUsize,
     peak: AtomicUsize,
     parent: Option<Arc<Node>>,
@@ -42,6 +43,7 @@ impl MemoryPool {
             node: Arc::new(Node {
                 name: name.into(),
                 limit,
+                emergency_headroom: AtomicUsize::new(0),
                 used: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 parent: None,
@@ -56,6 +58,7 @@ impl MemoryPool {
             node: Arc::new(Node {
                 name: name.into(),
                 limit,
+                emergency_headroom: AtomicUsize::new(0),
                 used: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 parent: Some(Arc::clone(&self.node)),
@@ -81,7 +84,39 @@ impl MemoryPool {
     }
 
     pub fn available(&self) -> usize {
-        self.limit().saturating_sub(self.used())
+        self.ancestors_root_first()
+            .into_iter()
+            .map(|node| {
+                node.allocatable_limit()
+                    .saturating_sub(node.used.load(Ordering::Acquire))
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn emergency_headroom(&self) -> usize {
+        self.ancestors_root_first()
+            .into_iter()
+            .map(|node| node.emergency_headroom.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Keeps a final slice of this pool unavailable to ordinary operators so
+    /// spill I/O can always copy at least one bounded chunk. The headroom is
+    /// not allocated and therefore does not inflate memory metrics.
+    pub(crate) fn protect_emergency_headroom(&self, bytes: usize) -> Result<()> {
+        if bytes > self.limit() {
+            return Err(Error::ResourceExhausted(format!(
+                "memory pool '{}' cannot protect {bytes} emergency bytes (limit {})",
+                self.name(),
+                self.limit()
+            )));
+        }
+        self.node
+            .emergency_headroom
+            .fetch_max(bytes, Ordering::AcqRel);
+        Ok(())
     }
 
     pub fn reservation(&self) -> MemoryReservation {
@@ -92,7 +127,15 @@ impl MemoryPool {
     }
 
     pub fn try_reserve(&self, bytes: usize) -> Result<MemoryReservation> {
-        self.acquire(bytes)?;
+        self.acquire(bytes, false)?;
+        Ok(MemoryReservation {
+            pool: self.clone(),
+            bytes,
+        })
+    }
+
+    pub(crate) fn try_reserve_emergency(&self, bytes: usize) -> Result<MemoryReservation> {
+        self.acquire(bytes, true)?;
         Ok(MemoryReservation {
             pool: self.clone(),
             bytes,
@@ -116,11 +159,12 @@ impl MemoryPool {
         if let Some(node) = self
             .ancestors_root_first()
             .into_iter()
-            .find(|node| single_operation_bytes > node.limit)
+            .find(|node| single_operation_bytes > node.allocatable_limit())
         {
             return Err(Error::ResourceExhausted(format!(
                 "memory pool '{}' cannot satisfy one operation requiring {bytes} workspace bytes while retaining {held_bytes} bytes (limit {})",
-                node.name, node.limit,
+                node.name,
+                node.allocatable_limit(),
             )));
         }
 
@@ -141,7 +185,7 @@ impl MemoryPool {
         }
     }
 
-    fn acquire(&self, bytes: usize) -> Result<()> {
+    fn acquire(&self, bytes: usize, use_emergency_headroom: bool) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
@@ -149,7 +193,7 @@ impl MemoryPool {
         let nodes = self.ancestors_root_first();
         let mut acquired = Vec::with_capacity(nodes.len());
         for node in &nodes {
-            match node.acquire(bytes) {
+            match node.acquire(bytes, use_emergency_headroom) {
                 Ok(used) => acquired.push((Arc::clone(node), used)),
                 Err(error) => {
                     for (rollback, _) in acquired.iter().rev() {
@@ -191,11 +235,21 @@ impl MemoryPool {
 }
 
 impl Node {
-    fn acquire(&self, bytes: usize) -> Result<usize> {
+    fn allocatable_limit(&self) -> usize {
+        self.limit
+            .saturating_sub(self.emergency_headroom.load(Ordering::Acquire))
+    }
+
+    fn acquire(&self, bytes: usize, use_emergency_headroom: bool) -> Result<usize> {
+        let allocation_limit = if use_emergency_headroom {
+            self.limit
+        } else {
+            self.allocatable_limit()
+        };
         let result = self
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                if bytes <= self.limit.saturating_sub(current) {
+                if bytes <= allocation_limit.saturating_sub(current) {
                     Some(current + bytes)
                 } else {
                     None
@@ -206,7 +260,7 @@ impl Node {
             Ok(previous) => Ok(previous + bytes),
             Err(current) => Err(Error::ResourceExhausted(format!(
                 "memory pool '{}' cannot reserve {bytes} bytes (used {current}, limit {})",
-                self.name, self.limit
+                self.name, allocation_limit
             ))),
         }
     }
@@ -235,7 +289,7 @@ impl MemoryReservation {
     }
 
     pub fn try_grow(&mut self, bytes: usize) -> Result<()> {
-        self.pool.acquire(bytes)?;
+        self.pool.acquire(bytes, false)?;
         self.bytes = self.bytes.saturating_add(bytes);
         Ok(())
     }
@@ -318,6 +372,8 @@ mod tests {
         let right = global.child("right", 80);
         let left_reservation = left.try_reserve(70).expect("left reservation");
 
+        assert_eq!(left.available(), 10);
+        assert_eq!(right.available(), 30);
         assert!(right.try_reserve(40).is_err());
         assert_eq!(global.used(), 70);
         assert_eq!(right.used(), 0);
@@ -326,6 +382,49 @@ mod tests {
         drop(left_reservation);
         assert_eq!(global.used(), 0);
         assert_eq!(global.peak(), 70);
+    }
+
+    #[test]
+    fn emergency_headroom_is_protected_at_child_and_parent_nodes() {
+        let engine = MemoryPool::named_root("engine", 100);
+        engine.protect_emergency_headroom(10).unwrap();
+        let query = engine.child("query", 100);
+        query.protect_emergency_headroom(10).unwrap();
+        let sibling = engine.child("sibling", 100);
+
+        let normal = query.try_reserve(90).unwrap();
+        assert_eq!(query.available(), 0);
+        assert_eq!(sibling.available(), 0);
+        assert!(query.try_reserve(1).is_err());
+        assert!(sibling.try_reserve(1).is_err());
+
+        let copy = query.try_reserve_emergency(10).unwrap();
+        assert_eq!(query.used(), 100);
+        assert_eq!(engine.peak(), 100);
+        assert!(query.try_reserve_emergency(1).is_err());
+
+        drop(copy);
+        drop(normal);
+        assert_eq!(query.used(), 0);
+        assert_eq!(engine.used(), 0);
+    }
+
+    #[test]
+    fn available_uses_the_tightest_ancestor_headroom() {
+        let engine = MemoryPool::named_root("engine", 100);
+        engine.protect_emergency_headroom(20).unwrap();
+        let query = engine.child("query", 100);
+        query.protect_emergency_headroom(10).unwrap();
+
+        let reservation = query.try_reserve(80).unwrap();
+        // The query node still has 10 ordinary bytes of its own, but the
+        // engine root has none. Reporting only the child value would let
+        // operators defer spilling until their next parent reservation fails.
+        assert_eq!(query.available(), 0);
+        assert!(query.try_reserve(1).is_err());
+
+        drop(reservation);
+        assert_eq!(query.available(), 80);
     }
 
     #[test]

@@ -20,6 +20,10 @@ use crate::{Catalog, Error, Result, TableEntry};
 
 use super::execute;
 
+mod lane_limit;
+mod predicate_relocation;
+mod projection;
+
 #[derive(Clone)]
 struct MemoryTable {
     batch: RecordBatch,
@@ -249,7 +253,7 @@ async fn executes_left_equi_join() {
     );
     let batches = run(
         &catalog,
-        "SELECT l.id, r.label FROM l LEFT JOIN r ON l.id = r.id",
+        "SELECT l.id, r.label FROM l LEFT JOIN r ON l.id = r.id ORDER BY l.id",
         1 << 20,
     )
     .await;
@@ -397,7 +401,7 @@ async fn optimizer_prunes_operator_columns_and_uses_the_smaller_inner_build() {
                JOIN large ON small.id = large.id ORDER BY large_value";
     let plan = crate::sql::plan_sql(&catalog, sql).unwrap();
     let explain = format!("{:?}", plan);
-    assert!(explain.contains("InnerJoin keys=1 build=right"));
+    assert!(explain.contains("InnerJoin keys=1 residual=false null_aware=false build=right"));
     assert!(explain.find("Scan table=large").unwrap() < explain.find("Scan table=small").unwrap());
     assert!(explain.contains("Scan table=small projection=Some([0, 1])"));
     assert!(explain.contains("Scan table=large projection=Some([0, 1])"));

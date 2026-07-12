@@ -11,7 +11,7 @@ use crate::{
         BatchEnvelope, IntoMemoryBatchStream, MemoryBatchStream, QueryContext,
         boxed_memory_batch_stream,
     },
-    sql::{BoundExpr, JoinType},
+    sql::{BoundExpr, ExprKind, JoinType, ScalarValue},
 };
 
 use super::{
@@ -19,16 +19,23 @@ use super::{
     value::{CellValue, cell},
 };
 
+mod condition;
 mod grace;
+mod output;
 mod parallel;
 mod probe;
 mod sort_merge;
 mod spill;
 
 #[cfg(test)]
+mod correlation_tests;
+#[cfg(test)]
+mod global_membership_tests;
+#[cfg(test)]
 mod tests;
 
-use probe::{ProbeCursor, try_build_hash_table};
+use condition::JoinPredicates;
+use probe::{GlobalMembershipState, ProbeCursor, try_build_hash_table};
 use spill::{BuildPartition, MAX_REPARTITION_DEPTH, Side};
 
 // The physical join boundary carries both input schemas, output schema, keys,
@@ -39,6 +46,8 @@ pub(crate) fn join<L, R>(
     left: L,
     right: R,
     on: Vec<(BoundExpr, BoundExpr)>,
+    residual: Option<BoundExpr>,
+    null_aware: Option<(BoundExpr, BoundExpr)>,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     join_type: JoinType,
@@ -50,11 +59,31 @@ where
     L: IntoMemoryBatchStream,
     R: IntoMemoryBatchStream,
 {
+    let use_global_membership_hash = on.is_empty()
+        && residual.is_none()
+        && null_aware.is_some()
+        && matches!(join_type, JoinType::Mark | JoinType::NullAwareAnti);
+    let skip_right_build = residual
+        .as_ref()
+        .is_some_and(|expr| matches!(&expr.kind, ExprKind::Literal(ScalarValue::Boolean(false))));
+    let predicates = JoinPredicates::new(residual, null_aware, &left_schema, &right_schema);
     let mut left = left.into_memory_batch_stream(Arc::clone(&context), "join left input");
     let mut right = right.into_memory_batch_stream(Arc::clone(&context), "join right input");
+    if skip_right_build {
+        // A guarded scalar/mark join with a constant-false residual cannot
+        // have a qualifying RHS row. Do not even poll the lazy right plan:
+        // evaluating an unreachable scalar projection could otherwise raise
+        // a division/cardinality error before the join sees the guard.
+        right = boxed_memory_batch_stream(futures::stream::empty());
+    }
     boxed_memory_batch_stream(async_stream::try_stream! {
         let left_key_expressions = on.iter().map(|(left, _)| left.clone()).collect::<Vec<_>>();
         let right_key_expressions = on.iter().map(|(_, right)| right.clone()).collect::<Vec<_>>();
+        if join_type == JoinType::NullAwareAnti && !predicates.is_null_aware() {
+            Err(crate::Error::Internal(
+                "NullAwareAnti join requires a null-aware membership comparison".into(),
+            ))?;
+        }
         let mut reservation = context.memory.reservation();
         let mut right_batches: Vec<RecordBatch> = Vec::new();
         let mut right_bytes = 0usize;
@@ -127,22 +156,60 @@ where
             };
             drop(right_batches);
             reservation.shrink(right_bytes);
-            let right_keys = evaluate_keys_accounted(
-                &right_key_expressions,
-                &right_batch,
-                &context,
-                "join build keys",
-            )?;
-            let hash_table = try_build_hash_table(
-                &right_keys,
-                right_batch.num_rows(),
-                matches!(join_type, JoinType::Semi | JoinType::Anti),
-                &mut reservation,
-            )?;
-            drop(right_keys);
+            let rows = right_batch.num_rows();
+            let (hash_table, right_values, global_membership) = if use_global_membership_hash {
+                let right_values = evaluate_optional_values(
+                    predicates.right_value(),
+                    &right_batch,
+                    &context,
+                    "join build membership value",
+                )?;
+                let right_array = optional_array(&right_values).ok_or_else(|| {
+                    crate::Error::Internal(
+                        "global membership hash is missing its right value array".into(),
+                    )
+                })?;
+                let state = GlobalMembershipState::new(rows, right_array);
+                let hash_table = try_build_hash_table(
+                    std::slice::from_ref(right_array),
+                    rows,
+                    true,
+                    &mut reservation,
+                )?;
+                (hash_table, right_values, Some(state))
+            } else {
+                let right_keys = evaluate_keys_accounted(
+                    &right_key_expressions,
+                    &right_batch,
+                    &context,
+                    "join build keys",
+                )?;
+                let hash_table = try_build_hash_table(
+                    &right_keys,
+                    rows,
+                    can_deduplicate_build(join_type, &predicates),
+                    &mut reservation,
+                )?;
+                drop(right_keys);
+                let right_values = evaluate_optional_values(
+                    predicates.right_value(),
+                    &right_batch,
+                    &context,
+                    "join build membership value",
+                )?;
+                (hash_table, right_values, None)
+            };
             match hash_table {
-                Some(hash_table) => in_memory_build = Some((right_batch, hash_table)),
+                Some(hash_table) => {
+                    in_memory_build = Some((
+                        right_batch,
+                        hash_table,
+                        right_values,
+                        global_membership,
+                    ))
+                }
                 None => {
+                    drop(right_values);
                 let mut spiller = spill::PartitionSpiller::new(&context, "join-right");
                     spill::spill_batch(
                         right_batch,
@@ -179,6 +246,7 @@ where
                     right_key_expressions.clone(),
                     Arc::clone(&left_schema),
                     Arc::clone(&right_schema),
+                    predicates.clone(),
                     join_type,
                     Arc::clone(&schema),
                     Arc::clone(&context),
@@ -209,19 +277,30 @@ where
                         let hash_table = try_build_hash_table(
                             &right_keys,
                             rows,
-                            matches!(join_type, JoinType::Semi | JoinType::Anti),
+                            can_deduplicate_build(join_type, &predicates),
                             &mut reservation,
                         )?;
                         drop(right_keys);
+                        let right_values = evaluate_optional_values(
+                            predicates.right_value(),
+                            &right_batch,
+                            &context,
+                            "join spill build membership value",
+                        )?;
                         match hash_table {
-                            Some(hash_table) => PartitionHashBuild::Ready(right_batch, hash_table),
-                            None => PartitionHashBuild::TooLarge(rows),
+                            Some(hash_table) => {
+                                PartitionHashBuild::Ready(right_batch, hash_table, right_values)
+                            }
+                            None => {
+                                drop(right_values);
+                                PartitionHashBuild::TooLarge(rows)
+                            }
                         }
                     }
                     BuildPartition::TooLarge { rows } => PartitionHashBuild::TooLarge(rows),
                 };
                 match build {
-                    PartitionHashBuild::Ready(right_batch, hash_table) => {
+                    PartitionHashBuild::Ready(right_batch, hash_table, right_values) => {
                         for file in &task.left {
                             for left_batch in context.spill.read_file(file)? {
                                 let left_batch = left_batch?;
@@ -236,18 +315,30 @@ where
                                     &context,
                                     "join spill probe keys",
                                 )?;
+                                let left_values = evaluate_optional_values(
+                                    predicates.left_value(),
+                                    left_batch.batch(),
+                                    &context,
+                                    "join spill probe membership value",
+                                )?;
                                 let mut probe = ProbeCursor::new(
                                     left_batch.batch(),
                                     &right_batch,
                                     &left_keys,
                                     &hash_table,
+                                    &predicates,
+                                    optional_array(&left_values),
+                                    optional_array(&right_values),
+                                    None,
                                     join_type,
                                     Arc::clone(&schema),
                                     batch_size,
                                     reservation
                                         .size()
                                         .saturating_add(left_batch.memory_size())
-                                        .saturating_add(left_keys.memory_size()),
+                                        .saturating_add(left_keys.memory_size())
+                                        .saturating_add(optional_memory(&left_values))
+                                        .saturating_add(optional_memory(&right_values)),
                                 );
                                 while let Some(output) = probe.next_batch(&context).await? {
                                     yield output;
@@ -292,6 +383,7 @@ where
                             right_key_expressions.clone(),
                             Arc::clone(&left_schema),
                             Arc::clone(&right_schema),
+                            predicates.clone(),
                             join_type,
                             Arc::clone(&schema),
                             Arc::clone(&context),
@@ -307,15 +399,22 @@ where
             return;
         }
 
-        let (right_batch, hash_table) = in_memory_build
+        let (right_batch, hash_table, right_values, global_membership) = in_memory_build
             .take()
             .expect("a non-spilling join has an in-memory build");
         if parallel::is_supported(&context, reservation.size()) {
-            let build = parallel::FrozenBuild::new(right_batch, hash_table, reservation);
+            let build = parallel::FrozenBuild::new(
+                right_batch,
+                hash_table,
+                right_values,
+                global_membership,
+                reservation,
+            );
             let mut output = parallel::probe(
                 left,
                 left_key_expressions,
                 build,
+                predicates.clone(),
                 join_type,
                 Arc::clone(&schema),
                 Arc::clone(&context),
@@ -329,24 +428,49 @@ where
         while let Some(batch) = left.next().await {
             context.check_cancelled()?;
             let left_batch = batch?;
-            let left_keys = evaluate_keys_accounted(
-                &left_key_expressions,
+            let left_values = evaluate_optional_values(
+                predicates.left_value(),
                 left_batch.batch(),
                 &context,
-                "join probe keys",
+                "join probe membership value",
             )?;
+            let left_keys = if global_membership.is_some() {
+                None
+            } else {
+                Some(evaluate_keys_accounted(
+                    &left_key_expressions,
+                    left_batch.batch(),
+                    &context,
+                    "join probe keys",
+                )?)
+            };
+            let probe_keys = if global_membership.is_some() {
+                std::slice::from_ref(optional_array(&left_values).ok_or_else(|| {
+                    crate::Error::Internal(
+                        "global membership hash is missing its left value array".into(),
+                    )
+                })?)
+            } else {
+                left_keys.as_deref().expect("regular join evaluated its keys")
+            };
             let mut probe = ProbeCursor::new(
                 left_batch.batch(),
                 &right_batch,
-                &left_keys,
+                probe_keys,
                 &hash_table,
+                &predicates,
+                optional_array(&left_values),
+                optional_array(&right_values),
+                global_membership,
                 join_type,
                 Arc::clone(&schema),
                 batch_size,
                 reservation
                     .size()
                     .saturating_add(left_batch.memory_size())
-                    .saturating_add(left_keys.memory_size()),
+                    .saturating_add(optional_memory(&left_keys))
+                    .saturating_add(optional_memory(&left_values))
+                    .saturating_add(optional_memory(&right_values)),
             );
             while let Some(output) = probe.next_batch(&context).await? {
                 yield output;
@@ -360,6 +484,7 @@ enum PartitionHashBuild {
     Ready(
         RecordBatch,
         std::collections::HashMap<Vec<CellValue>, Vec<u32>>,
+        Option<EvaluatedKeys>,
     ),
     TooLarge(usize),
 }
@@ -390,16 +515,49 @@ impl EvaluatedKeys {
     }
 }
 
+fn evaluate_optional_values(
+    expression: Option<&BoundExpr>,
+    batch: &RecordBatch,
+    context: &QueryContext,
+    owner: &'static str,
+) -> Result<Option<EvaluatedKeys>> {
+    expression
+        .map(|expression| {
+            evaluate_keys_accounted(std::slice::from_ref(expression), batch, context, owner)
+        })
+        .transpose()
+}
+
+fn optional_array(values: &Option<EvaluatedKeys>) -> Option<&ArrayRef> {
+    values.as_ref().map(|values| &values[0])
+}
+
+fn optional_memory(values: &Option<EvaluatedKeys>) -> usize {
+    values.as_ref().map(EvaluatedKeys::memory_size).unwrap_or(0)
+}
+
+fn can_deduplicate_build(join_type: JoinType, predicates: &JoinPredicates) -> bool {
+    predicates.residual().is_none()
+        && !predicates.is_null_aware()
+        && matches!(join_type, JoinType::Semi | JoinType::Anti | JoinType::Mark)
+}
+
 pub(super) fn evaluate_keys_accounted(
     expressions: &[BoundExpr],
     batch: &RecordBatch,
     context: &QueryContext,
     owner: &'static str,
 ) -> Result<EvaluatedKeys> {
-    let estimate = batch
-        .get_array_memory_size()
-        .saturating_mul(expressions.len().max(1))
-        .max(1);
+    let estimate = expressions
+        .iter()
+        .map(|expression| {
+            if matches!(&expression.kind, crate::sql::ExprKind::Column(_)) {
+                std::mem::size_of::<ArrayRef>().saturating_add(256)
+            } else {
+                super::expr::projection_workspace_bytes(std::slice::from_ref(expression), batch)
+            }
+        })
+        .fold(1usize, usize::saturating_add);
     let mut memory = context.memory.try_reserve(estimate).map_err(|error| {
         crate::Error::ResourceExhausted(format!(
             "{owner} require up to {estimate} bytes of expression workspace: {error}"
@@ -408,8 +566,20 @@ pub(super) fn evaluate_keys_accounted(
     let arrays = evaluate_keys(expressions, batch)?;
     let actual = arrays
         .iter()
+        .filter(|array| {
+            !batch
+                .columns()
+                .iter()
+                .any(|column| Arc::ptr_eq(column, array))
+        })
         .map(|array| array.get_array_memory_size())
         .fold(0usize, usize::saturating_add)
+        .saturating_add(
+            arrays
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ArrayRef>()),
+        )
+        .saturating_add(256)
         .max(1);
     memory.try_resize(actual).map_err(|error| {
         crate::Error::ResourceExhausted(format!(

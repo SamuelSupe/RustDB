@@ -10,7 +10,11 @@ use rustdb::{Error, QueryResult, Result};
 
 use super::args::OutputFormat;
 
-pub async fn write_result(result: &mut QueryResult, format: OutputFormat) -> Result<()> {
+pub async fn write_result(
+    result: &mut QueryResult,
+    format: OutputFormat,
+    csv_null: Option<&str>,
+) -> Result<()> {
     let schema = result.schema();
     let mut first = true;
     while let Some(batch) = result.stream().next().await {
@@ -21,8 +25,7 @@ pub async fn write_result(result: &mut QueryResult, format: OutputFormat) -> Res
             }
             OutputFormat::Csv => {
                 let mut bytes = Vec::new();
-                CsvWriterBuilder::new()
-                    .with_header(first)
+                csv_writer(first, csv_null)
                     .build(&mut bytes)
                     .write(&batch)?;
                 io::stdout()
@@ -45,10 +48,7 @@ pub async fn write_result(result: &mut QueryResult, format: OutputFormat) -> Res
             OutputFormat::Table => write_table_batch(&empty, true)?,
             OutputFormat::Csv => {
                 let mut bytes = Vec::new();
-                CsvWriterBuilder::new()
-                    .with_header(true)
-                    .build(&mut bytes)
-                    .write(&empty)?;
+                csv_writer(true, csv_null).build(&mut bytes).write(&empty)?;
                 io::stdout()
                     .write_all(&bytes)
                     .map_err(|error| Error::io(None, error))?;
@@ -57,6 +57,14 @@ pub async fn write_result(result: &mut QueryResult, format: OutputFormat) -> Res
         }
     }
     Ok(())
+}
+
+fn csv_writer(header: bool, null_value: Option<&str>) -> CsvWriterBuilder {
+    let writer = CsvWriterBuilder::new().with_header(header);
+    match null_value {
+        Some(value) => writer.with_null(value.to_owned()),
+        None => writer,
+    }
 }
 
 fn write_table_batch(batch: &RecordBatch, header: bool) -> Result<()> {

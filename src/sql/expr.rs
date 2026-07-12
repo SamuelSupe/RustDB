@@ -1,6 +1,6 @@
 use std::fmt;
 
-use arrow::datatypes::{DataType, IntervalUnit};
+use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScalarValue {
@@ -15,6 +15,7 @@ pub enum ScalarValue {
         scale: i8,
     },
     Date32(i32),
+    TimestampMicrosecond(i64),
     DayInterval(i32),
     MonthInterval(i32),
     Utf8(String),
@@ -32,6 +33,7 @@ impl ScalarValue {
                 precision, scale, ..
             } => DataType::Decimal128(*precision, *scale),
             Self::Date32(_) => DataType::Date32,
+            Self::TimestampMicrosecond(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
             Self::DayInterval(_) => DataType::Interval(IntervalUnit::DayTime),
             Self::MonthInterval(_) => DataType::Interval(IntervalUnit::YearMonth),
             Self::Utf8(_) => DataType::Utf8,
@@ -51,6 +53,9 @@ impl fmt::Display for ScalarValue {
                 formatter.write_str(&format_decimal(*value, *scale))
             }
             Self::Date32(value) => write!(formatter, "DATE_DAY({value})"),
+            Self::TimestampMicrosecond(value) => {
+                write!(formatter, "TIMESTAMP_MICROSECOND({value})")
+            }
             Self::DayInterval(value) => write!(formatter, "INTERVAL '{value}' DAY"),
             Self::MonthInterval(value) => write!(formatter, "INTERVAL '{value}' MONTH"),
             Self::Utf8(value) => write!(formatter, "'{value}'"),
@@ -126,10 +131,27 @@ impl BoundExpr {
         }
     }
 
+    pub(crate) fn outer_ref(
+        depth: u8,
+        index: usize,
+        data_type: DataType,
+        name: impl Into<String>,
+    ) -> Self {
+        let display_name = name.into();
+        Self {
+            kind: ExprKind::OuterRef { depth, index },
+            data_type,
+            display_name,
+        }
+    }
+
     pub fn referenced_columns(&self, output: &mut Vec<usize>) {
         match &self.kind {
             ExprKind::Column(index) => output.push(*index),
-            ExprKind::Literal(_) => {}
+            ExprKind::OuterRef { .. }
+            | ExprKind::DeferredGroup(_)
+            | ExprKind::DeferredAggregate(_)
+            | ExprKind::Literal(_) => {}
             ExprKind::Binary { left, right, .. } => {
                 left.referenced_columns(output);
                 right.referenced_columns(output);
@@ -151,6 +173,80 @@ impl BoundExpr {
             ExprKind::Unary { expr, .. }
             | ExprKind::IsNull { expr, .. }
             | ExprKind::Cast { expr } => expr.referenced_columns(output),
+            ExprKind::ScalarFunction { args, .. } => {
+                for arg in args {
+                    arg.referenced_columns(output);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn outer_references(&self, output: &mut Vec<(u8, usize)>) {
+        match &self.kind {
+            ExprKind::OuterRef { depth, index } => output.push((*depth, *index)),
+            ExprKind::Column(_)
+            | ExprKind::DeferredGroup(_)
+            | ExprKind::DeferredAggregate(_)
+            | ExprKind::Literal(_) => {}
+            ExprKind::Binary { left, right, .. } => {
+                left.outer_references(output);
+                right.outer_references(output);
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                expr.outer_references(output);
+                pattern.outer_references(output);
+            }
+            ExprKind::Case {
+                when_then,
+                else_expr,
+            } => {
+                for (when, then) in when_then {
+                    when.outer_references(output);
+                    then.outer_references(output);
+                }
+                else_expr.outer_references(output);
+            }
+            ExprKind::Unary { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::Cast { expr } => expr.outer_references(output),
+            ExprKind::ScalarFunction { args, .. } => {
+                for arg in args {
+                    arg.outer_references(output);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn contains_outer_ref(&self) -> bool {
+        let mut references = Vec::new();
+        self.outer_references(&mut references);
+        !references.is_empty()
+    }
+
+    pub(crate) fn contains_deferred_aggregate(&self) -> bool {
+        match &self.kind {
+            ExprKind::DeferredGroup(_) | ExprKind::DeferredAggregate(_) => true,
+            ExprKind::Column(_) | ExprKind::OuterRef { .. } | ExprKind::Literal(_) => false,
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Like {
+                expr: left,
+                pattern: right,
+                ..
+            } => left.contains_deferred_aggregate() || right.contains_deferred_aggregate(),
+            ExprKind::Unary { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::Cast { expr } => expr.contains_deferred_aggregate(),
+            ExprKind::Case {
+                when_then,
+                else_expr,
+            } => {
+                when_then.iter().any(|(when, then)| {
+                    when.contains_deferred_aggregate() || then.contains_deferred_aggregate()
+                }) || else_expr.contains_deferred_aggregate()
+            }
+            ExprKind::ScalarFunction { args, .. } => {
+                args.iter().any(BoundExpr::contains_deferred_aggregate)
+            }
         }
     }
 }
@@ -158,6 +254,16 @@ impl BoundExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprKind {
     Column(usize),
+    OuterRef {
+        depth: u8,
+        index: usize,
+    },
+    /// Planning-only reference to a GROUP BY output used by an IN attachment
+    /// that must run after aggregation.
+    DeferredGroup(usize),
+    /// Planning-only aggregate state used by an IN attachment that must run
+    /// after aggregation. Optimizer verification rejects any leaked value.
+    DeferredAggregate(Box<AggregateExpr>),
     Literal(ScalarValue),
     Binary {
         left: Box<BoundExpr>,
@@ -185,6 +291,87 @@ pub enum ExprKind {
     Cast {
         expr: Box<BoundExpr>,
     },
+    ScalarFunction {
+        function: ScalarFunction,
+        args: Vec<BoundExpr>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DateTimePart {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+impl fmt::Display for DateTimePart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Year => "year",
+            Self::Month => "month",
+            Self::Day => "day",
+            Self::Hour => "hour",
+            Self::Minute => "minute",
+            Self::Second => "second",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ScalarFunction {
+    Substring,
+    Length,
+    Lower,
+    Upper,
+    Trim,
+    LTrim,
+    RTrim,
+    Concat,
+    Replace,
+    StartsWith,
+    EndsWith,
+    Contains,
+    Coalesce,
+    NullIf,
+    Abs,
+    Ceil,
+    Floor,
+    Round,
+    DatePart(DateTimePart),
+    DateTrunc(DateTimePart),
+}
+
+impl fmt::Display for ScalarFunction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatePart(part) => write!(formatter, "date_part[{part}]"),
+            Self::DateTrunc(part) => write!(formatter, "date_trunc[{part}]"),
+            other => formatter.write_str(match other {
+                Self::Substring => "substring",
+                Self::Length => "length",
+                Self::Lower => "lower",
+                Self::Upper => "upper",
+                Self::Trim => "trim",
+                Self::LTrim => "ltrim",
+                Self::RTrim => "rtrim",
+                Self::Concat => "concat",
+                Self::Replace => "replace",
+                Self::StartsWith => "starts_with",
+                Self::EndsWith => "ends_with",
+                Self::Contains => "contains",
+                Self::Coalesce => "coalesce",
+                Self::NullIf => "nullif",
+                Self::Abs => "abs",
+                Self::Ceil => "ceil",
+                Self::Floor => "floor",
+                Self::Round => "round",
+                Self::DatePart(_) | Self::DateTrunc(_) => unreachable!(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -212,6 +399,9 @@ impl fmt::Display for AggregateFunction {
 pub struct AggregateExpr {
     pub function: AggregateFunction,
     pub expr: Option<BoundExpr>,
+    /// Whether the aggregate consumes one value per distinct, non-NULL input.
+    /// MIN/MAX DISTINCT are normalized to ordinary aggregates by the binder.
+    pub distinct: bool,
     pub data_type: DataType,
     pub display_name: String,
 }

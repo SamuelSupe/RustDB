@@ -8,12 +8,15 @@ use sqlparser::ast::{
 
 use crate::{Error, Result};
 
+mod deferred;
+
+use super::functions::bind_scalar_expr_with;
 use super::{
-    AggregateExpr, AggregateFunction, BinaryOp, BoundExpr, LogicalPlan, PlanSchema, ScalarValue,
-    UnaryOp,
+    AggregateExpr, AggregateFunction, BinaryOp, BoundExpr, ExprKind, LogicalPlan, PlanSchema,
+    ScalarValue, UnaryOp,
     binder::{
-        TruthValue, bind_expr, ensure_boolean, make_binary, make_case, make_is_null, make_is_truth,
-        make_like, make_unary, map_binary, parse_escape,
+        TruthValue, bind_expr, bind_expr_scoped, ensure_boolean, make_binary, make_case,
+        make_is_null, make_is_truth, make_like, make_unary, map_binary, parse_escape,
     },
     coercion::{cast, is_numeric},
 };
@@ -31,6 +34,8 @@ pub(super) fn plan_aggregate_projection(
     group_ast: &[Expr],
     items: &[SelectItem],
     having: Option<&Expr>,
+    outer: Option<&PlanSchema>,
+    hidden_groups: &[Expr],
 ) -> Result<LogicalPlan> {
     if items.iter().any(|item| {
         matches!(
@@ -42,9 +47,12 @@ pub(super) fn plan_aggregate_projection(
             "wildcards are not supported in aggregate queries".into(),
         ));
     }
+    if deferred::has_attachments(&input) {
+        return deferred::plan(input, group_ast, hidden_groups, items, having);
+    }
     let group_exprs = group_ast
         .iter()
-        .map(|expr| bind_expr(expr, input.schema()))
+        .map(|expr| bind_expr_scoped(expr, input.schema(), outer))
         .collect::<Result<Vec<_>>>()?;
     let mut aggregate_exprs = Vec::new();
     let mut output_exprs = Vec::with_capacity(items.len());
@@ -115,6 +123,11 @@ fn bind_after_aggregate(
             group.data_type.clone(),
             group.display_name.clone(),
         ));
+    }
+    if let Some(bound) = bind_scalar_expr_with(expr, &mut |arg| {
+        bind_after_aggregate(arg, input_schema, group_ast, group_exprs, aggregates)
+    }) {
+        return bound;
     }
     match expr {
         Expr::Function(function) if aggregate_function(function).is_some() => {
@@ -356,6 +369,77 @@ fn bind_after_aggregate(
     }
 }
 
+pub(super) fn bind_deferred_result(
+    expr: &Expr,
+    input_schema: &PlanSchema,
+    group_ast: &[Expr],
+) -> Result<BoundExpr> {
+    let group_exprs = group_ast
+        .iter()
+        .map(|group| bind_expr(group, input_schema))
+        .collect::<Result<Vec<_>>>()?;
+    let mut aggregates = Vec::new();
+    let mut result =
+        bind_after_aggregate(expr, input_schema, group_ast, &group_exprs, &mut aggregates)?;
+    defer_result_columns(&mut result, group_exprs.len(), &aggregates)?;
+    Ok(result)
+}
+
+fn defer_result_columns(
+    expr: &mut BoundExpr,
+    group_width: usize,
+    aggregates: &[AggregateExpr],
+) -> Result<()> {
+    match &mut expr.kind {
+        ExprKind::Column(index) if *index < group_width => {
+            expr.kind = ExprKind::DeferredGroup(*index);
+        }
+        ExprKind::Column(index) => {
+            let aggregate = aggregates
+                .get(index.saturating_sub(group_width))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "deferred aggregate result column {index} is out of bounds"
+                    ))
+                })?;
+            expr.kind = ExprKind::DeferredAggregate(Box::new(aggregate));
+        }
+        ExprKind::OuterRef { .. }
+        | ExprKind::DeferredGroup(_)
+        | ExprKind::DeferredAggregate(_)
+        | ExprKind::Literal(_) => {}
+        ExprKind::Binary { left, right, .. }
+        | ExprKind::Like {
+            expr: left,
+            pattern: right,
+            ..
+        } => {
+            defer_result_columns(left, group_width, aggregates)?;
+            defer_result_columns(right, group_width, aggregates)?;
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Cast { expr } => {
+            defer_result_columns(expr, group_width, aggregates)?
+        }
+        ExprKind::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (when, then) in when_then {
+                defer_result_columns(when, group_width, aggregates)?;
+                defer_result_columns(then, group_width, aggregates)?;
+            }
+            defer_result_columns(else_expr, group_width, aggregates)?;
+        }
+        ExprKind::ScalarFunction { args, .. } => {
+            for argument in args {
+                defer_result_columns(argument, group_width, aggregates)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result<AggregateExpr> {
     if function.over.is_some()
         || function.filter.is_some()
@@ -375,21 +459,20 @@ fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result<AggregateE
             function.name
         )));
     };
-    if arguments.duplicate_treatment == Some(DuplicateTreatment::Distinct)
-        || !arguments.clauses.is_empty()
-    {
+    if !arguments.clauses.is_empty() {
         return Err(Error::Unsupported(
-            "DISTINCT and ordered aggregate arguments are not supported".into(),
+            "ordered aggregate arguments are not supported".into(),
         ));
     }
+    let requested_distinct = arguments.duplicate_treatment == Some(DuplicateTreatment::Distinct);
     let expr = match arguments.args.as_slice() {
         [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => Some(bind_expr(expr, schema)?),
         [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
-            if aggregate == AggregateFunction::Count =>
+            if aggregate == AggregateFunction::Count && !requested_distinct =>
         {
             None
         }
-        [] if aggregate == AggregateFunction::Count => None,
+        [] if aggregate == AggregateFunction::Count && !requested_distinct => None,
         _ => {
             return Err(Error::InvalidArgument(format!(
                 "aggregate {} expects one expression (or * for count)",
@@ -408,9 +491,15 @@ fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result<AggregateE
         )));
     }
     let data_type = aggregate_type(aggregate, expr.as_ref(), function)?;
+    let distinct = requested_distinct
+        && matches!(
+            aggregate,
+            AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Avg
+        );
     Ok(AggregateExpr {
         function: aggregate,
         expr,
+        distinct,
         data_type,
         display_name: function.to_string(),
     })
@@ -482,9 +571,12 @@ fn select_item_has_aggregate(item: &SelectItem) -> bool {
     }
 }
 
-fn contains_aggregate(expr: &Expr) -> bool {
+pub(super) fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::Function(function) => aggregate_function(function).is_some(),
+        Expr::Function(function) => {
+            aggregate_function(function).is_some()
+                || function_arguments(function).any(contains_aggregate)
+        }
         Expr::BinaryOp { left, right, .. }
         | Expr::Like {
             expr: left,
@@ -505,6 +597,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::InList { expr, list, .. } => {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
         }
+        Expr::InSubquery { expr, .. } => contains_aggregate(expr),
         Expr::Between {
             expr, low, high, ..
         } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
@@ -520,8 +613,44 @@ fn contains_aggregate(expr: &Expr) -> bool {
                 })
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
+        Expr::Extract { expr, .. } | Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
+            contains_aggregate(expr)
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            contains_aggregate(expr)
+                || substring_from.as_deref().is_some_and(contains_aggregate)
+                || substring_for.as_deref().is_some_and(contains_aggregate)
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            contains_aggregate(expr)
+                || trim_what.as_deref().is_some_and(contains_aggregate)
+                || trim_characters
+                    .as_deref()
+                    .is_some_and(|values| values.iter().any(contains_aggregate))
+        }
         _ => false,
     }
+}
+
+fn function_arguments(function: &Function) -> impl Iterator<Item = &Expr> {
+    let arguments = match &function.args {
+        FunctionArguments::List(arguments) => arguments.args.as_slice(),
+        FunctionArguments::None | FunctionArguments::Subquery(_) => &[],
+    };
+    arguments.iter().filter_map(|argument| match argument {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+        _ => None,
+    })
 }
 
 fn aggregate_function(function: &Function) -> Option<AggregateFunction> {

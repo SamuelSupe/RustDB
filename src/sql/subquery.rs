@@ -1,127 +1,44 @@
 use arrow::datatypes::DataType;
-use sqlparser::ast::{BinaryOperator, Expr, Query};
+use sqlparser::ast::{BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::{Error, Result};
 
-use super::binder::{bind_expr, ensure_boolean, make_binary};
+use super::binder::{bind_expr_scoped, ensure_boolean};
 use super::coercion::cast_if_needed;
-use super::{BinaryOp, BoundExpr, ExprKind, JoinType, LogicalPlan};
+use super::{BoundExpr, DependentJoinKind, ExprKind, JoinType, LogicalPlan, PlanSchema, UnaryOp};
 
-pub(super) fn apply_where<F>(
+mod staging;
+
+pub(super) use staging::{is_direct_mark_attachment, stageable_direct_mark_term};
+
+pub(super) fn apply_where(
+    mut plan: LogicalPlan,
+    predicate: &Expr,
+    outer: Option<&PlanSchema>,
+) -> Result<LogicalPlan> {
+    let mut terms = Vec::new();
+    split_and(predicate, &mut terms);
+    // Subquery extraction nests Mark/DependentJoin nodes in discovery order.
+    // Apply generated marker predicates in reverse order so every direct
+    // WHERE IN/EXISTS can be lowered without moving unrelated filters.
+    terms.sort_by_key(|term| std::cmp::Reverse(marker_rank(term).unwrap_or(0)));
+    for term in terms {
+        plan = apply_filter(plan, term, outer)?;
+    }
+    Ok(plan)
+}
+
+fn apply_filter(
     plan: LogicalPlan,
     predicate: &Expr,
-    plan_subquery: &mut F,
-) -> Result<LogicalPlan>
-where
-    F: FnMut(&Query) -> Result<LogicalPlan>,
-{
-    if let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::And,
-        right,
-    } = predicate
-    {
-        let plan = apply_where(plan, left, plan_subquery)?;
-        return apply_where(plan, right, plan_subquery);
+    outer: Option<&PlanSchema>,
+) -> Result<LogicalPlan> {
+    if contains_subquery(predicate) {
+        return Err(Error::Internal(
+            "subquery expression reached WHERE after extraction".into(),
+        ));
     }
-    match predicate {
-        Expr::InSubquery {
-            expr,
-            subquery,
-            negated: false,
-        } => apply_in(plan, expr, subquery, plan_subquery),
-        Expr::InSubquery { negated: true, .. } => Err(Error::Unsupported(
-            "NOT IN subqueries require null-aware anti join semantics and are not supported".into(),
-        )),
-        Expr::Exists { subquery, negated } => apply_exists(plan, subquery, *negated, plan_subquery),
-        _ if contains_subquery(predicate) => Err(Error::Unsupported(
-            "subquery predicates are supported only as top-level AND conjuncts".into(),
-        )),
-        _ => apply_filter(plan, predicate),
-    }
-}
-
-fn apply_in<F>(
-    left_plan: LogicalPlan,
-    expr: &Expr,
-    subquery: &Query,
-    plan_subquery: &mut F,
-) -> Result<LogicalPlan>
-where
-    F: FnMut(&Query) -> Result<LogicalPlan>,
-{
-    let left_expr = bind_expr(expr, left_plan.schema())?;
-    let right_plan = plan_uncorrelated(subquery, plan_subquery)?;
-    if right_plan.schema().arrow().fields().len() != 1 {
-        return Err(Error::InvalidArgument(format!(
-            "IN subquery must return exactly one column, got {}",
-            right_plan.schema().arrow().fields().len()
-        )));
-    }
-    let field = right_plan.schema().arrow().field(0);
-    let equality = make_binary(
-        left_expr,
-        BinaryOp::Eq,
-        BoundExpr::column(0, field.data_type().clone(), field.name()),
-    )?;
-    let ExprKind::Binary { left, right, .. } = equality.kind else {
-        unreachable!("equality binding always creates a binary expression")
-    };
-    let schema = left_plan.schema().clone();
-    Ok(LogicalPlan::Join {
-        left: Box::new(left_plan),
-        right: Box::new(right_plan),
-        on: vec![(*left, *right)],
-        join_type: JoinType::Semi,
-        schema,
-    })
-}
-
-fn apply_exists<F>(
-    left_plan: LogicalPlan,
-    subquery: &Query,
-    negated: bool,
-    plan_subquery: &mut F,
-) -> Result<LogicalPlan>
-where
-    F: FnMut(&Query) -> Result<LogicalPlan>,
-{
-    let right_plan = plan_uncorrelated(subquery, plan_subquery)?;
-    let right_schema = right_plan.schema().clone();
-    let right_plan = LogicalPlan::Limit {
-        input: Box::new(right_plan),
-        offset: 0,
-        limit: Some(1),
-        schema: right_schema,
-    };
-    let schema = left_plan.schema().clone();
-    Ok(LogicalPlan::Join {
-        left: Box::new(left_plan),
-        right: Box::new(right_plan),
-        on: Vec::new(),
-        join_type: if negated {
-            JoinType::Anti
-        } else {
-            JoinType::Semi
-        },
-        schema,
-    })
-}
-
-fn plan_uncorrelated<F>(subquery: &Query, plan_subquery: &mut F) -> Result<LogicalPlan>
-where
-    F: FnMut(&Query) -> Result<LogicalPlan>,
-{
-    match plan_subquery(subquery) {
-        Err(Error::Catalog(message)) => Err(Error::Unsupported(format!(
-            "correlated subqueries are not supported ({message})"
-        ))),
-        result => result,
-    }
-}
-
-fn apply_filter(input: LogicalPlan, predicate: &Expr) -> Result<LogicalPlan> {
-    let predicate = bind_expr(predicate, input.schema())?;
+    let predicate = bind_expr_scoped(predicate, plan.schema(), outer)?;
     ensure_boolean(&predicate).map_err(|_| {
         Error::InvalidArgument(format!(
             "WHERE requires BOOLEAN, got {}",
@@ -129,12 +46,128 @@ fn apply_filter(input: LogicalPlan, predicate: &Expr) -> Result<LogicalPlan> {
         ))
     })?;
     let predicate = cast_if_needed(predicate, &DataType::Boolean);
-    let schema = input.schema().clone();
+    if let Some(negated) = direct_marker_predicate(&predicate, &plan) {
+        return lower_direct_marker(plan, negated);
+    }
+    let schema = plan.schema().clone();
     Ok(LogicalPlan::Filter {
-        input: Box::new(input),
+        input: Box::new(plan),
         predicate,
         schema,
     })
+}
+
+fn direct_marker_predicate(predicate: &BoundExpr, input: &LogicalPlan) -> Option<bool> {
+    let marker = match input {
+        LogicalPlan::Join {
+            left,
+            join_type: JoinType::Mark,
+            ..
+        } => left.schema().arrow().fields().len(),
+        LogicalPlan::DependentJoin {
+            left,
+            kind: DependentJoinKind::Exists | DependentJoinKind::In { .. },
+            guard: None,
+            ..
+        } => left.schema().arrow().fields().len(),
+        _ => return None,
+    };
+    match &predicate.kind {
+        ExprKind::Column(index) if *index == marker => Some(false),
+        ExprKind::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } if matches!(expr.kind, ExprKind::Column(index) if index == marker) => Some(true),
+        _ => None,
+    }
+}
+
+fn lower_direct_marker(plan: LogicalPlan, negated: bool) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Join {
+            left,
+            right,
+            mut on,
+            residual,
+            null_aware,
+            join_type: JoinType::Mark,
+            ..
+        } => {
+            let schema = left.schema().clone();
+            let (join_type, null_aware) = match (negated, null_aware) {
+                (false, Some(pair)) => {
+                    on.push(pair);
+                    (JoinType::Semi, None)
+                }
+                (false, None) => (JoinType::Semi, None),
+                (true, Some(pair)) => (JoinType::NullAwareAnti, Some(pair)),
+                (true, None) => (JoinType::Anti, None),
+            };
+            Ok(LogicalPlan::Join {
+                left,
+                right,
+                on,
+                residual,
+                null_aware,
+                join_type,
+                schema,
+            })
+        }
+        LogicalPlan::DependentJoin {
+            left,
+            right,
+            kind,
+            guard: None,
+            ..
+        } => {
+            let schema = left.schema().clone();
+            let kind = match kind {
+                DependentJoinKind::Exists => DependentJoinKind::ExistsFilter { negated },
+                DependentJoinKind::In { needle } => DependentJoinKind::InFilter { needle, negated },
+                _ => {
+                    return Err(Error::Internal(
+                        "direct marker lowering received a non-marker dependent join".into(),
+                    ));
+                }
+            };
+            Ok(LogicalPlan::DependentJoin {
+                left,
+                right,
+                kind,
+                guard: None,
+                schema,
+            })
+        }
+        _ => Err(Error::Internal(
+            "direct marker lowering received a non-Mark join".into(),
+        )),
+    }
+}
+
+fn split_and<'a>(expr: &'a Expr, output: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::And,
+        right,
+    } = expr
+    {
+        split_and(left, output);
+        split_and(right, output);
+    } else {
+        output.push(expr);
+    }
+}
+
+fn marker_rank(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Identifier(ident) => ident
+            .value
+            .strip_prefix("__rustdb_scalar_subquery_")
+            .and_then(|index| index.parse().ok())
+            .map(|index: usize| index.saturating_add(1)),
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => marker_rank(expr),
+        _ => None,
+    }
 }
 
 fn contains_subquery(expr: &Expr) -> bool {
@@ -150,6 +183,12 @@ fn contains_subquery(expr: &Expr) -> bool {
             pattern: right,
             ..
         } => contains_subquery(left) || contains_subquery(right),
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_subquery(expr) || contains_subquery(low) || contains_subquery(high),
+        Expr::InList { expr, list, .. } => {
+            contains_subquery(expr) || list.iter().any(contains_subquery)
+        }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
         | Expr::IsNull(expr)
@@ -160,7 +199,10 @@ fn contains_subquery(expr: &Expr) -> bool {
         | Expr::IsNotFalse(expr)
         | Expr::IsUnknown(expr)
         | Expr::IsNotUnknown(expr)
-        | Expr::Cast { expr, .. } => contains_subquery(expr),
+        | Expr::Cast { expr, .. }
+        | Expr::Extract { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. } => contains_subquery(expr),
         Expr::Case {
             operand,
             conditions,
@@ -172,6 +214,47 @@ fn contains_subquery(expr: &Expr) -> bool {
                     contains_subquery(&branch.condition) || contains_subquery(&branch.result)
                 })
                 || else_result.as_deref().is_some_and(contains_subquery)
+        }
+        Expr::Function(function) => match &function.args {
+            FunctionArguments::List(arguments) => arguments.args.iter().any(|argument| {
+                matches!(
+                    argument,
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(expr),
+                            ..
+                        }
+                        | FunctionArg::ExprNamed {
+                            arg: FunctionArgExpr::Expr(expr),
+                            ..
+                        }
+                        if contains_subquery(expr)
+                )
+            }),
+            FunctionArguments::Subquery(_) => true,
+            FunctionArguments::None => false,
+        },
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            contains_subquery(expr)
+                || substring_from.as_deref().is_some_and(contains_subquery)
+                || substring_for.as_deref().is_some_and(contains_subquery)
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            contains_subquery(expr)
+                || trim_what.as_deref().is_some_and(contains_subquery)
+                || trim_characters
+                    .as_deref()
+                    .is_some_and(|values| values.iter().any(contains_subquery))
         }
         _ => false,
     }

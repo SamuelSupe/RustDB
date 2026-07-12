@@ -6,15 +6,23 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import hashlib
 import json
 from pathlib import Path
+import re
 
 
 QUANTUM = Decimal("0.000001")
-EMPTY_RESULT = b"[]\n"
+ISO_TIMESTAMP = re.compile(
+    r"^(?P<date>[0-9]{4,}-[0-9]{2}-[0-9]{2})[T ](?P<time>[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?)$"
+)
 
 
 def canonical_value(value: str) -> str:
     if value == "":
         return ""
+    timestamp = ISO_TIMESTAMP.fullmatch(value)
+    if timestamp is not None:
+        # Arrow's CSV writer uses the ISO `T` separator while DuckDB's CSV
+        # writer uses a space for the same timezone-free timestamp value.
+        return f"{timestamp.group('date')} {timestamp.group('time')}"
     try:
         number = Decimal(value)
     except InvalidOperation:
@@ -30,8 +38,8 @@ def canonical_value(value: str) -> str:
 def canonical_bytes(path: Path, preserve_order: bool = False) -> bytes:
     with path.open(newline="", encoding="utf-8") as source:
         rows = list(csv.reader(source))
-    if len(rows) <= 1:
-        return EMPTY_RESULT
+    if not rows or not rows[0]:
+        raise SystemExit(f"CSV result is missing a header: {path}")
     width = len(rows[0])
     if any(len(row) != width for row in rows):
         raise SystemExit(f"inconsistent CSV row width: {path}")

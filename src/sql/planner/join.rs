@@ -132,6 +132,16 @@ fn rebase_right(mut expr: BoundExpr, left_width: usize) -> Result<BoundExpr> {
                 Error::Internal("right join expression used a left column".into())
             })?;
         }
+        ExprKind::OuterRef { .. } => {
+            return Err(Error::Internal(
+                "OuterRef reached parser-visible JOIN rebasing".into(),
+            ));
+        }
+        ExprKind::DeferredGroup(_) | ExprKind::DeferredAggregate(_) => {
+            return Err(Error::Internal(
+                "deferred aggregate result reached parser-visible JOIN rebasing".into(),
+            ));
+        }
         ExprKind::Literal(_) => {}
         ExprKind::Binary { left, right, .. } => {
             **left = rebase_right((**left).clone(), left_width)?;
@@ -153,6 +163,11 @@ fn rebase_right(mut expr: BoundExpr, left_width: usize) -> Result<BoundExpr> {
         }
         ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Cast { expr } => {
             **expr = rebase_right((**expr).clone(), left_width)?;
+        }
+        ExprKind::ScalarFunction { args, .. } => {
+            for arg in args {
+                *arg = rebase_right(arg.clone(), left_width)?;
+            }
         }
     }
     Ok(expr)

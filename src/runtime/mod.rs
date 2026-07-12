@@ -7,6 +7,7 @@ mod metrics;
 mod scheduler;
 mod spill;
 mod stream;
+mod task_group;
 
 pub(crate) use batch::{
     BatchEnvelope, IntoMemoryBatchStream, MemoryBatchStream, boxed_memory_batch_stream,
@@ -23,3 +24,4 @@ pub(crate) use spill::{
 };
 pub use spill::{SpillFile, SpillManager};
 pub use stream::{RecordBatchStream, boxed_record_batch_stream};
+pub(crate) use task_group::TaskGroup;

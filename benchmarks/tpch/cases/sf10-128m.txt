@@ -1,0 +1,7 @@
+# Correlation and DISTINCT cases required by the SF10 128 MiB Spill gate.
+q02
+q16
+q17
+q20
+q21
+q22

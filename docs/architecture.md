@@ -15,15 +15,30 @@ Aggregate, Join build, Sort, and scalar-subquery materialization remain
 pipeline breakers. Bounded envelope queues apply consumer backpressure.
 Object-store work is asynchronous and source fan-out is capped by
 `io_concurrency`. `compute_threads` is an upper bound, not a promise that every
-plan has that many simultaneously runnable lanes. Without `ORDER BY`, batches
-from multiple lanes have no stable output order.
+plan has that many simultaneously runnable lanes. The query scheduler also
+reserves at least 32 MiB of query budget per configured lane, so a 64 MiB
+query uses at most two lanes and a 128 MiB query at most four. This query-wide
+cap prevents nested Scan/Join queues from consuming every memory credit before
+a blocking operator can switch to Spill; a 1 GiB query can still use all 18
+requested lanes. Without `ORDER BY`, batches from multiple lanes have no
+stable output order.
+
+Every asynchronous worker belongs to the query's `TaskGroup`, including the
+public-stream producer, Scan lanes, Aggregate partial lanes, Hash/Grace Join
+workers, and Sort run generators. The first worker error or panic records one
+terminal failure and cancels its siblings. Normal completion and error paths
+wait for every registered task to unwind before removing query Spill files;
+consumer abandonment starts the same convergence through a background reaper,
+so `QueryResult::cancel()` remains a non-blocking signal.
 
 Scan lanes reserve a projected-schema decode credit before polling a decoder.
 Filter/Projection and blocking-operator outputs reserve conservative workspace
 before Arrow kernels run, then transfer that reservation directly into the
-output `BatchEnvelope`. Internal and public handoff queues each retain at most
-one batch; when downstream is slow, cancellation-aware memory waiters resume on
-lease release instead of treating temporary queue pressure as out-of-memory.
+output `BatchEnvelope`. Per-lane input queues remain single-slot, while shared
+fan-in queues are bounded in proportion to their active lane count. The public
+handoff remains single-slot. Every queued envelope retains its memory lease;
+when downstream is slow, cancellation-aware memory waiters resume on lease
+release instead of treating temporary queue pressure as out-of-memory.
 
 Parquet morsels are file plus row group and may execute concurrently. CSV
 morsels are files; one CSV remains sequential so quoted records cannot be split
@@ -40,6 +55,24 @@ probe when it fits, Grace partitions on pressure, and switches to external
 sort-merge after two seeds do not shrink a partition. Duplicate-key groups are
 replayed in bounded chunks. Sort creates lane-local memory blocks or LZ4 Arrow
 IPC runs and performs a bounded k-way merge.
+
+Aggregate DISTINCT uses a tagged `(group, aggregate-id, value)` key, so
+multiple DISTINCT aggregates share one de-duplication stage without
+conflating their inputs. In memory the key retains typed cell values; its
+private Spill codec writes the group, aggregate tag, and value as bounded
+binary fields. High-cardinality keys use recursive partitioning and the same
+Spill governance as ordinary aggregate state.
+
+The binder represents a one-level correlated reference explicitly as an
+`OuterRef`. Planning temporarily introduces a `DependentJoin`; decorrelation
+pulls equality keys and residual predicates into set-at-a-time join plans.
+Scalar, membership, and existence subqueries become internal single-row,
+Mark, null-aware anti, Semi, or Anti joins as appropriate. Direct top-level
+`IN`/`NOT IN`/`EXISTS` filters are staged independently, including when they
+appear later in an `AND` chain, so they lower directly to membership, Semi, or
+Anti joins without retaining marker columns between filters. The physical-plan
+verifier rejects every remaining `OuterRef` or `DependentJoin`, so execution
+never falls back to evaluating a subquery once per outer row.
 
 In the current alpha, parallel Aggregate and Sort, and the shared-build hash
 Join probe, require more than one configured lane and at least a 64 MiB query

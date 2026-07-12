@@ -79,6 +79,38 @@ pub enum JoinType {
     Left,
     Semi,
     Anti,
+    /// A scalar-subquery join. Execution must fail when more than one right
+    /// row matches a left row.
+    LeftSingle,
+    /// Appends one boolean marker instead of right-side columns. A missing
+    /// `null_aware` comparison means EXISTS semantics; a present comparison
+    /// means SQL IN semantics.
+    Mark,
+    /// Filters the left input using SQL NOT IN semantics, including RHS NULLs.
+    NullAwareAnti,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DependentJoinKind {
+    Scalar,
+    GuardedScalar {
+        expression: BoundExpr,
+    },
+    Exists,
+    In {
+        needle: BoundExpr,
+    },
+    /// A top-level correlated EXISTS predicate that can be decorrelated
+    /// directly to a Semi/Anti join without materializing a marker column.
+    ExistsFilter {
+        negated: bool,
+    },
+    /// A top-level correlated IN predicate that can be decorrelated directly
+    /// to a Semi/NullAwareAnti join without materializing a marker column.
+    InFilter {
+        needle: BoundExpr,
+        negated: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -112,6 +144,17 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         schema: PlanSchema,
     },
+    /// Temporary correlated-subquery representation. The optimizer must
+    /// decorrelate every instance before physical execution.
+    DependentJoin {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        kind: DependentJoinKind,
+        /// Predicate over the left input that determines whether this
+        /// attachment is semantically evaluated (CASE/AND/OR short-circuit).
+        guard: Option<BoundExpr>,
+        schema: PlanSchema,
+    },
     Aggregate {
         input: Box<LogicalPlan>,
         group_exprs: Vec<BoundExpr>,
@@ -134,6 +177,10 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
         on: Vec<(BoundExpr, BoundExpr)>,
+        /// Predicate over the concatenated left-then-right input schema.
+        residual: Option<BoundExpr>,
+        /// Separate probe/build comparison for IN/NOT IN null semantics.
+        null_aware: Option<(BoundExpr, BoundExpr)>,
         join_type: JoinType,
         schema: PlanSchema,
     },
@@ -147,6 +194,7 @@ impl LogicalPlan {
             | Self::Filter { schema, .. }
             | Self::Projection { schema, .. }
             | Self::Scalarize { schema, .. }
+            | Self::DependentJoin { schema, .. }
             | Self::Aggregate { schema, .. }
             | Self::Sort { schema, .. }
             | Self::Limit { schema, .. }
@@ -182,7 +230,7 @@ impl LogicalPlan {
             | Self::Aggregate { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.freeze_query_statistics(context),
-            Self::Join { left, right, .. } => {
+            Self::Join { left, right, .. } | Self::DependentJoin { left, right, .. } => {
                 left.freeze_query_statistics(context);
                 right.freeze_query_statistics(context);
             }
@@ -199,7 +247,7 @@ impl LogicalPlan {
             | Self::Aggregate { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.collect_scan_providers(providers),
-            Self::Join { left, right, .. } => {
+            Self::Join { left, right, .. } | Self::DependentJoin { left, right, .. } => {
                 left.collect_scan_providers(providers);
                 right.collect_scan_providers(providers);
             }
@@ -247,6 +295,20 @@ impl LogicalPlan {
                 output.push_str(&format!("{indent}Scalarize\n"));
                 input.write_explain(depth + 1, lane_limit, output);
             }
+            Self::DependentJoin {
+                left,
+                right,
+                kind,
+                guard,
+                ..
+            } => {
+                output.push_str(&format!(
+                    "{indent}DependentJoin kind={kind:?} guarded={} decorrelate=pending\n",
+                    guard.is_some()
+                ));
+                left.write_explain(depth + 1, lane_limit, output);
+                right.write_explain(depth + 1, lane_limit, output);
+            }
             Self::Aggregate {
                 input,
                 group_exprs,
@@ -261,8 +323,18 @@ impl LogicalPlan {
                     .iter()
                     .map(|expr| expr.display_name.as_str())
                     .collect();
+                let distinct = aggregate_exprs.iter().filter(|expr| expr.distinct).count();
+                let distinct_stage = if distinct == 0 && aggregate_exprs.is_empty() {
+                    "distinct=group_key_dedup".to_owned()
+                } else if distinct == 0 {
+                    "distinct=none".to_owned()
+                } else {
+                    format!(
+                        "distinct=count:{distinct},dedup:tagged_full_key,partition:(group,aggregate_id,value),spill:recursive_hash"
+                    )
+                };
                 output.push_str(&format!(
-                    "{indent}Aggregate groups={groups:?} aggregates={aggregates:?} partial_lane_limit={lanes} final=merge\n"
+                    "{indent}Aggregate groups={groups:?} aggregates={aggregates:?} {distinct_stage} partial_lane_limit={lanes} final=merge spill=recursive_hash\n"
                 ));
                 input.write_explain(depth + 1, lane_limit, output);
             }
@@ -277,7 +349,7 @@ impl LogicalPlan {
                     .map(|expr| expr.expr.display_name.as_str())
                     .collect();
                 output.push_str(&format!(
-                    "{indent}Sort {names:?} fetch={fetch:?} run_lane_limit={lanes} merge=kway\n"
+                    "{indent}Sort {names:?} fetch={fetch:?} run_lane_limit={lanes} merge=kway spill=external_ipc_lz4\n"
                 ));
                 input.write_explain(depth + 1, lane_limit, output);
             }
@@ -295,14 +367,18 @@ impl LogicalPlan {
                 right,
                 join_type,
                 on,
+                residual,
+                null_aware,
                 ..
             } => {
                 if on.is_empty() && matches!(right.as_ref(), Self::Scalarize { .. }) {
                     output.push_str(&format!("{indent}ScalarBroadcast build=right\n"));
                 } else {
                     output.push_str(&format!(
-                        "{indent}{join_type:?}Join keys={} build=right strategy=hash_partition lane_limit={lanes} partitions=64 repartition_seeds=2 fallback=sort_merge\n",
-                        on.len()
+                        "{indent}{join_type:?}Join keys={} residual={} null_aware={} build=right decorrelation=complete strategy=hash_partition lane_limit={lanes} partitions=64 spill=grace_hash repartition_seeds=2 fallback=sort_merge\n",
+                        on.len(),
+                        residual.is_some(),
+                        null_aware.is_some(),
                     ));
                 }
                 left.write_explain(depth + 1, lane_limit, output);

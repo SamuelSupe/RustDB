@@ -14,6 +14,11 @@ globs, unusually large Parquet footers/schemas, or a limit too small to open
 the minimum partition writers fail explicitly. Narrow the pattern or raise the
 limit; lowering `batch_size` only helps row-sized working state.
 
+`compute_threads` is automatically capped by the query memory budget at one
+lane per 32 MiB. This preserves forward progress for nested bounded queues;
+manually requesting more threads does not override the cap. Raise the memory
+limit if a low-memory query needs more parallel lanes.
+
 Confirm `EngineConfig::spill.directory` exists on a filesystem with enough
 free space and supports owner-only permissions. Spill rejects writes that
 would violate its engine/query quota or leave less than both the configured
@@ -39,7 +44,7 @@ reported instead of being silently ignored.
 
 ## CSV schema or UTF-8 errors
 
-CSV input is strict, UTF-8, and uncompressed in v0.2. Supply an explicit Arrow
+CSV input is strict, UTF-8, and uncompressed in v0.3. Supply an explicit Arrow
 schema when sampling would infer an unwanted type. All matched files must have
 compatible columns; errors identify the URI and mismatched column. Use
 `REFRESH TABLE name` only when the visible schema should be re-inferred.

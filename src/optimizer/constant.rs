@@ -1,6 +1,12 @@
 use std::cmp::Ordering;
 
-use arrow::datatypes::DataType;
+use arrow::{
+    array::{
+        Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+        TimestampMicrosecondArray, UInt64Array,
+    },
+    datatypes::{DataType, TimeUnit},
+};
 
 use crate::sql::{BinaryOp, BoundExpr, ExprKind, LogicalPlan, ScalarValue, UnaryOp};
 
@@ -27,6 +33,27 @@ pub(super) fn fold_plan(plan: &mut LogicalPlan) {
         LogicalPlan::Scalarize { input, .. } | LogicalPlan::Limit { input, .. } => {
             fold_plan(input);
         }
+        LogicalPlan::DependentJoin {
+            left,
+            right,
+            kind,
+            guard,
+            ..
+        } => {
+            fold_plan(left);
+            fold_plan(right);
+            if let crate::sql::DependentJoinKind::In { needle }
+            | crate::sql::DependentJoinKind::InFilter { needle, .. } = kind
+            {
+                fold_expr(needle);
+            }
+            if let crate::sql::DependentJoinKind::GuardedScalar { expression } = kind {
+                fold_expr(expression);
+            }
+            if let Some(guard) = guard {
+                fold_expr(guard);
+            }
+        }
         LogicalPlan::Aggregate {
             input,
             group_exprs,
@@ -50,11 +77,23 @@ pub(super) fn fold_plan(plan: &mut LogicalPlan) {
             }
         }
         LogicalPlan::Join {
-            left, right, on, ..
+            left,
+            right,
+            on,
+            residual,
+            null_aware,
+            ..
         } => {
             fold_plan(left);
             fold_plan(right);
             for (left, right) in on {
+                fold_expr(left);
+                fold_expr(right);
+            }
+            if let Some(residual) = residual {
+                fold_expr(residual);
+            }
+            if let Some((left, right)) = null_aware {
                 fold_expr(left);
                 fold_expr(right);
             }
@@ -64,7 +103,11 @@ pub(super) fn fold_plan(plan: &mut LogicalPlan) {
 
 fn fold_expr(expr: &mut BoundExpr) {
     match &mut expr.kind {
-        ExprKind::Column(_) | ExprKind::Literal(_) => {}
+        ExprKind::Column(_)
+        | ExprKind::OuterRef { .. }
+        | ExprKind::DeferredGroup(_)
+        | ExprKind::DeferredAggregate(_)
+        | ExprKind::Literal(_) => {}
         ExprKind::Binary { left, right, .. } => {
             fold_expr(left);
             fold_expr(right);
@@ -86,6 +129,7 @@ fn fold_expr(expr: &mut BoundExpr) {
             }
             fold_expr(else_expr);
         }
+        ExprKind::ScalarFunction { args, .. } => args.iter_mut().for_each(fold_expr),
     }
     if let Some(replacement) = fold_current(expr) {
         *expr = replacement;
@@ -102,8 +146,68 @@ fn fold_current(expr: &BoundExpr) -> Option<BoundExpr> {
                 matches!(value, ScalarValue::Null) ^ *negated,
             )))
         }
-        ExprKind::Cast { expr: input } => fold_cast(input, &expr.data_type),
+        ExprKind::Cast { expr: input } => {
+            fold_cast(input, &expr.data_type).or_else(|| fold_evaluated(expr))
+        }
+        ExprKind::ScalarFunction { args, .. }
+            if args
+                .iter()
+                .all(|arg| matches!(arg.kind, ExprKind::Literal(_))) =>
+        {
+            fold_evaluated(expr)
+        }
         _ => None,
+    }
+}
+
+fn fold_evaluated(expr: &BoundExpr) -> Option<BoundExpr> {
+    let array = crate::execution::evaluate_constant_expression(expr).ok()?;
+    let value = if array.is_null(0) {
+        ScalarValue::Null
+    } else {
+        match array.data_type() {
+            DataType::Boolean => {
+                ScalarValue::Boolean(array.as_any().downcast_ref::<BooleanArray>()?.value(0))
+            }
+            DataType::Int64 => {
+                ScalarValue::Int64(array.as_any().downcast_ref::<Int64Array>()?.value(0))
+            }
+            DataType::UInt64 => {
+                ScalarValue::UInt64(array.as_any().downcast_ref::<UInt64Array>()?.value(0))
+            }
+            DataType::Float64 => {
+                ScalarValue::Float64(array.as_any().downcast_ref::<Float64Array>()?.value(0))
+            }
+            DataType::Decimal128(precision, scale) => ScalarValue::Decimal128 {
+                value: array.as_any().downcast_ref::<Decimal128Array>()?.value(0),
+                precision: *precision,
+                scale: *scale,
+            },
+            DataType::Date32 => {
+                ScalarValue::Date32(array.as_any().downcast_ref::<Date32Array>()?.value(0))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, None) => ScalarValue::TimestampMicrosecond(
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()?
+                    .value(0),
+            ),
+            DataType::Utf8 => ScalarValue::Utf8(
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()?
+                    .value(0)
+                    .to_owned(),
+            ),
+            _ => return None,
+        }
+    };
+    let mut output = BoundExpr::literal(value);
+    if output.data_type == expr.data_type {
+        output.display_name.clone_from(&expr.display_name);
+        Some(output)
+    } else {
+        None
     }
 }
 
@@ -385,6 +489,9 @@ fn equal(left: &ScalarValue, right: &ScalarValue) -> Option<bool> {
             ScalarValue::Decimal128 { value: right, .. },
         ) => left == right,
         (ScalarValue::Date32(left), ScalarValue::Date32(right)) => left == right,
+        (ScalarValue::TimestampMicrosecond(left), ScalarValue::TimestampMicrosecond(right)) => {
+            left == right
+        }
         (ScalarValue::DayInterval(left), ScalarValue::DayInterval(right)) => left == right,
         (ScalarValue::MonthInterval(left), ScalarValue::MonthInterval(right)) => left == right,
         (ScalarValue::Utf8(left), ScalarValue::Utf8(right)) => left == right,
@@ -403,6 +510,9 @@ fn compare(left: &ScalarValue, right: &ScalarValue) -> Option<Ordering> {
             ScalarValue::Decimal128 { value: right, .. },
         ) => left.partial_cmp(right),
         (ScalarValue::Date32(left), ScalarValue::Date32(right)) => left.partial_cmp(right),
+        (ScalarValue::TimestampMicrosecond(left), ScalarValue::TimestampMicrosecond(right)) => {
+            left.partial_cmp(right)
+        }
         (ScalarValue::DayInterval(left), ScalarValue::DayInterval(right)) => {
             left.partial_cmp(right)
         }
@@ -411,5 +521,32 @@ fn compare(left: &ScalarValue, right: &ScalarValue) -> Option<Ordering> {
         }
         (ScalarValue::Utf8(left), ScalarValue::Utf8(right)) => left.partial_cmp(right),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::fold_expr;
+    use crate::sql::{BoundExpr, ExprKind, ScalarFunction, ScalarValue};
+
+    #[test]
+    fn folds_constant_scalar_functions() {
+        let mut expression = BoundExpr {
+            kind: ExprKind::ScalarFunction {
+                function: ScalarFunction::Lower,
+                args: vec![BoundExpr::literal(ScalarValue::Utf8("AbC".into()))],
+            },
+            data_type: DataType::Utf8,
+            display_name: "lower('AbC')".into(),
+        };
+
+        fold_expr(&mut expression);
+
+        assert_eq!(
+            expression.kind,
+            ExprKind::Literal(ScalarValue::Utf8("abc".into()))
+        );
     }
 }

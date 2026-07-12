@@ -12,7 +12,7 @@ use crate::{
     datasource::{MetadataCache, RegisteredCsvTable, RegisteredParquetTable},
     runtime::{
         ComputeRuntime, MemoryPool, QueryContext, QueryControl, RecordBatchStream, SpillIoPool,
-        SpillQuotaPool, boxed_record_batch_stream, scavenge_orphans,
+        SpillManager, SpillQuotaPool, boxed_record_batch_stream, scavenge_orphans,
     },
     sql::{LogicalPlan, StatementPlan},
 };
@@ -39,6 +39,7 @@ impl Engine {
             .map_err(|error| Error::io(Some(config.spill.directory.clone()), error))?;
         scavenge_orphans(&config.spill.directory, config.spill.orphan_ttl)?;
         let memory = MemoryPool::named_root("engine", config.memory_limit);
+        SpillManager::protect_io_headroom(&memory, config.spill.io_threads)?;
         let admission = Arc::new(Semaphore::new(config.max_concurrent_queries));
         let compute = ComputeRuntime::new(config.compute_threads)?;
         let metadata_cache = MetadataCache::new(config.metadata_cache_bytes);
@@ -174,7 +175,13 @@ impl Session {
             Err(error) => return Err(context.error_with_cleanup(error)),
         };
         let stream = self.engine.inner.compute.pipe(stream, Arc::clone(&context));
-        Ok(query_result(schema, stream, context, permit))
+        Ok(query_result(
+            schema,
+            stream,
+            context,
+            permit,
+            self.engine.clone(),
+        ))
     }
 
     async fn execute_command(
@@ -285,7 +292,13 @@ impl Session {
     ) -> Result<QueryResult> {
         let schema = batch.schema();
         let stream = boxed_record_batch_stream(futures::stream::once(async move { Ok(batch) }));
-        Ok(query_result(schema, stream, context, permit))
+        Ok(query_result(
+            schema,
+            stream,
+            context,
+            permit,
+            self.engine.clone(),
+        ))
     }
 
     fn query_context(&self) -> Result<Arc<QueryContext>> {
@@ -312,8 +325,9 @@ fn query_result(
     stream: RecordBatchStream,
     context: Arc<QueryContext>,
     permit: OwnedSemaphorePermit,
+    engine: Engine,
 ) -> QueryResult {
-    let stream = instrument_output(stream, Arc::clone(&context), permit);
+    let stream = instrument_output(stream, Arc::clone(&context), permit, engine);
     QueryResult {
         schema,
         stream,
@@ -374,17 +388,22 @@ fn instrument_output(
     mut input: RecordBatchStream,
     context: Arc<QueryContext>,
     permit: OwnedSemaphorePermit,
+    engine: Engine,
 ) -> RecordBatchStream {
     boxed_record_batch_stream(stream! {
+        // A QueryResult has no lifetime tied to Session. Keep the compute
+        // runtime alive in the returned stream, including after into_stream().
+        let _engine_keepalive = engine;
         let _permit = permit;
         while let Some(item) = input.next().await {
-            if let Err(error) = context.check_cancelled() {
-                context.metrics.finish();
-                yield Err(context.error_with_cleanup(error));
-                return;
-            }
             match item {
                 Ok(batch) => {
+                    if let Err(error) = context.check_cancelled() {
+                        context.metrics.finish();
+                        let error = context.tasks.first_failure().unwrap_or(error);
+                        yield Err(context.error_with_cleanup_after_tasks(error).await);
+                        return;
+                    }
                     context.metrics.record_output(
                         u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
                         1,
@@ -394,16 +413,17 @@ fn instrument_output(
                 }
                 Err(error) => {
                     context.metrics.finish();
+                    let error = context.tasks.first_failure().unwrap_or(error);
                     // A QueryResult may remain alive after the consumer sees
                     // an execution error.  Clean this query's files now rather
                     // than waiting for QueryContext::drop().
-                    yield Err(context.error_with_cleanup(error));
+                    yield Err(context.error_with_cleanup_after_tasks(error).await);
                     return;
                 }
             }
         }
         context.metrics.finish();
-        if let Err(error) = context.cleanup_spill() {
+        if let Err(error) = context.cleanup_spill_after_tasks().await {
             yield Err(error);
         }
     })
@@ -489,6 +509,107 @@ mod tests {
             ..EngineConfig::default()
         };
         assert!(Engine::new(config).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_stream_preserves_producer_error_after_task_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let values = directory.path().join("values.csv");
+        std::fs::write(&values, "id\n1\n2\n").unwrap();
+        let session = Engine::new(
+            EngineConfig::builder()
+                .spill_directory(directory.path().join("spill"))
+                .build(),
+        )
+        .unwrap()
+        .session();
+
+        let mut result = session.execute("SELECT 1 / 0").await.unwrap();
+        let error = result.stream().next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, Error::Execution(message) if message.contains("division by zero")),
+            "producer error was replaced by {error}"
+        );
+        assert!(result.stream().next().await.is_none());
+
+        let sql = format!(
+            "SELECT (SELECT id FROM read_csv('{}', header = true))",
+            values.display()
+        );
+        let mut result = session.execute(&sql).await.unwrap();
+        let error = result.stream().next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, Error::Execution(message) if message.contains("scalar subquery returned more than one row")),
+            "producer error was replaced by {error}"
+        );
+        assert!(result.stream().next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_result_streams_keep_runtime_alive_after_session_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut result = {
+            let engine = Engine::new(
+                EngineConfig::builder()
+                    .compute_threads(1)
+                    .spill_directory(directory.path().join("spill"))
+                    .build(),
+            )
+            .unwrap();
+            let session = engine.session();
+            let result = session.execute("SELECT 1 AS value").await.unwrap();
+            drop(session);
+            drop(engine);
+            result
+        };
+        let batches = tokio::time::timeout(
+            Duration::from_secs(2),
+            result.stream().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("QueryResult must outlive its creating Engine and Session")
+        .unwrap();
+        assert_single_value(&batches);
+        drop(result);
+
+        let stream = {
+            let engine = Engine::new(
+                EngineConfig::builder()
+                    .compute_threads(1)
+                    .spill_directory(directory.path().join("spill"))
+                    .build(),
+            )
+            .unwrap();
+            let session = engine.session();
+            let stream = session
+                .execute("SELECT 1 AS value")
+                .await
+                .unwrap()
+                .into_stream();
+            drop(session);
+            drop(engine);
+            stream
+        };
+
+        let batches = tokio::time::timeout(Duration::from_secs(2), stream.try_collect::<Vec<_>>())
+            .await
+            .expect("stream must outlive its creating Engine and Session")
+            .unwrap();
+        assert_single_value(&batches);
+    }
+
+    fn assert_single_value(batches: &[RecordBatch]) {
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1116,7 +1237,7 @@ mod tests {
         let input = crate::runtime::boxed_record_batch_stream(futures::stream::once(async {
             Err(Error::Execution("injected stream failure".into()))
         }));
-        let mut result = super::query_result(schema, input, context, permit);
+        let mut result = super::query_result(schema, input, context, permit, engine.clone());
         assert!(matches!(
             result.stream().next().await,
             Some(Err(Error::Execution(message))) if message == "injected stream failure"
@@ -1124,6 +1245,36 @@ mod tests {
 
         // `result` intentionally remains alive for this assertion.
         assert!(!query_directory.exists());
+    }
+
+    #[tokio::test]
+    async fn stream_prefers_first_task_failure_to_cancelled_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            EngineConfig::builder()
+                .spill_directory(directory.path().join("spill"))
+                .build(),
+        )
+        .unwrap();
+        let context = engine.session().query_context().unwrap();
+        context.record_task_failure(&Error::ResourceExhausted(
+            "injected operator resource failure".to_owned(),
+        ));
+        let permit = Arc::clone(&engine.inner.admission)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::empty());
+        let input = crate::runtime::boxed_record_batch_stream(futures::stream::once(async {
+            Err(Error::Cancelled)
+        }));
+        let mut result = super::query_result(schema, input, context, permit, engine.clone());
+
+        let error = result.stream().next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, Error::ResourceExhausted(message) if message == "injected operator resource failure")
+        );
+        assert!(result.stream().next().await.is_none());
     }
 
     #[tokio::test]
@@ -1152,7 +1303,7 @@ mod tests {
             .unwrap();
         let schema = Arc::new(Schema::empty());
         let input = crate::runtime::boxed_record_batch_stream(futures::stream::empty());
-        let mut result = super::query_result(schema, input, context, permit);
+        let mut result = super::query_result(schema, input, context, permit, engine.clone());
 
         let error = result.stream().next().await.unwrap().unwrap_err();
         assert!(
@@ -1188,7 +1339,7 @@ mod tests {
         let input = crate::runtime::boxed_record_batch_stream(futures::stream::once(async {
             Err(Error::Execution("injected operator failure".to_owned()))
         }));
-        let mut result = super::query_result(schema, input, context, permit);
+        let mut result = super::query_result(schema, input, context, permit, engine.clone());
 
         let error = result.stream().next().await.unwrap().unwrap_err();
         let message = error.to_string();
@@ -1222,7 +1373,7 @@ mod tests {
         let input = crate::runtime::boxed_record_batch_stream(futures::stream::once(async move {
             Ok(RecordBatch::new_empty(input_schema))
         }));
-        let mut result = super::query_result(schema, input, context, permit);
+        let mut result = super::query_result(schema, input, context, permit, engine.clone());
         result.cancel();
 
         let error = result.stream().next().await.unwrap().unwrap_err();

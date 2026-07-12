@@ -13,7 +13,7 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => choose_build_sides(input),
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::DependentJoin { left, right, .. } => {
             choose_build_sides(left);
             choose_build_sides(right);
         }
@@ -24,6 +24,8 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
             left,
             right,
             join_type: JoinType::Inner,
+            residual: None,
+            null_aware: None,
             ..
         } => smaller(left, right),
         _ => false,
@@ -40,6 +42,8 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         left,
         right,
         on,
+        residual: None,
+        null_aware: None,
         join_type: JoinType::Inner,
         schema,
     } = mem::replace(plan, placeholder)
@@ -77,6 +81,8 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         left: right,
         right: left,
         on: on.into_iter().map(|(left, right)| (right, left)).collect(),
+        residual: None,
+        null_aware: None,
         join_type: JoinType::Inner,
         schema: join_schema,
     };
@@ -144,6 +150,6 @@ fn estimate(plan: &LogicalPlan) -> Estimate {
         },
         // Avoid pretending a local estimate is a global multi-table cost
         // model. Each child join has already made its own safe build choice.
-        LogicalPlan::Join { .. } => Estimate::default(),
+        LogicalPlan::Join { .. } | LogicalPlan::DependentJoin { .. } => Estimate::default(),
     }
 }

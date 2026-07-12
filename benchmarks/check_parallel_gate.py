@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict fixed-hardware parallel performance gate for RustDB v0.2."""
+"""Strict fixed-hardware parallel performance gate for RustDB v0.3."""
 
 from __future__ import annotations
 
@@ -18,17 +18,17 @@ from parallel_gate import GateError, evaluate
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def alpha2_build_id() -> str:
+def baseline_build_id() -> str:
     try:
         return subprocess.run(
-            ["git", "rev-parse", "v0.1.0-alpha.2^{commit}"],
+            ["git", "rev-parse", "v0.2.0-alpha.1^{commit}"],
             cwd=Path(__file__).resolve().parent.parent,
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as error:
-        raise GateError(f"cannot resolve local v0.1.0-alpha.2 tag: {error}") from error
+        raise GateError(f"cannot resolve local v0.2.0-alpha.1 tag: {error}") from error
 
 
 def clean_candidate_build_id(root: Path | None = None) -> str:
@@ -115,7 +115,9 @@ def rebuild_candidate_binary_sha256(root: Path | None = None) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", type=Path, required=True, help="candidate manifest.json")
-    parser.add_argument("--baseline", type=Path, required=True, help="alpha.2 manifest.json")
+    parser.add_argument(
+        "--baseline", type=Path, required=True, help="v0.2.0-alpha.1 manifest.json"
+    )
     parser.add_argument("--json", action="store_true", help="emit machine-readable results")
     args = parser.parse_args()
     try:
@@ -126,7 +128,7 @@ def main() -> int:
         result = evaluate(
             args.candidate.resolve(),
             args.baseline.resolve(),
-            alpha2_build_id(),
+            baseline_build_id(),
             candidate_build_id,
             binary_sha256,
             cpu_model,

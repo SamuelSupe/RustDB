@@ -1,6 +1,6 @@
 [package]
 name = "rustdb"
-version = "0.2.0-alpha.1"
+version = "0.3.0-alpha.1"
 edition = "2024"
 description = "A single-node, read-only OLAP engine for local and object-store files"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ path = "src/bin/rustdb-bench.rs"
 
 [dependencies]
 ahash = "0.8"
-arrow = { version = "=59.1.0", features = ["csv", "ipc", "ipc_compression", "prettyprint"] }
+arrow = { version = "=59.1.0", features = ["chrono-tz", "csv", "ipc", "ipc_compression", "prettyprint"] }
 async-stream = "0.3"
 async-trait = "0.1"
 bytes = "1"

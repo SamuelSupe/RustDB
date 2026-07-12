@@ -1,8 +1,4 @@
-use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -25,32 +21,33 @@ pub(super) fn spawn_run(
     fetch: Option<usize>,
     schema: arrow::datatypes::SchemaRef,
     context: Arc<QueryContext>,
-) {
-    tokio::spawn(async move {
-        let result = {
+) -> Result<()> {
+    let tasks = context.tasks.clone();
+    tasks.spawn("sort-run-lane", async move {
+        let generated = {
             let _active = context.scheduler.enter_lane();
-            catch_unwind(AssertUnwindSafe(|| {
-                context.check_cancelled()?;
-                let converter = make_converter(&expressions)?;
-                let (batch, input_memory) = input.into_parts();
-                let sorted = sort_batches(&[batch], &expressions, &converter, fetch, &schema)?;
-                drop(input_memory);
-                let sorted_bytes = sorted.get_array_memory_size();
-                let mut workspace = workspace;
-                workspace.try_resize(sorted_bytes)?;
-                context.metrics.observe_memory(context.memory.used());
-                Ok(MemoryRun::new(sorted, workspace))
-            }))
-            .unwrap_or_else(|_| Err(Error::Internal("parallel sort lane panicked".into())))
+            context.check_cancelled()?;
+            let converter = make_converter(&expressions)?;
+            let (batch, input_memory) = input.into_parts();
+            let sorted = sort_batches(&[batch], &expressions, &converter, fetch, &schema)?;
+            drop(input_memory);
+            let sorted_bytes = sorted.get_array_memory_size();
+            let mut workspace = workspace;
+            workspace.try_resize(sorted_bytes)?;
+            context.metrics.observe_memory(context.memory.used());
+            MemoryRun::new(sorted, workspace)
         };
         let started = Instant::now();
-        tokio::select! {
-            _ = cancellation.cancelled() => {}
-            _ = context.control.cancelled() => {}
-            _ = sender.send(result) => {}
-        }
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => Err(Error::Cancelled),
+            _ = context.control.cancelled() => Err(context
+                .check_cancelled()
+                .expect_err("cancelled query has a terminal error")),
+            result = sender.send(Ok(generated)) => result.map_err(|_| Error::Cancelled),
+        };
         context.scheduler.record_wait(started.elapsed());
-    });
+        result
+    })
 }
 
 pub(super) async fn receive_run(
@@ -60,8 +57,11 @@ pub(super) async fn receive_run(
 ) -> Result<MemoryRun> {
     let started = Instant::now();
     let result = tokio::select! {
+        biased;
+        _ = context.control.cancelled() => Err(context
+            .check_cancelled()
+            .expect_err("cancelled query has a terminal error")),
         _ = cancellation.cancelled() => Err(Error::Cancelled),
-        _ = context.control.cancelled() => Err(Error::Cancelled),
         generated = receiver.recv() => generated.unwrap_or_else(|| {
             Err(Error::Execution("parallel sort lane stopped before returning its run".into()))
         }),

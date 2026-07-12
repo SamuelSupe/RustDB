@@ -71,16 +71,19 @@ tools/sql/differential.sh
 ```
 
 It compares truth predicates, projection aliases, grouping ordinals, HAVING
-aliases, and hidden sort expressions through canonicalized result checksums.
+aliases, hidden sort expressions, v0.3 scalar/temporal functions, aggregate
+DISTINCT, and correlated scalar/IN/EXISTS NULL semantics through canonicalized
+result checksums. Runtime cardinality failures are required outcomes, not
+allow-failure cases.
 
-The seven-query checksum gate is deliberately a separate, single Linux x64
-job. Run the fast development gate with:
+The 22-query checksum gate is deliberately a separate, single Linux x64 job.
+Run the fast local development gate with:
 
 ```sh
 tools/tpch/run.sh 0.01
 ```
 
-Run the release correctness gate with SF1:
+Run the local half of the release correctness gate with SF1:
 
 ```sh
 tools/tpch/run.sh 1
@@ -93,9 +96,23 @@ generation/query scripts. No platform matrix repeats the download or
 generation. A cache miss must regenerate and validate the dataset rather than
 being treated as a failure.
 
-Acceptance requires sorted checksums to match DuckDB 1.4.3 for Q1, Q3, Q6,
-Q11, Q12, Q13, and Q14. A release record should include the dataset manifest,
-query checksums, RustDB commit, and workflow run URL.
+Acceptance requires sorted checksums to match DuckDB 1.4.3 for Q1 through Q22
+on both local Parquet and MinIO. The hosted gate uploads the exact generated
+dataset and reruns the same complete query list through `s3://`. To reproduce
+the remote half locally:
+
+```sh
+uri=$(tools/tpch/upload_minio.sh 1 | tail -n 1)
+tools/tpch/compare.sh --report \
+  --queries benchmarks/tpch/cases/sf1-minio.txt \
+  --rustdb-root "$uri" 1
+```
+
+A release record should include the dataset manifest, local and MinIO status
+tables/checksums, their generated `provenance.json` files, and the workflow run
+URL. Provenance records the exact Git/worktree state, binary and query hashes,
+dataset manifest, data root, and execution configuration even when
+`TPCH_SKIP_BUILD=1` is used.
 
 ## Resource and performance gates
 
@@ -108,9 +125,19 @@ the nominated machine:
 benchmarks/run_low_memory.sh data/tpch-sf10
 ```
 
-The command writes a timestamped machine-readable manifest and per-case JSON
-reports below `benchmarks/results/low-memory/`. Before an alpha is promoted,
-verify:
+The v0.3 correlated/DISTINCT constrained suite runs the selected TPC-H queries
+with the same checksum comparison and a hard 128 MiB query budget:
+
+```sh
+TPCH_MEMORY_LIMIT_BYTES=134217728 TPCH_REQUIRE_SPILL=1 \
+tools/tpch/compare.sh --report \
+  --queries benchmarks/tpch/cases/sf10-128m.txt 10
+```
+
+The constrained checksum command writes its status and checksums below
+`data/tpch-sf10/results/latest`. `benchmarks/run_low_memory.sh` separately
+writes timestamped manifests and per-case JSON reports below
+`benchmarks/results/low-memory/`. Before an alpha is promoted, verify:
 
 - Sort, Aggregate, Inner Join, and Left Join checksums are correct.
 - Each checksum execution uses its stated 64/128 MiB limit and must itself
@@ -125,6 +152,20 @@ verify:
 - Local NVMe and MinIO benchmark results record hardware, cache state,
   executable versions, p50/p95, first-batch latency, RSS, throughput, S3
   requests, and spill metrics.
+
+The two 1,000-iteration lifecycle soaks are deliberately ignored by routine
+`cargo test` runs. Execute both release-mode tests explicitly before tagging:
+
+```sh
+docker compose run --rm --no-deps dev sh -c '
+  cargo test --locked --release --lib \
+    runtime::task_group::tests::one_thousand_mixed_lifecycle_release_soak \
+    -- --ignored --exact &&
+  cargo test --locked --release --lib \
+    runtime::compute::tests::one_thousand_abandoned_consumers_release_soak \
+    -- --ignored --exact
+'
+```
 
 Use a small forward run to validate benchmark plumbing before spending time on
 the full matrix:
@@ -148,10 +189,10 @@ benchmarks/run_baseline.sh \
 
 python3 -B benchmarks/check_parallel_gate.py \
   --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
-  --baseline benchmarks/results/baseline/<alpha2-sf10-run>/manifest.json
+  --baseline benchmarks/results/baseline/<v02-sf10-run>/manifest.json
 ```
 
-The baseline must come from a clean `v0.1.0-alpha.2` build over the same SF10
+The baseline must come from a clean `v0.2.0-alpha.1` build over the same SF10
 manifest. The gate resolves that local tag and rejects a different baseline
 build identifier. The candidate must be the exact 40-character commit of the
 current clean worktree. Each target/thread/batch configuration is checksum-run
@@ -171,7 +212,7 @@ its manifest. Missing evidence is a failure, never a pass.
 For both `scan-filter` and `aggregate`, the candidate must satisfy:
 
 - `t1_p50 / t4_p50 >= 2.0` (the four-thread throughput multiplier);
-- candidate one-thread p50 no more than 10% slower than alpha.2;
+- candidate one-thread p50 no more than 10% slower than v0.2;
 - identical result checksums for candidate/baseline at one and four threads.
 
 The runner refuses an existing output directory, builds `rustdb-bench` with
@@ -182,5 +223,5 @@ use native CPU flags, and hosted CI checks parallel correctness without using
 this hardware timing gate.
 
 SF1 remains the routine TPC-H correctness gate. SF10 is the separately recorded
-resource/performance release gate; absence of its dataset, alpha.2 baseline, or
+resource/performance release gate; absence of its dataset, v0.2 baseline, or
 nominated hardware must be reported as not run, never as a pass.

@@ -184,7 +184,14 @@ pub(in crate::execution::join) fn spill_batch(
         loop {
             let required = spill_temporary_bytes(&batch, offset, rows)?;
             let copy_headroom = spiller.spill.write_copy_headroom_bytes();
-            if required > spiller.memory.available().saturating_sub(copy_headroom) {
+            let unprotected_copy_headroom =
+                copy_headroom.saturating_sub(spiller.memory.emergency_headroom());
+            if required
+                > spiller
+                    .memory
+                    .available()
+                    .saturating_sub(unprotected_copy_headroom)
+            {
                 if rows > 1 {
                     rows /= 2;
                     continue;
@@ -199,7 +206,7 @@ pub(in crate::execution::join) fn spill_batch(
             }
             match spiller.memory.try_reserve(required) {
                 Ok(temporary) => {
-                    if spiller.memory.available() < copy_headroom {
+                    if spiller.memory.available() < unprotected_copy_headroom {
                         drop(temporary);
                         if rows > 1 {
                             rows /= 2;

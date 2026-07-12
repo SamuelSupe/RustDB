@@ -6,6 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use arrow::{
@@ -104,7 +105,7 @@ impl SpillWriter {
         let create_path = path.clone();
         let quota = state.quota.clone();
         let metrics = state.metrics.clone();
-        let file = match state.io_pool.run_cancelable(&state.control, move || {
+        let file = match state.run_io(move || {
             quota.check_available().inspect_err(|_| {
                 if let Some(metrics) = &metrics {
                     metrics.add_spill_quota_rejection();
@@ -199,14 +200,11 @@ impl SpillWriter {
             .ok_or_else(|| Error::Internal("spill writer has no file".to_owned()))?;
         let path = spill_file.path().to_path_buf();
         let metadata_path = path.clone();
-        let bytes = self
-            .state
-            .io_pool
-            .run_cancelable(&self.state.control, move || {
-                std::fs::metadata(&metadata_path)
-                    .map(|metadata| metadata.len())
-                    .map_err(|error| Error::io(Some(metadata_path), error))
-            })?;
+        let bytes = self.state.run_io(move || {
+            std::fs::metadata(&metadata_path)
+                .map(|metadata| metadata.len())
+                .map_err(|error| Error::io(Some(metadata_path), error))
+        })?;
         if let Some(metrics) = &self.state.metrics {
             metrics.record_spill(bytes, partitions);
         }
@@ -242,7 +240,7 @@ impl SpillReader {
     pub(super) fn open(state: Arc<State>, spill_file: &SpillFile) -> Result<Self> {
         let path = spill_file.path().to_path_buf();
         let open_path = path.clone();
-        let file = state.io_pool.run_cancelable(&state.control, move || {
+        let file = state.run_io(move || {
             File::open(&open_path).map_err(|error| Error::io(Some(open_path), error))
         })?;
         let io_error = Arc::new(IoErrorState::new());
@@ -300,10 +298,23 @@ impl Drop for SpillWriter {
         self.writer.take();
         take_copy_memory(&self.copy_memory);
         self.memory.take();
-        if let Some(spill_file) = self.spill_file.take()
-            && let Err(error) = self.state.remove_file(&spill_file)
-        {
-            tracing::error!(%error, path = %spill_file.path().display(), "failed to remove unfinished spill file");
+        if let Some(spill_file) = self.spill_file.take() {
+            // Query-level cleanup owns the directory after cancellation. A
+            // per-writer unlink would only return Cancelled and can emit tens
+            // of thousands of duplicate errors for a partitioned spill.
+            if self.state.control.is_cancelled()
+                || self
+                    .state
+                    .cleaned
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            if let Err(error) = self.state.remove_file(&spill_file)
+                && !matches!(error, Error::Cancelled)
+            {
+                tracing::error!(%error, path = %spill_file.path().display(), "failed to remove unfinished spill file");
+            }
         }
     }
 }
@@ -345,39 +356,36 @@ impl Write for SpillOutput {
         let files = Arc::clone(&self.state.files);
         let metrics = self.state.metrics.clone();
         let quota = self.state.quota.clone();
-        let outcome = self
-            .state
-            .io_pool
-            .run_cancelable(&self.state.control, move || {
-                let reserved = quota.try_reserve(copy_bytes_u64).inspect_err(|_| {
-                    if let Some(metrics) = &metrics {
-                        metrics.add_spill_quota_rejection();
-                    }
-                })?;
-                let mut file = file.lock().unwrap_or_else(|poison| poison.into_inner());
-                let before = file.metadata().ok().map(|metadata| metadata.len());
-                let result = file.write_all(&data);
-                let actual = if result.is_ok() {
-                    u64::try_from(data.len()).unwrap_or(u64::MAX)
-                } else {
-                    before
-                        .and_then(|before| {
-                            file.metadata()
-                                .ok()
-                                .map(|metadata| metadata.len().saturating_sub(before))
-                        })
-                        // If metadata also fails, retain the complete reserved
-                        // amount rather than under-accounting a partial write.
-                        .unwrap_or_else(|| u64::try_from(data.len()).unwrap_or(u64::MAX))
-                };
-                drop(file);
-                let charge = reserved.commit(actual)?;
-                files.add_charge(spill_file.path(), charge)?;
-                if let Some(metrics) = metrics {
-                    metrics.add_spill_write_bytes(actual);
+        let outcome = self.state.run_io(move || {
+            let reserved = quota.try_reserve(copy_bytes_u64).inspect_err(|_| {
+                if let Some(metrics) = &metrics {
+                    metrics.add_spill_quota_rejection();
                 }
-                Ok((result, path, copy_memory))
-            });
+            })?;
+            let mut file = file.lock().unwrap_or_else(|poison| poison.into_inner());
+            let before = file.metadata().ok().map(|metadata| metadata.len());
+            let result = file.write_all(&data);
+            let actual = if result.is_ok() {
+                u64::try_from(data.len()).unwrap_or(u64::MAX)
+            } else {
+                before
+                    .and_then(|before| {
+                        file.metadata()
+                            .ok()
+                            .map(|metadata| metadata.len().saturating_sub(before))
+                    })
+                    // If metadata also fails, retain the complete reserved
+                    // amount rather than under-accounting a partial write.
+                    .unwrap_or_else(|| u64::try_from(data.len()).unwrap_or(u64::MAX))
+            };
+            drop(file);
+            let charge = reserved.commit(actual)?;
+            files.add_charge(spill_file.path(), charge)?;
+            if let Some(metrics) = metrics {
+                metrics.add_spill_write_bytes(actual);
+            }
+            Ok((result, path, copy_memory))
+        });
         let (result, path, copy_memory) =
             outcome.map_err(|error| store_io_error(&self.io_error, error))?;
         *self
@@ -398,8 +406,7 @@ impl Write for SpillOutput {
         let file = Arc::clone(&self.file);
         let path = self.spill_file.path().to_path_buf();
         self.state
-            .io_pool
-            .run_cancelable(&self.state.control, move || {
+            .run_io(move || {
                 file.lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .flush()
@@ -427,8 +434,7 @@ impl Read for SpillInput {
             .map_err(|error| store_io_error(&self.io_error, error))?;
         let (data, _read_memory) = self
             .state
-            .io_pool
-            .run_cancelable(&self.state.control, move || {
+            .run_io(move || {
                 let mut data = vec![0_u8; capacity];
                 let read = file
                     .lock()
@@ -511,13 +517,25 @@ pub(super) fn reserve_writer_memory(memory: &MemoryPool, schema: &Schema) -> Res
 }
 
 fn reserve_copy_memory(state: &State, bytes: usize) -> Result<MemoryReservation> {
-    let reservation = state.memory.try_reserve(bytes).map_err(|error| {
-        Error::ResourceExhausted(format!(
-            "spill I/O queue copy requires {bytes} bytes before allocation (query limit {} bytes, currently available {} bytes): {error}",
-            state.memory.limit(),
-            state.memory.available()
-        ))
-    })?;
+    let reservation = loop {
+        match state.memory.try_reserve_emergency(bytes) {
+            Ok(reservation) => break reservation,
+            Err(_) if state.memory.emergency_headroom() >= bytes => {
+                state.control.check_cancelled()?;
+                // Another spill reader/writer is using the protected slot.
+                // It runs on the bounded I/O pool and therefore must release
+                // the slot; wait briefly without allocating another copy.
+                std::thread::park_timeout(Duration::from_millis(2));
+            }
+            Err(error) => {
+                return Err(Error::ResourceExhausted(format!(
+                    "spill I/O queue copy requires {bytes} bytes before allocation (query limit {} bytes, currently available {} bytes): {error}",
+                    state.memory.limit(),
+                    state.memory.available()
+                )));
+            }
+        }
+    };
     if let Some(metrics) = &state.metrics {
         metrics.observe_memory(state.memory.used());
     }

@@ -39,5 +39,6 @@ docker compose --project-directory "$TPCH_ROOT" run --rm --no-deps --no-TTY \
   '
 
 remote_uri=s3://rustdb-tests/$destination
+tpch_validate_s3_uri "$remote_uri"
 "$TPCH_TOOLS/verify_minio.sh" "$relative" "$remote_uri"
 printf '%s\n' "$remote_uri"

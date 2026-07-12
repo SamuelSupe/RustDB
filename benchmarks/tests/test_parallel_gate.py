@@ -27,17 +27,20 @@ class GateFixture:
         self.manifests = {}
         self.reports = {}
         self.entries = {}
+        baseline_placeholder = "0" * 40
         self._write_variant(
             "baseline",
-            "alpha2-id",
-            "0.1.0",
+            baseline_placeholder,
+            "0.2.0-alpha.1",
             {("scan-filter", 1): 100, ("scan-filter", 4): 90,
              ("aggregate", 1): 200, ("aggregate", 4): 180},
         )
+        self.baseline_build_id = self._commit_baseline_harness()
+        self._replace_build_id("baseline", baseline_placeholder, self.baseline_build_id)
         self._write_variant(
             "candidate",
             CANDIDATE,
-            "0.2.0-alpha.1",
+            "0.3.0-alpha.1",
             {("scan-filter", 1): 105, ("scan-filter", 4): 50,
              ("aggregate", 1): 210, ("aggregate", 4): 100},
         )
@@ -125,6 +128,66 @@ class GateFixture:
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         self.manifests[variant] = manifest_path
 
+    def _commit_baseline_harness(self):
+        directory = self.root / "baseline"
+        subprocess.run(["git", "init", "--quiet"], cwd=directory, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "gate@example.invalid"],
+            cwd=directory,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Gate Test"], cwd=directory, check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "add",
+                "Cargo.toml",
+                "benchmarks/run_baseline.sh",
+                "benchmarks/suites/lib.sh",
+                "tools/tpch/compare_query.sh",
+            ],
+            cwd=directory,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", "baseline harness fixture"],
+            cwd=directory,
+            check=True,
+        )
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=directory,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def _replace_build_id(self, variant, previous, replacement):
+        for (report_variant, _, _), path in self.reports.items():
+            if report_variant != variant:
+                continue
+            report = json.loads(path.read_text(encoding="utf-8"))
+            self._replace_value(report, previous, replacement)
+            path.write_text(json.dumps(report), encoding="utf-8")
+        manifest_path = self.manifests[variant]
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self._replace_value(manifest, previous, replacement)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    @staticmethod
+    def _replace_value(value, previous, replacement):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if item == previous:
+                    value[key] = replacement
+                else:
+                    GateFixture._replace_value(item, previous, replacement)
+        elif isinstance(value, list):
+            for item in value:
+                GateFixture._replace_value(item, previous, replacement)
+
     def rewrite_manifest(self, variant):
         path = self.manifests[variant]
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -149,7 +212,7 @@ class ParallelGateTests(unittest.TestCase):
         return evaluate(
             self.fixture.manifests["candidate"],
             self.fixture.manifests["baseline"],
-            "alpha2-id",
+            self.fixture.baseline_build_id,
             CANDIDATE,
         )
 
@@ -185,7 +248,7 @@ class ParallelGateTests(unittest.TestCase):
             evaluate(
                 self.fixture.manifests["candidate"],
                 self.fixture.manifests["baseline"],
-                "alpha2-id",
+                self.fixture.baseline_build_id,
                 CANDIDATE,
                 "8" * 64,
             )
@@ -195,7 +258,7 @@ class ParallelGateTests(unittest.TestCase):
             evaluate(
                 self.fixture.manifests["candidate"],
                 self.fixture.manifests["baseline"],
-                "alpha2-id",
+                self.fixture.baseline_build_id,
                 CANDIDATE,
                 CANDIDATE_BINARY,
                 "Apple M5 Max (different fixture)",
@@ -222,14 +285,18 @@ class ParallelGateTests(unittest.TestCase):
         manifest["rustdb_build_id"] = f"{CANDIDATE}-dirty"
         path.write_text(json.dumps(manifest), encoding="utf-8")
         with self.assertRaisesRegex(GateError, "exact clean 40-character Git commit"):
-            evaluate(path, self.fixture.manifests["baseline"], "alpha2-id")
+            evaluate(
+                path,
+                self.fixture.manifests["baseline"],
+                self.fixture.baseline_build_id,
+            )
 
     def test_candidate_must_match_expected_commit(self):
         with self.assertRaisesRegex(GateError, "current clean HEAD"):
             evaluate(
                 self.fixture.manifests["candidate"],
                 self.fixture.manifests["baseline"],
-                "alpha2-id",
+                self.fixture.baseline_build_id,
                 "d" * 40,
             )
 
@@ -271,6 +338,56 @@ class ParallelGateTests(unittest.TestCase):
         runner = self.fixture.manifests["candidate"].parent / "benchmarks/run_baseline.sh"
         runner.write_text("tampered\n", encoding="utf-8")
         with self.assertRaisesRegex(GateError, "runner_sha256 does not match"):
+            self.evaluate()
+
+    def test_baseline_harness_is_read_from_its_git_tree(self):
+        root = self.fixture.manifests["baseline"].parent
+        for relative in (
+            "benchmarks/run_baseline.sh",
+            "benchmarks/suites/lib.sh",
+            "tools/tpch/compare_query.sh",
+        ):
+            (root / relative).write_text("tampered worktree copy\n", encoding="utf-8")
+
+        result = self.evaluate()
+        self.assertEqual(result["status"], "pass")
+
+    def test_every_baseline_harness_hash_is_checked_against_git(self):
+        path = self.fixture.manifests["baseline"]
+        original = json.loads(path.read_text(encoding="utf-8"))
+        for field in (
+            "runner_sha256",
+            "library_sha256",
+            "checksum_runner_sha256",
+        ):
+            with self.subTest(field=field):
+                manifest = json.loads(json.dumps(original))
+                manifest["harness"][field] = "b" * 64
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    GateError, rf"baseline\.harness\.{field} does not match Git tree"
+                ):
+                    self.evaluate()
+        path.write_text(json.dumps(original), encoding="utf-8")
+
+    def test_baseline_build_id_rejects_non_commit_input(self):
+        path = self.fixture.manifests["baseline"]
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["rustdb_build_id"] = "--help"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(
+            GateError, "baseline build id must be an exact clean 40-character Git commit"
+        ):
+            self.evaluate()
+
+    def test_missing_baseline_git_tree_has_a_clear_error(self):
+        path = self.fixture.manifests["baseline"]
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["rustdb_build_id"] = "f" * 40
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(
+            GateError, "cannot read baseline harness artifact .* from Git tree"
+        ):
             self.evaluate()
 
     def test_threshold_failure_is_not_a_pass(self):

@@ -23,6 +23,16 @@ fn remap_expr(expr: &mut BoundExpr, projection: &[usize]) -> Result<()> {
                     ))
                 })?;
         }
+        ExprKind::OuterRef { .. } => {
+            return Err(Error::Internal(
+                "OuterRef reached compact pipeline remapping after decorrelation".into(),
+            ));
+        }
+        ExprKind::DeferredGroup(_) | ExprKind::DeferredAggregate(_) => {
+            return Err(Error::Internal(
+                "deferred aggregate result reached compact pipeline remapping".into(),
+            ));
+        }
         ExprKind::Literal(_) => {}
         ExprKind::Binary { left, right, .. } => {
             remap_expr(left, projection)?;
@@ -44,6 +54,11 @@ fn remap_expr(expr: &mut BoundExpr, projection: &[usize]) -> Result<()> {
                 remap_expr(then, projection)?;
             }
             remap_expr(else_expr, projection)?;
+        }
+        ExprKind::ScalarFunction { args, .. } => {
+            for arg in args {
+                remap_expr(arg, projection)?;
+            }
         }
     }
     Ok(())

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
 use sqlparser::ast::{
     Distinct, Expr, GroupByExpr, Ident, JoinOperator, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, TableFactor, TableWithJoins,
+    SelectItemQualifiedWildcardKind, Spanned, TableFactor, TableWithJoins,
 };
 
 use crate::{Error, Result};
@@ -11,11 +11,11 @@ use crate::{Error, Result};
 use super::super::{
     BoundExpr, JoinType, LogicalPlan, PlanSchema,
     aggregate::{is_aggregate_query, plan_aggregate_projection},
-    binder::bind_expr,
-    name_resolution::{resolve_group_by, rewrite_projection_aliases},
+    binder::{bind_expr, bind_expr_scoped},
+    name_resolution::{resolve_group_by, rewrite_projection_aliases, source_location_suffix},
     relation::{CteScope, alias_plan, cte_name},
     scalar_subquery::extract as extract_scalar_subqueries,
-    subquery::apply_where,
+    subquery::{apply_where, is_direct_mark_attachment, stageable_direct_mark_term},
 };
 use super::{
     Planner,
@@ -29,6 +29,7 @@ impl Planner<'_> {
         select: &Select,
         ctes: &CteScope,
         hidden_projection: &[Expr],
+        outer: Option<&PlanSchema>,
     ) -> Result<LogicalPlan> {
         if select.top.is_some() || select.qualify.is_some() || !select.named_window.is_empty() {
             return Err(Error::Unsupported(
@@ -71,13 +72,26 @@ impl Planner<'_> {
         let aggregate_query = is_aggregate_query(&group_ast, &projection, having.as_ref());
 
         if let Some(predicate) = &mut selection {
-            plan = self.extract_scalars(plan, predicate, None, ctes)?;
-            let mut plan_subquery = |query: &Query| self.plan_query_scoped(query, ctes);
-            plan = apply_where(plan, predicate, &mut plan_subquery)?;
+            plan = self.plan_where(plan, predicate, outer, ctes)?;
         }
         for group in &mut group_ast {
-            plan = self.extract_scalars(plan, group, None, ctes)?;
+            plan = self.extract_scalars(plan, group, None, None, None, ctes)?;
         }
+        let grouped_outer_columns = if aggregate_query {
+            let mut columns = group_ast
+                .iter()
+                .filter_map(|group| bind_expr(group, plan.schema()).ok())
+                .filter_map(|group| match group.kind {
+                    super::super::ExprKind::Column(index) => Some(index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            columns.sort_unstable();
+            columns.dedup();
+            Some(columns)
+        } else {
+            None
+        };
         let mut hidden_groups = Vec::new();
         for item in &mut projection {
             let expr = match item {
@@ -88,6 +102,8 @@ impl Planner<'_> {
                 plan,
                 expr,
                 aggregate_query.then_some(&mut hidden_groups),
+                aggregate_query.then_some(group_ast.as_slice()),
+                grouped_outer_columns.as_deref(),
                 ctes,
             )?;
         }
@@ -96,10 +112,12 @@ impl Planner<'_> {
                 plan,
                 predicate,
                 aggregate_query.then_some(&mut hidden_groups),
+                aggregate_query.then_some(group_ast.as_slice()),
+                grouped_outer_columns.as_deref(),
                 ctes,
             )?;
         }
-        group_ast.extend(hidden_groups);
+        group_ast.extend(hidden_groups.iter().cloned());
 
         if aggregate_query {
             if distinct {
@@ -107,15 +125,47 @@ impl Planner<'_> {
                     "SELECT DISTINCT with aggregates or HAVING is not supported".into(),
                 ));
             }
-            plan_aggregate_projection(plan, &group_ast, &projection, having.as_ref())
+            plan_aggregate_projection(
+                plan,
+                &group_ast,
+                &projection,
+                having.as_ref(),
+                outer,
+                &hidden_groups,
+            )
         } else {
-            let plan = self.plan_projection(plan, &projection)?;
+            let plan = self.plan_projection(plan, &projection, outer)?;
             if distinct {
                 Ok(plan_distinct(plan))
             } else {
                 Ok(plan)
             }
         }
+    }
+
+    fn plan_where(
+        &self,
+        plan: LogicalPlan,
+        predicate: &mut Expr,
+        outer: Option<&PlanSchema>,
+        ctes: &CteScope,
+    ) -> Result<LogicalPlan> {
+        if let Some((mut direct_mark, mut remainder)) = stageable_direct_mark_term(predicate) {
+            let scalar_checkpoint = self.next_scalar.get();
+            let candidate =
+                self.extract_scalars(plan.clone(), &mut direct_mark, None, None, None, ctes)?;
+            if is_direct_mark_attachment(&candidate) {
+                let candidate = apply_where(candidate, &direct_mark, outer)?;
+                return self.plan_where(candidate, &mut remainder, outer, ctes);
+            }
+            // Speculative extraction did not produce a direct marker
+            // attachment. Discard it and preserve deterministic names for the
+            // guarded path.
+            self.next_scalar.set(scalar_checkpoint);
+        }
+
+        let plan = self.extract_scalars(plan, predicate, None, None, None, ctes)?;
+        apply_where(plan, predicate, outer)
     }
 
     fn plan_from(&self, from: &[TableWithJoins], ctes: &CteScope) -> Result<LogicalPlan> {
@@ -133,6 +183,8 @@ impl Planner<'_> {
                 left: Box::new(plan),
                 right: Box::new(right),
                 on: Vec::new(),
+                residual: None,
+                null_aware: None,
                 join_type: JoinType::Inner,
                 schema,
             };
@@ -181,12 +233,17 @@ impl Planner<'_> {
             let schema = match join_type {
                 JoinType::Inner => PlanSchema::join(left.schema(), right.schema()),
                 JoinType::Left => PlanSchema::left_join(left.schema(), right.schema()),
-                JoinType::Semi | JoinType::Anti => left.schema().clone(),
+                JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti => left.schema().clone(),
+                JoinType::LeftSingle | JoinType::Mark => unreachable!(
+                    "parser-visible joins do not produce internal correlated join types"
+                ),
             };
             left = LogicalPlan::Join {
                 left: Box::new(left),
                 right: Box::new(right),
                 on,
+                residual: None,
+                null_aware: None,
                 join_type,
                 schema,
             };
@@ -291,8 +348,13 @@ impl Planner<'_> {
         }
     }
 
-    fn plan_projection(&self, input: LogicalPlan, items: &[SelectItem]) -> Result<LogicalPlan> {
-        let expressions = bind_select_items(items, input.schema())?;
+    fn plan_projection(
+        &self,
+        input: LogicalPlan,
+        items: &[SelectItem],
+        outer: Option<&PlanSchema>,
+    ) -> Result<LogicalPlan> {
+        let expressions = bind_select_items(items, input.schema(), outer)?;
         let schema = expression_schema(&expressions);
         Ok(LogicalPlan::Projection {
             input: Box::new(input),
@@ -306,6 +368,8 @@ impl Planner<'_> {
         plan: LogicalPlan,
         expr: &mut Expr,
         hidden_groups: Option<&mut Vec<Expr>>,
+        aggregate_groups: Option<&[Expr]>,
+        allowed_outer_columns: Option<&[usize]>,
         ctes: &CteScope,
     ) -> Result<LogicalPlan> {
         let mut next_name = || {
@@ -313,11 +377,24 @@ impl Planner<'_> {
             self.next_scalar.set(index.saturating_add(1));
             format!("__rustdb_scalar_subquery_{index}")
         };
-        let mut plan_subquery = |query: &Query| self.plan_query_scoped(query, ctes);
+        let outer_schema = plan.schema().clone();
+        let mut plan_subquery = |query: &Query| {
+            let plan = self.plan_query_with_outer(query, ctes, Some(&outer_schema))?;
+            if let Some(allowed) = allowed_outer_columns {
+                super::super::scalar_subquery::validate_outer_grouping(
+                    &plan,
+                    allowed,
+                    &outer_schema,
+                    &source_location_suffix(query.span()),
+                )?;
+            }
+            Ok(plan)
+        };
         extract_scalar_subqueries(
             plan,
             expr,
             hidden_groups,
+            aggregate_groups,
             &mut next_name,
             &mut plan_subquery,
         )
@@ -369,13 +446,17 @@ fn column_expr(schema: &PlanSchema, index: usize) -> Expr {
     }
 }
 
-fn bind_select_items(items: &[SelectItem], schema: &PlanSchema) -> Result<Vec<BoundExpr>> {
+fn bind_select_items(
+    items: &[SelectItem],
+    schema: &PlanSchema,
+    outer: Option<&PlanSchema>,
+) -> Result<Vec<BoundExpr>> {
     let mut output = Vec::new();
     for item in items {
         match item {
-            SelectItem::UnnamedExpr(expr) => output.push(bind_expr(expr, schema)?),
+            SelectItem::UnnamedExpr(expr) => output.push(bind_expr_scoped(expr, schema, outer)?),
             SelectItem::ExprWithAlias { expr, alias } => {
-                let mut expr = bind_expr(expr, schema)?;
+                let mut expr = bind_expr_scoped(expr, schema, outer)?;
                 expr.display_name = alias.value.clone();
                 output.push(expr);
             }

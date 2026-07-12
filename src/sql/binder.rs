@@ -3,6 +3,7 @@ use sqlparser::ast::{BinaryOperator, CastKind, Expr, Ident, UnaryOperator};
 
 use crate::{Error, Result};
 
+use super::functions::bind_scalar_expr_with;
 use super::{BinaryOp, BoundExpr, ExprKind, PlanSchema, ScalarValue, UnaryOp};
 use super::{
     coercion::{
@@ -13,24 +14,38 @@ use super::{
 };
 
 pub(super) fn bind_expr(expr: &Expr, schema: &PlanSchema) -> Result<BoundExpr> {
+    bind_expr_scoped(expr, schema, None)
+}
+
+pub(super) fn bind_expr_scoped(
+    expr: &Expr,
+    schema: &PlanSchema,
+    outer: Option<&PlanSchema>,
+) -> Result<BoundExpr> {
+    if let Some(bound) =
+        bind_scalar_expr_with(expr, &mut |arg| bind_expr_scoped(arg, schema, outer))
+    {
+        return bound;
+    }
     match expr {
-        Expr::Identifier(ident) => bind_column(None, ident, schema),
-        Expr::CompoundIdentifier(idents) if idents.len() >= 2 => bind_column(
+        Expr::Identifier(ident) => bind_scoped_column(None, ident, schema, outer),
+        Expr::CompoundIdentifier(idents) if idents.len() >= 2 => bind_scoped_column(
             Some(&idents[idents.len() - 2].value),
             &idents[idents.len() - 1],
             schema,
+            outer,
         ),
         Expr::Value(value) => bind_value(&value.value),
         Expr::TypedString(value) => bind_typed_string(value),
         Expr::Interval(interval) => bind_interval(interval),
-        Expr::Nested(expr) => bind_expr(expr, schema),
+        Expr::Nested(expr) => bind_expr_scoped(expr, schema, outer),
         Expr::BinaryOp { left, op, right } => make_binary(
-            bind_expr(left, schema)?,
+            bind_expr_scoped(left, schema, outer)?,
             map_binary(op.clone())?,
-            bind_expr(right, schema)?,
+            bind_expr_scoped(right, schema, outer)?,
         ),
         Expr::UnaryOp { op, expr } => {
-            let expr = bind_expr(expr, schema)?;
+            let expr = bind_expr_scoped(expr, schema, outer)?;
             match op {
                 UnaryOperator::Plus => Ok(expr),
                 UnaryOperator::Minus => make_unary(UnaryOp::Negate, expr),
@@ -57,7 +72,7 @@ pub(super) fn bind_expr(expr: &Expr, schema: &PlanSchema) -> Result<BoundExpr> {
                     "TRY_CAST and SAFE_CAST are not supported".into(),
                 ));
             }
-            cast(bind_expr(expr, schema)?, data_type)
+            cast(bind_expr_scoped(expr, schema, outer)?, data_type)
         }
         Expr::Like {
             negated,
@@ -74,8 +89,8 @@ pub(super) fn bind_expr(expr: &Expr, schema: &PlanSchema) -> Result<BoundExpr> {
                 .map(|value| parse_escape(&value.value))
                 .transpose()?;
             make_like(
-                bind_expr(expr, schema)?,
-                bind_expr(pattern, schema)?,
+                bind_expr_scoped(expr, schema, outer)?,
+                bind_expr_scoped(pattern, schema, outer)?,
                 *negated,
                 escape,
             )
@@ -91,46 +106,66 @@ pub(super) fn bind_expr(expr: &Expr, schema: &PlanSchema) -> Result<BoundExpr> {
         } => {
             let operand = operand
                 .as_ref()
-                .map(|expr| bind_expr(expr, schema))
+                .map(|expr| bind_expr_scoped(expr, schema, outer))
                 .transpose()?;
             let when_then = conditions
                 .iter()
                 .map(|branch| {
                     Ok((
-                        bind_expr(&branch.condition, schema)?,
-                        bind_expr(&branch.result, schema)?,
+                        bind_expr_scoped(&branch.condition, schema, outer)?,
+                        bind_expr_scoped(&branch.result, schema, outer)?,
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let else_expr = else_result
                 .as_ref()
-                .map(|expr| bind_expr(expr, schema))
+                .map(|expr| bind_expr_scoped(expr, schema, outer))
                 .transpose()?;
             make_case(operand, when_then, else_expr)
         }
-        Expr::IsNull(expr) => make_is_null(bind_expr(expr, schema)?, false),
-        Expr::IsNotNull(expr) => make_is_null(bind_expr(expr, schema)?, true),
-        Expr::IsTrue(expr) => make_is_truth(bind_expr(expr, schema)?, TruthValue::True, false),
-        Expr::IsNotTrue(expr) => make_is_truth(bind_expr(expr, schema)?, TruthValue::True, true),
-        Expr::IsFalse(expr) => make_is_truth(bind_expr(expr, schema)?, TruthValue::False, false),
-        Expr::IsNotFalse(expr) => make_is_truth(bind_expr(expr, schema)?, TruthValue::False, true),
-        Expr::IsUnknown(expr) => {
-            make_is_truth(bind_expr(expr, schema)?, TruthValue::Unknown, false)
-        }
-        Expr::IsNotUnknown(expr) => {
-            make_is_truth(bind_expr(expr, schema)?, TruthValue::Unknown, true)
-        }
+        Expr::IsNull(expr) => make_is_null(bind_expr_scoped(expr, schema, outer)?, false),
+        Expr::IsNotNull(expr) => make_is_null(bind_expr_scoped(expr, schema, outer)?, true),
+        Expr::IsTrue(expr) => make_is_truth(
+            bind_expr_scoped(expr, schema, outer)?,
+            TruthValue::True,
+            false,
+        ),
+        Expr::IsNotTrue(expr) => make_is_truth(
+            bind_expr_scoped(expr, schema, outer)?,
+            TruthValue::True,
+            true,
+        ),
+        Expr::IsFalse(expr) => make_is_truth(
+            bind_expr_scoped(expr, schema, outer)?,
+            TruthValue::False,
+            false,
+        ),
+        Expr::IsNotFalse(expr) => make_is_truth(
+            bind_expr_scoped(expr, schema, outer)?,
+            TruthValue::False,
+            true,
+        ),
+        Expr::IsUnknown(expr) => make_is_truth(
+            bind_expr_scoped(expr, schema, outer)?,
+            TruthValue::Unknown,
+            false,
+        ),
+        Expr::IsNotUnknown(expr) => make_is_truth(
+            bind_expr_scoped(expr, schema, outer)?,
+            TruthValue::Unknown,
+            true,
+        ),
         Expr::InList {
             expr,
             list,
             negated,
-        } => bind_in_list(expr, list, *negated, schema),
+        } => bind_in_list(expr, list, *negated, schema, outer),
         Expr::Between {
             expr,
             negated,
             low,
             high,
-        } => bind_between(expr, low, high, *negated, schema),
+        } => bind_between(expr, low, high, *negated, schema, outer),
         Expr::Function(function) if function.over.is_some() => Err(Error::Unsupported(
             "window functions are not supported".into(),
         )),
@@ -138,6 +173,10 @@ pub(super) fn bind_expr(expr: &Expr, schema: &PlanSchema) -> Result<BoundExpr> {
             "scalar function {} is not supported",
             function.name
         ))),
+        Expr::AtTimeZone { .. } => Err(Error::Unsupported(
+            "AT TIME ZONE is not supported; RustDB does not apply an implicit session timezone"
+                .into(),
+        )),
         Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
@@ -156,20 +195,25 @@ fn bind_in_list(
     list: &[Expr],
     negated: bool,
     schema: &PlanSchema,
+    outer: Option<&PlanSchema>,
 ) -> Result<BoundExpr> {
     if list.is_empty() {
         return Ok(BoundExpr::literal(ScalarValue::Boolean(negated)));
     }
-    let needle = bind_expr(expr, schema)?;
+    let needle = bind_expr_scoped(expr, schema, outer)?;
     let comparison = if negated {
         BinaryOp::NotEq
     } else {
         BinaryOp::Eq
     };
     let connective = if negated { BinaryOp::And } else { BinaryOp::Or };
-    let mut comparisons = list
-        .iter()
-        .map(|candidate| make_binary(needle.clone(), comparison, bind_expr(candidate, schema)?));
+    let mut comparisons = list.iter().map(|candidate| {
+        make_binary(
+            needle.clone(),
+            comparison,
+            bind_expr_scoped(candidate, schema, outer)?,
+        )
+    });
     let mut output = comparisons
         .next()
         .expect("non-empty IN list established above")?;
@@ -185,10 +229,19 @@ fn bind_between(
     high: &Expr,
     negated: bool,
     schema: &PlanSchema,
+    outer: Option<&PlanSchema>,
 ) -> Result<BoundExpr> {
-    let value = bind_expr(expr, schema)?;
-    let lower = make_binary(value.clone(), BinaryOp::GtEq, bind_expr(low, schema)?)?;
-    let upper = make_binary(value, BinaryOp::LtEq, bind_expr(high, schema)?)?;
+    let value = bind_expr_scoped(expr, schema, outer)?;
+    let lower = make_binary(
+        value.clone(),
+        BinaryOp::GtEq,
+        bind_expr_scoped(low, schema, outer)?,
+    )?;
+    let upper = make_binary(
+        value,
+        BinaryOp::LtEq,
+        bind_expr_scoped(high, schema, outer)?,
+    )?;
     let between = make_binary(lower, BinaryOp::And, upper)?;
     if negated {
         make_unary(UnaryOp::Not, between)
@@ -197,11 +250,39 @@ fn bind_between(
     }
 }
 
-pub(super) fn bind_column(
+fn bind_scoped_column(
     qualifier: Option<&str>,
     ident: &Ident,
     schema: &PlanSchema,
+    outer: Option<&PlanSchema>,
 ) -> Result<BoundExpr> {
+    if let Some(index) = find_column(qualifier, ident, schema)? {
+        let field = schema.arrow().field(index);
+        return Ok(BoundExpr::column(
+            index,
+            field.data_type().clone(),
+            ident.value.clone(),
+        ));
+    }
+    if let Some(outer) = outer
+        && let Some(index) = find_column(qualifier, ident, outer)?
+    {
+        let field = outer.arrow().field(index);
+        return Ok(BoundExpr::outer_ref(
+            1,
+            index,
+            field.data_type().clone(),
+            ident.value.clone(),
+        ));
+    }
+    Err(missing_column(qualifier, ident))
+}
+
+fn find_column(
+    qualifier: Option<&str>,
+    ident: &Ident,
+    schema: &PlanSchema,
+) -> Result<Option<usize>> {
     let mut matches = Vec::new();
     for (index, field) in schema.arrow().fields().iter().enumerate() {
         if !field.name().eq_ignore_ascii_case(&ident.value) {
@@ -218,26 +299,23 @@ pub(super) fn bind_column(
     }
 
     match matches.as_slice() {
-        [index] => {
-            let field = schema.arrow().field(*index);
-            Ok(BoundExpr::column(
-                *index,
-                field.data_type().clone(),
-                ident.value.clone(),
-            ))
-        }
-        [] => Err(Error::Catalog(format!(
-            "column {}{} does not exist",
-            qualifier
-                .map(|value| format!("{value}."))
-                .unwrap_or_default(),
-            ident.value
-        ))),
+        [index] => Ok(Some(*index)),
+        [] => Ok(None),
         _ => Err(Error::Catalog(format!(
             "column '{}' is ambiguous",
             ident.value
         ))),
     }
+}
+
+fn missing_column(qualifier: Option<&str>, ident: &Ident) -> Error {
+    Error::Catalog(format!(
+        "column {}{} does not exist",
+        qualifier
+            .map(|value| format!("{value}."))
+            .unwrap_or_default(),
+        ident.value
+    ))
 }
 
 pub(super) fn make_binary(left: BoundExpr, op: BinaryOp, right: BoundExpr) -> Result<BoundExpr> {

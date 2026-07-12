@@ -4,7 +4,12 @@ use rustdb::{Error, Result, Session};
 
 use super::{args::OutputFormat, output};
 
-pub async fn run(session: &Session, format: OutputFormat, metrics: bool) -> Result<()> {
+pub async fn run(
+    session: &Session,
+    format: OutputFormat,
+    csv_null: Option<&str>,
+    metrics: bool,
+) -> Result<()> {
     eprintln!(
         "RustDB v{}; end SQL with ';', or use .help",
         env!("CARGO_PKG_VERSION")
@@ -43,7 +48,9 @@ pub async fn run(session: &Session, format: OutputFormat, metrics: bool) -> Resu
             continue;
         }
         let sql = std::mem::take(&mut pending);
-        if let Err(error) = super::execute_statements(session, &sql, format, metrics).await {
+        if let Err(error) =
+            super::execute_statements(session, &sql, format, csv_null, metrics).await
+        {
             eprintln!("error: {error}");
         }
     }
@@ -54,6 +61,7 @@ pub async fn execute(
     session: &Session,
     sql: &str,
     format: OutputFormat,
+    csv_null: Option<&str>,
     metrics: bool,
 ) -> Result<()> {
     let execute = session.execute(sql);
@@ -67,7 +75,7 @@ pub async fn execute(
     };
     {
         let cancellation = result.cancellation_handle();
-        let write = output::write_result(&mut result, format);
+        let write = output::write_result(&mut result, format, csv_null);
         tokio::pin!(write);
         tokio::select! {
             result = &mut write => result?,

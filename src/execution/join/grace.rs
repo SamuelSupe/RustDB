@@ -7,20 +7,22 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Error, Result,
-    runtime::{
-        BatchEnvelope, MemoryBatchStream, QueryContext, SpillManager, boxed_memory_batch_stream,
-    },
+    runtime::{BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream},
     sql::{BoundExpr, JoinType},
 };
 
 use super::{
-    ProbeCursor, evaluate_keys_accounted, sort_merge,
+    EvaluatedKeys, ProbeCursor,
+    condition::JoinPredicates,
+    evaluate_keys_accounted, evaluate_optional_values, optional_array, optional_memory, sort_merge,
     spill::{self, BuildPartition, MAX_REPARTITION_DEPTH, PartitionTask},
     try_build_hash_table,
 };
 
+const MIN_MEMORY_PER_LANE: usize = 512 << 10;
+
 pub(super) fn is_supported(context: &QueryContext, tasks: usize) -> bool {
-    context.scheduler.configured_lanes() > 1 && tasks > 1
+    lane_count(context, tasks) > 1
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30,21 +32,21 @@ pub(super) fn join(
     right_key_expressions: Vec<BoundExpr>,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
+    predicates: JoinPredicates,
     join_type: JoinType,
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
 ) -> MemoryBatchStream {
     boxed_memory_batch_stream(async_stream::try_stream! {
-        let lanes = context.scheduler.lanes_for(tasks.len());
+        let lanes = lane_count(&context, tasks.len());
         let pending = Arc::new(Mutex::new(VecDeque::from(tasks)));
         let cancellation = CancellationToken::new();
-        let mut spill_cleanup = SpillCleanup::new(context.spill.clone());
         let _cancel_on_drop = CancelOnDrop(cancellation.clone());
         let (sender, mut receiver) = mpsc::channel(lanes.saturating_mul(2).max(2));
 
         for _ in 0..lanes {
-            tokio::spawn(run_worker(
+            context.tasks.spawn("grace-join-worker", run_worker(
                 Arc::clone(&pending),
                 sender.clone(),
                 cancellation.clone(),
@@ -52,46 +54,45 @@ pub(super) fn join(
                 right_key_expressions.clone(),
                 Arc::clone(&left_schema),
                 Arc::clone(&right_schema),
+                predicates.clone(),
                 join_type,
                 Arc::clone(&schema),
                 Arc::clone(&context),
                 batch_size.max(1),
-            ));
+                lanes,
+            ))?;
         }
         drop(pending);
-        drop(sender);
+        // Keep the coordinator sender alive until all workers report Done.
+        // TaskGroup records a worker panic only after that worker has unwound
+        // and dropped its sender clone.
 
         let mut completed = 0usize;
         while completed < lanes {
             let message: Result<Option<WorkerMessage>> = tokio::select! {
-                _ = context.control.cancelled() => Err(Error::Cancelled),
+                biased;
+                _ = context.control.cancelled() => Err(context
+                    .check_cancelled()
+                    .expect_err("cancelled query has a terminal error")),
                 message = receiver.recv() => Ok(message),
             };
-            let message = match message {
-                Ok(message) => message,
-                Err(error) => Err(spill_cleanup.fail(error))?,
-            };
+            let message = message?;
             match message {
                 Some(WorkerMessage::Batch(batch)) => yield batch,
-                Some(WorkerMessage::Error(error)) => {
-                    cancellation.cancel();
-                    Err(spill_cleanup.fail(error))?;
-                }
                 Some(WorkerMessage::Done) => completed += 1,
                 None => {
-                    Err(spill_cleanup.fail(Error::Execution(
+                    Err(Error::Execution(
                         "parallel Grace join workers stopped before completing all partitions".into(),
-                    )))?;
+                    ))?;
                 }
             }
         }
-        spill_cleanup.disarm();
+        drop(sender);
     })
 }
 
 enum WorkerMessage {
     Batch(BatchEnvelope),
-    Error(Error),
     Done,
 }
 
@@ -104,12 +105,14 @@ async fn run_worker(
     right_key_expressions: Vec<BoundExpr>,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
+    predicates: JoinPredicates,
     join_type: JoinType,
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
-) {
-    let result = run_worker_inner(
+    worker_lanes: usize,
+) -> Result<()> {
+    run_worker_inner(
         pending,
         &sender,
         &cancellation,
@@ -117,20 +120,18 @@ async fn run_worker(
         &right_key_expressions,
         &left_schema,
         &right_schema,
+        &predicates,
         join_type,
         &schema,
         &context,
         batch_size,
+        worker_lanes,
     )
-    .await;
-    if let Err(error) = result
-        && !cancellation.is_cancelled()
-        && !context.control.is_cancelled()
-    {
-        let _ = sender.send(WorkerMessage::Error(error)).await;
-        cancellation.cancel();
-    }
-    let _ = sender.send(WorkerMessage::Done).await;
+    .await?;
+    sender
+        .send(WorkerMessage::Done)
+        .await
+        .map_err(|_| Error::Cancelled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -142,10 +143,12 @@ async fn run_worker_inner(
     right_key_expressions: &[BoundExpr],
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
+    predicates: &JoinPredicates,
     join_type: JoinType,
     schema: &SchemaRef,
     context: &Arc<QueryContext>,
     batch_size: usize,
+    worker_lanes: usize,
 ) -> Result<()> {
     loop {
         let task = { pending.lock().await.pop_front() };
@@ -153,7 +156,7 @@ async fn run_worker_inner(
         let mut local = vec![task];
         let worker_pool = context.memory.child(
             format!("Grace-join-worker-{}", context.query_id),
-            grace_worker_limit(context.memory.limit(), context.scheduler.configured_lanes()),
+            grace_worker_limit(context.memory.limit(), worker_lanes),
         );
         let mut reservation = worker_pool.reservation();
         while let Some(task) = local.pop() {
@@ -177,20 +180,31 @@ async fn run_worker_inner(
                         let hash_table = try_build_hash_table(
                             &right_keys,
                             rows,
-                            matches!(join_type, JoinType::Semi | JoinType::Anti),
+                            super::can_deduplicate_build(join_type, predicates),
                             &mut reservation,
                         )?;
                         drop(right_keys);
+                        let right_values = evaluate_optional_values(
+                            predicates.right_value(),
+                            &right_batch,
+                            context,
+                            "Grace join build membership value",
+                        )?;
                         match hash_table {
-                            Some(hash_table) => TaskHashBuild::Ready(right_batch, hash_table),
-                            None => TaskHashBuild::TooLarge(rows),
+                            Some(hash_table) => {
+                                TaskHashBuild::Ready(right_batch, hash_table, right_values)
+                            }
+                            None => {
+                                drop(right_values);
+                                TaskHashBuild::TooLarge(rows)
+                            }
                         }
                     }
                     BuildPartition::TooLarge { rows } => TaskHashBuild::TooLarge(rows),
                 }
             };
             match build {
-                TaskHashBuild::Ready(right_batch, hash_table) => {
+                TaskHashBuild::Ready(right_batch, hash_table, right_values) => {
                     for file in &task.left {
                         for left_batch in context.spill.read_file(file)? {
                             check_running(cancellation, context)?;
@@ -209,18 +223,30 @@ async fn run_worker_inner(
                                 )?;
                                 (left_batch, left_keys)
                             };
+                            let left_values = evaluate_optional_values(
+                                predicates.left_value(),
+                                left_batch.batch(),
+                                context,
+                                "Grace join probe membership value",
+                            )?;
                             let mut probe = ProbeCursor::new(
                                 left_batch.batch(),
                                 &right_batch,
                                 &left_keys,
                                 &hash_table,
+                                predicates,
+                                optional_array(&left_values),
+                                optional_array(&right_values),
+                                None,
                                 join_type,
                                 Arc::clone(schema),
                                 batch_size,
                                 reservation
                                     .size()
                                     .saturating_add(left_batch.memory_size())
-                                    .saturating_add(left_keys.memory_size()),
+                                    .saturating_add(left_keys.memory_size())
+                                    .saturating_add(optional_memory(&left_values))
+                                    .saturating_add(optional_memory(&right_values)),
                             );
                             loop {
                                 let output = probe.next_batch(context).await?;
@@ -270,6 +296,7 @@ async fn run_worker_inner(
                         right_key_expressions.to_vec(),
                         Arc::clone(left_schema),
                         Arc::clone(right_schema),
+                        predicates.clone(),
                         join_type,
                         Arc::clone(schema),
                         Arc::clone(context),
@@ -299,10 +326,27 @@ fn grace_worker_limit(query_limit: usize, lanes: usize) -> usize {
         .max(1)
 }
 
+fn lane_count(context: &QueryContext, tasks: usize) -> usize {
+    memory_bounded_lane_count(
+        context.memory.limit(),
+        context.scheduler.configured_lanes(),
+        tasks,
+    )
+}
+
+fn memory_bounded_lane_count(query_limit: usize, configured_lanes: usize, tasks: usize) -> usize {
+    let memory_lanes = query_limit
+        .checked_div(MIN_MEMORY_PER_LANE)
+        .unwrap_or(0)
+        .max(1);
+    configured_lanes.min(tasks).min(memory_lanes).max(1)
+}
+
 enum TaskHashBuild {
     Ready(
         arrow::record_batch::RecordBatch,
         std::collections::HashMap<Vec<super::CellValue>, Vec<u32>>,
+        Option<EvaluatedKeys>,
     ),
     TooLarge(usize),
 }
@@ -339,37 +383,25 @@ impl Drop for CancelOnDrop {
     }
 }
 
-struct SpillCleanup {
-    spill: SpillManager,
-    armed: bool,
-}
+#[cfg(test)]
+mod tests {
+    use super::{grace_worker_limit, memory_bounded_lane_count};
 
-impl SpillCleanup {
-    fn new(spill: SpillManager) -> Self {
-        Self { spill, armed: true }
+    #[test]
+    fn low_memory_limits_lanes_and_splits_the_build_budget_across_actual_workers() {
+        let memory_limit = 2 << 20;
+        let lanes = memory_bounded_lane_count(memory_limit, 18, 64);
+        assert_eq!(lanes, 4);
+        assert_eq!(
+            grace_worker_limit(memory_limit, lanes) * lanes,
+            3 * (memory_limit / 4)
+        );
     }
 
-    fn fail(&mut self, error: Error) -> Error {
-        self.armed = false;
-        match self.spill.cleanup() {
-            Ok(()) => error,
-            Err(cleanup) => Error::Execution(format!(
-                "{error}; additionally failed to clean Grace join spill: {cleanup}"
-            )),
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for SpillCleanup {
-    fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = self.spill.cleanup()
-        {
-            tracing::error!(%error, "failed to clean abandoned Grace join spill");
-        }
+    #[test]
+    fn lane_count_still_obeys_tasks_and_configured_parallelism() {
+        assert_eq!(memory_bounded_lane_count(128 << 20, 18, 64), 18);
+        assert_eq!(memory_bounded_lane_count(128 << 20, 18, 2), 2);
+        assert_eq!(memory_bounded_lane_count(128 << 20, 1, 64), 1);
     }
 }

@@ -2,17 +2,23 @@ use crate::Result;
 use crate::sql::{BoundExpr, LogicalPlan};
 
 mod constant;
+mod decorrelate;
 mod join_order;
+mod predicate_relocation;
 mod projection;
+mod verify;
 
 /// Applies conservative scan pushdowns. Residual operators remain in the plan,
 /// so a data source is always free to ignore a pushed predicate.
 pub fn optimize(mut plan: LogicalPlan) -> Result<LogicalPlan> {
     constant::fold_plan(&mut plan);
+    plan = decorrelate::apply(plan)?;
+    plan = predicate_relocation::apply(plan);
     push_filter(&mut plan);
     join_order::choose_build_sides(&mut plan);
     projection::push_required_columns(&mut plan);
     push_limit(&mut plan);
+    verify::executable(&plan)?;
     Ok(plan)
 }
 
@@ -29,7 +35,7 @@ fn push_filter(plan: &mut LogicalPlan) {
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => push_filter(input),
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::DependentJoin { left, right, .. } => {
             push_filter(left);
             push_filter(right);
         }
@@ -66,6 +72,9 @@ fn remap_projection_columns(expr: &BoundExpr, projection: &[BoundExpr]) -> Optio
             }
             return Some(source.clone());
         }
+        ExprKind::OuterRef { .. } | ExprKind::DeferredGroup(_) | ExprKind::DeferredAggregate(_) => {
+            return None;
+        }
         ExprKind::Literal(_) => {}
         ExprKind::Binary { left, right, .. } => {
             **left = remap_projection_columns(left, projection)?;
@@ -87,6 +96,11 @@ fn remap_projection_columns(expr: &BoundExpr, projection: &[BoundExpr]) -> Optio
                 *then = remap_projection_columns(then, projection)?;
             }
             **else_expr = remap_projection_columns(else_expr, projection)?;
+        }
+        ExprKind::ScalarFunction { args, .. } => {
+            for arg in args {
+                *arg = remap_projection_columns(arg, projection)?;
+            }
         }
     }
     Some(mapped)
@@ -110,7 +124,7 @@ fn push_limit(plan: &mut LogicalPlan) {
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => push_limit(input),
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::DependentJoin { left, right, .. } => {
             push_limit(left);
             push_limit(right);
         }

@@ -64,7 +64,7 @@ sed "s|__TPCH_ROOT__|$rustdb_root|g" "$query_template" > "$rustdb_query"
 sed "s|__TPCH_ROOT__|/workspace/$reference_relative|g" "$query_template" > "$duckdb_query"
 
 set -- docker compose --project-directory "$TPCH_ROOT" run --rm --no-deps --no-TTY dev \
-  /workspace/target/release/rustdb --format csv
+  /workspace/target/release/rustdb --format csv --csv-null __RUSTDB_NULL__
 case "$rustdb_argument" in
   s3://*)
     s3_endpoint=${TPCH_S3_ENDPOINT-http://minio:9000}
@@ -130,7 +130,8 @@ fi
 docker run --rm --interactive \
   --volume "$TPCH_ROOT:/workspace" \
   --workdir /workspace \
-  "$TPCH_DUCKDB_IMAGE" :memory: -csv -header -batch < "$duckdb_query" > "$duckdb_csv"
+  "$TPCH_DUCKDB_IMAGE" :memory: -csv -header -nullvalue __RUSTDB_NULL__ -batch \
+  < "$duckdb_query" > "$duckdb_csv"
 
 rustdb_checksum=$(python3 "$TPCH_TOOLS/canonicalize.py" "$rustdb_csv" "$rustdb_canonical")
 duckdb_checksum=$(python3 "$TPCH_TOOLS/canonicalize.py" "$duckdb_csv" "$duckdb_canonical")

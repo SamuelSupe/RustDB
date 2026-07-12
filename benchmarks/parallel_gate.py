@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validation logic for the RustDB v0.2 fixed-hardware performance gate."""
+"""Validation logic for the RustDB v0.3 fixed-hardware performance gate."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import hashlib
 import math
 import re
 import statistics
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,11 @@ MEMORY_LIMIT = 1_073_741_824
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 NATIVE = re.compile(r"(?:^|\s)-C(?:\s+)?target-cpu=native(?:\s|$)")
+HARNESS_ARTIFACTS = {
+    "runner_sha256": Path("benchmarks/run_baseline.sh"),
+    "library_sha256": Path("benchmarks/suites/lib.sh"),
+    "checksum_runner_sha256": Path("tools/tpch/compare_query.sh"),
+}
 
 
 class GateError(ValueError):
@@ -56,26 +62,51 @@ def repository_root(manifest_path: Path, label: str) -> Path:
     fail(f"cannot locate the repository root for {label} manifest {manifest_path}")
 
 
+def sha256_git_blob(root: Path, build_id: str, path: Path, label: str) -> str:
+    if GIT_COMMIT.fullmatch(build_id) is None:
+        fail(
+            f"{label} build id must be an exact 40-character Git commit, "
+            f"got {build_id!r}"
+        )
+    object_name = f"{build_id}:{path.as_posix()}"
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", object_name],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        stderr = getattr(error, "stderr", b"")
+        detail = stderr.decode("utf-8", errors="replace").strip() or str(error)
+        fail(
+            f"cannot read {label} harness artifact {path} from Git tree "
+            f"{build_id}: {detail}"
+        )
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
 def validate_harness(
-    manifest: dict[str, Any], manifest_path: Path, label: str
+    manifest: dict[str, Any], manifest_path: Path, label: str, build_id: str
 ) -> Path:
     harness = manifest.get("harness")
     if not isinstance(harness, dict):
         fail(f"{label}.harness must be an object")
     root = repository_root(manifest_path, label)
-    artifacts = {
-        "runner_sha256": root / "benchmarks/run_baseline.sh",
-        "library_sha256": root / "benchmarks/suites/lib.sh",
-        "checksum_runner_sha256": root / "tools/tpch/compare_query.sh",
-    }
-    for field, path in artifacts.items():
+    for field, relative_path in HARNESS_ARTIFACTS.items():
         expected = harness.get(field)
         if not isinstance(expected, str) or SHA256.fullmatch(expected) is None:
             fail(f"{label}.harness.{field} must be a lowercase SHA-256")
-        actual = sha256_file(path, f"{label} harness artifact")
+        if label == "baseline":
+            actual = sha256_git_blob(root, build_id, relative_path, label)
+            source = f"Git tree {build_id}:{relative_path.as_posix()}"
+        else:
+            path = root / relative_path
+            actual = sha256_file(path, f"{label} harness artifact")
+            source = str(path)
         if actual != expected:
             fail(
-                f"{label}.harness.{field} does not match {path}: "
+                f"{label}.harness.{field} does not match {source}: "
                 f"expected {expected}, got {actual}"
             )
     return root
@@ -199,13 +230,13 @@ def inspect_manifest(
     build_id = manifest.get("rustdb_build_id")
     if not isinstance(build_id, str) or not build_id or build_id == "unknown":
         fail(f"{label}.rustdb_build_id must be non-empty and known")
-    if label == "candidate" and GIT_COMMIT.fullmatch(build_id) is None:
+    if label in ("baseline", "candidate") and GIT_COMMIT.fullmatch(build_id) is None:
         fail(
-            "candidate build id must be an exact clean 40-character Git commit, "
+            f"{label} build id must be an exact clean 40-character Git commit, "
             f"got {build_id!r}"
         )
     build = validate_build(manifest.get("build"), label)
-    validate_harness(manifest, path, label)
+    validate_harness(manifest, path, label, build_id)
     binary_sha256 = manifest.get("benchmark_binary_sha256")
     if label == "candidate":
         if not isinstance(binary_sha256, str) or SHA256.fullmatch(binary_sha256) is None:
@@ -310,7 +341,7 @@ def inspect_manifest(
 def evaluate(
     candidate_path: Path,
     baseline_path: Path,
-    alpha2_build_id: str,
+    baseline_build_id: str,
     candidate_build_id: str | None = None,
     candidate_binary_sha256: str | None = None,
     actual_cpu_model: str | None = None,
@@ -318,19 +349,19 @@ def evaluate(
     baseline = inspect_manifest(
         baseline_path,
         label="baseline",
-        engine_version="0.1.0",
+        engine_version="0.2.0-alpha.1",
         actual_cpu_model=actual_cpu_model,
     )
     candidate = inspect_manifest(
         candidate_path,
         label="candidate",
-        engine_version="0.2.0-alpha.1",
+        engine_version="0.3.0-alpha.1",
         actual_cpu_model=actual_cpu_model,
     )
-    if baseline["build_id"] != alpha2_build_id:
+    if baseline["build_id"] != baseline_build_id:
         fail(
-            "baseline build id does not match v0.1.0-alpha.2: "
-            f"expected {alpha2_build_id}, got {baseline['build_id']}"
+            "baseline build id does not match v0.2.0-alpha.1: "
+            f"expected {baseline_build_id}, got {baseline['build_id']}"
         )
     actual_candidate_id = candidate["build_id"]
     if candidate_build_id is not None and actual_candidate_id != candidate_build_id:
@@ -348,7 +379,7 @@ def evaluate(
             f"got {candidate['binary_sha256']}"
         )
     if candidate["dataset"] != baseline["dataset"]:
-        fail("candidate and alpha.2 baseline dataset fingerprints differ")
+        fail("candidate and v0.2 baseline dataset fingerprints differ")
 
     results: dict[str, Any] = {}
     for case in CASES:

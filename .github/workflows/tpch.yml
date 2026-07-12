@@ -23,9 +23,9 @@ concurrency:
 
 jobs:
   checksum:
-    name: Seven-query checksum
+    name: Q1-Q22 local and MinIO checksums
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     env:
       TPCH_SCALE: ${{ github.event_name == 'schedule' && '1' || inputs.scale || '0.01' }}
     steps:
@@ -35,5 +35,35 @@ jobs:
         with:
           path: data/tpch-sf${{ env.TPCH_SCALE }}
           key: tpch-parquet-duckdb-1.4.3-sf${{ env.TPCH_SCALE }}-${{ hashFiles('tools/tpch/**', 'benchmarks/tpch/**') }}
-      - name: Generate, validate, and compare checksums
-        run: tools/tpch/run.sh "$TPCH_SCALE"
+      - name: Generate and validate Parquet dataset
+        run: tools/tpch/generate.sh "$TPCH_SCALE"
+      - name: Compare Q1-Q22 on local files
+        run: |
+          tools/tpch/compare.sh --report \
+            --queries benchmarks/tpch/cases/sf1-local.txt "$TPCH_SCALE"
+          dataset="data/tpch-sf${TPCH_SCALE}/results"
+          rm -rf "$dataset/local"
+          mv "$dataset/latest" "$dataset/local"
+      - name: Upload the matching dataset to MinIO
+        id: minio
+        run: |
+          uri=$(tools/tpch/upload_minio.sh "$TPCH_SCALE" | tail -n 1)
+          case "$uri" in
+            s3://*/*) ;;
+            *) echo "upload did not return a non-empty s3:// bucket/prefix URI" >&2; exit 2 ;;
+          esac
+          echo "uri=$uri" >> "$GITHUB_OUTPUT"
+      - name: Compare Q1-Q22 through S3-compatible I/O
+        env:
+          TPCH_MINIO_URI: ${{ steps.minio.outputs.uri }}
+        run: |
+          case "$TPCH_MINIO_URI" in
+            s3://*/*) ;;
+            *) echo "MinIO URI is missing or invalid" >&2; exit 2 ;;
+          esac
+          tools/tpch/compare.sh --report \
+            --queries benchmarks/tpch/cases/sf1-minio.txt \
+            --rustdb-root "$TPCH_MINIO_URI" "$TPCH_SCALE"
+          dataset="data/tpch-sf${TPCH_SCALE}/results"
+          rm -rf "$dataset/minio"
+          mv "$dataset/latest" "$dataset/minio"

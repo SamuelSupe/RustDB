@@ -1,9 +1,11 @@
 use sqlparser::ast::{
-    DataType as SqlDataType, DateTimeField, Expr, Interval, TypedString, UnaryOperator, Value,
+    DataType as SqlDataType, DateTimeField, Expr, Interval, TimezoneInfo, TypedString,
+    UnaryOperator, Value,
 };
 
 use crate::{Error, Result};
 
+use super::temporal::{parse_date32, parse_timestamp_microsecond};
 use super::{BoundExpr, ScalarValue};
 
 pub(super) fn bind_value(value: &Value) -> Result<BoundExpr> {
@@ -46,11 +48,39 @@ pub(super) fn bind_typed_string(value: &TypedString) -> Result<BoundExpr> {
         SqlDataType::Date | SqlDataType::Date32 => Ok(BoundExpr::literal(ScalarValue::Date32(
             parse_date32(literal)?,
         ))),
+        SqlDataType::Timestamp(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
+        | SqlDataType::TimestampNtz(precision) => Ok(BoundExpr::literal(
+            ScalarValue::TimestampMicrosecond(timestamp_with_precision(literal, precision)?),
+        )),
+        SqlDataType::Timestamp(_, _) => Err(Error::Unsupported(
+            "timezone-aware TIMESTAMP literals are not supported".into(),
+        )),
         _ => Err(Error::Unsupported(format!(
             "typed literal {} is not supported",
             value.data_type
         ))),
     }
+}
+
+fn timestamp_with_precision(literal: &str, precision: Option<u64>) -> Result<i64> {
+    let precision = precision.unwrap_or(6);
+    if precision > 6 {
+        return Err(Error::InvalidArgument(
+            "TIMESTAMP precision above 6 cannot be represented by the microsecond engine type"
+                .into(),
+        ));
+    }
+    let value = parse_timestamp_microsecond(literal)?;
+    let factor = 10_i128.pow(6 - u32::try_from(precision).expect("precision is at most six"));
+    let magnitude = i128::from(value).abs();
+    let rounded = (magnitude + factor / 2) / factor * factor;
+    let rounded = if value.is_negative() {
+        -rounded
+    } else {
+        rounded
+    };
+    i64::try_from(rounded)
+        .map_err(|_| Error::InvalidArgument("TIMESTAMP literal is out of range".into()))
 }
 
 pub(super) fn bind_interval(interval: &Interval) -> Result<BoundExpr> {
@@ -186,55 +216,11 @@ fn parse_interval_suffix(value: &str) -> Result<ScalarValue> {
     }
 }
 
-fn parse_date32(value: &str) -> Result<i32> {
-    let mut parts = value.split('-');
-    let year = parse_date_part(parts.next(), "year", value)?;
-    let month = parse_date_part(parts.next(), "month", value)?;
-    let day = parse_date_part(parts.next(), "day", value)?;
-    if parts.next().is_some() || !(1..=12).contains(&month) {
-        return Err(invalid_date(value));
-    }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let max_day = match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if !(1..=max_day).contains(&day) {
-        return Err(invalid_date(value));
-    }
-    let adjusted_year = year - i32::from(month <= 2);
-    let era = if adjusted_year >= 0 {
-        adjusted_year
-    } else {
-        adjusted_year - 399
-    } / 400;
-    let year_of_era = adjusted_year - era * 400;
-    let shifted_month = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Ok(era * 146_097 + day_of_era - 719_468)
-}
-
-fn parse_date_part(part: Option<&str>, name: &str, value: &str) -> Result<i32> {
-    part.ok_or_else(|| invalid_date(value))?
-        .parse()
-        .map_err(|_| {
-            Error::InvalidArgument(format!("DATE literal '{value}' has an invalid {name}"))
-        })
-}
-
-fn invalid_date(value: &str) -> Error {
-    Error::InvalidArgument(format!(
-        "DATE literal '{value}' is not a valid calendar date"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_date32, parse_decimal};
+    use super::parse_decimal;
     use crate::sql::ScalarValue;
+    use crate::sql::temporal::parse_date32;
 
     #[test]
     fn parses_exact_decimal_literals() {

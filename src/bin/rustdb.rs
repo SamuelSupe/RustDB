@@ -80,15 +80,18 @@ async fn run(args: Args) -> Result<()> {
     config.s3.anonymous = args.s3_anonymous;
 
     let session = Engine::new(config)?.session();
+    let csv_null = args.csv_null.as_deref();
     match (args.command, args.file) {
-        (Some(sql), None) => execute_statements(&session, &sql, args.format, args.metrics).await,
+        (Some(sql), None) => {
+            execute_statements(&session, &sql, args.format, csv_null, args.metrics).await
+        }
         (None, Some(path)) => {
             let sql = tokio::fs::read_to_string(&path)
                 .await
                 .map_err(|error| Error::io(Some(path), error))?;
-            execute_statements(&session, &sql, args.format, args.metrics).await
+            execute_statements(&session, &sql, args.format, csv_null, args.metrics).await
         }
-        (None, None) => repl::run(&session, args.format, args.metrics).await,
+        (None, None) => repl::run(&session, args.format, csv_null, args.metrics).await,
         (Some(_), Some(_)) => unreachable!("clap rejects conflicting arguments"),
     }
 }
@@ -97,6 +100,7 @@ pub(crate) async fn execute_statements(
     session: &rustdb::Session,
     sql: &str,
     format: args::OutputFormat,
+    csv_null: Option<&str>,
     metrics: bool,
 ) -> Result<()> {
     let statements = sql_input::parse_statements(sql)?;
@@ -104,7 +108,7 @@ pub(crate) async fn execute_statements(
         return Err(Error::InvalidArgument("SQL input is empty".to_owned()));
     }
     for statement in statements {
-        repl::execute(session, &statement, format, metrics).await?;
+        repl::execute(session, &statement, format, csv_null, metrics).await?;
     }
     Ok(())
 }

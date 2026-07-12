@@ -1,10 +1,13 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+
+#[cfg(test)]
+use std::sync::Weak;
 
 use arrow::{
     datatypes::{Schema, SchemaRef},
@@ -24,6 +27,7 @@ use super::{RecordBatchStream, boxed_record_batch_stream};
 mod activity;
 mod io;
 mod io_pool;
+mod io_tracker;
 mod metadata;
 #[allow(dead_code)]
 mod quota;
@@ -35,6 +39,7 @@ pub(crate) use io::SpillWriter;
 use io::writer_memory_bytes;
 use io::{SpillReader, copy_memory_bytes};
 pub(crate) use io_pool::SpillIoPool;
+use io_tracker::IoTracker;
 use metadata::ActiveFiles;
 #[allow(unused_imports)]
 pub(crate) use quota::{
@@ -69,13 +74,41 @@ struct State {
     files: Arc<ActiveFiles>,
     quota: QuerySpillQuota,
     io_pool: SpillIoPool,
+    io_tracker: IoTracker,
     next_file: AtomicU64,
     cleaned: AtomicBool,
+    cleanup_completed: AtomicBool,
+    cleanup_on_drop: bool,
     cleanup_lock: Mutex<()>,
     metrics: Option<QueryMetrics>,
 }
 
 impl SpillManager {
+    pub(crate) fn protect_io_headroom(memory: &MemoryPool, io_threads: usize) -> Result<()> {
+        Self::protect_copy_slots(memory, io_threads.max(1))
+    }
+
+    fn protect_query_io_headroom(memory: &MemoryPool) -> Result<()> {
+        // A query only needs one copy slot to make forward progress. The
+        // Engine root separately protects one slot per shared I/O worker, so
+        // concurrent queries can still keep the whole pool busy without every
+        // query withholding all global worker slots from its own operators.
+        Self::protect_copy_slots(memory, 1)
+    }
+
+    fn protect_copy_slots(memory: &MemoryPool, slots: usize) -> Result<()> {
+        let copy_bytes = copy_memory_bytes(memory.limit());
+        // Tiny unit-test pools may be smaller than the minimum I/O copy and
+        // cannot spill at all. Keep them usable for non-spill tests instead of
+        // protecting their complete limit.
+        let bytes = if copy_bytes > memory.limit().checked_div(8).unwrap_or(0) {
+            0
+        } else {
+            copy_bytes.saturating_mul(slots)
+        };
+        memory.protect_emergency_headroom(bytes)
+    }
+
     #[cfg(test)]
     pub fn new(spill_root: impl AsRef<Path>, memory: MemoryPool) -> Result<Self> {
         let root = spill_root.as_ref().to_path_buf();
@@ -88,6 +121,7 @@ impl SpillManager {
             None,
             quota,
             io_pool,
+            true,
         )
     }
 
@@ -104,8 +138,31 @@ impl SpillManager {
         Self::for_query_with_resources(root, query_id, control, memory, metrics, quota, io_pool)
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_task_group_query(
+        spill_root: impl AsRef<Path>,
+        query_id: Uuid,
+        control: &QueryControl,
+        memory: MemoryPool,
+        metrics: Option<QueryMetrics>,
+    ) -> Result<Self> {
+        let root = spill_root.as_ref().to_path_buf();
+        let (quota, io_pool) = compatibility_resources(&root)?;
+        Self::create(
+            root,
+            query_id,
+            control.clone(),
+            memory,
+            metrics,
+            quota,
+            io_pool,
+            false,
+        )
+    }
+
     /// Production constructor. Engine owns one `SpillQuotaPool` and one
     /// `SpillIoPool`, then starts a query quota and passes both resources here.
+    #[cfg(test)]
     pub(crate) fn for_query_with_resources(
         spill_root: impl AsRef<Path>,
         query_id: Uuid,
@@ -123,6 +180,7 @@ impl SpillManager {
             metrics,
             quota,
             io_pool,
+            false,
         )?;
         let state = Arc::downgrade(&manager.state);
         control.register_cleanup(move || cleanup_weak(state));
@@ -130,6 +188,31 @@ impl SpillManager {
         Ok(manager)
     }
 
+    /// QueryContext owns cancellation cleanup through its TaskGroup. This
+    /// constructor therefore does not attach the legacy immediate cleanup
+    /// callback to QueryControl.
+    pub(crate) fn for_task_group_query_with_resources(
+        spill_root: impl AsRef<Path>,
+        query_id: Uuid,
+        control: &QueryControl,
+        memory: MemoryPool,
+        metrics: Option<QueryMetrics>,
+        quota: QuerySpillQuota,
+        io_pool: SpillIoPool,
+    ) -> Result<Self> {
+        Self::create(
+            spill_root,
+            query_id,
+            control.clone(),
+            memory,
+            metrics,
+            quota,
+            io_pool,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn create(
         spill_root: impl AsRef<Path>,
         query_id: Uuid,
@@ -138,7 +221,9 @@ impl SpillManager {
         metrics: Option<QueryMetrics>,
         quota: QuerySpillQuota,
         io_pool: SpillIoPool,
+        cleanup_on_drop: bool,
     ) -> Result<Self> {
+        Self::protect_query_io_headroom(&memory)?;
         let root = spill_root.as_ref().to_path_buf();
         let create_root = root.clone();
         io_pool.run(move || {
@@ -195,8 +280,11 @@ impl SpillManager {
                 files: Arc::new(ActiveFiles::new(memory)),
                 quota,
                 io_pool,
+                io_tracker: IoTracker::new(),
                 next_file: AtomicU64::new(0),
                 cleaned: AtomicBool::new(false),
+                cleanup_completed: AtomicBool::new(false),
+                cleanup_on_drop,
                 cleanup_lock: Mutex::new(()),
                 metrics,
             }),
@@ -286,6 +374,15 @@ impl SpillManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn run_tracked_io_for_test<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        self.state.run_io(operation)
+    }
+
+    #[cfg(test)]
     fn activity_lock_held(&self) -> bool {
         self.state.activity_lock.lock().is_some()
     }
@@ -328,6 +425,18 @@ impl SpillManager {
 }
 
 impl State {
+    fn run_io<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let permit = self.io_tracker.start()?;
+        self.io_pool.run_cancelable(&self.control, move || {
+            let _permit = permit;
+            operation()
+        })
+    }
+
     fn ensure_active(&self) -> Result<()> {
         if self.cleaned.load(Ordering::Acquire) {
             Err(Error::Cancelled)
@@ -351,12 +460,10 @@ impl State {
     fn remove_file(&self, spill_file: &SpillFile) -> Result<()> {
         let path = spill_file.path().to_path_buf();
         let remove_path = path.clone();
-        self.io_pool.run_cancelable(&self.control, move || {
-            match std::fs::remove_file(&remove_path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(Error::io(Some(remove_path), error)),
-            }
+        self.run_io(move || match std::fs::remove_file(&remove_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::io(Some(remove_path), error)),
         })?;
         // Retained quota charges are released only after physical deletion has
         // succeeded (or the path was already absent).
@@ -365,8 +472,15 @@ impl State {
     }
 
     fn cleanup(&self) -> Result<()> {
+        if self.cleanup_completed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let _cleanup = self.cleanup_lock.lock();
+        if self.cleanup_completed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.cleaned.store(true, Ordering::Release);
+        self.io_tracker.close_and_wait();
         // Do not unlink a directory while its advisory-lock file is still
         // open. That is legal on local Unix filesystems, but shared macOS/Linux
         // mounts can expose an empty ghost directory when the handle closes
@@ -400,19 +514,33 @@ impl State {
         })?;
         self.files.clear();
         self.io_pool
-            .run_cleanup(move || io::sync_parent_directory(&sync_path))
+            .run_cleanup(move || io::sync_parent_directory(&sync_path))?;
+        self.cleanup_completed.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        if let Err(error) = self.cleanup() {
+        if self.cleanup_completed.load(Ordering::Acquire) {
+            return;
+        }
+        if self.cleanup_on_drop {
+            if let Err(error) = self.cleanup() {
+                self.files.retain_charges_on_drop();
+                tracing::error!(%error, directory = %self.directory.display(), "spill cleanup failed");
+            }
+        } else {
             self.files.retain_charges_on_drop();
-            tracing::error!(%error, directory = %self.directory.display(), "spill cleanup failed");
+            tracing::error!(
+                directory = %self.directory.display(),
+                "spill state dropped before background cleanup completed; retaining orphan and quota charges"
+            );
         }
     }
 }
 
+#[cfg(test)]
 fn cleanup_weak(state: Weak<State>) {
     if let Some(state) = state.upgrade()
         && let Err(error) = state.cleanup()

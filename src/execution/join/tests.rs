@@ -7,14 +7,45 @@ use arrow::{
 };
 use futures::TryStreamExt;
 
-use super::{join, sort_merge, spill};
+use super::{evaluate_keys_accounted, join, sort_merge, spill};
 use crate::{
-    runtime::{MemoryPool, QueryContext, QueryMetricsSnapshot, boxed_record_batch_stream},
+    runtime::{
+        BatchEnvelope, MemoryPool, QueryContext, QueryMetricsSnapshot, boxed_record_batch_stream,
+    },
     sql::{BoundExpr, JoinType},
 };
 
 const MEMORY_LIMIT: usize = 1_536 << 10;
 const RIGHT_DUPLICATES: i64 = 12_000;
+
+#[test]
+fn direct_column_keys_do_not_charge_the_input_buffer_twice() {
+    let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec!["x".repeat(256 << 10)]))],
+    )
+    .unwrap();
+    let input_bytes = batch.get_array_memory_size();
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(input_bytes + 4_096), temp.path()).unwrap();
+    let input = BatchEnvelope::try_new(batch, &context.memory, "join key input").unwrap();
+    let before = context.memory.used();
+
+    let keys = evaluate_keys_accounted(
+        &[BoundExpr::column(0, DataType::Utf8, "key")],
+        input.batch(),
+        &context,
+        "join key alias",
+    )
+    .unwrap();
+
+    assert!(keys.memory_size() < 1_024);
+    assert_eq!(context.memory.used(), before + keys.memory_size());
+    drop(keys);
+    drop(input);
+    assert_eq!(context.memory.used(), 0);
+}
 
 #[tokio::test]
 async fn output_materialization_transfers_its_workspace_into_the_batch_lease() {
@@ -38,11 +69,12 @@ async fn output_materialization_transfers_its_workspace_into_the_batch_lease() {
     let temp = tempfile::tempdir().unwrap();
     let context = QueryContext::shared(MemoryPool::new(1 << 20), temp.path()).unwrap();
 
-    let output = super::probe::build_output_envelope(
+    let output = super::output::build_output_envelope(
         &left,
         &right,
         &[0, 0],
         &[Some(0), Some(1)],
+        None,
         JoinType::Inner,
         output_schema(JoinType::Inner, &left_schema, &right_schema),
         &context,
@@ -552,6 +584,7 @@ async fn skew_fallback_rejects_a_decoded_spill_batch_over_budget() {
         vec![BoundExpr::column(0, DataType::Int64, "right.key")],
         Arc::clone(&left_schema),
         Arc::clone(&right_schema),
+        super::condition::JoinPredicates::new(None, None, &left_schema, &right_schema),
         JoinType::Inner,
         output_schema(JoinType::Inner, &left_schema, &right_schema),
         Arc::clone(&context),
@@ -617,8 +650,10 @@ async fn small_frozen_build_is_probed_by_multiple_lanes() {
             BoundExpr::column(0, DataType::Int64, "left.key"),
             BoundExpr::column(0, DataType::Int64, "right.key"),
         )],
-        left_schema,
-        right_schema,
+        None,
+        None,
+        Arc::clone(&left_schema),
+        Arc::clone(&right_schema),
         JoinType::Inner,
         schema,
         Arc::clone(&context),
@@ -697,8 +732,10 @@ async fn long_string_hash_keys_are_accounted_and_switch_to_grace_join() {
             BoundExpr::column(0, DataType::Utf8, "left.key"),
             BoundExpr::column(0, DataType::Utf8, "right.key"),
         )],
-        left_schema,
-        right_schema,
+        None,
+        None,
+        Arc::clone(&left_schema),
+        Arc::clone(&right_schema),
         JoinType::Inner,
         output_schema,
         Arc::clone(&context),
@@ -768,6 +805,8 @@ async fn float_key_sort_merge_matches_hash_join_for_zero_and_nan() {
             BoundExpr::column(0, DataType::Float64, "left.key"),
             BoundExpr::column(0, DataType::Float64, "right.key"),
         )],
+        None,
+        None,
         Arc::clone(&left_schema),
         Arc::clone(&right_schema),
         JoinType::Inner,
@@ -800,8 +839,9 @@ async fn float_key_sort_merge_matches_hash_join_for_zero_and_nan() {
         task,
         vec![BoundExpr::column(0, DataType::Float64, "left.key")],
         vec![BoundExpr::column(0, DataType::Float64, "right.key")],
-        left_schema,
-        right_schema,
+        Arc::clone(&left_schema),
+        Arc::clone(&right_schema),
+        super::condition::JoinPredicates::new(None, None, &left_schema, &right_schema),
         JoinType::Inner,
         schema,
         Arc::clone(&merge_context),
@@ -853,6 +893,8 @@ async fn abandoning_parallel_probe_releases_frozen_build_memory() {
             BoundExpr::column(0, DataType::Int64, "left.key"),
             BoundExpr::column(0, DataType::Int64, "right.key"),
         )],
+        None,
+        None,
         left_schema,
         right_schema,
         JoinType::Inner,
@@ -864,6 +906,7 @@ async fn abandoning_parallel_probe_releases_frozen_build_memory() {
     let first = output.try_next().await.unwrap().unwrap();
     drop(first);
     drop(output);
+    context.cleanup_spill_after_tasks().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while context.memory.used() != 0 {
             tokio::task::yield_now().await;
@@ -898,7 +941,7 @@ async fn abandoning_parallel_grace_join_cleans_files_and_leases() {
     let schema = output_schema(JoinType::Inner, &left_schema, &right_schema);
     let temp = tempfile::tempdir().unwrap();
     let context = QueryContext::shared(MemoryPool::new(2 << 20), temp.path()).unwrap();
-    context.configure_compute_lanes(4);
+    context.configure_compute_lanes_unbounded_for_test(4);
     let spill_directory = context.spill.directory().to_path_buf();
     let mut output = join(
         left,
@@ -907,6 +950,8 @@ async fn abandoning_parallel_grace_join_cleans_files_and_leases() {
             BoundExpr::column(0, DataType::Int64, "left.key"),
             BoundExpr::column(0, DataType::Int64, "right.key"),
         )],
+        None,
+        None,
         left_schema,
         right_schema,
         JoinType::Inner,
@@ -918,6 +963,7 @@ async fn abandoning_parallel_grace_join_cleans_files_and_leases() {
     let first = output.try_next().await.unwrap().unwrap();
     drop(first);
     drop(output);
+    context.cleanup_spill_after_tasks().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while context.memory.used() != 0 {
             tokio::task::yield_now().await;
@@ -925,6 +971,11 @@ async fn abandoning_parallel_grace_join_cleans_files_and_leases() {
     })
     .await
     .expect("parallel Grace join lanes did not release their reservations");
+    drop(context);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while spill_directory.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert!(!spill_directory.exists());
 }
 
@@ -997,7 +1048,7 @@ async fn run_parallel_grace_join(join_type: JoinType) -> (usize, QueryMetricsSna
     let schema = output_schema(join_type, &left_schema, &right_schema);
     let temp = tempfile::tempdir().unwrap();
     let context = QueryContext::shared(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
-    context.configure_compute_lanes(4);
+    context.configure_compute_lanes_unbounded_for_test(4);
     let batches = join(
         left,
         right,
@@ -1005,6 +1056,8 @@ async fn run_parallel_grace_join(join_type: JoinType) -> (usize, QueryMetricsSna
             BoundExpr::column(0, DataType::Int64, "left.key"),
             BoundExpr::column(0, DataType::Int64, "right.key"),
         )],
+        None,
+        None,
         left_schema,
         right_schema,
         join_type,
@@ -1070,6 +1123,8 @@ async fn run_join_with_limit(
             BoundExpr::column(0, DataType::Int64, "left.key"),
             BoundExpr::column(0, DataType::Int64, "right.key"),
         )],
+        None,
+        None,
         left_schema,
         right_schema,
         join_type,
@@ -1110,15 +1165,22 @@ fn schemas() -> (SchemaRef, SchemaRef) {
 }
 
 fn output_schema(join_type: JoinType, left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
-    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+    if matches!(
+        join_type,
+        JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti
+    ) {
         return Arc::clone(left);
     }
     let mut fields = left.fields().iter().cloned().collect::<Vec<_>>();
+    if join_type == JoinType::Mark {
+        fields.push(Arc::new(Field::new("marker", DataType::Boolean, true)));
+        return Arc::new(Schema::new(fields));
+    }
     fields.extend(right.fields().iter().map(|field| {
         Arc::new(Field::new(
             field.name(),
             field.data_type().clone(),
-            join_type == JoinType::Left || field.is_nullable(),
+            matches!(join_type, JoinType::Left | JoinType::LeftSingle) || field.is_nullable(),
         ))
     }));
     Arc::new(Schema::new(fields))

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, BooleanArray, Int64Array, StringArray},
+    array::{
+        Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+        TimestampMicrosecondArray,
+    },
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -23,7 +26,64 @@ fn plans_distinct_as_grouping() {
     };
     let explain = plan.explain();
     assert!(explain.starts_with("Aggregate groups=[\"1\"]"));
+    assert!(explain.contains("distinct=group_key_dedup"));
     assert!(explain.contains("Projection [\"1\"]"));
+}
+
+#[test]
+fn explain_reports_decorrelation_and_spill_strategies() {
+    let StatementPlan::Query(plan) = plan_sql(
+        &Catalog::default(),
+        "SELECT count(DISTINCT 1) ORDER BY count(DISTINCT 1)",
+    )
+    .unwrap() else {
+        panic!("expected query plan");
+    };
+    let explain = plan.explain();
+    assert!(explain.contains("dedup:tagged_full_key"), "{explain}");
+    assert!(explain.contains("Aggregate") && explain.contains("spill=recursive_hash"));
+    assert!(explain.contains("Sort") && explain.contains("spill=external_ipc_lz4"));
+
+    let catalog = Catalog::default();
+    register_ids(&catalog, "left_ids", vec![Some(1)]);
+    register_ids(&catalog, "right_ids", vec![Some(1)]);
+    let StatementPlan::Query(plan) = plan_sql(
+        &catalog,
+        "SELECT l.id FROM left_ids l WHERE EXISTS (\
+             SELECT 1 FROM right_ids r WHERE r.id = l.id\
+         )",
+    )
+    .unwrap() else {
+        panic!("expected query plan");
+    };
+    let explain = plan.explain();
+    assert!(explain.contains("SemiJoin"), "{explain}");
+    assert!(explain.contains("decorrelation=complete"), "{explain}");
+    assert!(explain.contains("spill=grace_hash"), "{explain}");
+}
+
+#[test]
+fn binds_supported_distinct_aggregates_and_rejects_unsupported_shapes() {
+    let StatementPlan::Query(plan) = plan_sql(
+        &Catalog::default(),
+        "SELECT count(DISTINCT 1), sum(DISTINCT 2), avg(DISTINCT 3), \
+         min(DISTINCT 4), max(DISTINCT 5)",
+    )
+    .unwrap() else {
+        panic!("expected query plan");
+    };
+    let explain = plan.explain();
+    assert!(explain.contains("distinct=count:3,dedup:tagged_full_key"));
+
+    for sql in [
+        "SELECT count(DISTINCT *)",
+        "SELECT count(DISTINCT 1, 2)",
+        "SELECT sum(DISTINCT *)",
+        "SELECT sum(1 ORDER BY 1)",
+        "SELECT count(1) FILTER (WHERE TRUE)",
+    ] {
+        assert!(plan_sql(&Catalog::default(), sql).is_err(), "{sql}");
+    }
 }
 
 #[test]
@@ -89,6 +149,51 @@ async fn executes_year_month_and_day_date_intervals() {
 }
 
 #[tokio::test]
+async fn timestamp_typed_literals_honor_microsecond_precision() {
+    let batches = run("SELECT TIMESTAMP(0) '2024-02-29 12:34:56.999999', \
+                TIMESTAMP(3) '2024-02-29 12:34:56.123999', \
+                TIMESTAMP(6) '1969-12-31 23:59:59.123456', \
+                TIMESTAMP(3) '1969-12-31 23:59:59.123456', \
+                TIMESTAMP(3) '1969-12-31 23:59:59.8765'")
+    .await;
+    let batch = &batches[0];
+    let values = (0..5)
+        .map(|column| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values[0] % 1_000_000, 0);
+    assert_eq!(values[1] % 1_000_000, 124_000);
+    assert_eq!(values[2], -876_544);
+    assert_eq!(values[3], -877_000);
+    assert_eq!(values[4], -124_000);
+
+    let error = plan_sql(
+        &Catalog::default(),
+        "SELECT TIMESTAMP(7) '2024-02-29 12:34:56.1234567'",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("precision above 6"), "{error}");
+
+    let error = plan_sql(
+        &Catalog::default(),
+        "SELECT CAST('2024-02-29 12:34:56.123456' AS TIMESTAMP(3))",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("precision-qualified TIMESTAMP casts"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn explain_analyze_executes_and_reports_global_metrics() {
     let batches = run("EXPLAIN ANALYZE SELECT 1").await;
     let output = batches[0]
@@ -103,7 +208,7 @@ async fn explain_analyze_executes_and_reports_global_metrics() {
 }
 
 #[tokio::test]
-async fn folds_constants_without_hiding_execution_errors() {
+async fn folds_constants_and_short_circuits_inactive_rows() {
     let StatementPlan::Query(plan) =
         plan_sql(&Catalog::default(), "SELECT 1 + 2 * 3 WHERE TRUE AND 2 > 1").unwrap()
     else {
@@ -116,8 +221,9 @@ async fn folds_constants_without_hiding_execution_errors() {
 
     for sql in [
         "SELECT 1 / 0",
-        "SELECT FALSE AND (9223372036854775807 + 1 > 0)",
-        "SELECT TRUE OR (9223372036854775807 + 1 > 0)",
+        "SELECT CAST(NULL AS BOOLEAN) AND (9223372036854775807 + 1 > 0)",
+        "SELECT CAST(NULL AS BOOLEAN) OR (9223372036854775807 + 1 > 0)",
+        "SELECT CAST(1000 AS DECIMAL(3, 2))",
     ] {
         let plan = plan_sql(&Catalog::default(), sql).unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -130,10 +236,164 @@ async fn folds_constants_without_hiding_execution_errors() {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("division by zero") || error.contains("overflow"),
+            error.contains("division by zero")
+                || error.contains("overflow")
+                || error.contains("strict CAST"),
             "unexpected error for {sql}: {error}"
         );
     }
+
+    let short = run("SELECT CASE WHEN FALSE THEN 1 / 0 ELSE 0 END, \
+                CASE WHEN CAST(NULL AS BOOLEAN) THEN 1 / 0 ELSE 1 END, \
+                FALSE AND (1 / 0 = 0), TRUE OR (1 / 0 = 0), \
+                coalesce(7, 1 / 0), nullif(CAST(NULL AS BIGINT), 1 / 0)")
+    .await;
+    let batch = &short[0];
+    for (column, expected) in [(0, 0), (1, 1), (4, 7)] {
+        assert_eq!(
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap()
+                .value(0),
+            f64::from(expected)
+        );
+    }
+    assert!(
+        !batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0)
+    );
+    assert!(
+        batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0)
+    );
+    assert!(batch.column(5).is_null(0));
+}
+
+#[tokio::test]
+async fn short_circuit_masks_are_applied_per_row() {
+    let catalog = Catalog::default();
+    register_ids(&catalog, "ids", vec![Some(0), Some(2)]);
+    let batches = run_with_catalog(
+        &catalog,
+        "SELECT CASE WHEN id = 0 THEN 0 ELSE 10 / id END, \
+                id <> 0 AND 10 / id > 0, \
+                id = 0 OR 10 / id > 0, \
+                coalesce(id, 9223372036854775807 + 1) \
+         FROM ids ORDER BY id",
+    )
+    .await;
+    let batch = &batches[0];
+    let case = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!((case.value(0), case.value(1)), (0.0, 5.0));
+    let and = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    let or = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert_eq!((and.value(0), and.value(1)), (false, true));
+    assert_eq!((or.value(0), or.value(1)), (true, true));
+    let coalesce = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!((coalesce.value(0), coalesce.value(1)), (0, 2));
+}
+
+#[tokio::test]
+async fn nullif_preserves_its_left_type_and_decimal_branches_widen_losslessly() {
+    let batches = run("SELECT nullif(1, 2.5), \
+                coalesce(CAST(NULL AS DECIMAL(3, 2)), 1000), \
+                CASE WHEN false THEN CAST(0 AS DECIMAL(3, 2)) ELSE 1000 END")
+    .await;
+    let batch = &batches[0];
+    let nullif = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(nullif.value(0), 1);
+    for column in 1..=2 {
+        let value = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(value.value(0), 100_000);
+        assert_eq!(value.data_type(), &DataType::Decimal128(21, 2));
+    }
+}
+
+#[tokio::test]
+async fn decimal_rounding_adjusts_output_scale_without_invalid_payloads() {
+    let batches = run("SELECT ceil(CAST(99.99 AS DECIMAL(4, 2))), \
+                floor(CAST(-99.99 AS DECIMAL(4, 2))), \
+                round(CAST(99.99 AS DECIMAL(4, 2)), 0), \
+                round(CAST(12.345 AS DECIMAL(8, 3)), 2), \
+                round(CAST(12.345 AS DECIMAL(8, 3)), CAST(2 AS INTEGER)), \
+                round(CAST(12.345 AS DECIMAL(8, 3)), 1 + 1)")
+    .await;
+    let batch = &batches[0];
+    for (column, value) in [(0, 100), (1, -100), (2, 100)] {
+        let array = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(array.value(0), value);
+        assert_eq!(array.data_type(), &DataType::Decimal128(4, 0));
+    }
+    for column in 3..=5 {
+        let rounded = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(rounded.value(0), 1_235);
+        assert_eq!(rounded.data_type(), &DataType::Decimal128(8, 2));
+    }
+}
+
+#[tokio::test]
+async fn integer_ceil_and_floor_follow_duckdb_double_semantics() {
+    let batches = run("SELECT ceil(CAST(9007199254740993 AS BIGINT)), \
+                floor(CAST(9007199254740993 AS BIGINT)), \
+                round(CAST(9007199254740993 AS BIGINT))")
+    .await;
+    let batch = &batches[0];
+    for column in 0..=1 {
+        let value = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(value.value(0), 9_007_199_254_740_992.0);
+    }
+    let rounded = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(rounded.value(0), 9_007_199_254_740_993);
 }
 
 #[tokio::test]
@@ -200,8 +460,31 @@ async fn semi_join_preserves_left_multiplicity_only() {
     assert_eq!(values, vec![2, 2]);
 }
 
+#[tokio::test]
+async fn correlated_scalar_subquery_enforces_per_outer_row_cardinality() {
+    let catalog = Catalog::default();
+    register_ids(&catalog, "left_ids", vec![Some(2)]);
+    register_ids(&catalog, "right_ids", vec![Some(2), Some(2)]);
+    let plan = plan_sql(
+        &catalog,
+        "SELECT l.id, (SELECT r.id FROM right_ids AS r WHERE r.id = l.id) \
+         FROM left_ids AS l",
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(1 << 20), temp.path()).unwrap();
+    let error = execute(plan, context)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("scalar subquery returned more than one row"));
+}
+
 #[test]
-fn rejects_correlated_subqueries_explicitly() {
+fn rejects_correlation_without_an_inner_equality_key() {
     let error = plan_sql(
         &Catalog::default(),
         "SELECT d.value FROM (SELECT 1 AS value) d \
@@ -209,7 +492,7 @@ fn rejects_correlated_subqueries_explicitly() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("correlated subqueries are not supported"));
+    assert!(error.contains("at least one outer-to-inner equality key"));
 }
 
 async fn run(sql: &str) -> Vec<RecordBatch> {

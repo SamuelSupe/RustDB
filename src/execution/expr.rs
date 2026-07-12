@@ -7,8 +7,8 @@ use arrow::{
         types::{IntervalDayTimeType, IntervalYearMonthType},
     },
     compute::{
-        cast, filter_record_batch,
-        kernels::{boolean, cmp, numeric, zip::zip},
+        filter_record_batch,
+        kernels::{boolean, cmp, numeric},
     },
     record_batch::RecordBatch,
 };
@@ -17,15 +17,41 @@ use crate::runtime::estimate_array_bytes;
 use crate::sql::{BinaryOp, BoundExpr, ExprKind, ScalarValue, UnaryOp};
 use crate::{Error, Result};
 
+mod short_circuit;
+
 pub(crate) fn evaluate(expr: &BoundExpr, batch: &RecordBatch) -> Result<ArrayRef> {
     match &expr.kind {
         ExprKind::Column(index) => batch.columns().get(*index).cloned().ok_or_else(|| {
             Error::Internal(format!("column index {index} is outside the input schema"))
         }),
+        ExprKind::OuterRef { .. } => Err(Error::Internal(
+            "OuterRef reached physical expression execution after decorrelation".into(),
+        )),
+        ExprKind::DeferredGroup(_) | ExprKind::DeferredAggregate(_) => Err(Error::Internal(
+            "deferred aggregate result reached physical expression execution".into(),
+        )),
         ExprKind::Literal(value) => literal_array(value, batch.num_rows()),
         ExprKind::Cast { expr: input } => {
             let input = evaluate(input, batch)?;
-            Ok(cast(input.as_ref(), &expr.data_type)?)
+            super::functions::cast_array(&input, &expr.data_type)
+        }
+        ExprKind::ScalarFunction { function, args }
+            if matches!(
+                function,
+                crate::sql::ScalarFunction::Coalesce | crate::sql::ScalarFunction::NullIf
+            ) =>
+        {
+            short_circuit::null_function(*function, args, expr, batch)
+        }
+        ExprKind::ScalarFunction { function, args } => {
+            let args = args
+                .iter()
+                .map(|arg| evaluate(arg, batch))
+                .collect::<Result<Vec<_>>>()?;
+            super::functions::evaluate(*function, &args, &expr.data_type)
+        }
+        ExprKind::Binary { left, op, right } if matches!(op, BinaryOp::And | BinaryOp::Or) => {
+            short_circuit::boolean(*op, left, right, batch)
         }
         ExprKind::Binary { left, op, right } => {
             let left = evaluate(left, batch)?;
@@ -61,15 +87,7 @@ pub(crate) fn evaluate(expr: &BoundExpr, batch: &RecordBatch) -> Result<ArrayRef
         ExprKind::Case {
             when_then,
             else_expr,
-        } => {
-            let mut output = evaluate(else_expr, batch)?;
-            for (condition, result) in when_then.iter().rev() {
-                let condition = evaluate(condition, batch)?;
-                let result = evaluate(result, batch)?;
-                output = zip(as_boolean(&condition)?, &result, &output)?;
-            }
-            Ok(output)
-        }
+        } => short_circuit::case(when_then, else_expr, expr, batch),
     }
 }
 
@@ -119,7 +137,11 @@ struct ExpressionMemory {
 fn expression_memory(expression: &BoundExpr, batch: &RecordBatch) -> ExpressionMemory {
     let output = expression_output_bytes(expression, batch);
     match &expression.kind {
-        ExprKind::Column(_) | ExprKind::Literal(_) => ExpressionMemory {
+        ExprKind::Column(_)
+        | ExprKind::OuterRef { .. }
+        | ExprKind::DeferredGroup(_)
+        | ExprKind::DeferredAggregate(_)
+        | ExprKind::Literal(_) => ExpressionMemory {
             output,
             peak: output,
         },
@@ -130,8 +152,34 @@ fn expression_memory(expression: &BoundExpr, batch: &RecordBatch) -> ExpressionM
                 peak: input.peak.max(input.output.saturating_add(output)),
             }
         }
-        ExprKind::Binary { left, right, .. }
-        | ExprKind::Like {
+        ExprKind::ScalarFunction { function, args } => {
+            let mut retained = 0usize;
+            let mut peak = output;
+            for arg in args {
+                let estimate = expression_memory(arg, batch);
+                peak = peak.max(retained.saturating_add(estimate.peak));
+                retained = retained.saturating_add(estimate.output);
+            }
+            let mut estimate = ExpressionMemory {
+                output,
+                peak: peak.max(retained.saturating_add(output)),
+            };
+            if matches!(
+                function,
+                crate::sql::ScalarFunction::Coalesce | crate::sql::ScalarFunction::NullIf
+            ) {
+                estimate.peak = estimate.peak.saturating_add(masked_input_bytes(batch));
+            }
+            estimate
+        }
+        ExprKind::Binary { left, op, right } => {
+            let mut estimate = binary_expression_memory(left, right, output, batch);
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                estimate.peak = estimate.peak.saturating_add(masked_input_bytes(batch));
+            }
+            estimate
+        }
+        ExprKind::Like {
             expr: left,
             pattern: right,
             ..
@@ -166,9 +214,19 @@ fn expression_memory(expression: &BoundExpr, batch: &RecordBatch) -> ExpressionM
                     );
                 current = ExpressionMemory { output, peak };
             }
-            ExpressionMemory { output, peak }
+            ExpressionMemory {
+                output,
+                peak: peak.saturating_add(masked_input_bytes(batch)),
+            }
         }
     }
+}
+
+fn masked_input_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .get_array_memory_size()
+        .saturating_add(batch.num_rows().saturating_mul(std::mem::size_of::<u64>()))
+        .saturating_add(512)
 }
 
 fn binary_expression_memory(
@@ -413,6 +471,9 @@ fn literal_array(value: &ScalarValue, len: usize) -> Result<ArrayRef> {
                 .with_precision_and_scale(*precision, *scale)?,
         ),
         ScalarValue::Date32(value) => Arc::new(Date32Array::from(vec![Some(*value); len])),
+        ScalarValue::TimestampMicrosecond(value) => {
+            super::functions::timestamp_literal(*value, len)
+        }
         ScalarValue::DayInterval(days) => Arc::new(IntervalDayTimeArray::from(vec![
             Some(
                 IntervalDayTimeType::make_value(*days, 0)
@@ -528,7 +589,7 @@ mod tests {
     use arrow::{
         array::{
             Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
-            RecordBatch, StringArray,
+            RecordBatch, StringArray, TimestampMicrosecondArray,
         },
         datatypes::{DataType, Field, Schema},
     };
@@ -692,6 +753,186 @@ mod tests {
             .unwrap();
         assert_eq!(decimal.value(0), 2_468);
         assert_eq!(decimal.data_type(), &DataType::Decimal128(10, 2));
+    }
+
+    #[tokio::test]
+    async fn evaluates_v03_scalar_functions_and_substring_boundaries() {
+        let catalog = Catalog::default();
+        let plan = crate::sql::plan_sql(
+            &catalog,
+            "SELECT \
+                substring('abcdef' FROM 0 FOR 2), \
+                substring('abcdef' FROM 0 FOR 1), \
+                substring('abcdef' FROM 0 FOR 3), \
+                substring('abcdef' FROM -8 FOR 5), \
+                substring('abcdef' FROM -1 FOR 3), \
+                length('你好'), lower('AbC'), upper('AbC'), trim('  x  '), \
+                concat('a', NULL, 'b'), replace('abcabc', 'b', 'x'), \
+                starts_with('alpha', 'al'), ends_with('alpha', 'ha'), contains('alpha', 'ph'), \
+                coalesce(NULL, 'fallback'), nullif('same', 'same'), \
+                abs(-7), ceil(CAST(1.2 AS DOUBLE)), floor(CAST(-1.2 AS DOUBLE)), \
+                round(CAST(1.25 AS DOUBLE), 1)",
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let context = QueryContext::shared(MemoryPool::new(1 << 20), temp.path()).unwrap();
+        let batches = execute(plan, context)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        let strings = ["a", "", "ab", "abc", "f"];
+        for (index, expected) in strings.iter().enumerate() {
+            assert_eq!(
+                batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                *expected
+            );
+        }
+        assert_eq!(
+            batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+        for (index, expected) in [
+            (6, "abc"),
+            (7, "ABC"),
+            (8, "x"),
+            (9, "ab"),
+            (10, "axcaxc"),
+            (14, "fallback"),
+        ] {
+            assert_eq!(
+                batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+        for index in 11..=13 {
+            assert!(
+                batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .value(0)
+            );
+        }
+        assert!(batch.column(15).is_null(0));
+        assert_eq!(
+            batch
+                .column(16)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+        for (index, expected) in [(17, 2.0), (18, -2.0), (19, 1.3)] {
+            assert_eq!(
+                batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluates_microsecond_timestamp_casts_functions_and_aggregate_wrapper() {
+        let catalog = Catalog::default();
+        let plan = crate::sql::plan_sql(
+            &catalog,
+            "SELECT \
+                extract(year FROM min(TIMESTAMP '1995-03-15 12:34:56.123456')), \
+                date_part('month', min(TIMESTAMP '1995-03-15 12:34:56.123456')), \
+                day(min(TIMESTAMP '1995-03-15 12:34:56.123456')), \
+                date_trunc('day', min(TIMESTAMP '1995-03-15 12:34:56.123456')), \
+                CAST(CAST('1998-12-01 12:30:45.123456' AS TIMESTAMP) AS VARCHAR), \
+                CAST(TIMESTAMP '1998-12-01 12:30:45.123456' AS DATE), \
+                TIMESTAMP '2000-01-31 01:02:03' + INTERVAL '1' MONTH, \
+                TIMESTAMP '1998-12-01 12:30:45.123456' - INTERVAL '1' DAY",
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let context = QueryContext::shared(MemoryPool::new(1 << 20), temp.path()).unwrap();
+        let batches = execute(plan, context)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        for (index, expected) in [(0, 1995), (1, 3), (2, 15)] {
+            assert_eq!(
+                batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+        let parse = crate::sql::temporal::parse_timestamp_microsecond;
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            crate::sql::temporal::parse_date32("1995-03-15").unwrap()
+        );
+        assert_eq!(
+            batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "1998-12-01 12:30:45.123456"
+        );
+        assert_eq!(
+            batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            crate::sql::temporal::parse_date32("1998-12-01").unwrap()
+        );
+        for (index, expected) in [
+            (6, "2000-02-29 01:02:03"),
+            (7, "1998-11-30 12:30:45.123456"),
+        ] {
+            assert_eq!(
+                batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value(0),
+                parse(expected).unwrap()
+            );
+        }
     }
 
     #[tokio::test]
