@@ -50,6 +50,27 @@ fn decorrelates_scalar_aggregate_and_preserves_count_empty_value() {
 }
 
 #[test]
+fn compacts_correlated_aggregate_input_before_the_domain_join() {
+    let plan = explain(
+        "SELECT d.partkey, \
+                (SELECT avg(i.quantity) \
+                 FROM (SELECT 1 AS partkey, 10 AS quantity, 99 AS unused_payload) AS i \
+                 WHERE i.partkey = d.partkey) \
+         FROM (SELECT 1 AS partkey) AS d",
+    );
+    assert!(
+        plan.contains("Projection [\"partkey\", \"quantity\", \"__rustdb_inner_match\"]"),
+        "{plan}"
+    );
+    assert!(
+        !plan.contains(
+            "Projection [\"partkey\", \"quantity\", \"unused_payload\", \"__rustdb_inner_match\"]"
+        ),
+        "{plan}"
+    );
+}
+
+#[test]
 fn uses_left_single_for_non_aggregate_scalar_subquery() {
     let plan = explain(
         "SELECT d.value, \

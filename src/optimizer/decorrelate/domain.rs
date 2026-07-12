@@ -13,6 +13,8 @@ use super::rewrite::{
     combine_and, outer_to_domain_columns, remap_columns, residual_to_domain_join, shift_columns,
 };
 
+mod compact;
+
 pub(super) fn is_aggregate(plan: &LogicalPlan) -> bool {
     let LogicalPlan::Projection { input, .. } = plan else {
         return false;
@@ -36,7 +38,7 @@ pub(super) fn rewrite(
     } = decompose(right)?;
     let original_group_count = groups.len();
     let aggregate_count = aggregates.len();
-    let pulled = pull(input)?;
+    let pulled = compact::apply(pull(input)?, &mut groups, &mut aggregates)?;
     let parameters = correlation_parameters(&pulled.correlations)?;
     if parameters.is_empty() {
         return Err(Error::Internal(
@@ -93,12 +95,10 @@ pub(super) fn rewrite(
     };
 
     for group in &mut groups {
-        remap_columns(group, &pulled.old_to_new)?;
         shift_columns(group, domain_width)?;
     }
     for aggregate in &mut aggregates {
         if let Some(expression) = &mut aggregate.expr {
-            remap_columns(expression, &pulled.old_to_new)?;
             shift_columns(expression, domain_width)?;
             *expression =
                 gate_aggregate_argument(expression.clone(), domain_width + sentinel_index);
