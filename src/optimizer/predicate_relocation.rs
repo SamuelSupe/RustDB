@@ -1,4 +1,4 @@
-use crate::sql::{BinaryOp, BoundExpr, ExprKind, JoinType, LogicalPlan, UnaryOp};
+use crate::sql::{BoundExpr, ExprKind, JoinType, LogicalPlan};
 
 /// Moves structurally infallible, single-side predicates below joins that
 /// preserve their semantics. This is intentionally narrower than general
@@ -96,7 +96,7 @@ fn relocate(
     input: LogicalPlan,
     schema: crate::sql::PlanSchema,
 ) -> LogicalPlan {
-    if !infallible(&predicate) {
+    if !predicate.is_structurally_infallible() {
         return filter(input, predicate, schema);
     }
     match input {
@@ -104,7 +104,7 @@ fn relocate(
             input,
             predicate: existing,
             ..
-        } if infallible(&existing) => {
+        } if existing.is_structurally_infallible() => {
             let child_schema = input.schema().clone();
             LogicalPlan::Filter {
                 input: Box::new(relocate(predicate, *input, child_schema)),
@@ -220,10 +220,12 @@ fn inner_predicates_infallible(
     residual: Option<&BoundExpr>,
     null_aware: Option<&(BoundExpr, BoundExpr)>,
 ) -> bool {
-    on.iter()
-        .all(|(left, right)| infallible(left) && infallible(right))
-        && residual.is_none_or(infallible)
-        && null_aware.is_none_or(|(left, right)| infallible(left) && infallible(right))
+    on.iter().all(|(left, right)| {
+        left.is_structurally_infallible() && right.is_structurally_infallible()
+    }) && residual.is_none_or(BoundExpr::is_structurally_infallible)
+        && null_aware.is_none_or(|(left, right)| {
+            left.is_structurally_infallible() && right.is_structurally_infallible()
+        })
 }
 
 fn rebase_right_columns(expression: &mut BoundExpr, left_width: usize) {
@@ -259,39 +261,6 @@ fn rebase_right_columns(expression: &mut BoundExpr, left_width: usize) {
         | ExprKind::OuterRef { .. }
         | ExprKind::DeferredGroup(_)
         | ExprKind::DeferredAggregate(_) => {}
-    }
-}
-
-fn infallible(expression: &BoundExpr) -> bool {
-    match &expression.kind {
-        ExprKind::Column(_) | ExprKind::Literal(_) => true,
-        ExprKind::Binary {
-            left,
-            op:
-                BinaryOp::Eq
-                | BinaryOp::NotEq
-                | BinaryOp::Lt
-                | BinaryOp::LtEq
-                | BinaryOp::Gt
-                | BinaryOp::GtEq
-                | BinaryOp::And
-                | BinaryOp::Or,
-            right,
-        } => infallible(left) && infallible(right),
-        ExprKind::Unary {
-            op: UnaryOp::Not,
-            expr,
-        }
-        | ExprKind::IsNull { expr, .. } => infallible(expr),
-        ExprKind::OuterRef { .. }
-        | ExprKind::DeferredGroup(_)
-        | ExprKind::DeferredAggregate(_)
-        | ExprKind::Binary { .. }
-        | ExprKind::Unary { .. }
-        | ExprKind::Like { .. }
-        | ExprKind::Case { .. }
-        | ExprKind::Cast { .. }
-        | ExprKind::ScalarFunction { .. } => false,
     }
 }
 

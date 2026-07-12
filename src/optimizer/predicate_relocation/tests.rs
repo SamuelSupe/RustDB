@@ -6,7 +6,7 @@ use crate::sql::{
     BinaryOp, BoundExpr, ExprKind, JoinType, LogicalPlan, PlanSchema, ScalarFunction, ScalarValue,
 };
 
-use super::{apply, infallible};
+use super::apply;
 
 #[test]
 fn only_structurally_infallible_predicates_can_move() {
@@ -18,33 +18,42 @@ fn only_structurally_infallible_predicates_can_move() {
         literal.clone(),
         DataType::Boolean,
     );
-    assert!(infallible(&comparison));
+    assert!(comparison.is_structurally_infallible());
 
     let divide = binary(column.clone(), BinaryOp::Divide, literal, DataType::Int64);
-    assert!(!infallible(&divide));
-    assert!(!infallible(&BoundExpr {
-        kind: ExprKind::Cast {
-            expr: Box::new(column.clone()),
-        },
-        data_type: DataType::Utf8,
-        display_name: "CAST(value AS VARCHAR)".into(),
-    }));
-    assert!(!infallible(&BoundExpr {
-        kind: ExprKind::ScalarFunction {
-            function: ScalarFunction::Length,
-            args: vec![column.clone()],
-        },
-        data_type: DataType::Int64,
-        display_name: "length(value)".into(),
-    }));
-    assert!(!infallible(&BoundExpr {
-        kind: ExprKind::Case {
-            when_then: vec![(comparison, column.clone())],
-            else_expr: Box::new(column),
-        },
-        data_type: DataType::Int64,
-        display_name: "CASE".into(),
-    }));
+    assert!(!divide.is_structurally_infallible());
+    assert!(
+        !BoundExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(column.clone()),
+            },
+            data_type: DataType::Utf8,
+            display_name: "CAST(value AS VARCHAR)".into(),
+        }
+        .is_structurally_infallible()
+    );
+    assert!(
+        !BoundExpr {
+            kind: ExprKind::ScalarFunction {
+                function: ScalarFunction::Length,
+                args: vec![column.clone()],
+            },
+            data_type: DataType::Int64,
+            display_name: "length(value)".into(),
+        }
+        .is_structurally_infallible()
+    );
+    assert!(
+        !BoundExpr {
+            kind: ExprKind::Case {
+                when_then: vec![(comparison, column.clone())],
+                else_expr: Box::new(column),
+            },
+            data_type: DataType::Int64,
+            display_name: "CASE".into(),
+        }
+        .is_structurally_infallible()
+    );
 }
 
 #[test]

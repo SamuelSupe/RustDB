@@ -174,7 +174,7 @@ fn expression_memory(expression: &BoundExpr, batch: &RecordBatch) -> ExpressionM
         }
         ExprKind::Binary { left, op, right } => {
             let mut estimate = binary_expression_memory(left, right, output, batch);
-            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            if matches!(op, BinaryOp::And | BinaryOp::Or) && !right.is_structurally_infallible() {
                 estimate.peak = estimate.peak.saturating_add(masked_input_bytes(batch));
             }
             estimate

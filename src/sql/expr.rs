@@ -223,6 +223,43 @@ impl BoundExpr {
         !references.is_empty()
     }
 
+    /// Returns true when evaluating this expression cannot raise a structured
+    /// SQL error. Optimizer relocation and boolean execution use the same
+    /// deliberately conservative classification so eager evaluation never
+    /// exposes an error from an otherwise inactive branch.
+    pub(crate) fn is_structurally_infallible(&self) -> bool {
+        match &self.kind {
+            ExprKind::Column(_) | ExprKind::Literal(_) => true,
+            ExprKind::Binary {
+                left,
+                op:
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::And
+                    | BinaryOp::Or,
+                right,
+            } => left.is_structurally_infallible() && right.is_structurally_infallible(),
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                expr,
+            }
+            | ExprKind::IsNull { expr, .. } => expr.is_structurally_infallible(),
+            ExprKind::OuterRef { .. }
+            | ExprKind::DeferredGroup(_)
+            | ExprKind::DeferredAggregate(_)
+            | ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Like { .. }
+            | ExprKind::Case { .. }
+            | ExprKind::Cast { .. }
+            | ExprKind::ScalarFunction { .. } => false,
+        }
+    }
+
     pub(crate) fn contains_deferred_aggregate(&self) -> bool {
         match &self.kind {
             ExprKind::DeferredGroup(_) | ExprKind::DeferredAggregate(_) => true,

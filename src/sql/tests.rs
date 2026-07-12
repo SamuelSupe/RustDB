@@ -320,6 +320,40 @@ async fn short_circuit_masks_are_applied_per_row() {
 }
 
 #[tokio::test]
+async fn eager_boolean_fast_path_preserves_kleene_null_semantics() {
+    let batches = run("SELECT FALSE AND CAST(NULL AS BOOLEAN), \
+                TRUE AND CAST(NULL AS BOOLEAN), \
+                CAST(NULL AS BOOLEAN) AND FALSE, \
+                CAST(NULL AS BOOLEAN) AND TRUE, \
+                TRUE OR CAST(NULL AS BOOLEAN), \
+                FALSE OR CAST(NULL AS BOOLEAN), \
+                CAST(NULL AS BOOLEAN) OR TRUE, \
+                CAST(NULL AS BOOLEAN) OR FALSE")
+    .await;
+    let batch = &batches[0];
+    for (column, expected) in [
+        (0, Some(false)),
+        (1, None),
+        (2, Some(false)),
+        (3, None),
+        (4, Some(true)),
+        (5, None),
+        (6, Some(true)),
+        (7, None),
+    ] {
+        let actual = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
+        assert_eq!(actual, expected, "column {column}");
+    }
+}
+
+#[tokio::test]
 async fn nullif_preserves_its_left_type_and_decimal_branches_widen_losslessly() {
     let batches = run("SELECT nullif(1, 2.5), \
                 coalesce(CAST(NULL AS DECIMAL(3, 2)), 1000), \

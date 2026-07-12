@@ -25,6 +25,11 @@ pub(super) fn boolean(
 ) -> Result<ArrayRef> {
     let left = evaluate(left, batch)?;
     let left_values = as_boolean(&left)?;
+    if right.is_structurally_infallible() {
+        let right = evaluate(right, batch)?;
+        let right_values = as_boolean(&right)?;
+        return combine_boolean(op, left_values, right_values);
+    }
     let active = BooleanArray::from_iter((0..left_values.len()).map(|row| {
         let needed = if left_values.is_null(row) {
             true
@@ -39,9 +44,13 @@ pub(super) fn boolean(
     }));
     let right = evaluate_masked(right, batch, &active)?;
     let right_values = as_boolean(&right)?;
+    combine_boolean(op, left_values, right_values)
+}
+
+fn combine_boolean(op: BinaryOp, left: &BooleanArray, right: &BooleanArray) -> Result<ArrayRef> {
     let result = match op {
-        BinaryOp::And => boolean::and_kleene(left_values, right_values)?,
-        BinaryOp::Or => boolean::or_kleene(left_values, right_values)?,
+        BinaryOp::And => boolean::and_kleene(left, right)?,
+        BinaryOp::Or => boolean::or_kleene(left, right)?,
         _ => unreachable!("caller passes only AND/OR"),
     };
     Ok(Arc::new(result))
