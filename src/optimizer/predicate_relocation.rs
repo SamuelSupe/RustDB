@@ -100,18 +100,6 @@ fn relocate(
         return filter(input, predicate, schema);
     }
     match input {
-        LogicalPlan::Filter {
-            input,
-            predicate: existing,
-            ..
-        } if existing.is_structurally_infallible() => {
-            let child_schema = input.schema().clone();
-            LogicalPlan::Filter {
-                input: Box::new(relocate(predicate, *input, child_schema)),
-                predicate: existing,
-                schema,
-            }
-        }
         LogicalPlan::Join {
             left,
             right,

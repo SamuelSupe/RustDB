@@ -119,6 +119,37 @@ fn keeps_a_predicate_above_a_potentially_failing_inner_join_residual() {
     ));
 }
 
+#[test]
+fn preserves_adjacent_filter_order_without_a_cost_model() {
+    let schema = one_column_schema("value");
+    let plan = apply(LogicalPlan::Filter {
+        input: Box::new(LogicalPlan::Filter {
+            input: Box::new(empty(schema.clone())),
+            predicate: comparison(0, 1),
+            schema: schema.clone(),
+        }),
+        predicate: comparison(0, 2),
+        schema,
+    });
+
+    let LogicalPlan::Filter {
+        input,
+        predicate: outer,
+        ..
+    } = plan
+    else {
+        panic!("expected outer filter")
+    };
+    let LogicalPlan::Filter {
+        predicate: inner, ..
+    } = *input
+    else {
+        panic!("expected inner filter")
+    };
+    assert_eq!(outer.display_name, "column_0 = 2");
+    assert_eq!(inner.display_name, "column_0 = 1");
+}
+
 fn relocate_over_inner(
     predicate: BoundExpr,
     on: Vec<(BoundExpr, BoundExpr)>,
