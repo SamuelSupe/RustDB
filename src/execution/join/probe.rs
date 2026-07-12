@@ -11,6 +11,7 @@ use crate::{
 use super::{
     CellValue, cell,
     condition::{JoinPredicates, SqlTruth},
+    matched::BuildMatchTracker,
     output::{build_output, candidate_workspace_bytes, grow_workspace, output_workspace_bytes},
     row_key,
 };
@@ -36,6 +37,16 @@ pub(super) fn try_build_hash_table(
     deduplicate: bool,
     reservation: &mut MemoryReservation,
 ) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
+    try_build_hash_table_with_nulls(key_arrays, rows, deduplicate, false, reservation)
+}
+
+pub(super) fn try_build_hash_table_with_nulls(
+    key_arrays: &[ArrayRef],
+    rows: usize,
+    deduplicate: bool,
+    null_equal_keys: bool,
+    reservation: &mut MemoryReservation,
+) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
     let initial_reservation = reservation.size();
     let mut hash_table: HashMap<Vec<CellValue>, Vec<u32>> = HashMap::new();
     for row in 0..rows {
@@ -46,7 +57,7 @@ pub(super) fn try_build_hash_table(
                 return Err(error);
             }
         };
-        if key.iter().any(CellValue::is_null) {
+        if !null_equal_keys && key.iter().any(CellValue::is_null) {
             continue;
         }
         let row_index = match u32::try_from(row) {
@@ -194,6 +205,8 @@ pub(super) struct ProbeCursor<'a> {
     left_values: Option<&'a ArrayRef>,
     right_values: Option<&'a ArrayRef>,
     global_membership: Option<GlobalMembershipState>,
+    null_equal_keys: bool,
+    matched_build: Option<BuildMatchTracker>,
     join_type: JoinType,
     schema: SchemaRef,
     batch_size: usize,
@@ -229,6 +242,8 @@ impl<'a> ProbeCursor<'a> {
         left_values: Option<&'a ArrayRef>,
         right_values: Option<&'a ArrayRef>,
         global_membership: Option<GlobalMembershipState>,
+        null_equal_keys: bool,
+        matched_build: Option<BuildMatchTracker>,
         join_type: JoinType,
         schema: SchemaRef,
         batch_size: usize,
@@ -243,6 +258,8 @@ impl<'a> ProbeCursor<'a> {
             left_values,
             right_values,
             global_membership,
+            null_equal_keys,
+            matched_build,
             join_type,
             schema,
             batch_size: batch_size.max(1),
@@ -291,7 +308,7 @@ impl<'a> ProbeCursor<'a> {
                 {
                     let left_row = self.row;
                     let key = row_key(self.left_keys, left_row)?;
-                    let matches = if key.iter().any(CellValue::is_null) {
+                    let matches = if !self.null_equal_keys && key.iter().any(CellValue::is_null) {
                         None
                     } else {
                         self.hash_table.get(&key)
@@ -392,12 +409,21 @@ impl<'a> ProbeCursor<'a> {
                             } else {
                                 state.matches = state.matches.saturating_add(1);
                                 state.first_right.get_or_insert(right_row);
+                                if let Some(matched) = &self.matched_build {
+                                    matched.mark(right_row);
+                                }
                                 if self.join_type == JoinType::LeftSingle && state.matches > 1 {
                                     return Err(Error::Execution(
                                         "scalar subquery returned more than one row".into(),
                                     ));
                                 }
-                                if matches!(self.join_type, JoinType::Inner | JoinType::Left) {
+                                if matches!(
+                                    self.join_type,
+                                    JoinType::Inner
+                                        | JoinType::Left
+                                        | JoinType::Right
+                                        | JoinType::Full
+                                ) {
                                     left_indices.push(group.left_row as u32);
                                     right_indices.push(Some(right_row));
                                 }
@@ -499,6 +525,10 @@ fn finish_row(
     let emit = match join_type {
         JoinType::Inner => return Ok(()),
         JoinType::Left => state.matches == 0,
+        JoinType::Right => false,
+        // Interim FULL behavior emits the left side; unmatched build rows are
+        // appended by the v0.4 FULL-join finalization path.
+        JoinType::Full => state.matches == 0,
         JoinType::Semi => state.matches != 0,
         JoinType::Anti => state.matches == 0,
         JoinType::LeftSingle | JoinType::Mark => true,

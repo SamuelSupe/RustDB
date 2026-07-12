@@ -7,20 +7,32 @@ use crate::{
     runtime::QueryContext,
 };
 
-use super::{AggregateExpr, BoundExpr, SortExpr};
+use super::{AggregateExpr, BoundExpr, SortExpr, WindowExpr};
 
 #[derive(Clone, Debug)]
 pub struct PlanSchema {
     arrow: SchemaRef,
     qualifiers: Arc<[Option<String>]>,
+    visible: Arc<[bool]>,
 }
 
 impl PlanSchema {
     pub fn new(arrow: SchemaRef, qualifiers: Vec<Option<String>>) -> Self {
+        let visible = vec![true; arrow.fields().len()];
+        Self::new_with_visibility(arrow, qualifiers, visible)
+    }
+
+    pub(crate) fn new_with_visibility(
+        arrow: SchemaRef,
+        qualifiers: Vec<Option<String>>,
+        visible: Vec<bool>,
+    ) -> Self {
         debug_assert_eq!(arrow.fields().len(), qualifiers.len());
+        debug_assert_eq!(arrow.fields().len(), visible.len());
         Self {
             arrow,
             qualifiers: qualifiers.into(),
+            visible: visible.into(),
         }
     }
 
@@ -41,20 +53,47 @@ impl PlanSchema {
         self.qualifiers[index].as_deref()
     }
 
+    pub(crate) fn is_visible(&self, index: usize) -> bool {
+        self.visible[index]
+    }
+
     pub fn join(left: &Self, right: &Self) -> Self {
         Self::join_with_right_nullability(left, right, false)
     }
 
     pub fn left_join(left: &Self, right: &Self) -> Self {
-        Self::join_with_right_nullability(left, right, true)
+        Self::join_with_nullability(left, right, false, true)
+    }
+
+    pub fn right_join(left: &Self, right: &Self) -> Self {
+        Self::join_with_nullability(left, right, true, false)
+    }
+
+    pub fn full_join(left: &Self, right: &Self) -> Self {
+        Self::join_with_nullability(left, right, true, true)
     }
 
     fn join_with_right_nullability(left: &Self, right: &Self, right_nullable: bool) -> Self {
+        Self::join_with_nullability(left, right, false, right_nullable)
+    }
+
+    fn join_with_nullability(
+        left: &Self,
+        right: &Self,
+        left_nullable: bool,
+        right_nullable: bool,
+    ) -> Self {
         let fields: Vec<Arc<Field>> = left
             .arrow
             .fields()
             .iter()
-            .cloned()
+            .map(|field| {
+                if left_nullable {
+                    Arc::new(field.as_ref().clone().with_nullable(true))
+                } else {
+                    Arc::clone(field)
+                }
+            })
             .chain(right.arrow.fields().iter().map(|field| {
                 if right_nullable {
                     Arc::new(field.as_ref().clone().with_nullable(true))
@@ -69,7 +108,13 @@ impl PlanSchema {
             .chain(right.qualifiers.iter())
             .cloned()
             .collect();
-        Self::new(Arc::new(Schema::new(fields)), qualifiers)
+        let visible = left
+            .visible
+            .iter()
+            .chain(right.visible.iter())
+            .copied()
+            .collect();
+        Self::new_with_visibility(Arc::new(Schema::new(fields)), qualifiers, visible)
     }
 }
 
@@ -77,6 +122,8 @@ impl PlanSchema {
 pub enum JoinType {
     Inner,
     Left,
+    Right,
+    Full,
     Semi,
     Anti,
     /// A scalar-subquery join. Execution must fail when more than one right
@@ -161,6 +208,18 @@ pub enum LogicalPlan {
         aggregate_exprs: Vec<AggregateExpr>,
         schema: PlanSchema,
     },
+    /// Appends compatible child relations. DISTINCT set operations are
+    /// lowered to this node plus de-duplication or membership operators.
+    Append {
+        inputs: Vec<LogicalPlan>,
+        schema: PlanSchema,
+    },
+    /// Appends one column per bound window expression to the input.
+    Window {
+        input: Box<LogicalPlan>,
+        expressions: Vec<WindowExpr>,
+        schema: PlanSchema,
+    },
     Sort {
         input: Box<LogicalPlan>,
         expressions: Vec<SortExpr>,
@@ -177,6 +236,9 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
         on: Vec<(BoundExpr, BoundExpr)>,
+        /// Treat NULL key components as equal. Reserved for SQL set
+        /// membership, whose duplicate semantics differ from ordinary JOIN.
+        null_equal_keys: bool,
         /// Predicate over the concatenated left-then-right input schema.
         residual: Option<BoundExpr>,
         /// Separate probe/build comparison for IN/NOT IN null semantics.
@@ -196,6 +258,8 @@ impl LogicalPlan {
             | Self::Scalarize { schema, .. }
             | Self::DependentJoin { schema, .. }
             | Self::Aggregate { schema, .. }
+            | Self::Append { schema, .. }
+            | Self::Window { schema, .. }
             | Self::Sort { schema, .. }
             | Self::Limit { schema, .. }
             | Self::Join { schema, .. } => schema,
@@ -228,11 +292,17 @@ impl LogicalPlan {
             | Self::Projection { input, .. }
             | Self::Scalarize { input, .. }
             | Self::Aggregate { input, .. }
+            | Self::Window { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.freeze_query_statistics(context),
             Self::Join { left, right, .. } | Self::DependentJoin { left, right, .. } => {
                 left.freeze_query_statistics(context);
                 right.freeze_query_statistics(context);
+            }
+            Self::Append { inputs, .. } => {
+                for input in inputs {
+                    input.freeze_query_statistics(context);
+                }
             }
         }
     }
@@ -245,11 +315,17 @@ impl LogicalPlan {
             | Self::Projection { input, .. }
             | Self::Scalarize { input, .. }
             | Self::Aggregate { input, .. }
+            | Self::Window { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.collect_scan_providers(providers),
             Self::Join { left, right, .. } | Self::DependentJoin { left, right, .. } => {
                 left.collect_scan_providers(providers);
                 right.collect_scan_providers(providers);
+            }
+            Self::Append { inputs, .. } => {
+                for input in inputs {
+                    input.collect_scan_providers(providers);
+                }
             }
         }
     }
@@ -338,6 +414,27 @@ impl LogicalPlan {
                 ));
                 input.write_explain(depth + 1, lane_limit, output);
             }
+            Self::Append { inputs, .. } => {
+                output.push_str(&format!(
+                    "{indent}Append inputs={} mode=streaming\n",
+                    inputs.len()
+                ));
+                for input in inputs {
+                    input.write_explain(depth + 1, lane_limit, output);
+                }
+            }
+            Self::Window {
+                input, expressions, ..
+            } => {
+                let names = expressions
+                    .iter()
+                    .map(|expression| expression.display_name.as_str())
+                    .collect::<Vec<_>>();
+                output.push_str(&format!(
+                    "{indent}Window expressions={names:?} sort=shared spill=partition_ipc_lz4 lane_limit={lanes}\n"
+                ));
+                input.write_explain(depth + 1, lane_limit, output);
+            }
             Self::Sort {
                 input,
                 expressions,
@@ -367,6 +464,7 @@ impl LogicalPlan {
                 right,
                 join_type,
                 on,
+                null_equal_keys,
                 residual,
                 null_aware,
                 ..
@@ -375,8 +473,9 @@ impl LogicalPlan {
                     output.push_str(&format!("{indent}ScalarBroadcast build=right\n"));
                 } else {
                     output.push_str(&format!(
-                        "{indent}{join_type:?}Join keys={} residual={} null_aware={} build=right decorrelation=complete strategy=hash_partition lane_limit={lanes} partitions=64 spill=grace_hash repartition_seeds=2 fallback=sort_merge\n",
+                        "{indent}{join_type:?}Join keys={} null_equal_keys={} residual={} null_aware={} build=right decorrelation=complete strategy=hash_partition lane_limit={lanes} partitions=64 spill=grace_hash repartition_seeds=2 fallback=sort_merge\n",
                         on.len(),
+                        null_equal_keys,
                         residual.is_some(),
                         null_aware.is_some(),
                     ));

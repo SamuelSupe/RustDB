@@ -102,6 +102,14 @@ impl MemoryPool {
             .unwrap_or(0)
     }
 
+    pub(crate) fn operation_limit(&self) -> usize {
+        self.ancestors_root_first()
+            .into_iter()
+            .map(|node| node.allocatable_limit())
+            .min()
+            .unwrap_or(0)
+    }
+
     /// Keeps a final slice of this pool unavailable to ordinary operators so
     /// spill I/O can always copy at least one bounded chunk. The headroom is
     /// not allocated and therefore does not inflate memory metrics.

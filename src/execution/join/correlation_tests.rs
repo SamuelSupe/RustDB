@@ -357,6 +357,7 @@ async fn run_grace_null_aware(
         left_schema,
         right_schema,
         predicates,
+        false,
         join_type,
         schema,
         context,

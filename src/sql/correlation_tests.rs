@@ -24,7 +24,10 @@ fn decorrelates_exists_and_cross_side_residual() {
              WHERE i.key = d.value AND i.other_key <> d.value\
          )",
     );
-    assert!(plan.contains("SemiJoin keys=1 residual=true"), "{plan}");
+    assert!(
+        plan.contains("SemiJoin keys=1 null_equal_keys=false residual=true"),
+        "{plan}"
+    );
     assert!(!plan.contains("DependentJoin"), "{plan}");
 }
 
@@ -108,7 +111,9 @@ fn stages_q16_style_rightmost_not_in_as_global_membership() {
          GROUP BY p.brand",
     );
     assert!(
-        plan.contains("NullAwareAntiJoin keys=0 residual=false null_aware=true"),
+        plan.contains(
+            "NullAwareAntiJoin keys=0 null_equal_keys=false residual=false null_aware=true"
+        ),
         "{plan}"
     );
     assert!(!plan.contains("MarkJoin"), "{plan}");
@@ -131,8 +136,14 @@ fn stages_q21_style_correlated_exists_pairs_independently() {
            ) \
          GROUP BY l1.supp",
     );
-    assert!(plan.contains("SemiJoin keys=1 residual=true"), "{plan}");
-    assert!(plan.contains("AntiJoin keys=1 residual=true"), "{plan}");
+    assert!(
+        plan.contains("SemiJoin keys=1 null_equal_keys=false residual=true"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("AntiJoin keys=1 null_equal_keys=false residual=true"),
+        "{plan}"
+    );
     assert!(!plan.contains("MarkJoin"), "{plan}");
     assert!(!plan.contains("DependentJoin"), "{plan}");
 }
@@ -148,7 +159,9 @@ fn lowers_correlated_not_in_with_separate_group_and_membership_keys() {
          )",
     );
     assert!(
-        plan.contains("NullAwareAntiJoin keys=1 residual=false null_aware=true"),
+        plan.contains(
+            "NullAwareAntiJoin keys=1 null_equal_keys=false residual=false null_aware=true"
+        ),
         "{plan}"
     );
 }

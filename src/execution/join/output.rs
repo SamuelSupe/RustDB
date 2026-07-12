@@ -67,6 +67,43 @@ pub(super) async fn build_output_envelope(
     BatchEnvelope::from_reservation(output, workspace, owner)
 }
 
+pub(super) async fn build_unmatched_right_envelope(
+    left_schema: &SchemaRef,
+    right: &RecordBatch,
+    right_indices: &[u32],
+    schema: SchemaRef,
+    context: &QueryContext,
+    held_bytes: usize,
+) -> Result<BatchEnvelope> {
+    let right_bytes = selected_rows_bytes(right, right_indices.iter().copied().map(Some))?;
+    let estimate = right_bytes
+        .saturating_mul(2)
+        .saturating_add(right_indices.len().saturating_mul(size_of::<u32>()))
+        .saturating_add(
+            left_schema
+                .fields()
+                .len()
+                .saturating_add(right.num_columns())
+                .saturating_mul(512),
+        )
+        .saturating_add(1_024)
+        .max(1);
+    let workspace = context
+        .reserve_memory_while_holding(estimate, held_bytes, "join unmatched build output")
+        .await?;
+    let rows = right_indices.len();
+    let indices = UInt32Array::from(right_indices.to_vec());
+    let mut columns = Vec::with_capacity(left_schema.fields().len() + right.num_columns());
+    for field in left_schema.fields() {
+        columns.push(new_null_array(field.data_type(), rows));
+    }
+    for column in right.columns() {
+        columns.push(take(column.as_ref(), &indices, None)?);
+    }
+    let output = build_record_batch(schema, columns, rows)?;
+    BatchEnvelope::from_reservation(output, workspace, "join unmatched build output")
+}
+
 pub(super) async fn grow_workspace(
     workspace: &mut MemoryReservation,
     required: usize,

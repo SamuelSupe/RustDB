@@ -11,7 +11,7 @@ use crate::Result;
 use crate::runtime::{BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream};
 use crate::sql::{LogicalPlan, StatementPlan};
 
-use super::{aggregate, expr, join, pipeline, scalar, scan, sort};
+use super::{aggregate, expr, join, pipeline, scalar, scan, sort, window};
 
 pub(super) async fn execute(
     plan: StatementPlan,
@@ -136,6 +136,32 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> MemoryBatchStr
                 }
             })
         }
+        LogicalPlan::Append { inputs, .. } => {
+            boxed_memory_batch_stream(async_stream::try_stream! {
+                for input in inputs {
+                    let mut input = execute_plan(input, Arc::clone(&context));
+                    while let Some(batch) = input.next().await {
+                        context.check_cancelled()?;
+                        yield batch?;
+                    }
+                }
+            })
+        }
+        LogicalPlan::Window {
+            input,
+            expressions,
+            schema,
+        } => {
+            let input_schema = Arc::clone(input.schema().arrow());
+            window::window(
+                execute_plan(*input, Arc::clone(&context)),
+                expressions,
+                input_schema,
+                Arc::clone(schema.arrow()),
+                context,
+                batch_size,
+            )
+        }
         LogicalPlan::Scalarize { input, schema } => scalar::scalarize(
             execute_plan(*input, Arc::clone(&context)),
             Arc::clone(schema.arrow()),
@@ -187,6 +213,7 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> MemoryBatchStr
             left,
             right,
             on,
+            null_equal_keys,
             residual,
             null_aware,
             join_type,
@@ -194,10 +221,11 @@ fn execute_plan(plan: LogicalPlan, context: Arc<QueryContext>) -> MemoryBatchStr
         } => {
             let left_schema = Arc::clone(left.schema().arrow());
             let right_schema = Arc::clone(right.schema().arrow());
-            join::join(
+            join::join_with_null_keys(
                 execute_plan(*left, Arc::clone(&context)),
                 execute_plan(*right, Arc::clone(&context)),
                 on,
+                null_equal_keys,
                 residual,
                 null_aware,
                 left_schema,
@@ -290,7 +318,7 @@ fn explain_analyze_stream(
         context.metrics.finish();
         let metrics = context.metrics.snapshot();
         let summary = format!(
-            "{explain}\nGlobal Metrics\n  elapsed={:?}\n  scanned_rows={} scanned_batches={} scanned_bytes={}\n  returned_rows={} returned_batches={} returned_bytes={}\n  discovered_files={} files_pruned={} row_groups_pruned={}\n  s3_requests={} s3_bytes={}\n  peak_memory_bytes={} peak_active_lanes={} scheduler_wait={:?}\n  spill_bytes={} spill_read_bytes={} spill_write_bytes={} spill_files={} spill_partitions={} quota_rejections={}\n",
+            "{explain}\nGlobal Metrics\n  elapsed={:?}\n  scanned_rows={} scanned_batches={} scanned_bytes={}\n  returned_rows={} returned_batches={} returned_bytes={}\n  discovered_files={} files_pruned={} row_groups_pruned={}\n  parquet_page_index_bytes={} parquet_bloom_bytes={} pages_pruned={} page_rows_pruned={} bloom_row_groups_pruned={} pruning_budget_skips={}\n  s3_requests={} s3_bytes={}\n  peak_memory_bytes={} peak_active_lanes={} scheduler_wait={:?}\n  spill_bytes={} spill_read_bytes={} spill_write_bytes={} spill_files={} spill_partitions={} quota_rejections={}\n",
             metrics.elapsed,
             metrics.rows_scanned,
             metrics.batches_scanned,
@@ -301,6 +329,12 @@ fn explain_analyze_stream(
             metrics.discovered_files,
             metrics.files_pruned,
             metrics.row_groups_pruned,
+            metrics.parquet_page_index_bytes_read,
+            metrics.parquet_bloom_filter_bytes_read,
+            metrics.parquet_pages_pruned,
+            metrics.parquet_page_rows_pruned,
+            metrics.parquet_bloom_row_groups_pruned,
+            metrics.parquet_pruning_budget_skips,
             metrics.s3_requests,
             metrics.s3_bytes_transferred,
             metrics.peak_memory_bytes,

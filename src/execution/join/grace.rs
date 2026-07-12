@@ -14,9 +14,13 @@ use crate::{
 use super::{
     EvaluatedKeys, ProbeCursor,
     condition::JoinPredicates,
-    evaluate_keys_accounted, evaluate_optional_values, optional_array, optional_memory, sort_merge,
+    evaluate_keys_accounted, evaluate_optional_values,
+    matched::BuildMatchTracker,
+    optional_array, optional_memory,
+    output::build_unmatched_right_envelope,
+    probe::try_build_hash_table_with_nulls,
+    sort_merge,
     spill::{self, BuildPartition, MAX_REPARTITION_DEPTH, PartitionTask},
-    try_build_hash_table,
 };
 
 const MIN_MEMORY_PER_LANE: usize = 512 << 10;
@@ -33,6 +37,7 @@ pub(super) fn join(
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     predicates: JoinPredicates,
+    null_equal_keys: bool,
     join_type: JoinType,
     schema: SchemaRef,
     context: Arc<QueryContext>,
@@ -55,6 +60,7 @@ pub(super) fn join(
                 Arc::clone(&left_schema),
                 Arc::clone(&right_schema),
                 predicates.clone(),
+                null_equal_keys,
                 join_type,
                 Arc::clone(&schema),
                 Arc::clone(&context),
@@ -106,6 +112,7 @@ async fn run_worker(
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     predicates: JoinPredicates,
+    null_equal_keys: bool,
     join_type: JoinType,
     schema: SchemaRef,
     context: Arc<QueryContext>,
@@ -121,6 +128,7 @@ async fn run_worker(
         &left_schema,
         &right_schema,
         &predicates,
+        null_equal_keys,
         join_type,
         &schema,
         &context,
@@ -144,6 +152,7 @@ async fn run_worker_inner(
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
     predicates: &JoinPredicates,
+    null_equal_keys: bool,
     join_type: JoinType,
     schema: &SchemaRef,
     context: &Arc<QueryContext>,
@@ -177,10 +186,11 @@ async fn run_worker_inner(
                             "Grace join build keys",
                         )?;
                         let rows = right_batch.num_rows();
-                        let hash_table = try_build_hash_table(
+                        let hash_table = try_build_hash_table_with_nulls(
                             &right_keys,
                             rows,
                             super::can_deduplicate_build(join_type, predicates),
+                            null_equal_keys,
                             &mut reservation,
                         )?;
                         drop(right_keys);
@@ -191,8 +201,24 @@ async fn run_worker_inner(
                             "Grace join build membership value",
                         )?;
                         match hash_table {
+                            Some(hash_table)
+                                if let Some(matched_build) = super::try_build_match_tracker(
+                                    join_type,
+                                    rows,
+                                    &mut reservation,
+                                ) =>
+                            {
+                                TaskHashBuild::Ready(
+                                    right_batch,
+                                    hash_table,
+                                    right_values,
+                                    matched_build,
+                                )
+                            }
                             Some(hash_table) => {
-                                TaskHashBuild::Ready(right_batch, hash_table, right_values)
+                                drop(hash_table);
+                                drop(right_values);
+                                TaskHashBuild::TooLarge(rows)
                             }
                             None => {
                                 drop(right_values);
@@ -204,7 +230,7 @@ async fn run_worker_inner(
                 }
             };
             match build {
-                TaskHashBuild::Ready(right_batch, hash_table, right_values) => {
+                TaskHashBuild::Ready(right_batch, hash_table, right_values, matched_build) => {
                     for file in &task.left {
                         for left_batch in context.spill.read_file(file)? {
                             check_running(cancellation, context)?;
@@ -238,6 +264,8 @@ async fn run_worker_inner(
                                 optional_array(&left_values),
                                 optional_array(&right_values),
                                 None,
+                                null_equal_keys,
+                                matched_build.clone(),
                                 join_type,
                                 Arc::clone(schema),
                                 batch_size,
@@ -255,6 +283,28 @@ async fn run_worker_inner(
                             }
                         }
                     }
+                    if let Some(matched) = &matched_build {
+                        let mut start = 0;
+                        loop {
+                            let indices = matched
+                                .unmatched_from(start, batch_size, context, reservation.size())
+                                .await?;
+                            let Some(last) = indices.last().copied() else {
+                                break;
+                            };
+                            start = last as usize + 1;
+                            let output = build_unmatched_right_envelope(
+                                left_schema,
+                                &right_batch,
+                                &indices,
+                                Arc::clone(schema),
+                                context,
+                                reservation.size().saturating_add(indices.memory_size()),
+                            )
+                            .await?;
+                            send(sender, output, cancellation, context).await?;
+                        }
+                    }
                     spill::remove_task(context, &task)?;
                     reservation.try_resize(0)?;
                 }
@@ -269,6 +319,7 @@ async fn run_worker_inner(
                                 left_key_expressions,
                                 right_key_expressions,
                                 join_type,
+                                null_equal_keys,
                                 next_depth,
                                 context,
                             )?
@@ -290,13 +341,14 @@ async fn run_worker_inner(
                         spill::remove_tasks(context, &repartitioned.tasks)?;
                     }
 
-                    let mut fallback = sort_merge::fallback(
+                    let mut fallback = sort_merge::fallback_with_null_keys(
                         task,
                         left_key_expressions.to_vec(),
                         right_key_expressions.to_vec(),
                         Arc::clone(left_schema),
                         Arc::clone(right_schema),
                         predicates.clone(),
+                        null_equal_keys,
                         join_type,
                         Arc::clone(schema),
                         Arc::clone(context),
@@ -347,6 +399,7 @@ enum TaskHashBuild {
         arrow::record_batch::RecordBatch,
         std::collections::HashMap<Vec<super::CellValue>, Vec<u32>>,
         Option<EvaluatedKeys>,
+        Option<BuildMatchTracker>,
     ),
     TooLarge(usize),
 }

@@ -109,6 +109,31 @@ fn push(plan: &mut LogicalPlan, required: &[usize]) {
             }
             push(input, &columns);
         }
+        LogicalPlan::Append { inputs, schema } => {
+            *schema = nullable_unrequired(schema, required);
+            for input in inputs {
+                push(input, required);
+            }
+        }
+        LogicalPlan::Window {
+            input,
+            expressions,
+            schema,
+        } => {
+            let input_width = input.schema().arrow().fields().len();
+            let mut columns = required
+                .iter()
+                .copied()
+                .filter(|index| *index < input_width)
+                .collect::<Vec<_>>();
+            // Until window-output pruning is implemented, retain every bound
+            // expression: aggregate arguments can contain structured errors.
+            for expression in expressions {
+                expression.referenced_columns(&mut columns);
+            }
+            *schema = nullable_unrequired(schema, required);
+            push(input, &columns);
+        }
         LogicalPlan::Sort {
             input,
             expressions,
@@ -144,7 +169,11 @@ fn push(plan: &mut LogicalPlan, required: &[usize]) {
                     left_columns.push(*index);
                 } else if matches!(
                     join_type,
-                    JoinType::Inner | JoinType::Left | JoinType::LeftSingle
+                    JoinType::Inner
+                        | JoinType::Left
+                        | JoinType::Right
+                        | JoinType::Full
+                        | JoinType::LeftSingle
                 ) {
                     right_columns.push(*index - left_width);
                 }
@@ -180,7 +209,11 @@ fn push(plan: &mut LogicalPlan, required: &[usize]) {
                 && !right.schema().arrow().fields().is_empty()
                 && matches!(
                     join_type,
-                    JoinType::Inner | JoinType::Left | JoinType::LeftSingle
+                    JoinType::Inner
+                        | JoinType::Left
+                        | JoinType::Right
+                        | JoinType::Full
+                        | JoinType::LeftSingle
                 )
             {
                 right_columns.push(0);
@@ -221,7 +254,10 @@ fn nullable_unrequired(schema: &PlanSchema, required: &[usize]) -> PlanSchema {
     let qualifiers = (0..fields.len())
         .map(|index| schema.qualifier(index).map(str::to_owned))
         .collect();
-    PlanSchema::new(Arc::new(Schema::new(fields)), qualifiers)
+    let visible = (0..fields.len())
+        .map(|index| schema.is_visible(index))
+        .collect();
+    PlanSchema::new_with_visibility(Arc::new(Schema::new(fields)), qualifiers, visible)
 }
 
 fn referenced_columns(expressions: &[BoundExpr]) -> Vec<usize> {

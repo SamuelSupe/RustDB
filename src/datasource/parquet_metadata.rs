@@ -6,6 +6,7 @@ use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use super::{
     MetadataCache,
     metadata_cache::metadata_weight,
+    parquet_pruning_budget::PruningLease,
     parquet_reader::{QueryIo, SnapshotParquetReader},
 };
 use crate::{
@@ -29,20 +30,42 @@ pub(super) struct ParquetMetadata {
 struct MetadataInner {
     metadata: ArrowReaderMetadata,
     _reservation: Option<MemoryReservation>,
+    _pruning_lease: Option<PruningLease>,
 }
 
 impl ParquetMetadata {
-    fn new(metadata: ArrowReaderMetadata, reservation: Option<MemoryReservation>) -> Self {
+    pub(super) fn new(
+        metadata: ArrowReaderMetadata,
+        reservation: Option<MemoryReservation>,
+        pruning_lease: Option<PruningLease>,
+    ) -> Self {
         Self {
             inner: Arc::new(MetadataInner {
                 metadata,
                 _reservation: reservation,
+                _pruning_lease: pruning_lease,
             }),
         }
     }
 
     pub(super) fn reader_metadata(&self) -> &ArrowReaderMetadata {
         &self.inner.metadata
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> Result<(
+        ArrowReaderMetadata,
+        Option<MemoryReservation>,
+        Option<PruningLease>,
+    )> {
+        Arc::try_unwrap(self.inner)
+            .map(|inner| (inner.metadata, inner._reservation, inner._pruning_lease))
+            .map_err(|_| {
+                Error::Internal(
+                    "cannot upgrade shared Parquet metadata to page-index metadata".to_owned(),
+                )
+            })
     }
 
     #[cfg(test)]
@@ -112,7 +135,7 @@ pub(super) async fn load_parquet_metadata(
     cache: &MetadataCache,
     registration_limit: usize,
 ) -> Result<ParquetMetadata> {
-    if let Some(metadata) = cache.get(file, &snapshot) {
+    if let Some(metadata) = cache.get_footer(file, &snapshot) {
         return lease_metadata(file, &snapshot, metadata, context, registration_limit);
     }
 
@@ -132,8 +155,8 @@ pub(super) async fn load_parquet_metadata(
         registration_limit,
         reservation.as_mut(),
     )?;
-    cache.insert(file, &snapshot, metadata.clone());
-    Ok(ParquetMetadata::new(metadata, reservation))
+    cache.insert_footer(file, &snapshot, metadata.clone());
+    Ok(ParquetMetadata::new(metadata, reservation, None))
 }
 
 fn lease_metadata(
@@ -145,7 +168,7 @@ fn lease_metadata(
 ) -> Result<ParquetMetadata> {
     let actual = metadata_weight(file, snapshot, &metadata);
     let reservation = reserve_before_load(file.uri(), actual, context, registration_limit)?;
-    Ok(ParquetMetadata::new(metadata, reservation))
+    Ok(ParquetMetadata::new(metadata, reservation, None))
 }
 
 fn estimated_metadata_bytes(footer_len: usize) -> usize {

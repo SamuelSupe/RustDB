@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::{EngineConfig, S3Config, SpillConfig};
+use super::{EngineConfig, ParquetPruningMode, ParquetScanConfig, S3Config, SpillConfig};
 
 #[derive(Clone, Debug)]
 pub struct EngineConfigBuilder {
@@ -51,6 +51,30 @@ impl EngineConfigBuilder {
     }
 
     #[must_use]
+    pub fn parquet_scan(mut self, parquet_scan: ParquetScanConfig) -> Self {
+        self.config.parquet_scan = parquet_scan;
+        self
+    }
+
+    #[must_use]
+    pub fn parquet_page_index(mut self, mode: ParquetPruningMode) -> Self {
+        self.config.parquet_scan.page_index = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn parquet_bloom_filter(mut self, mode: ParquetPruningMode) -> Self {
+        self.config.parquet_scan.bloom_filter = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn parquet_pruning_metadata_bytes(mut self, bytes: usize) -> Self {
+        self.config.parquet_scan.max_pruning_metadata_bytes = bytes;
+        self
+    }
+
+    #[must_use]
     pub fn s3(mut self, s3: S3Config) -> Self {
         self.config.s3 = s3;
         self
@@ -85,6 +109,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::EngineConfig;
+    use crate::ParquetPruningMode;
 
     #[test]
     fn builder_overrides_resource_settings() {
@@ -92,11 +117,20 @@ mod tests {
             .memory_limit(128 << 20)
             .batch_size(4_096)
             .compute_threads(4)
+            .parquet_page_index(ParquetPruningMode::Disabled)
+            .parquet_bloom_filter(ParquetPruningMode::Disabled)
+            .parquet_pruning_metadata_bytes(2 << 20)
             .spill_directory("/tmp/rustdb-builder-spill")
             .build();
         assert_eq!(config.memory_limit, 128 << 20);
         assert_eq!(config.batch_size, 4_096);
         assert_eq!(config.compute_threads, 4);
+        assert_eq!(config.parquet_scan.page_index, ParquetPruningMode::Disabled);
+        assert_eq!(
+            config.parquet_scan.bloom_filter,
+            ParquetPruningMode::Disabled
+        );
+        assert_eq!(config.parquet_scan.max_pruning_metadata_bytes, 2 << 20);
         assert_eq!(
             config.spill.directory,
             PathBuf::from("/tmp/rustdb-builder-spill")

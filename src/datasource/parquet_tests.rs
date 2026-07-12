@@ -222,6 +222,8 @@ async fn empty_projection_preserves_row_counts_without_materializing_columns() {
     let metrics = context.metrics.snapshot();
     assert_eq!(metrics.rows_scanned, 5);
     assert_eq!(metrics.bytes_scanned, 0);
+    assert_eq!(metrics.parquet_page_index_bytes_read, 0);
+    assert_eq!(metrics.parquet_bloom_filter_bytes_read, 0);
 }
 
 #[tokio::test]

@@ -44,7 +44,7 @@ reported instead of being silently ignored.
 
 ## CSV schema or UTF-8 errors
 
-CSV input is strict, UTF-8, and uncompressed in v0.3. Supply an explicit Arrow
+CSV input is strict, UTF-8, and uncompressed in v0.4. Supply an explicit Arrow
 schema when sampling would infer an unwanted type. All matched files must have
 compatible columns; errors identify the URI and mismatched column. Use
 `REFRESH TABLE name` only when the visible schema should be re-inferred.

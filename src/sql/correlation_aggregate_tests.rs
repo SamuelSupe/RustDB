@@ -448,7 +448,7 @@ async fn direct_marker_staging_does_not_hide_later_scalar_cardinality() {
         );
         assert!(
             plan_text.contains("MarkJoin keys=0")
-                || plan_text.contains("SemiJoin keys=1 residual=true"),
+                || plan_text.contains("SemiJoin keys=1 null_equal_keys=false residual=true"),
             "a potentially multi-row scalar must retain a cardinality-enforcing guard: {predicate}\n{plan:?}"
         );
         let temp = tempfile::tempdir().unwrap();

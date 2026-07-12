@@ -270,6 +270,93 @@ async fn executes_left_equi_join() {
 }
 
 #[tokio::test]
+async fn executes_right_full_and_using_joins() {
+    let catalog = Catalog::default();
+    register_join_table(&catalog, "l", &[1, 2, 4], &[10, 20, 40]);
+    register_join_table(&catalog, "r", &[2, 3, 4], &[25, 30, 35]);
+
+    let right = run(
+        &catalog,
+        "SELECT l.id AS lid, r.id AS rid \
+         FROM l RIGHT JOIN r ON l.id = r.id AND l.v < r.v ORDER BY r.id",
+        1 << 20,
+    )
+    .await;
+    assert_nullable_i64(&right, 0, &[Some(2), None, None]);
+    assert_nullable_i64(&right, 1, &[Some(2), Some(3), Some(4)]);
+
+    let full = run(
+        &catalog,
+        "SELECT coalesce(l.id, r.id) AS id, l.v AS lv, r.v AS rv \
+         FROM l FULL OUTER JOIN r ON l.id = r.id AND l.v < r.v \
+         ORDER BY id, lv NULLS LAST, rv NULLS LAST",
+        1 << 20,
+    )
+    .await;
+    assert_nullable_i64(&full, 0, &[Some(1), Some(2), Some(3), Some(4), Some(4)]);
+    assert_nullable_i64(&full, 1, &[Some(10), Some(20), None, Some(40), None]);
+    assert_nullable_i64(&full, 2, &[None, Some(25), Some(30), None, Some(35)]);
+
+    let using = run(
+        &catalog,
+        "SELECT id, l.id AS lid, r.id AS rid, l.v AS lv, r.v AS rv \
+         FROM l FULL OUTER JOIN r USING (id) ORDER BY id",
+        1 << 20,
+    )
+    .await;
+    assert_nullable_i64(&using, 0, &[Some(1), Some(2), Some(3), Some(4)]);
+    assert_nullable_i64(&using, 1, &[Some(1), Some(2), None, Some(4)]);
+    assert_nullable_i64(&using, 2, &[None, Some(2), Some(3), Some(4)]);
+    assert_nullable_i64(&using, 3, &[Some(10), Some(20), None, Some(40)]);
+    assert_nullable_i64(&using, 4, &[None, Some(25), Some(30), Some(35)]);
+
+    let qualified_wildcards = run(
+        &catalog,
+        "SELECT l.*, r.* FROM l FULL OUTER JOIN r USING (id) ORDER BY id",
+        1 << 20,
+    )
+    .await;
+    assert_eq!(qualified_wildcards[0].num_columns(), 4);
+    assert_nullable_i64(&qualified_wildcards, 0, &[Some(1), Some(2), None, Some(4)]);
+    assert_nullable_i64(&qualified_wildcards, 2, &[None, Some(2), Some(3), Some(4)]);
+}
+
+fn register_join_table(catalog: &Catalog, name: &str, ids: &[i64], values: &[i64]) {
+    register(
+        catalog,
+        name,
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Int64Array::from(values.to_vec())),
+            ],
+        )
+        .unwrap(),
+    );
+}
+
+fn assert_nullable_i64(batches: &[RecordBatch], column: usize, expected: &[Option<i64>]) {
+    let actual = batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| (!array.is_null(row)).then(|| array.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
 async fn fixes_all_join_snapshots_before_build_side_is_consumed() {
     let catalog = Catalog::default();
     let prepared = Arc::new(AtomicUsize::new(0));
@@ -401,7 +488,9 @@ async fn optimizer_prunes_operator_columns_and_uses_the_smaller_inner_build() {
                JOIN large ON small.id = large.id ORDER BY large_value";
     let plan = crate::sql::plan_sql(&catalog, sql).unwrap();
     let explain = format!("{:?}", plan);
-    assert!(explain.contains("InnerJoin keys=1 residual=false null_aware=false build=right"));
+    assert!(explain.contains(
+        "InnerJoin keys=1 null_equal_keys=false residual=false null_aware=false build=right"
+    ));
     assert!(explain.find("Scan table=large").unwrap() < explain.find("Scan table=small").unwrap());
     assert!(explain.contains("Scan table=small projection=Some([0, 1])"));
     assert!(explain.contains("Scan table=large projection=Some([0, 1])"));

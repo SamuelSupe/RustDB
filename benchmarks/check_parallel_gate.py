@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict fixed-hardware parallel performance gate for RustDB v0.3."""
+"""Strict fixed-hardware parallel performance gate for RustDB v0.4."""
 
 from __future__ import annotations
 

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use arrow::datatypes::DataType;
 use sqlparser::ast::{BinaryOperator, CastKind, Expr, Ident, UnaryOperator};
 
@@ -15,6 +17,30 @@ use super::{
 
 pub(super) fn bind_expr(expr: &Expr, schema: &PlanSchema) -> Result<BoundExpr> {
     bind_expr_scoped(expr, schema, None)
+}
+
+/// Resolves planner-generated group/aggregate/window columns while preserving
+/// normal SQL visibility for every user-facing field.
+pub(super) fn bind_expr_scoped_internal(
+    expr: &Expr,
+    schema: &PlanSchema,
+    outer: Option<&PlanSchema>,
+) -> Result<BoundExpr> {
+    let fields = Arc::clone(schema.arrow());
+    let qualifiers = (0..fields.fields().len())
+        .map(|index| schema.qualifier(index).map(str::to_owned))
+        .collect::<Vec<_>>();
+    let visible = fields
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            schema.is_visible(index)
+                || (schema.qualifier(index).is_none() && field.name().starts_with("__rustdb_"))
+        })
+        .collect::<Vec<_>>();
+    let internal = PlanSchema::new_with_visibility(fields, qualifiers, visible);
+    bind_expr_scoped(expr, &internal, outer)
 }
 
 pub(super) fn bind_expr_scoped(
@@ -285,6 +311,9 @@ fn find_column(
 ) -> Result<Option<usize>> {
     let mut matches = Vec::new();
     for (index, field) in schema.arrow().fields().iter().enumerate() {
+        if qualifier.is_none() && !schema.is_visible(index) {
+            continue;
+        }
         if !field.name().eq_ignore_ascii_case(&ident.value) {
             continue;
         }

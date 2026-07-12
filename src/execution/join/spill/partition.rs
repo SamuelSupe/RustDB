@@ -153,6 +153,7 @@ pub(in crate::execution::join) async fn spill_stream(
     expressions: &[BoundExpr],
     side: Side,
     join_type: JoinType,
+    null_equal_keys: bool,
     context: &QueryContext,
     label: &str,
 ) -> Result<Vec<Vec<SpillFile>>> {
@@ -160,17 +161,26 @@ pub(in crate::execution::join) async fn spill_stream(
     while let Some(batch) = stream.next().await {
         context.check_cancelled()?;
         let (batch, memory) = batch?.into_parts();
-        spill_batch(batch, expressions, side, join_type, &mut spiller, 0)?;
+        spill_batch_with_null_keys(
+            batch,
+            expressions,
+            side,
+            join_type,
+            null_equal_keys,
+            &mut spiller,
+            0,
+        )?;
         drop(memory);
     }
     spiller.finish()
 }
 
-pub(in crate::execution::join) fn spill_batch(
+pub(in crate::execution::join) fn spill_batch_with_null_keys(
     batch: RecordBatch,
     expressions: &[BoundExpr],
     side: Side,
     join_type: JoinType,
+    null_equal_keys: bool,
     spiller: &mut PartitionSpiller,
     seed: u64,
 ) -> Result<Vec<usize>> {
@@ -227,6 +237,7 @@ pub(in crate::execution::join) fn spill_batch(
                         expressions,
                         side,
                         join_type,
+                        null_equal_keys,
                         spiller,
                         seed,
                     )?;
@@ -253,6 +264,18 @@ pub(in crate::execution::join) fn spill_batch(
     Ok(totals.to_vec())
 }
 
+#[cfg(test)]
+pub(in crate::execution::join) fn spill_batch(
+    batch: RecordBatch,
+    expressions: &[BoundExpr],
+    side: Side,
+    join_type: JoinType,
+    spiller: &mut PartitionSpiller,
+    seed: u64,
+) -> Result<Vec<usize>> {
+    spill_batch_with_null_keys(batch, expressions, side, join_type, false, spiller, seed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spill_batch_slice(
     batch: &RecordBatch,
@@ -261,6 +284,7 @@ fn spill_batch_slice(
     expressions: &[BoundExpr],
     side: Side,
     join_type: JoinType,
+    null_equal_keys: bool,
     spiller: &mut PartitionSpiller,
     seed: u64,
 ) -> Result<[usize; PARTITIONS]> {
@@ -272,17 +296,22 @@ fn spill_batch_slice(
     let mut counts = [0usize; PARTITIONS];
     for row in 0..rows {
         let key = row_key(&keys, row)?;
-        let partition = if key.iter().any(CellValue::is_null) {
+        let partition = if !null_equal_keys && key.iter().any(CellValue::is_null) {
             match side {
-                Side::Right => {
+                Side::Right if !matches!(join_type, JoinType::Right | JoinType::Full) => {
                     assignments.push(SKIP);
                     continue;
                 }
-                Side::Left if matches!(join_type, JoinType::Inner | JoinType::Semi) => {
+                Side::Left
+                    if matches!(
+                        join_type,
+                        JoinType::Inner | JoinType::Right | JoinType::Semi
+                    ) =>
+                {
                     assignments.push(SKIP);
                     continue;
                 }
-                Side::Left => 0,
+                Side::Left | Side::Right => 0,
             }
         } else {
             partition_for_key(&key, seed)

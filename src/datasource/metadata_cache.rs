@@ -27,6 +27,13 @@ struct MetadataKey {
     size: u64,
     e_tag: Option<String>,
     version: Option<String>,
+    level: MetadataLevel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MetadataLevel {
+    Footer,
+    PageIndex,
 }
 
 struct CacheEntry {
@@ -49,12 +56,29 @@ impl MetadataCache {
         }
     }
 
-    pub(crate) fn get(
+    pub(crate) fn get_footer(
         &self,
         source: &ObjectSource,
         snapshot: &ObjectSnapshot,
     ) -> Option<ArrowReaderMetadata> {
-        let key = MetadataKey::new(source, snapshot);
+        self.get(source, snapshot, MetadataLevel::Footer)
+    }
+
+    pub(crate) fn get_page_index(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+    ) -> Option<ArrowReaderMetadata> {
+        self.get(source, snapshot, MetadataLevel::PageIndex)
+    }
+
+    fn get(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        level: MetadataLevel,
+    ) -> Option<ArrowReaderMetadata> {
+        let key = MetadataKey::new(source, snapshot, level);
         let mut state = self.inner.lock();
         let metadata = state.entries.get(&key).map(|entry| entry.metadata.clone());
         #[cfg(test)]
@@ -66,14 +90,33 @@ impl MetadataCache {
         metadata
     }
 
-    pub(crate) fn insert(
+    pub(crate) fn insert_footer(
         &self,
         source: &ObjectSource,
         snapshot: &ObjectSnapshot,
         metadata: ArrowReaderMetadata,
     ) {
+        self.insert(source, snapshot, MetadataLevel::Footer, metadata);
+    }
+
+    pub(crate) fn insert_page_index(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        metadata: ArrowReaderMetadata,
+    ) {
+        self.insert(source, snapshot, MetadataLevel::PageIndex, metadata);
+    }
+
+    fn insert(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        level: MetadataLevel,
+        metadata: ArrowReaderMetadata,
+    ) {
         let weight = metadata_weight(source, snapshot, &metadata);
-        let key = MetadataKey::new(source, snapshot);
+        let key = MetadataKey::new(source, snapshot, level);
         let mut state = self.inner.lock();
         if state.max_bytes == 0 || weight > state.max_bytes {
             return;
@@ -112,16 +155,20 @@ pub(super) fn metadata_weight(
     snapshot: &ObjectSnapshot,
     metadata: &ArrowReaderMetadata,
 ) -> usize {
-    entry_weight(&MetadataKey::new(source, snapshot), metadata)
+    entry_weight(
+        &MetadataKey::new(source, snapshot, MetadataLevel::Footer),
+        metadata,
+    )
 }
 
 impl MetadataKey {
-    fn new(source: &ObjectSource, snapshot: &ObjectSnapshot) -> Self {
+    fn new(source: &ObjectSource, snapshot: &ObjectSnapshot, level: MetadataLevel) -> Self {
         Self {
             uri: source.uri().to_owned(),
             size: snapshot.size,
             e_tag: snapshot.e_tag.clone(),
             version: snapshot.version.clone(),
+            level,
         }
     }
 }
@@ -181,7 +228,7 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{MetadataCache, MetadataKey, entry_weight};
+    use super::{MetadataCache, MetadataKey, MetadataLevel, entry_weight};
     use crate::{S3Config, storage::LocationResolver};
 
     #[tokio::test]
@@ -189,16 +236,33 @@ mod tests {
         let (source, metadata) = fixture().await;
         let snapshot = source.snapshot().clone();
         let cache = MetadataCache::new(usize::MAX);
-        assert!(cache.get(&source, &snapshot).is_none());
-        cache.insert(&source, &snapshot, metadata.clone());
-        assert!(cache.get(&source, &snapshot).is_some());
+        assert!(cache.get_footer(&source, &snapshot).is_none());
+        cache.insert_footer(&source, &snapshot, metadata.clone());
+        assert!(cache.get_footer(&source, &snapshot).is_some());
+        assert!(cache.get_page_index(&source, &snapshot).is_none());
 
         let mut changed = snapshot.clone();
         changed.e_tag = Some("new-etag".to_owned());
-        assert!(cache.get(&source, &changed).is_none());
+        assert!(cache.get_footer(&source, &changed).is_none());
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.misses, 3);
+    }
+
+    #[tokio::test]
+    async fn footer_and_page_index_entries_are_distinct() {
+        let (source, metadata) = fixture().await;
+        let snapshot = source.snapshot().clone();
+        let cache = MetadataCache::new(usize::MAX);
+
+        cache.insert_footer(&source, &snapshot, metadata.clone());
+        assert!(cache.get_footer(&source, &snapshot).is_some());
+        assert!(cache.get_page_index(&source, &snapshot).is_none());
+
+        cache.insert_page_index(&source, &snapshot, metadata);
+        assert!(cache.get_footer(&source, &snapshot).is_some());
+        assert!(cache.get_page_index(&source, &snapshot).is_some());
+        assert_eq!(cache.stats().entries, 2);
     }
 
     #[tokio::test]
@@ -209,22 +273,28 @@ mod tests {
         second.version = Some("v2".to_owned());
         let mut third = first.clone();
         third.version = Some("v3".to_owned());
-        let first_weight = entry_weight(&MetadataKey::new(&source, &first), &metadata);
-        let second_weight = entry_weight(&MetadataKey::new(&source, &second), &metadata);
+        let first_weight = entry_weight(
+            &MetadataKey::new(&source, &first, MetadataLevel::Footer),
+            &metadata,
+        );
+        let second_weight = entry_weight(
+            &MetadataKey::new(&source, &second, MetadataLevel::Footer),
+            &metadata,
+        );
         let limit = first_weight.saturating_add(second_weight);
         let cache = MetadataCache::new(limit);
 
-        cache.insert(&source, &first, metadata.clone());
-        cache.insert(&source, &second, metadata.clone());
-        assert!(cache.get(&source, &first).is_some());
-        cache.insert(&source, &third, metadata);
+        cache.insert_footer(&source, &first, metadata.clone());
+        cache.insert_footer(&source, &second, metadata.clone());
+        assert!(cache.get_footer(&source, &first).is_some());
+        cache.insert_footer(&source, &third, metadata);
 
         let stats = cache.stats();
         assert_eq!(stats.entries, 2);
         assert!(stats.used_bytes <= limit);
-        assert!(cache.get(&source, &first).is_some());
-        assert!(cache.get(&source, &second).is_none());
-        assert!(cache.get(&source, &third).is_some());
+        assert!(cache.get_footer(&source, &first).is_some());
+        assert!(cache.get_footer(&source, &second).is_none());
+        assert!(cache.get_footer(&source, &third).is_some());
     }
 
     async fn fixture() -> (crate::storage::ObjectSource, ArrowReaderMetadata) {

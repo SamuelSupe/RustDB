@@ -55,6 +55,15 @@ async fn run(args: Args) -> Result<()> {
     if let Some(metadata_cache) = args.metadata_cache {
         config.metadata_cache_bytes = metadata_cache;
     }
+    if let Some(mode) = args.parquet_page_index {
+        config.parquet_scan.page_index = mode.into();
+    }
+    if let Some(mode) = args.parquet_bloom_filter {
+        config.parquet_scan.bloom_filter = mode.into();
+    }
+    if let Some(bytes) = args.parquet_pruning_metadata {
+        config.parquet_scan.max_pruning_metadata_bytes = bytes;
+    }
     if let Some(max_concurrent_queries) = args.max_concurrent_queries {
         config.max_concurrent_queries = max_concurrent_queries;
     }

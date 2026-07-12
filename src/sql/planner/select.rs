@@ -16,10 +16,11 @@ use super::super::{
     relation::{CteScope, alias_plan, cte_name},
     scalar_subquery::extract as extract_scalar_subqueries,
     subquery::{apply_where, is_direct_mark_attachment, stageable_direct_mark_term},
+    window,
 };
 use super::{
     Planner,
-    join::{JoinBinding, bind_join_constraint},
+    join::{JoinBinding, apply_using_projection, bind_join_constraint},
     last_name_part, object_name,
 };
 
@@ -31,10 +32,8 @@ impl Planner<'_> {
         hidden_projection: &[Expr],
         outer: Option<&PlanSchema>,
     ) -> Result<LogicalPlan> {
-        if select.top.is_some() || select.qualify.is_some() || !select.named_window.is_empty() {
-            return Err(Error::Unsupported(
-                "TOP, QUALIFY, and window clauses are not supported".into(),
-            ));
+        if select.top.is_some() {
+            return Err(Error::Unsupported("TOP is not supported".into()));
         }
         let distinct = match &select.distinct {
             None | Some(Distinct::All) => false,
@@ -47,6 +46,7 @@ impl Planner<'_> {
         let mut projection = select.projection.clone();
         let mut selection = select.selection.clone();
         let mut having = select.having.clone();
+        let mut qualify = select.qualify.clone();
         let mut group_ast = match &select.group_by {
             GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => {
                 expressions.clone()
@@ -63,13 +63,37 @@ impl Planner<'_> {
         if let Some(predicate) = &mut having {
             rewrite_projection_aliases(predicate, &projection, "HAVING")?;
         }
+        if let Some(predicate) = &mut qualify {
+            rewrite_projection_aliases(predicate, &projection, "QUALIFY")?;
+        }
+        if selection.as_ref().is_some_and(window::contains_window) {
+            return Err(Error::InvalidArgument(
+                "window functions are not allowed in WHERE".into(),
+            ));
+        }
+        if group_ast.iter().any(window::contains_window) {
+            return Err(Error::InvalidArgument(
+                "window functions are not allowed in GROUP BY".into(),
+            ));
+        }
+        if having.as_ref().is_some_and(window::contains_window) {
+            return Err(Error::InvalidArgument(
+                "window functions are not allowed in HAVING".into(),
+            ));
+        }
         projection.extend(
             hidden_projection
                 .iter()
                 .cloned()
                 .map(SelectItem::UnnamedExpr),
         );
-        let aggregate_query = is_aggregate_query(&group_ast, &projection, having.as_ref());
+        let aggregate_query = is_aggregate_query(
+            &group_ast,
+            &projection,
+            having.as_ref(),
+            qualify.as_ref(),
+            &select.named_window,
+        );
 
         if let Some(predicate) = &mut selection {
             plan = self.plan_where(plan, predicate, outer, ctes)?;
@@ -117,22 +141,49 @@ impl Planner<'_> {
                 ctes,
             )?;
         }
+        if let Some(predicate) = &mut qualify {
+            plan = self.extract_scalars(
+                plan,
+                predicate,
+                aggregate_query.then_some(&mut hidden_groups),
+                aggregate_query.then_some(group_ast.as_slice()),
+                grouped_outer_columns.as_deref(),
+                ctes,
+            )?;
+        }
         group_ast.extend(hidden_groups.iter().cloned());
 
+        let has_windows = projection.iter().any(|item| match item {
+            SelectItem::UnnamedExpr(expression)
+            | SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => window::contains_window(expression),
+            _ => false,
+        }) || qualify.as_ref().is_some_and(window::contains_window);
+        if has_windows || qualify.is_some() {
+            let plan = window::plan_window_projection(
+                plan,
+                &group_ast,
+                &projection,
+                having.as_ref(),
+                qualify.as_ref(),
+                &select.named_window,
+                outer,
+                aggregate_query,
+            )?;
+            return Ok(if distinct { plan_distinct(plan) } else { plan });
+        }
+
         if aggregate_query {
-            if distinct {
-                return Err(Error::Unsupported(
-                    "SELECT DISTINCT with aggregates or HAVING is not supported".into(),
-                ));
-            }
-            plan_aggregate_projection(
+            let plan = plan_aggregate_projection(
                 plan,
                 &group_ast,
                 &projection,
                 having.as_ref(),
                 outer,
                 &hidden_groups,
-            )
+            )?;
+            Ok(if distinct { plan_distinct(plan) } else { plan })
         } else {
             let plan = self.plan_projection(plan, &projection, outer)?;
             if distinct {
@@ -183,6 +234,7 @@ impl Planner<'_> {
                 left: Box::new(plan),
                 right: Box::new(right),
                 on: Vec::new(),
+                null_equal_keys: false,
                 residual: None,
                 null_aware: None,
                 join_type: JoinType::Inner,
@@ -199,7 +251,7 @@ impl Planner<'_> {
     ) -> Result<LogicalPlan> {
         let mut left = self.plan_table(&table.relation, ctes)?;
         for join in &table.joins {
-            let mut right = self.plan_table(&join.relation, ctes)?;
+            let right = self.plan_table(&join.relation, ctes)?;
             let (join_type, constraint) = match &join.join_operator {
                 JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
                     (JoinType::Inner, constraint)
@@ -207,6 +259,10 @@ impl Planner<'_> {
                 JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
                     (JoinType::Left, constraint)
                 }
+                JoinOperator::Right(constraint) | JoinOperator::RightOuter(constraint) => {
+                    (JoinType::Right, constraint)
+                }
+                JoinOperator::FullOuter(constraint) => (JoinType::Full, constraint),
                 other => {
                     return Err(Error::Unsupported(format!(
                         "join type {other:?} is not supported"
@@ -215,38 +271,45 @@ impl Planner<'_> {
             };
             let JoinBinding {
                 keys: on,
-                right_filters,
+                residual,
+                using_columns,
             } = bind_join_constraint(constraint, left.schema(), right.schema())?;
             if on.is_empty() {
                 return Err(Error::Unsupported(
                     "joins require at least one equality key".into(),
                 ));
             }
-            for predicate in right_filters {
-                let schema = right.schema().clone();
-                right = LogicalPlan::Filter {
-                    input: Box::new(right),
-                    predicate,
-                    schema,
-                };
-            }
+            let left_schema = left.schema().clone();
+            let right_schema = right.schema().clone();
             let schema = match join_type {
                 JoinType::Inner => PlanSchema::join(left.schema(), right.schema()),
                 JoinType::Left => PlanSchema::left_join(left.schema(), right.schema()),
+                JoinType::Right => PlanSchema::right_join(left.schema(), right.schema()),
+                JoinType::Full => PlanSchema::full_join(left.schema(), right.schema()),
                 JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti => left.schema().clone(),
                 JoinType::LeftSingle | JoinType::Mark => unreachable!(
                     "parser-visible joins do not produce internal correlated join types"
                 ),
             };
-            left = LogicalPlan::Join {
+            let using_keys = on.clone();
+            let joined = LogicalPlan::Join {
                 left: Box::new(left),
                 right: Box::new(right),
                 on,
-                residual: None,
+                null_equal_keys: false,
+                residual,
                 null_aware: None,
                 join_type,
                 schema,
             };
+            left = apply_using_projection(
+                joined,
+                join_type,
+                &left_schema,
+                &right_schema,
+                &using_columns,
+                &using_keys,
+            )?;
         }
         Ok(left)
     }
@@ -407,6 +470,7 @@ fn expand_wildcards(items: &[SelectItem], schema: &PlanSchema) -> Result<Vec<Sel
         match item {
             SelectItem::Wildcard(_) => output.extend(
                 (0..schema.arrow().fields().len())
+                    .filter(|index| schema.is_visible(*index))
                     .map(|index| SelectItem::UnnamedExpr(column_expr(schema, index))),
             ),
             SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _) => {
@@ -466,6 +530,7 @@ fn bind_select_items(
                     .fields()
                     .iter()
                     .enumerate()
+                    .filter(|(index, _)| schema.is_visible(*index))
                     .map(|(index, field)| {
                         BoundExpr::column(index, field.data_type().clone(), field.name())
                     }),

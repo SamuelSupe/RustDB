@@ -33,8 +33,10 @@ fn push_filter(plan: &mut LogicalPlan) {
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Scalarize { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => push_filter(input),
+        LogicalPlan::Append { inputs, .. } => inputs.iter_mut().for_each(push_filter),
         LogicalPlan::Join { left, right, .. } | LogicalPlan::DependentJoin { left, right, .. } => {
             push_filter(left);
             push_filter(right);
@@ -122,8 +124,10 @@ fn push_limit(plan: &mut LogicalPlan) {
         | LogicalPlan::Scalarize { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => push_limit(input),
+        LogicalPlan::Append { inputs, .. } => inputs.iter_mut().for_each(push_limit),
         LogicalPlan::Join { left, right, .. } | LogicalPlan::DependentJoin { left, right, .. } => {
             push_limit(left);
             push_limit(right);

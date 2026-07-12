@@ -22,7 +22,7 @@ mod distinct;
 mod key;
 mod parallel;
 mod spill;
-mod state;
+pub(super) mod state;
 
 #[cfg(test)]
 mod tests;

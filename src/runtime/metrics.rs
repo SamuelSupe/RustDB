@@ -30,6 +30,12 @@ struct Inner {
     discovered_files: AtomicU64,
     files_pruned: AtomicU64,
     row_groups_pruned: AtomicU64,
+    parquet_page_index_bytes_read: AtomicU64,
+    parquet_bloom_filter_bytes_read: AtomicU64,
+    parquet_pages_pruned: AtomicU64,
+    parquet_page_rows_pruned: AtomicU64,
+    parquet_bloom_row_groups_pruned: AtomicU64,
+    parquet_pruning_budget_skips: AtomicU64,
     s3_requests: AtomicU64,
     s3_bytes_transferred: AtomicU64,
     peak_memory_bytes: AtomicU64,
@@ -55,6 +61,12 @@ pub struct QueryMetricsSnapshot {
     pub discovered_files: u64,
     pub files_pruned: u64,
     pub row_groups_pruned: u64,
+    pub parquet_page_index_bytes_read: u64,
+    pub parquet_bloom_filter_bytes_read: u64,
+    pub parquet_pages_pruned: u64,
+    pub parquet_page_rows_pruned: u64,
+    pub parquet_bloom_row_groups_pruned: u64,
+    pub parquet_pruning_budget_skips: u64,
     pub s3_requests: u64,
     pub s3_bytes_transferred: u64,
     pub peak_memory_bytes: u64,
@@ -85,6 +97,12 @@ impl QueryMetrics {
                 discovered_files: AtomicU64::new(0),
                 files_pruned: AtomicU64::new(0),
                 row_groups_pruned: AtomicU64::new(0),
+                parquet_page_index_bytes_read: AtomicU64::new(0),
+                parquet_bloom_filter_bytes_read: AtomicU64::new(0),
+                parquet_pages_pruned: AtomicU64::new(0),
+                parquet_page_rows_pruned: AtomicU64::new(0),
+                parquet_bloom_row_groups_pruned: AtomicU64::new(0),
+                parquet_pruning_budget_skips: AtomicU64::new(0),
                 s3_requests: AtomicU64::new(0),
                 s3_bytes_transferred: AtomicU64::new(0),
                 peak_memory_bytes: AtomicU64::new(0),
@@ -160,6 +178,30 @@ impl QueryMetrics {
         add(&self.inner.row_groups_pruned, count);
     }
 
+    pub(crate) fn add_parquet_page_index_bytes_read(&self, bytes: u64) {
+        add(&self.inner.parquet_page_index_bytes_read, bytes);
+    }
+
+    pub(crate) fn add_parquet_bloom_filter_bytes_read(&self, bytes: u64) {
+        add(&self.inner.parquet_bloom_filter_bytes_read, bytes);
+    }
+
+    pub(crate) fn add_parquet_pages_pruned(&self, pages: u64) {
+        add(&self.inner.parquet_pages_pruned, pages);
+    }
+
+    pub(crate) fn add_parquet_page_rows_pruned(&self, rows: u64) {
+        add(&self.inner.parquet_page_rows_pruned, rows);
+    }
+
+    pub(crate) fn add_parquet_bloom_row_groups_pruned(&self, row_groups: u64) {
+        add(&self.inner.parquet_bloom_row_groups_pruned, row_groups);
+    }
+
+    pub(crate) fn add_parquet_pruning_budget_skip(&self) {
+        add(&self.inner.parquet_pruning_budget_skips, 1);
+    }
+
     pub fn add_s3_requests(&self, count: u64) {
         add(&self.inner.s3_requests, count);
     }
@@ -227,6 +269,12 @@ impl QueryMetrics {
             discovered_files: load(&self.inner.discovered_files),
             files_pruned: load(&self.inner.files_pruned),
             row_groups_pruned: load(&self.inner.row_groups_pruned),
+            parquet_page_index_bytes_read: load(&self.inner.parquet_page_index_bytes_read),
+            parquet_bloom_filter_bytes_read: load(&self.inner.parquet_bloom_filter_bytes_read),
+            parquet_pages_pruned: load(&self.inner.parquet_pages_pruned),
+            parquet_page_rows_pruned: load(&self.inner.parquet_page_rows_pruned),
+            parquet_bloom_row_groups_pruned: load(&self.inner.parquet_bloom_row_groups_pruned),
+            parquet_pruning_budget_skips: load(&self.inner.parquet_pruning_budget_skips),
             s3_requests: load(&self.inner.s3_requests),
             s3_bytes_transferred: load(&self.inner.s3_bytes_transferred),
             peak_memory_bytes: load(&self.inner.peak_memory_bytes).max(pool_peak),
@@ -293,6 +341,12 @@ mod tests {
         metrics.add_spill_quota_rejection();
         metrics.add_s3_requests(1);
         metrics.record_s3_get(123);
+        metrics.add_parquet_page_index_bytes_read(41);
+        metrics.add_parquet_bloom_filter_bytes_read(42);
+        metrics.add_parquet_pages_pruned(3);
+        metrics.add_parquet_page_rows_pruned(30);
+        metrics.add_parquet_bloom_row_groups_pruned(2);
+        metrics.add_parquet_pruning_budget_skip();
         metrics.finish();
 
         let snapshot = metrics.snapshot();
@@ -313,6 +367,12 @@ mod tests {
         assert_eq!(snapshot.spill_quota_rejections, 1);
         assert_eq!(snapshot.s3_requests, 2);
         assert_eq!(snapshot.s3_bytes_transferred, 123);
+        assert_eq!(snapshot.parquet_page_index_bytes_read, 41);
+        assert_eq!(snapshot.parquet_bloom_filter_bytes_read, 42);
+        assert_eq!(snapshot.parquet_pages_pruned, 3);
+        assert_eq!(snapshot.parquet_page_rows_pruned, 30);
+        assert_eq!(snapshot.parquet_bloom_row_groups_pruned, 2);
+        assert_eq!(snapshot.parquet_pruning_budget_skips, 1);
         assert!(!snapshot.elapsed.is_zero());
     }
 }

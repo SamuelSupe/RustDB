@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validation logic for the RustDB v0.3 fixed-hardware performance gate."""
+"""Validation logic for the RustDB v0.4 fixed-hardware performance gate."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from typing import Any
 CASES = ("scan-filter", "aggregate")
 THREADS = (1, 4)
 MEMORY_LIMIT = 1_073_741_824
+BASELINE_ENGINE_VERSION = "0.2.0-alpha.1"
+CANDIDATE_ENGINE_VERSION = "0.4.0-alpha.1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 NATIVE = re.compile(r"(?:^|\s)-C(?:\s+)?target-cpu=native(?:\s|$)")
@@ -349,13 +351,13 @@ def evaluate(
     baseline = inspect_manifest(
         baseline_path,
         label="baseline",
-        engine_version="0.2.0-alpha.1",
+        engine_version=BASELINE_ENGINE_VERSION,
         actual_cpu_model=actual_cpu_model,
     )
     candidate = inspect_manifest(
         candidate_path,
         label="candidate",
-        engine_version="0.3.0-alpha.1",
+        engine_version=CANDIDATE_ENGINE_VERSION,
         actual_cpu_model=actual_cpu_model,
     )
     if baseline["build_id"] != baseline_build_id:

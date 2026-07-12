@@ -4,13 +4,11 @@ use arrow::datatypes::Schema;
 
 use sqlparser::{
     ast::{
-        Distinct, Expr, LimitClause, ObjectName, OrderByKind, Query, SetExpr, Spanned, Statement,
-        Value,
+        Distinct, Expr, LimitClause, ObjectName, OrderByKind, Query, Select, SetExpr, Spanned,
+        Statement, Value,
     },
     tokenizer::Span,
 };
-#[cfg(test)]
-use sqlparser::{dialect::DuckDbDialect, parser::Parser};
 
 use crate::{Catalog, Error, Result, runtime::QueryContext};
 
@@ -25,6 +23,7 @@ use super::{
 
 mod join;
 mod select;
+mod set_ops;
 
 #[cfg(test)]
 pub fn plan_sql(catalog: &Catalog, sql: &str) -> Result<StatementPlan> {
@@ -33,7 +32,7 @@ pub fn plan_sql(catalog: &Catalog, sql: &str) -> Result<StatementPlan> {
 
 #[cfg(test)]
 fn bind_sql(catalog: &Catalog, sql: &str) -> Result<StatementPlan> {
-    let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql)?;
+    let mut statements = super::parse_statements(sql)?;
     if statements.len() != 1 {
         return Err(Error::InvalidArgument(
             "exactly one SQL statement is required".into(),
@@ -140,13 +139,24 @@ impl Planner<'_> {
                 ctes.insert(name, plan);
             }
         }
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            return Err(Error::Unsupported(
-                "set operations and nested query bodies are not supported".into(),
-            ));
-        };
-
         let (offset, limit) = query_limit(query)?;
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            let mut plan = self.plan_set_expr(query.body.as_ref(), &ctes, outer)?;
+            plan = set_ops::apply_set_order(plan, query.order_by.as_ref(), limit, offset)?;
+            return apply_query_limit(plan, offset, limit);
+        };
+        self.plan_select_query(select, query, &ctes, outer, offset, limit)
+    }
+
+    fn plan_select_query(
+        &self,
+        select: &Select,
+        query: &Query,
+        ctes: &CteScope,
+        outer: Option<&PlanSchema>,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<LogicalPlan> {
         let distinct = matches!(&select.distinct, Some(Distinct::Distinct));
         let mut hidden_order = Vec::new();
         let mut prepared_order = Vec::new();
@@ -184,7 +194,7 @@ impl Planner<'_> {
             }
         }
 
-        let mut plan = self.plan_select(select, &ctes, &hidden_order, outer)?;
+        let mut plan = self.plan_select(select, ctes, &hidden_order, outer)?;
         if !prepared_order.is_empty() {
             let visible_width = plan
                 .schema()
@@ -235,16 +245,7 @@ impl Planner<'_> {
                 plan = project_visible(plan, visible_width);
             }
         }
-        if offset != 0 || limit.is_some() {
-            let schema = plan.schema().clone();
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                offset,
-                limit,
-                schema,
-            };
-        }
-        Ok(plan)
+        apply_query_limit(plan, offset, limit)
     }
 }
 
@@ -336,6 +337,23 @@ fn project_visible(input: LogicalPlan, visible_width: usize) -> LogicalPlan {
         expressions,
         schema,
     }
+}
+
+fn apply_query_limit(
+    plan: LogicalPlan,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<LogicalPlan> {
+    if offset == 0 && limit.is_none() {
+        return Ok(plan);
+    }
+    let schema = plan.schema().clone();
+    Ok(LogicalPlan::Limit {
+        input: Box::new(plan),
+        offset,
+        limit,
+        schema,
+    })
 }
 
 fn query_limit(query: &Query) -> Result<(usize, Option<usize>)> {

@@ -82,6 +82,49 @@ pub(super) fn pull(plan: LogicalPlan) -> Result<Pulled> {
             aggregate_exprs,
             schema,
         } => pull_aggregate(*input, group_exprs, aggregate_exprs, schema),
+        LogicalPlan::Append { inputs, schema } => {
+            let mut rewritten = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let child = pull(input)?;
+                if !child.correlations.is_empty() {
+                    return Err(Error::Unsupported(
+                        "set operations in a correlated subquery are not supported".into(),
+                    ));
+                }
+                rewritten.push(child.plan);
+            }
+            Ok(Pulled {
+                old_to_new: identity(schema.arrow().fields().len()),
+                plan: LogicalPlan::Append {
+                    inputs: rewritten,
+                    schema,
+                },
+                correlations: Vec::new(),
+                scalar_aggregate: false,
+            })
+        }
+        LogicalPlan::Window {
+            input,
+            expressions,
+            schema,
+        } => {
+            let child = pull(*input)?;
+            if !child.correlations.is_empty() {
+                return Err(Error::Unsupported(
+                    "window functions in a correlated subquery are not supported".into(),
+                ));
+            }
+            Ok(Pulled {
+                old_to_new: identity(schema.arrow().fields().len()),
+                plan: LogicalPlan::Window {
+                    input: Box::new(child.plan),
+                    expressions,
+                    schema,
+                },
+                correlations: Vec::new(),
+                scalar_aggregate: false,
+            })
+        }
         LogicalPlan::Sort {
             input,
             mut expressions,
@@ -151,11 +194,21 @@ pub(super) fn pull(plan: LogicalPlan) -> Result<Pulled> {
             left,
             right,
             on,
+            null_equal_keys,
             residual,
             null_aware,
             join_type,
             schema,
-        } => pull_join(*left, *right, on, residual, null_aware, join_type, schema),
+        } => pull_join(
+            *left,
+            *right,
+            on,
+            null_equal_keys,
+            residual,
+            null_aware,
+            join_type,
+            schema,
+        ),
         LogicalPlan::DependentJoin { .. } => Err(Error::Internal(
             "nested DependentJoin reached correlation-key extraction".into(),
         )),
@@ -354,6 +407,7 @@ fn pull_join(
     left: LogicalPlan,
     right: LogicalPlan,
     mut on: Vec<(BoundExpr, BoundExpr)>,
+    null_equal_keys: bool,
     mut residual: Option<BoundExpr>,
     mut null_aware: Option<(BoundExpr, BoundExpr)>,
     join_type: JoinType,
@@ -395,6 +449,7 @@ fn pull_join(
             left: Box::new(left.plan),
             right: Box::new(right.plan),
             on,
+            null_equal_keys,
             residual,
             null_aware,
             join_type,
@@ -433,7 +488,11 @@ fn extended_projection_schema(original: &PlanSchema, appended: &[BoundExpr]) -> 
         .map(|index| original.qualifier(index).map(str::to_owned))
         .collect::<Vec<_>>();
     qualifiers.resize(fields.len(), None);
-    PlanSchema::new(Arc::new(Schema::new(fields)), qualifiers)
+    let mut visible = (0..original.arrow().fields().len())
+        .map(|index| original.is_visible(index))
+        .collect::<Vec<_>>();
+    visible.resize(fields.len(), false);
+    PlanSchema::new_with_visibility(Arc::new(Schema::new(fields)), qualifiers, visible)
 }
 
 fn aggregate_schema(groups: &[BoundExpr], aggregates: &[crate::sql::AggregateExpr]) -> PlanSchema {
@@ -461,7 +520,7 @@ fn join_output_mapping(left: &Pulled, right: &Pulled, join_type: JoinType) -> Ve
     let mut mapping = left.old_to_new.clone();
     if matches!(
         join_type,
-        JoinType::Inner | JoinType::Left | JoinType::LeftSingle
+        JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full | JoinType::LeftSingle
     ) {
         let left_width = left.plan.schema().arrow().fields().len();
         mapping.extend(
@@ -485,6 +544,8 @@ fn join_schema(
     match join_type {
         JoinType::Inner => PlanSchema::join(left, right),
         JoinType::Left | JoinType::LeftSingle => PlanSchema::left_join(left, right),
+        JoinType::Right => PlanSchema::right_join(left, right),
+        JoinType::Full => PlanSchema::full_join(left, right),
         JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti => left.clone(),
         JoinType::Mark => {
             let marker =

@@ -11,8 +11,10 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Scalarize { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => choose_build_sides(input),
+        LogicalPlan::Append { inputs, .. } => inputs.iter_mut().for_each(choose_build_sides),
         LogicalPlan::Join { left, right, .. } | LogicalPlan::DependentJoin { left, right, .. } => {
             choose_build_sides(left);
             choose_build_sides(right);
@@ -42,6 +44,7 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         left,
         right,
         on,
+        null_equal_keys,
         residual: None,
         null_aware: None,
         join_type: JoinType::Inner,
@@ -81,6 +84,7 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         left: right,
         right: left,
         on: on.into_iter().map(|(left, right)| (right, left)).collect(),
+        null_equal_keys,
         residual: None,
         null_aware: None,
         join_type: JoinType::Inner,
@@ -126,7 +130,25 @@ fn estimate(plan: &LogicalPlan) -> Estimate {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. } => estimate(input),
+        LogicalPlan::Append { inputs, .. } => {
+            inputs.iter().fold(Estimate::default(), |total, input| {
+                let input = estimate(input);
+                Estimate {
+                    rows: match (total.rows, input.rows) {
+                        (None, rows) => rows,
+                        (rows, None) => rows,
+                        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+                    },
+                    bytes: match (total.bytes, input.bytes) {
+                        (None, bytes) => bytes,
+                        (bytes, None) => bytes,
+                        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+                    },
+                }
+            })
+        }
         LogicalPlan::Limit {
             input,
             offset,

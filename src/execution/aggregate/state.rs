@@ -46,7 +46,7 @@ impl GroupState {
     }
 }
 
-pub(super) enum AggregateState {
+pub(in crate::execution) enum AggregateState {
     Count(i64),
     SumSigned {
         value: i128,
@@ -79,7 +79,7 @@ pub(super) enum AggregateState {
 }
 
 impl AggregateState {
-    pub(super) fn new(expression: &AggregateExpr) -> Self {
+    pub(in crate::execution) fn new(expression: &AggregateExpr) -> Self {
         match expression.function {
             AggregateFunction::Count => Self::Count(0),
             AggregateFunction::Sum => match expression.data_type {
@@ -116,7 +116,7 @@ impl AggregateState {
         }
     }
 
-    pub(super) fn update(
+    pub(in crate::execution) fn update(
         &mut self,
         expression: &AggregateExpr,
         value: Option<CellValue>,
@@ -210,7 +210,7 @@ impl AggregateState {
         Ok(())
     }
 
-    pub(super) fn finish(&self) -> Result<CellValue> {
+    pub(in crate::execution) fn finish(&self) -> Result<CellValue> {
         match self {
             Self::Count(value) => Ok(CellValue::Int64(*value)),
             Self::SumSigned { seen: false, .. }

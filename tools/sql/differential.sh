@@ -44,7 +44,7 @@ for template in "$ROOT"/tools/sql/cases/*.sql; do
     "$template" > "$query"
 
   case "$name" in
-    distinct-hidden-order-error)
+    distinct-hidden-order-error|*-rustdb-error)
       rustdb_error="$work/$name.rustdb.err"
       if docker compose --project-directory "$ROOT" run --rm --no-deps --no-TTY dev \
         /workspace/target/release/rustdb --format csv --csv-null __RUSTDB_NULL__ \
@@ -52,18 +52,20 @@ for template in "$ROOT"/tools/sql/cases/*.sql; do
         tpch_die "$name unexpectedly succeeded in RustDB"
       fi
       pattern_file=${template%.sql}.rustdb-pattern
+      [ -f "$pattern_file" ] || tpch_die "missing RustDB error pattern: $pattern_file"
       pattern=$(cat "$pattern_file")
       grep -F "$pattern" "$rustdb_error" >/dev/null || {
         sed -n '1,80p' "$rustdb_error" >&2
         tpch_die "$name RustDB error did not contain '$pattern'"
       }
-      grep -E 'at line [1-9][0-9]*, column [1-9][0-9]*' "$rustdb_error" >/dev/null || {
-        sed -n '1,80p' "$rustdb_error" >&2
-        tpch_die "$name RustDB error did not contain an AST source position"
-      }
-      # DuckDB accepts this query. RustDB deliberately limits hidden sort
-      # expressions to non-DISTINCT blocks, so this is an explicit
-      # compatibility-boundary assertion rather than a same-outcome case.
+      if [ "$name" = distinct-hidden-order-error ]; then
+        grep -E 'at line [1-9][0-9]*, column [1-9][0-9]*' "$rustdb_error" >/dev/null || {
+          sed -n '1,80p' "$rustdb_error" >&2
+          tpch_die "$name RustDB error did not contain an AST source position"
+        }
+      fi
+      # These are explicit compatibility boundaries: RustDB must reject with
+      # its documented error while DuckDB must accept the same SQL.
       docker run --rm --interactive \
         --volume "$ROOT:/workspace" --workdir /workspace \
         "$TPCH_DUCKDB_IMAGE" :memory: -csv -header -nullvalue __RUSTDB_NULL__ -batch \

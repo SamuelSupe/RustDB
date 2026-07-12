@@ -38,6 +38,25 @@ pub(super) fn executable(plan: &LogicalPlan) -> Result<()> {
             }
             executable(input)?;
         }
+        LogicalPlan::Append { inputs, .. } => {
+            for input in inputs {
+                executable(input)?;
+            }
+        }
+        LogicalPlan::Window {
+            input, expressions, ..
+        } => {
+            for expression in expressions {
+                if let crate::sql::WindowFunction::Aggregate(aggregate) = &expression.function {
+                    check_optional(&aggregate.expr)?;
+                }
+                check_many(&expression.partition_by)?;
+                for order in &expression.order_by {
+                    check(&order.expr)?;
+                }
+            }
+            executable(input)?;
+        }
         LogicalPlan::Sort {
             input, expressions, ..
         } => {

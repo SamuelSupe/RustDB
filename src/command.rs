@@ -7,13 +7,9 @@ use arrow::{
 };
 use async_trait::async_trait;
 use futures::StreamExt;
-use sqlparser::{
-    ast::{
-        CreateTableOptions, DescribeAlias, ObjectName, ObjectNamePart, ObjectType,
-        ShowStatementOptions, Spanned, Statement,
-    },
-    dialect::DuckDbDialect,
-    parser::Parser,
+use sqlparser::ast::{
+    CreateTableOptions, DescribeAlias, ObjectName, ObjectNamePart, ObjectType,
+    ShowStatementOptions, Spanned, Statement,
 };
 
 use crate::datasource::{MetadataCache, ScanRequest, ScanTask, TableProvider, TableStatistics};
@@ -50,7 +46,7 @@ pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
     if let Some(command) = parse_refresh_table(sql)? {
         return Ok(Some(command));
     }
-    let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql)?;
+    let mut statements = crate::sql::parse_statements(sql)?;
     if statements.len() != 1 {
         return Err(Error::InvalidArgument(
             "exactly one SQL statement is required".into(),
@@ -173,7 +169,7 @@ fn parse_refresh_table(sql: &str) -> Result<Option<SessionCommand>> {
             "REFRESH TABLE requires a table name".to_owned(),
         ));
     }
-    let mut statements = Parser::parse_sql(&DuckDbDialect {}, &format!("DESCRIBE {table}"))?;
+    let mut statements = crate::sql::parse_statements(&format!("DESCRIBE {table}"))?;
     if statements.len() != 1 {
         return Err(Error::InvalidArgument(
             "REFRESH TABLE accepts exactly one table name".to_owned(),

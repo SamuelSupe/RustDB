@@ -101,11 +101,17 @@ fn binds_having_to_aggregate_output_and_deduplicates_aggregates() {
 }
 
 #[test]
-fn keeps_windows_explicitly_unsupported() {
-    let window = plan_sql(&Catalog::default(), "SELECT count(*) OVER ()")
-        .unwrap_err()
-        .to_string();
-    assert!(window.contains("window") || window.contains("OVER"));
+fn plans_window_functions_as_an_explicit_stage() {
+    let StatementPlan::Query(plan) = plan_sql(
+        &Catalog::default(),
+        "SELECT count(*) OVER (), row_number() OVER ()",
+    )
+    .unwrap() else {
+        panic!("expected query plan");
+    };
+    let explain = plan.explain();
+    assert!(explain.contains("Window"), "{explain}");
+    assert!(explain.contains("partition_ipc_lz4"), "{explain}");
 }
 
 #[tokio::test]

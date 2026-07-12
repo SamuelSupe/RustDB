@@ -70,6 +70,7 @@ pub(super) fn join(
         left: Box::new(left),
         right: Box::new(right),
         on: Vec::new(),
+        null_equal_keys: false,
         residual: Some(guard.clone()),
         null_aware: None,
         join_type: JoinType::LeftSingle,

@@ -162,6 +162,7 @@ fn relocate_over_inner(
         left: Box::new(empty(left_schema)),
         right: Box::new(empty(right_schema)),
         on,
+        null_equal_keys: false,
         residual,
         null_aware: None,
         join_type: JoinType::Inner,

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 mod support;
 
-use support::parquet_evolution;
+use support::{parquet_evolution, parquet_pruning};
 
 const BUCKET: &str = "rustdb-tests";
 const PUBLIC_BUCKET: &str = "rustdb-public";
@@ -33,6 +33,7 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
     let csv_path = Path::from(format!("{prefix}events.csv"));
     let parquet_path = Path::from(format!("{prefix}events.parquet"));
     let pruning_path = Path::from(format!("{prefix}row-group-pruning.parquet"));
+    let deep_pruning_path = Path::from(format!("{prefix}deep-pruning.parquet"));
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(BUCKET)
         .with_region("us-east-1")
@@ -60,6 +61,12 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
     );
     store
         .put(&pruning_path, Bytes::from(pruning_bytes).into())
+        .await?;
+    store
+        .put(
+            &deep_pruning_path,
+            Bytes::from(parquet_pruning::deep_pruning_bytes()?).into(),
+        )
         .await?;
 
     let config = EngineConfig::builder()
@@ -298,6 +305,41 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
     assert!(parquet_metrics.s3_requests >= 2);
     assert!(parquet_metrics.s3_bytes_transferred > 0);
 
+    let deep_count_sql =
+        format!("SELECT count(*) FROM read_parquet('s3://{BUCKET}/{deep_pruning_path}')");
+    let mut deep_count = session.execute(&deep_count_sql).await?;
+    let deep_count_metrics = deep_count.metrics();
+    assert_eq!(
+        int64_value(&deep_count.stream().next().await.unwrap()?),
+        100
+    );
+    drop(deep_count);
+    let deep_count_metrics = deep_count_metrics.snapshot();
+    assert_eq!(deep_count_metrics.parquet_page_index_bytes_read, 0);
+    assert_eq!(deep_count_metrics.parquet_bloom_filter_bytes_read, 0);
+
+    let deep_page_sql = format!(
+        "SELECT count(*) FROM read_parquet('s3://{BUCKET}/{deep_pruning_path}') WHERE id >= 180"
+    );
+    let mut deep_page = session.execute(&deep_page_sql).await?;
+    let deep_page_metrics = deep_page.metrics();
+    assert_eq!(int64_value(&deep_page.stream().next().await.unwrap()?), 10);
+    drop(deep_page);
+    let deep_page_metrics = deep_page_metrics.snapshot();
+    assert!(deep_page_metrics.parquet_page_index_bytes_read > 0);
+    assert!(deep_page_metrics.parquet_page_rows_pruned > 0);
+
+    let deep_bloom_sql = format!(
+        "SELECT count(*) FROM read_parquet('s3://{BUCKET}/{deep_pruning_path}') WHERE id = 51"
+    );
+    let mut deep_bloom = session.execute(&deep_bloom_sql).await?;
+    let deep_bloom_metrics = deep_bloom.metrics();
+    assert_eq!(int64_value(&deep_bloom.stream().next().await.unwrap()?), 0);
+    drop(deep_bloom);
+    let deep_bloom_metrics = deep_bloom_metrics.snapshot();
+    assert!(deep_bloom_metrics.parquet_bloom_filter_bytes_read > 0);
+    assert_eq!(deep_bloom_metrics.parquet_bloom_row_groups_pruned, 1);
+
     let uncached_session = Engine::new(uncached_config)?.session();
     let mut uncached_result = uncached_session.execute(&parquet_sql).await?;
     let uncached_metrics = uncached_result.metrics();
@@ -423,6 +465,7 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
     store.delete(&csv_path).await?;
     store.delete(&parquet_path).await?;
     store.delete(&pruning_path).await?;
+    store.delete(&deep_pruning_path).await?;
     store.delete(&widening_c).await?;
     store.delete(&widening_d).await?;
     public_store.delete(&public_path).await?;

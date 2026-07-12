@@ -1,3 +1,4 @@
+mod bounded;
 mod cursor;
 
 use std::{cmp::Ordering, sync::Arc};
@@ -14,25 +15,59 @@ use futures::StreamExt;
 
 use super::{
     condition::{JoinPredicates, SqlTruth},
-    evaluate_optional_values, optional_array, optional_memory,
-    output::{build_output_envelope, candidate_workspace_bytes},
+    evaluate_optional_values,
+    matched::BuildMatchTracker,
+    optional_array, optional_memory,
+    output::{build_output_envelope, build_unmatched_right_envelope, candidate_workspace_bytes},
     spill::{PartitionTask, remove_files},
 };
 use crate::execution::{sort, value::CellValue};
 use cursor::SortedCursor;
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn fallback(
+pub(super) fn fallback_with_null_keys(
     task: PartitionTask,
     left_expressions: Vec<BoundExpr>,
     right_expressions: Vec<BoundExpr>,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     predicates: JoinPredicates,
+    null_equal_keys: bool,
     join_type: JoinType,
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
+) -> MemoryBatchStream {
+    fallback_impl(
+        task,
+        left_expressions,
+        right_expressions,
+        left_schema,
+        right_schema,
+        predicates,
+        null_equal_keys,
+        join_type,
+        schema,
+        context,
+        batch_size,
+        usize::MAX,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fallback_impl(
+    task: PartitionTask,
+    left_expressions: Vec<BoundExpr>,
+    right_expressions: Vec<BoundExpr>,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+    predicates: JoinPredicates,
+    null_equal_keys: bool,
+    join_type: JoinType,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+    match_tracker_budget: usize,
 ) -> MemoryBatchStream {
     boxed_memory_batch_stream(async_stream::try_stream! {
         let cleanup = TaskCleanup::new(
@@ -73,7 +108,7 @@ pub(super) fn fallback(
         while left.ensure_row().await? {
             context.check_cancelled()?;
             let left_key = left.key()?;
-            if has_null(&left_key) {
+            if !null_equal_keys && has_null(&left_key) {
                 if emits_empty_group(join_type) {
                     let held_bytes = left.held_bytes().saturating_add(right.held_bytes());
                     yield left_only(
@@ -92,10 +127,20 @@ pub(super) fn fallback(
 
             while right.ensure_row().await? {
                 let right_key = right.key()?;
-                if has_null(&right_key) || compare_keys(&right_key, &left_key)? != Ordering::Less {
+                if compare_keys(&right_key, &left_key)? != Ordering::Less {
                     break;
                 }
-                right.take_row();
+                let row = right.take_row();
+                if tracks_build_matches(join_type) {
+                    let held_bytes = left.held_bytes().saturating_add(right.held_bytes());
+                    yield right_only(
+                        &left_schema,
+                        row,
+                        Arc::clone(&schema),
+                        &context,
+                        held_bytes,
+                    ).await?;
+                }
             }
 
             if !right.ensure_row().await? {
@@ -116,7 +161,7 @@ pub(super) fn fallback(
             }
 
             let right_key = right.key()?;
-            if has_null(&right_key) || compare_keys(&left_key, &right_key)? == Ordering::Less {
+            if compare_keys(&left_key, &right_key)? == Ordering::Less {
                 if emits_empty_group(join_type) {
                     let held_bytes = left.held_bytes().saturating_add(right.held_bytes());
                     yield left_only(
@@ -134,20 +179,38 @@ pub(super) fn fallback(
             }
 
             let group_key = left_key;
-            let group_file = spill_right_group(
+            let (group_file, group_rows) = spill_right_group(
                 &mut right,
                 &group_key,
                 Arc::clone(&right_schema),
                 &context,
             ).await?;
+            let mut group_memory = context.memory.reservation();
+            let matched_build = if tracks_build_matches(join_type)
+                && group_rows <= u32::MAX as usize
+                && BuildMatchTracker::required_bytes(group_rows) <= match_tracker_budget
+            {
+                BuildMatchTracker::try_new(group_rows, &mut group_memory)
+            } else {
+                None
+            };
 
-            while left.ensure_row().await? && left.key()? == group_key {
-                let left_run = left.take_equal_run(&group_key)?;
-                let mut output = process_equal_run(
-                    left_run,
-                    &group_file,
-                    &empty_right,
-                    &predicates,
+            if tracks_build_matches(join_type)
+                && matched_build.is_none()
+                && predicates.residual().is_some()
+            {
+                let left_group = spill_left_group(
+                    &mut left,
+                    &group_key,
+                    Arc::clone(&left_schema),
+                    &context,
+                ).await?;
+                let mut output = bounded::process(
+                    left_group,
+                    group_file,
+                    Arc::clone(&left_schema),
+                    Arc::clone(&right_schema),
+                    predicates.clone(),
                     join_type,
                     Arc::clone(&schema),
                     Arc::clone(&context),
@@ -157,11 +220,162 @@ pub(super) fn fallback(
                 while let Some(batch) = output.next().await {
                     yield batch?;
                 }
+                continue;
+            }
+            // With no residual every row in the equal-key build group matches
+            // at least one left row, so an unavailable whole-group tracker can
+            // be elided without producing unmatched-right rows.
+
+            while left.ensure_row().await? && left.key()? == group_key {
+                let left_run = left.take_equal_run(&group_key)?;
+                let mut output = process_equal_run(
+                    left_run,
+                    &group_file,
+                    &empty_right,
+                    &predicates,
+                    matched_build.clone(),
+                    join_type,
+                    true,
+                    Arc::clone(&schema),
+                    Arc::clone(&context),
+                    batch_size,
+                    left.held_bytes()
+                        .saturating_add(right.held_bytes())
+                        .saturating_add(group_memory.size()),
+                );
+                while let Some(batch) = output.next().await {
+                    yield batch?;
+                }
+            }
+            if let Some(matched) = &matched_build {
+                let mut group_offset = 0usize;
+                for right_batch in context.spill.read_file(&group_file)? {
+                    let right_batch = BatchEnvelope::try_new(
+                        right_batch?,
+                        &context.memory,
+                        "join sort-merge unmatched group",
+                    )?;
+                    let mut local_start = 0usize;
+                    while local_start < right_batch.num_rows() {
+                        let global_start = group_offset.checked_add(local_start).ok_or_else(|| {
+                            Error::ResourceExhausted(
+                                "sort-merge unmatched row offset overflowed usize".into(),
+                            )
+                        })?;
+                        let global_end = group_offset
+                            .checked_add(right_batch.num_rows())
+                            .ok_or_else(|| {
+                                Error::ResourceExhausted(
+                                    "sort-merge unmatched row count overflowed usize".into(),
+                                )
+                            })?;
+                        let held_bytes = left
+                            .held_bytes()
+                            .saturating_add(right.held_bytes())
+                            .saturating_add(group_memory.size())
+                            .saturating_add(right_batch.memory_size());
+                        let indices = matched
+                            .unmatched_range(
+                                global_start,
+                                global_end,
+                                group_offset,
+                                batch_size.max(1),
+                                &context,
+                                held_bytes,
+                            )
+                            .await?;
+                        let Some(last) = indices.last().copied() else {
+                            break;
+                        };
+                        local_start = last as usize + 1;
+                        yield build_unmatched_right_envelope(
+                            &left_schema,
+                            right_batch.batch(),
+                            &indices,
+                            Arc::clone(&schema),
+                            &context,
+                            held_bytes.saturating_add(indices.memory_size()),
+                        ).await?;
+                    }
+                    group_offset = group_offset.saturating_add(right_batch.num_rows());
+                }
             }
             context.spill.remove_file(&group_file)?;
         }
+        if tracks_build_matches(join_type) {
+            while right.ensure_row().await? {
+                let held_bytes = left.held_bytes().saturating_add(right.held_bytes());
+                yield right_only(
+                    &left_schema,
+                    right.take_row(),
+                    Arc::clone(&schema),
+                    &context,
+                    held_bytes,
+                ).await?;
+            }
+        }
         drop(cleanup);
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub(super) fn fallback(
+    task: PartitionTask,
+    left_expressions: Vec<BoundExpr>,
+    right_expressions: Vec<BoundExpr>,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+    predicates: JoinPredicates,
+    join_type: JoinType,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+) -> MemoryBatchStream {
+    fallback_with_null_keys(
+        task,
+        left_expressions,
+        right_expressions,
+        left_schema,
+        right_schema,
+        predicates,
+        false,
+        join_type,
+        schema,
+        context,
+        batch_size,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub(super) fn fallback_with_tracker_budget(
+    task: PartitionTask,
+    left_expressions: Vec<BoundExpr>,
+    right_expressions: Vec<BoundExpr>,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+    predicates: JoinPredicates,
+    join_type: JoinType,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+    match_tracker_budget: usize,
+) -> MemoryBatchStream {
+    fallback_impl(
+        task,
+        left_expressions,
+        right_expressions,
+        left_schema,
+        right_schema,
+        predicates,
+        false,
+        join_type,
+        schema,
+        context,
+        batch_size,
+        match_tracker_budget,
+    )
 }
 
 #[derive(Clone, Copy, Default)]
@@ -177,7 +391,9 @@ fn process_equal_run(
     group_file: &SpillFile,
     empty_right: &RecordBatch,
     predicates: &JoinPredicates,
+    matched_build: Option<BuildMatchTracker>,
     join_type: JoinType,
+    emit_matches: bool,
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
@@ -333,6 +549,20 @@ fn process_equal_run(
                         }
                     } else {
                         state.matches = state.matches.saturating_add(1);
+                        if let Some(matched) = &matched_build {
+                            let right_row = right_offset
+                                .checked_add(*right_row as usize)
+                                .ok_or_else(|| {
+                                    Error::ResourceExhausted(
+                                        "sort-merge matched row offset overflowed usize".into(),
+                                    )
+                                })?;
+                            matched.mark(u32::try_from(right_row).map_err(|_| {
+                                Error::ResourceExhausted(
+                                    "sort-merge matched row exceeds UINT32_MAX".into(),
+                                )
+                            })?);
+                        }
                         if state.matches == 1 && join_type == JoinType::LeftSingle {
                             state.first_right = Some(
                                 right_offset.checked_add(*right_row as usize).ok_or_else(|| {
@@ -347,9 +577,12 @@ fn process_equal_run(
                                 "scalar subquery returned more than one row".into(),
                             ))?;
                         }
-                        if matches!(
+                        if emit_matches && matches!(
                             join_type,
-                            JoinType::Inner | JoinType::Left
+                            JoinType::Inner
+                                | JoinType::Left
+                                | JoinType::Right
+                                | JoinType::Full
                         ) {
                             output_left.push(*left_row);
                             output_right.push(Some(*right_row));
@@ -459,6 +692,8 @@ fn process_equal_run(
             let emit = match join_type {
                 JoinType::Inner => false,
                 JoinType::Left => state.matches == 0,
+                JoinType::Right => false,
+                JoinType::Full => state.matches == 0,
                 JoinType::Semi => state.matches != 0,
                 JoinType::Anti => state.matches == 0,
                 JoinType::LeftSingle => state.matches == 0,
@@ -527,12 +762,40 @@ async fn spill_right_group(
     key: &[CellValue],
     schema: SchemaRef,
     context: &QueryContext,
-) -> Result<SpillFile> {
+) -> Result<(SpillFile, usize)> {
     let mut writer = context.spill.writer("join-equal-group", schema)?;
+    let mut rows = 0usize;
     while right.ensure_row().await? && right.key()? == key {
-        writer.write_batch(&right.take_equal_run(key)?)?;
+        let batch = right.take_equal_run(key)?;
+        rows = rows.checked_add(batch.num_rows()).ok_or_else(|| {
+            Error::ResourceExhausted("sort-merge equality group row count overflowed".into())
+        })?;
+        writer.write_batch(&batch)?;
+    }
+    Ok((writer.finish(1)?, rows))
+}
+
+async fn spill_left_group(
+    left: &mut SortedCursor,
+    key: &[CellValue],
+    schema: SchemaRef,
+    context: &QueryContext,
+) -> Result<SpillFile> {
+    let mut writer = context.spill.writer("join-left-equal-group", schema)?;
+    while left.ensure_row().await? && left.key()? == key {
+        writer.write_batch(&left.take_equal_run(key)?)?;
     }
     writer.finish(1)
+}
+
+async fn right_only(
+    left_schema: &SchemaRef,
+    right: RecordBatch,
+    schema: SchemaRef,
+    context: &QueryContext,
+    held_bytes: usize,
+) -> Result<BatchEnvelope> {
+    build_unmatched_right_envelope(left_schema, &right, &[0], schema, context, held_bytes).await
 }
 
 async fn left_only(
@@ -563,11 +826,16 @@ fn emits_empty_group(join_type: JoinType) -> bool {
     matches!(
         join_type,
         JoinType::Left
+            | JoinType::Full
             | JoinType::Anti
             | JoinType::LeftSingle
             | JoinType::Mark
             | JoinType::NullAwareAnti
     )
+}
+
+fn tracks_build_matches(join_type: JoinType) -> bool {
+    matches!(join_type, JoinType::Right | JoinType::Full)
 }
 
 fn sort_keys(expressions: &[BoundExpr]) -> Vec<SortExpr> {

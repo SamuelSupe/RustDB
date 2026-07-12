@@ -46,8 +46,9 @@ and parallelism checks.
 
 ## Low-memory acceptance suite
 
-The SF10 resource gate runs full Sort, high-cardinality Aggregate, Inner Join,
-and Left Join workloads at both 64 MiB and 128 MiB:
+The SF10 resource gate runs full Sort, high-cardinality Aggregate,
+Inner/Left/Right/Full Join, DISTINCT set-operation, and Window workloads at
+both 64 MiB and 128 MiB:
 
 ```sh
 benchmarks/run_low_memory.sh data/tpch-sf10
@@ -107,7 +108,7 @@ checksum runner used to produce the evidence. An explicitly supplied build ID
 or CPU model is accepted only when it matches the current worktree or detected
 host, so an environment override cannot silently relabel a run.
 
-For the v0.3 M5 Max gate, capture the local SF10 candidate and compare it with
+For the v0.4 M5 Max gate, capture the local SF10 candidate and compare it with
 the clean `v0.2.0-alpha.1` SF10 manifest:
 
 ```sh
@@ -120,6 +121,10 @@ python3 -B benchmarks/check_parallel_gate.py \
   --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
   --baseline benchmarks/results/baseline/<v02-sf10-run>/manifest.json
 ```
+
+The checker requires `0.4.0-alpha.1` candidate reports and a
+`0.2.0-alpha.1` baseline; a report produced by another engine release is not
+accepted as either side of the comparison.
 
 The checker reads only local, metadata-warm, batch-8192 reports for
 `scan-filter` and `aggregate` at one and four threads. It requires M5 Max,

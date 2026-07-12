@@ -8,9 +8,9 @@ mod build;
 mod partition;
 
 pub(super) use build::{BuildPartition, load_build_partition};
+pub(super) use partition::{PartitionSpiller, Side, spill_batch_with_null_keys, spill_stream};
 #[cfg(test)]
-pub(super) use partition::partition_for_key;
-pub(super) use partition::{PartitionSpiller, Side, spill_batch, spill_stream};
+pub(super) use partition::{partition_for_key, spill_batch};
 
 pub(super) const PARTITIONS: usize = 64;
 pub(super) const MAX_REPARTITION_DEPTH: usize = 4;
@@ -55,6 +55,7 @@ pub(super) fn repartition(
     left_expressions: &[BoundExpr],
     right_expressions: &[BoundExpr],
     join_type: JoinType,
+    null_equal_keys: bool,
     next_depth: usize,
     context: &QueryContext,
 ) -> Result<Repartitioned> {
@@ -67,11 +68,12 @@ pub(super) fn repartition(
             let batch =
                 BatchEnvelope::try_new(batch?, &context.memory, "join repartition left batch")?;
             let (batch, _batch_memory) = batch.into_parts();
-            spill_batch(
+            spill_batch_with_null_keys(
                 batch,
                 left_expressions,
                 Side::Left,
                 join_type,
+                null_equal_keys,
                 &mut left_spiller,
                 seed,
             )?;
@@ -85,11 +87,12 @@ pub(super) fn repartition(
             let batch =
                 BatchEnvelope::try_new(batch?, &context.memory, "join repartition right batch")?;
             let (batch, _batch_memory) = batch.into_parts();
-            let counts = spill_batch(
+            let counts = spill_batch_with_null_keys(
                 batch,
                 right_expressions,
                 Side::Right,
                 join_type,
+                null_equal_keys,
                 &mut right_spiller,
                 seed,
             )?;

@@ -2,7 +2,7 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query,
-    SelectItem, SetExpr, Visit, Visitor,
+    SetExpr, Visit, Visitor,
 };
 
 use crate::sql::{JoinType, LogicalPlan};
@@ -223,6 +223,20 @@ fn scalar_cardinality_is_bounded(expr: &Expr) -> bool {
 }
 
 fn query_contains_scalar_subquery(query: &Query) -> bool {
+    ast_contains_scalar_subquery(query)
+}
+
+fn select_contains_scalar_subquery(select: &sqlparser::ast::Select) -> bool {
+    // Visit the complete query block so QUALIFY and inline/named window specs
+    // cannot hide a cardinality-producing scalar from speculative staging.
+    ast_contains_scalar_subquery(select)
+}
+
+fn contains_scalar_subquery(expr: &Expr) -> bool {
+    ast_contains_scalar_subquery(expr)
+}
+
+fn ast_contains_scalar_subquery(ast: &impl Visit) -> bool {
     struct FindScalar;
 
     impl Visitor for FindScalar {
@@ -237,7 +251,7 @@ fn query_contains_scalar_subquery(query: &Query) -> bool {
         }
     }
 
-    matches!(query.visit(&mut FindScalar), ControlFlow::Break(()))
+    matches!(ast.visit(&mut FindScalar), ControlFlow::Break(()))
 }
 
 fn query_is_at_most_one_row(query: &Query) -> bool {
@@ -258,65 +272,9 @@ fn query_is_at_most_one_row(query: &Query) -> bool {
             groups,
             &select.projection,
             select.having.as_ref(),
+            select.qualify.as_ref(),
+            &select.named_window,
         )
-}
-
-fn select_contains_scalar_subquery(select: &sqlparser::ast::Select) -> bool {
-    select.projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            contains_scalar_subquery(expr)
-        }
-        _ => false,
-    }) || select
-        .selection
-        .as_ref()
-        .is_some_and(contains_scalar_subquery)
-        || select.having.as_ref().is_some_and(contains_scalar_subquery)
-}
-
-fn contains_scalar_subquery(expr: &Expr) -> bool {
-    match expr {
-        Expr::Subquery(_) => true,
-        Expr::BinaryOp { left, right, .. }
-        | Expr::Like {
-            expr: left,
-            pattern: right,
-            ..
-        }
-        | Expr::ILike {
-            expr: left,
-            pattern: right,
-            ..
-        }
-        | Expr::SimilarTo {
-            expr: left,
-            pattern: right,
-            ..
-        } => contains_scalar_subquery(left) || contains_scalar_subquery(right),
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            contains_scalar_subquery(expr)
-                || contains_scalar_subquery(low)
-                || contains_scalar_subquery(high)
-        }
-        Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => contains_scalar_subquery(expr),
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsTrue(expr)
-        | Expr::IsNotTrue(expr)
-        | Expr::IsFalse(expr)
-        | Expr::IsNotFalse(expr)
-        | Expr::IsUnknown(expr)
-        | Expr::IsNotUnknown(expr)
-        | Expr::Cast { expr, .. }
-        | Expr::Extract { expr, .. }
-        | Expr::Ceil { expr, .. }
-        | Expr::Floor { expr, .. } => contains_scalar_subquery(expr),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -385,6 +343,29 @@ mod tests {
         ] {
             let predicate = selection(&format!("SELECT 1 WHERE {predicate}"));
             assert!(stageable_direct_mark_term(&predicate).is_none());
+        }
+    }
+
+    #[test]
+    fn does_not_stage_past_scalars_in_qualify_or_window_specs() {
+        for scalar in [
+            "SELECT count(*) FROM detail \
+             QUALIFY row_number() OVER () = (SELECT value FROM multi)",
+            "SELECT count(*) FROM detail \
+             WINDOW w AS (ORDER BY (SELECT value FROM multi)) \
+             QUALIFY row_number() OVER w = 1",
+            "SELECT count(*), \
+                    row_number() OVER (ORDER BY (SELECT value FROM multi)) \
+             FROM detail",
+        ] {
+            let predicate = selection(&format!(
+                "SELECT 1 WHERE key IN (SELECT key FROM rhs) \
+                 AND 1 = ({scalar})"
+            ));
+            assert!(
+                stageable_direct_mark_term(&predicate).is_none(),
+                "scalar cardinality in `{scalar}` must prevent direct-marker staging"
+            );
         }
     }
 

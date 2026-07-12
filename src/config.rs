@@ -12,6 +12,33 @@ mod builder;
 pub use builder::EngineConfigBuilder;
 
 const DEFAULT_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_PARQUET_PRUNING_METADATA_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ParquetPruningMode {
+    #[default]
+    Auto,
+    Disabled,
+}
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ParquetScanConfig {
+    pub page_index: ParquetPruningMode,
+    pub bloom_filter: ParquetPruningMode,
+    pub max_pruning_metadata_bytes: usize,
+}
+
+impl Default for ParquetScanConfig {
+    fn default() -> Self {
+        Self {
+            page_index: ParquetPruningMode::Auto,
+            bloom_filter: ParquetPruningMode::Auto,
+            max_pruning_metadata_bytes: DEFAULT_PARQUET_PRUNING_METADATA_BYTES,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SpillConfig {
@@ -98,6 +125,7 @@ pub struct EngineConfig {
     pub io_concurrency: usize,
     pub max_concurrent_queries: usize,
     pub metadata_cache_bytes: usize,
+    pub parquet_scan: ParquetScanConfig,
     pub s3: S3Config,
     pub spill: SpillConfig,
 }
@@ -120,6 +148,7 @@ impl Default for EngineConfig {
             io_concurrency: 32,
             max_concurrent_queries: 1,
             metadata_cache_bytes: 64 * 1024 * 1024,
+            parquet_scan: ParquetScanConfig::default(),
             s3: S3Config::default(),
             spill,
         }
@@ -214,7 +243,7 @@ impl ParquetOptions {
 mod tests {
     use std::{path::PathBuf, time::Duration};
 
-    use super::{S3Config, SpillConfig};
+    use super::{ParquetPruningMode, ParquetScanConfig, S3Config, SpillConfig};
     use crate::Error;
 
     #[test]
@@ -226,6 +255,14 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("<configured>"));
         assert!(!debug.contains("user-secret"));
+    }
+
+    #[test]
+    fn parquet_pruning_defaults_to_auto_with_a_sixty_four_mib_cap() {
+        let config = ParquetScanConfig::default();
+        assert_eq!(config.page_index, ParquetPruningMode::Auto);
+        assert_eq!(config.bloom_filter, ParquetPruningMode::Auto);
+        assert_eq!(config.max_pruning_metadata_bytes, 64 * 1024 * 1024);
     }
 
     #[test]

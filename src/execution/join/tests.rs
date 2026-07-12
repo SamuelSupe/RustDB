@@ -7,7 +7,7 @@ use arrow::{
 };
 use futures::TryStreamExt;
 
-use super::{evaluate_keys_accounted, join, sort_merge, spill};
+use super::{evaluate_keys_accounted, join, join_with_null_keys, sort_merge, spill};
 use crate::{
     runtime::{
         BatchEnvelope, MemoryPool, QueryContext, QueryMetricsSnapshot, boxed_record_batch_stream,
@@ -527,6 +527,138 @@ async fn skew_fallback_left_join_emits_unmatched_and_null_keys() {
 }
 
 #[tokio::test]
+async fn skew_fallback_full_join_emits_unmatched_build_rows() {
+    let (batches, metrics) = run_skew_join(JoinType::Full).await;
+    assert!(metrics.spill_partitions > 0);
+    assert_eq!(rows(&batches), 2 * RIGHT_DUPLICATES as usize + 3);
+
+    let unmatched_build = batches
+        .iter()
+        .flat_map(|batch| {
+            let left_ids = int64(batch, 1);
+            let right_ids = int64(batch, 3);
+            (0..batch.num_rows())
+                .filter(|row| left_ids.is_null(*row) && !right_ids.is_null(*row))
+                .map(|row| right_ids.value(row))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unmatched_build, [RIGHT_DUPLICATES]);
+}
+
+#[tokio::test]
+async fn right_and_full_join_emit_unmatched_build_rows() {
+    let (left_schema, right_schema) = schemas();
+    let left = RecordBatch::try_new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), None])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let right = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2, 3, 4])),
+            Arc::new(Int64Array::from(vec![200, 300, 400])),
+        ],
+    )
+    .unwrap();
+
+    let (right_rows, _) = run_join(
+        JoinType::Right,
+        Arc::clone(&left_schema),
+        Arc::clone(&right_schema),
+        left.clone(),
+        right.clone(),
+    )
+    .await;
+    assert_eq!(rows(&right_rows), 3);
+    assert_eq!(right_ids(&right_rows), [200, 300, 400]);
+
+    let (full_rows, _) = run_join(JoinType::Full, left_schema, right_schema, left, right).await;
+    assert_eq!(rows(&full_rows), 5);
+    assert_eq!(right_ids(&full_rows), [200, 300, 400]);
+    let unmatched_left = full_rows
+        .iter()
+        .flat_map(|batch| {
+            let left_ids = int64(batch, 1);
+            let right_ids = int64(batch, 3);
+            (0..batch.num_rows())
+                .filter(|row| right_ids.is_null(*row))
+                .map(|row| left_ids.value(row))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unmatched_left, [10, 30]);
+}
+
+#[tokio::test]
+async fn null_equal_semi_join_preserves_null_through_grace_spill() {
+    const ROWS: i64 = 24_000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, true),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let keys = (0..ROWS)
+        .map(Some)
+        .chain(std::iter::once(None))
+        .collect::<Vec<_>>();
+    let batch = || {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(keys.clone())),
+                Arc::new(Int64Array::from_iter_values(0..=ROWS)),
+            ],
+        )
+        .unwrap()
+    };
+    let left = boxed_record_batch_stream(futures::stream::once({
+        let batch = batch();
+        async move { Ok(batch) }
+    }));
+    let right = boxed_record_batch_stream(futures::stream::once({
+        let batch = batch();
+        async move { Ok(batch) }
+    }));
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(2 << 20), temp.path()).unwrap();
+    let batches = join_with_null_keys(
+        left,
+        right,
+        vec![(
+            BoundExpr::column(0, DataType::Int64, "left.key"),
+            BoundExpr::column(0, DataType::Int64, "right.key"),
+        )],
+        true,
+        None,
+        None,
+        Arc::clone(&schema),
+        Arc::clone(&schema),
+        JoinType::Semi,
+        schema,
+        Arc::clone(&context),
+        256,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    assert_eq!(rows(&batches), ROWS as usize + 1);
+    assert!(context.metrics.snapshot().spill_partitions > 0);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| int64(batch, 0).null_count())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(context.memory.used(), 0);
+}
+
+#[tokio::test]
 async fn skew_fallback_semi_and_anti_preserve_left_multiplicity() {
     let (semi, _) = run_skew_join(JoinType::Semi).await;
     assert_eq!(left_ids(&semi), [10, 11]);
@@ -989,11 +1121,13 @@ async fn run_skew_join(join_type: JoinType) -> (Vec<RecordBatch>, QueryMetricsSn
         ],
     )
     .unwrap();
+    let mut right_keys = vec![1; RIGHT_DUPLICATES as usize];
+    right_keys.push(3);
     let right_batch = RecordBatch::try_new(
         Arc::clone(&right_schema),
         vec![
-            Arc::new(Int64Array::from(vec![1; RIGHT_DUPLICATES as usize])),
-            Arc::new(Int64Array::from_iter_values(0..RIGHT_DUPLICATES)),
+            Arc::new(Int64Array::from(right_keys)),
+            Arc::new(Int64Array::from_iter_values(0..=RIGHT_DUPLICATES)),
         ],
     )
     .unwrap();
@@ -1171,7 +1305,17 @@ fn output_schema(join_type: JoinType, left: &SchemaRef, right: &SchemaRef) -> Sc
     ) {
         return Arc::clone(left);
     }
-    let mut fields = left.fields().iter().cloned().collect::<Vec<_>>();
+    let mut fields = left
+        .fields()
+        .iter()
+        .map(|field| {
+            Arc::new(Field::new(
+                field.name(),
+                field.data_type().clone(),
+                matches!(join_type, JoinType::Right | JoinType::Full) || field.is_nullable(),
+            ))
+        })
+        .collect::<Vec<_>>();
     if join_type == JoinType::Mark {
         fields.push(Arc::new(Field::new("marker", DataType::Boolean, true)));
         return Arc::new(Schema::new(fields));
@@ -1180,7 +1324,10 @@ fn output_schema(join_type: JoinType, left: &SchemaRef, right: &SchemaRef) -> Sc
         Arc::new(Field::new(
             field.name(),
             field.data_type().clone(),
-            matches!(join_type, JoinType::Left | JoinType::LeftSingle) || field.is_nullable(),
+            matches!(
+                join_type,
+                JoinType::Left | JoinType::Full | JoinType::LeftSingle
+            ) || field.is_nullable(),
         ))
     }));
     Arc::new(Schema::new(fields))
@@ -1202,6 +1349,21 @@ fn left_ids(batches: &[RecordBatch]) -> Vec<i64> {
     let mut ids = batches
         .iter()
         .flat_map(|batch| int64(batch, 1).values().iter().copied())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
+fn right_ids(batches: &[RecordBatch]) -> Vec<i64> {
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| {
+            let values = int64(batch, 3);
+            (0..values.len())
+                .filter(|row| !values.is_null(*row))
+                .map(|row| values.value(row))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids

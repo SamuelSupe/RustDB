@@ -8,6 +8,7 @@ mod scalar;
 mod scan;
 mod sort;
 mod value;
+mod window;
 
 use std::sync::Arc;
 

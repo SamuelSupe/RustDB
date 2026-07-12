@@ -53,6 +53,22 @@ fn rewrite_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
             aggregate_exprs,
             schema,
         },
+        LogicalPlan::Append { inputs, schema } => LogicalPlan::Append {
+            inputs: inputs
+                .into_iter()
+                .map(rewrite_plan)
+                .collect::<Result<Vec<_>>>()?,
+            schema,
+        },
+        LogicalPlan::Window {
+            input,
+            expressions,
+            schema,
+        } => LogicalPlan::Window {
+            input: Box::new(rewrite_plan(*input)?),
+            expressions,
+            schema,
+        },
         LogicalPlan::Sort {
             input,
             expressions,
@@ -79,6 +95,7 @@ fn rewrite_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
             left,
             right,
             on,
+            null_equal_keys,
             residual,
             null_aware,
             join_type,
@@ -87,6 +104,7 @@ fn rewrite_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
             left: Box::new(rewrite_plan(*left)?),
             right: Box::new(rewrite_plan(*right)?),
             on,
+            null_equal_keys,
             residual,
             null_aware,
             join_type,
@@ -184,6 +202,7 @@ fn decorrelate(
             left: Box::new(left),
             right: Box::new(pulled.plan),
             on,
+            null_equal_keys: false,
             residual,
             null_aware: None,
             join_type: JoinType::Mark,
@@ -206,6 +225,7 @@ fn decorrelate(
                 left: Box::new(left),
                 right: Box::new(pulled.plan),
                 on,
+                null_equal_keys: false,
                 residual,
                 null_aware: Some((needle, right_value)),
                 join_type: JoinType::Mark,
@@ -216,6 +236,7 @@ fn decorrelate(
             left: Box::new(left),
             right: Box::new(pulled.plan),
             on,
+            null_equal_keys: false,
             residual,
             null_aware: None,
             join_type: if negated {
@@ -249,6 +270,7 @@ fn decorrelate(
                 left: Box::new(left),
                 right: Box::new(pulled.plan),
                 on,
+                null_equal_keys: false,
                 residual,
                 null_aware,
                 join_type,
@@ -275,6 +297,7 @@ fn guarded_scalar_join(
         left: Box::new(left),
         right: Box::new(right),
         on,
+        null_equal_keys: false,
         residual,
         null_aware: None,
         join_type: JoinType::LeftSingle,
@@ -308,6 +331,7 @@ fn scalar_join(
         left: Box::new(left),
         right: Box::new(right),
         on,
+        null_equal_keys: false,
         residual,
         null_aware: None,
         join_type: if scalar_aggregate {
@@ -384,6 +408,22 @@ fn lower_mark_filters(plan: LogicalPlan) -> Result<LogicalPlan> {
             aggregate_exprs,
             schema,
         },
+        LogicalPlan::Append { inputs, schema } => LogicalPlan::Append {
+            inputs: inputs
+                .into_iter()
+                .map(lower_mark_filters)
+                .collect::<Result<Vec<_>>>()?,
+            schema,
+        },
+        LogicalPlan::Window {
+            input,
+            expressions,
+            schema,
+        } => LogicalPlan::Window {
+            input: Box::new(lower_mark_filters(*input)?),
+            expressions,
+            schema,
+        },
         LogicalPlan::Sort {
             input,
             expressions,
@@ -410,6 +450,7 @@ fn lower_mark_filters(plan: LogicalPlan) -> Result<LogicalPlan> {
             left,
             right,
             on,
+            null_equal_keys,
             residual,
             null_aware,
             join_type,
@@ -418,6 +459,7 @@ fn lower_mark_filters(plan: LogicalPlan) -> Result<LogicalPlan> {
             left: Box::new(lower_mark_filters(*left)?),
             right: Box::new(lower_mark_filters(*right)?),
             on,
+            null_equal_keys,
             residual,
             null_aware,
             join_type,
@@ -481,6 +523,7 @@ fn lower_marker(plan: LogicalPlan, negated: bool) -> Result<LogicalPlan> {
         left,
         right,
         on,
+        null_equal_keys: false,
         residual,
         null_aware,
         join_type,

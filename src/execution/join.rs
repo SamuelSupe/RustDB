@@ -21,6 +21,7 @@ use super::{
 
 mod condition;
 mod grace;
+mod matched;
 mod output;
 mod parallel;
 mod probe;
@@ -33,19 +34,26 @@ mod correlation_tests;
 mod global_membership_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tracker_fallback_tests;
 
 use condition::JoinPredicates;
-use probe::{GlobalMembershipState, ProbeCursor, try_build_hash_table};
+use matched::BuildMatchTracker;
+use output::build_unmatched_right_envelope;
+use probe::{
+    GlobalMembershipState, ProbeCursor, try_build_hash_table, try_build_hash_table_with_nulls,
+};
 use spill::{BuildPartition, MAX_REPARTITION_DEPTH, Side};
 
 // The physical join boundary carries both input schemas, output schema, keys,
 // execution state, and sizing. Keeping this explicit avoids a public options
 // abstraction for a single internal call site.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn join<L, R>(
+pub(crate) fn join_with_null_keys<L, R>(
     left: L,
     right: R,
     on: Vec<(BoundExpr, BoundExpr)>,
+    null_equal_keys: bool,
     residual: Option<BoundExpr>,
     null_aware: Option<(BoundExpr, BoundExpr)>,
     left_schema: SchemaRef,
@@ -65,7 +73,11 @@ where
         && matches!(join_type, JoinType::Mark | JoinType::NullAwareAnti);
     let skip_right_build = residual
         .as_ref()
-        .is_some_and(|expr| matches!(&expr.kind, ExprKind::Literal(ScalarValue::Boolean(false))));
+        .is_some_and(|expr| matches!(&expr.kind, ExprKind::Literal(ScalarValue::Boolean(false))))
+        && matches!(
+            join_type,
+            JoinType::Left | JoinType::LeftSingle | JoinType::Mark
+        );
     let predicates = JoinPredicates::new(residual, null_aware, &left_schema, &right_schema);
     let mut left = left.into_memory_batch_stream(Arc::clone(&context), "join left input");
     let mut right = right.into_memory_batch_stream(Arc::clone(&context), "join right input");
@@ -107,33 +119,36 @@ where
                 let mut spiller = spill::PartitionSpiller::new(&context, "join-right");
                 for buffered in right_batches.drain(..) {
                     let buffered_bytes = buffered.get_array_memory_size();
-                    spill::spill_batch(
+                    spill::spill_batch_with_null_keys(
                         buffered,
                         &right_key_expressions,
                         Side::Right,
                         join_type,
+                        null_equal_keys,
                         &mut spiller,
                         0,
                     )?;
                     reservation.shrink(buffered_bytes);
                 }
                 let (batch, batch_memory) = batch.into_parts();
-                spill::spill_batch(
+                spill::spill_batch_with_null_keys(
                     batch,
                     &right_key_expressions,
                     Side::Right,
                     join_type,
+                    null_equal_keys,
                     &mut spiller,
                     0,
                 )?;
                 drop(batch_memory);
                 while let Some(batch) = right.next().await {
                     let (batch, batch_memory) = batch?.into_parts();
-                    spill::spill_batch(
+                    spill::spill_batch_with_null_keys(
                         batch,
                         &right_key_expressions,
                         Side::Right,
                         join_type,
+                        null_equal_keys,
                         &mut spiller,
                         0,
                     )?;
@@ -184,10 +199,11 @@ where
                     &context,
                     "join build keys",
                 )?;
-                let hash_table = try_build_hash_table(
+                let hash_table = try_build_hash_table_with_nulls(
                     &right_keys,
                     rows,
                     can_deduplicate_build(join_type, &predicates),
+                    null_equal_keys,
                     &mut reservation,
                 )?;
                 drop(right_keys);
@@ -201,26 +217,39 @@ where
             };
             match hash_table {
                 Some(hash_table) => {
-                    in_memory_build = Some((
-                        right_batch,
-                        hash_table,
-                        right_values,
-                        global_membership,
-                    ))
+                    if let Some(matched_build) =
+                        try_build_match_tracker(join_type, rows, &mut reservation)
+                    {
+                        in_memory_build = Some((
+                            right_batch,
+                            hash_table,
+                            right_values,
+                            global_membership,
+                            matched_build,
+                        ));
+                    } else {
+                        drop(hash_table);
+                        drop(right_values);
+                        right_partitions = Some(spill_build_batch(
+                            right_batch,
+                            &right_key_expressions,
+                            join_type,
+                            null_equal_keys,
+                            &context,
+                            &mut reservation,
+                        )?);
+                    }
                 }
                 None => {
                     drop(right_values);
-                let mut spiller = spill::PartitionSpiller::new(&context, "join-right");
-                    spill::spill_batch(
+                    right_partitions = Some(spill_build_batch(
                         right_batch,
                         &right_key_expressions,
-                        Side::Right,
                         join_type,
-                        &mut spiller,
-                        0,
-                    )?;
-                    reservation.try_resize(0)?;
-                    right_partitions = Some(spiller.finish()?);
+                        null_equal_keys,
+                        &context,
+                        &mut reservation,
+                    )?);
                 }
             }
         }
@@ -231,6 +260,7 @@ where
                 &left_key_expressions,
                 Side::Left,
                 join_type,
+                null_equal_keys,
                 &context,
                 "join-left",
             ).await?;
@@ -247,6 +277,7 @@ where
                     Arc::clone(&left_schema),
                     Arc::clone(&right_schema),
                     predicates.clone(),
+                    null_equal_keys,
                     join_type,
                     Arc::clone(&schema),
                     Arc::clone(&context),
@@ -274,10 +305,11 @@ where
                             "join spill build keys",
                         )?;
                         let rows = right_batch.num_rows();
-                        let hash_table = try_build_hash_table(
+                        let hash_table = try_build_hash_table_with_nulls(
                             &right_keys,
                             rows,
                             can_deduplicate_build(join_type, &predicates),
+                            null_equal_keys,
                             &mut reservation,
                         )?;
                         drop(right_keys);
@@ -288,8 +320,24 @@ where
                             "join spill build membership value",
                         )?;
                         match hash_table {
+                            Some(hash_table)
+                                if let Some(matched_build) = try_build_match_tracker(
+                                    join_type,
+                                    rows,
+                                    &mut reservation,
+                                ) =>
+                            {
+                                PartitionHashBuild::Ready(
+                                    right_batch,
+                                    hash_table,
+                                    right_values,
+                                    matched_build,
+                                )
+                            }
                             Some(hash_table) => {
-                                PartitionHashBuild::Ready(right_batch, hash_table, right_values)
+                                drop(hash_table);
+                                drop(right_values);
+                                PartitionHashBuild::TooLarge(rows)
                             }
                             None => {
                                 drop(right_values);
@@ -300,7 +348,12 @@ where
                     BuildPartition::TooLarge { rows } => PartitionHashBuild::TooLarge(rows),
                 };
                 match build {
-                    PartitionHashBuild::Ready(right_batch, hash_table, right_values) => {
+                    PartitionHashBuild::Ready(
+                        right_batch,
+                        hash_table,
+                        right_values,
+                        matched_build,
+                    ) => {
                         for file in &task.left {
                             for left_batch in context.spill.read_file(file)? {
                                 let left_batch = left_batch?;
@@ -330,6 +383,8 @@ where
                                     optional_array(&left_values),
                                     optional_array(&right_values),
                                     None,
+                                    null_equal_keys,
+                                    matched_build.clone(),
                                     join_type,
                                     Arc::clone(&schema),
                                     batch_size,
@@ -345,6 +400,29 @@ where
                                 }
                             }
                         }
+                        if let Some(matched) = &matched_build {
+                            let mut start = 0;
+                            loop {
+                                let indices = matched
+                                    .unmatched_from(
+                                        start,
+                                        batch_size.max(1),
+                                        &context,
+                                        reservation.size(),
+                                    )
+                                    .await?;
+                                let Some(last) = indices.last().copied() else { break };
+                                start = last as usize + 1;
+                                yield build_unmatched_right_envelope(
+                                    &left_schema,
+                                    &right_batch,
+                                    &indices,
+                                    Arc::clone(&schema),
+                                    &context,
+                                    reservation.size().saturating_add(indices.memory_size()),
+                                ).await?;
+                            }
+                        }
                         spill::remove_task(&context, &task)?;
                         reservation.try_resize(0)?;
                     }
@@ -357,6 +435,7 @@ where
                                 &left_key_expressions,
                                 &right_key_expressions,
                                 join_type,
+                                null_equal_keys,
                                 next_depth,
                                 &context,
                             )?;
@@ -377,13 +456,14 @@ where
                             spill::remove_tasks(&context, &repartitioned.tasks)?;
                         }
 
-                        let mut fallback = sort_merge::fallback(
+                        let mut fallback = sort_merge::fallback_with_null_keys(
                             task,
                             left_key_expressions.clone(),
                             right_key_expressions.clone(),
                             Arc::clone(&left_schema),
                             Arc::clone(&right_schema),
                             predicates.clone(),
+                            null_equal_keys,
                             join_type,
                             Arc::clone(&schema),
                             Arc::clone(&context),
@@ -399,7 +479,7 @@ where
             return;
         }
 
-        let (right_batch, hash_table, right_values, global_membership) = in_memory_build
+        let (right_batch, hash_table, right_values, global_membership, matched_build) = in_memory_build
             .take()
             .expect("a non-spilling join has an in-memory build");
         if parallel::is_supported(&context, reservation.size()) {
@@ -408,6 +488,8 @@ where
                 hash_table,
                 right_values,
                 global_membership,
+                null_equal_keys,
+                matched_build,
                 reservation,
             );
             let mut output = parallel::probe(
@@ -416,6 +498,7 @@ where
                 build,
                 predicates.clone(),
                 join_type,
+                Arc::clone(&left_schema),
                 Arc::clone(&schema),
                 Arc::clone(&context),
                 batch_size,
@@ -462,6 +545,8 @@ where
                 optional_array(&left_values),
                 optional_array(&right_values),
                 global_membership,
+                null_equal_keys,
+                matched_build.clone(),
                 join_type,
                 Arc::clone(&schema),
                 batch_size,
@@ -476,8 +561,65 @@ where
                 yield output;
             }
         }
-        let _ = left_schema;
+        if let Some(matched) = &matched_build {
+            let mut start = 0;
+            loop {
+                let indices = matched
+                    .unmatched_from(
+                        start,
+                        batch_size.max(1),
+                        &context,
+                        reservation.size(),
+                    )
+                    .await?;
+                let Some(last) = indices.last().copied() else { break };
+                start = last as usize + 1;
+                yield build_unmatched_right_envelope(
+                    &left_schema,
+                    &right_batch,
+                    &indices,
+                    Arc::clone(&schema),
+                    &context,
+                    reservation.size().saturating_add(indices.memory_size()),
+                ).await?;
+            }
+        }
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+pub(crate) fn join<L, R>(
+    left: L,
+    right: R,
+    on: Vec<(BoundExpr, BoundExpr)>,
+    residual: Option<BoundExpr>,
+    null_aware: Option<(BoundExpr, BoundExpr)>,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+    join_type: JoinType,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+) -> MemoryBatchStream
+where
+    L: IntoMemoryBatchStream,
+    R: IntoMemoryBatchStream,
+{
+    join_with_null_keys(
+        left,
+        right,
+        on,
+        false,
+        residual,
+        null_aware,
+        left_schema,
+        right_schema,
+        join_type,
+        schema,
+        context,
+        batch_size,
+    )
 }
 
 enum PartitionHashBuild {
@@ -485,6 +627,7 @@ enum PartitionHashBuild {
         RecordBatch,
         std::collections::HashMap<Vec<CellValue>, Vec<u32>>,
         Option<EvaluatedKeys>,
+        Option<BuildMatchTracker>,
     ),
     TooLarge(usize),
 }
@@ -540,6 +683,45 @@ fn can_deduplicate_build(join_type: JoinType, predicates: &JoinPredicates) -> bo
     predicates.residual().is_none()
         && !predicates.is_null_aware()
         && matches!(join_type, JoinType::Semi | JoinType::Anti | JoinType::Mark)
+}
+
+fn tracks_build_matches(join_type: JoinType) -> bool {
+    matches!(join_type, JoinType::Right | JoinType::Full)
+}
+
+fn try_build_match_tracker(
+    join_type: JoinType,
+    rows: usize,
+    reservation: &mut crate::runtime::MemoryReservation,
+) -> Option<Option<BuildMatchTracker>> {
+    if tracks_build_matches(join_type) {
+        BuildMatchTracker::try_new(rows, reservation).map(Some)
+    } else {
+        Some(None)
+    }
+}
+
+fn spill_build_batch(
+    batch: RecordBatch,
+    keys: &[BoundExpr],
+    join_type: JoinType,
+    null_equal_keys: bool,
+    context: &QueryContext,
+    reservation: &mut crate::runtime::MemoryReservation,
+) -> Result<Vec<Vec<crate::runtime::SpillFile>>> {
+    reservation.try_resize(batch.get_array_memory_size())?;
+    let mut spiller = spill::PartitionSpiller::new(context, "join-right");
+    spill::spill_batch_with_null_keys(
+        batch,
+        keys,
+        Side::Right,
+        join_type,
+        null_equal_keys,
+        &mut spiller,
+        0,
+    )?;
+    reservation.try_resize(0)?;
+    spiller.finish()
 }
 
 pub(super) fn evaluate_keys_accounted(

@@ -9,11 +9,15 @@ use tokio::sync::Semaphore;
 use super::{
     MetadataCache, ScanRequest, ScanTask, TableProvider, TableStatistics,
     hive::HivePartitions,
+    parquet_bloom::{bloom_prunes_row_group, supports_bloom},
+    parquet_index_metadata::load_page_index_metadata,
     parquet_metadata::{
         load_parquet_metadata, registration_metadata_limit, resize_schema_budget,
         schema_memory_size,
     },
+    parquet_page_pruning::{prune_pages, supports_page_index},
     parquet_pruning::can_prune_row_group,
+    parquet_pruning_budget::PruningBudget,
     parquet_scan::{ParquetMorsel, ParquetMorselStream, morsel_stream, scan_morsels},
     provider::prepare_object_sources,
     schema_evolution::{
@@ -22,7 +26,7 @@ use super::{
     },
 };
 use crate::{
-    EngineConfig, Error, ParquetOptions, Result,
+    EngineConfig, Error, ParquetOptions, ParquetPruningMode, ParquetScanConfig, Result,
     runtime::{MemoryReservation, QueryContext, RecordBatchStream, estimate_schema_batch_bytes},
     storage::{LocationResolver, ObjectSource},
 };
@@ -38,6 +42,7 @@ pub struct ParquetTable {
     file_schemas: Arc<[FileSchema]>,
     metadata_cache: MetadataCache,
     io_concurrency: usize,
+    parquet_scan: ParquetScanConfig,
     _schema_reservation: Option<Arc<MemoryReservation>>,
 }
 
@@ -73,6 +78,7 @@ impl ParquetTable {
             files,
             options,
             config.io_concurrency,
+            config.parquet_scan.clone(),
             metadata_cache,
             context,
             registration_metadata_limit(config),
@@ -84,6 +90,7 @@ impl ParquetTable {
         files: Vec<ObjectSource>,
         options: ParquetOptions,
         io_concurrency: usize,
+        parquet_scan: ParquetScanConfig,
         metadata_cache: MetadataCache,
         context: Option<Arc<QueryContext>>,
         registration_limit: usize,
@@ -208,6 +215,7 @@ impl ParquetTable {
             file_schemas: file_schemas.into(),
             metadata_cache,
             io_concurrency,
+            parquet_scan,
             _schema_reservation: schema_reservation.map(Arc::new),
         })
     }
@@ -283,6 +291,7 @@ impl TableProvider for ParquetTable {
             request,
             context: Arc::clone(&context),
             metadata_cache: self.metadata_cache.clone(),
+            parquet_scan: self.parquet_scan.clone(),
         });
         Ok(scan_morsels(
             morsels,
@@ -320,6 +329,7 @@ impl TableProvider for ParquetTable {
             request,
             context: Arc::clone(&context),
             metadata_cache: self.metadata_cache.clone(),
+            parquet_scan: self.parquet_scan.clone(),
         });
 
         // Prefetch at most one first morsel per configured lane. This reveals
@@ -414,6 +424,7 @@ struct ScanPlanning {
     request: ScanRequest,
     context: Arc<QueryContext>,
     metadata_cache: MetadataCache,
+    parquet_scan: ParquetScanConfig,
 }
 
 fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
@@ -421,6 +432,14 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
         if plan.request.limit == Some(0) {
             return;
         }
+        let pruning_budget = PruningBudget::for_query(
+            &plan.parquet_scan,
+            plan.context.memory.limit(),
+        );
+        let use_page_index = plan.parquet_scan.page_index == ParquetPruningMode::Auto
+            && supports_page_index(plan.request.predicate.as_ref());
+        let use_bloom = plan.parquet_scan.bloom_filter == ParquetPruningMode::Auto
+            && supports_bloom(plan.request.predicate.as_ref());
         let mut pushdown_remaining = plan.request.limit.unwrap_or(usize::MAX);
         for file_index in 0..plan.files.len() {
             if plan
@@ -437,7 +456,7 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
             plan.context.check_cancelled()?;
             let file = &plan.files[file_index];
             let snapshot = plan.context.object_snapshot(file.uri())?;
-            let metadata = load_parquet_metadata(
+            let mut metadata = load_parquet_metadata(
                 file,
                 snapshot.clone(),
                 Some(&plan.context),
@@ -456,8 +475,23 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                 hive.validate_physical_schema(&file_schema)?;
             }
             let projection = file_projection(&file_schema, &plan.output_schema);
-            let mut has_unpruned_group = false;
-            for row_group in 0..reader_metadata.metadata().num_row_groups() {
+            let row_groups = reader_metadata.metadata().num_row_groups();
+            let candidate_bytes = row_groups
+                .checked_mul(size_of::<usize>())
+                .and_then(|bytes| bytes.checked_mul(if use_bloom { 2 } else { 1 }))
+                .ok_or_else(|| Error::ResourceExhausted(format!(
+                    "Parquet pruning state for {} exceeds this platform's address space",
+                    file.uri(),
+                )))?;
+            let _candidate_reservation = plan.context.memory.try_reserve(candidate_bytes).map_err(|_| {
+                Error::ResourceExhausted(format!(
+                    "Parquet pruning state for {} requires {candidate_bytes} bytes, but the query memory pool has {} bytes available",
+                    file.uri(),
+                    plan.context.memory.available(),
+                ))
+            })?;
+            let mut candidate_groups = Vec::with_capacity(row_groups);
+            for row_group in 0..row_groups {
                 if can_prune_row_group(
                     reader_metadata.metadata(),
                     reader_metadata.parquet_schema(),
@@ -469,18 +503,91 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                     plan.context.metrics.add_row_groups_pruned(1);
                     continue;
                 }
-                has_unpruned_group = true;
+                candidate_groups.push(row_group);
+            }
+            if candidate_groups.is_empty() {
+                plan.context.metrics.add_files_pruned(1);
+                continue;
+            }
+            if use_bloom {
+                let mut bloom_survivors = Vec::with_capacity(candidate_groups.len());
+                for row_group in candidate_groups {
+                    plan.context.check_cancelled()?;
+                    if bloom_prunes_row_group(
+                        file,
+                        &metadata,
+                        &file_schema,
+                        &plan.table_schema,
+                        row_group,
+                        plan.request.predicate.as_ref(),
+                        &plan.context,
+                        &pruning_budget,
+                    ).await? {
+                        plan.context.metrics.add_parquet_bloom_row_groups_pruned(1);
+                        plan.context.metrics.add_row_groups_pruned(1);
+                    } else {
+                        bloom_survivors.push(row_group);
+                    }
+                }
+                candidate_groups = bloom_survivors;
+            }
+            if candidate_groups.is_empty() {
+                plan.context.metrics.add_files_pruned(1);
+                continue;
+            }
+            if use_page_index {
+                metadata = load_page_index_metadata(
+                    file,
+                    &snapshot,
+                    metadata,
+                    &plan.context,
+                    &plan.metadata_cache,
+                    &pruning_budget,
+                ).await?;
+            }
+
+            let mut has_unpruned_group = false;
+            for row_group in candidate_groups {
                 let row_count = usize::try_from(
-                    reader_metadata.metadata().row_group(row_group).num_rows(),
+                    metadata.reader_metadata().metadata().row_group(row_group).num_rows(),
                 ).map_err(|_| Error::Execution(format!(
                     "Parquet row group {row_group} in {} has an invalid row count",
                     file.uri(),
                 )))?;
+                let page_pruning = if use_page_index {
+                    prune_pages(
+                        file.uri(),
+                        metadata.reader_metadata().metadata(),
+                        &file_schema,
+                        &plan.table_schema,
+                        row_group,
+                        plan.request.predicate.as_ref(),
+                    )?
+                } else {
+                    None
+                };
+                let (row_selection, effective_rows) = match page_pruning {
+                    Some(pruning) if pruning.rows_pruned > 0 => {
+                        plan.context
+                            .metrics
+                            .add_parquet_pages_pruned(pruning.pages_pruned);
+                        plan.context
+                            .metrics
+                            .add_parquet_page_rows_pruned(pruning.rows_pruned);
+                        if pruning.selected_rows == 0 {
+                            plan.context.metrics.add_row_groups_pruned(1);
+                            continue;
+                        }
+                        (Some(pruning.selection), pruning.selected_rows)
+                    }
+                    _ => (None, row_count),
+                };
+                has_unpruned_group = true;
                 if row_count == 0 {
                     continue;
                 }
                 let row_limit = plan.request.limit.map(|_| {
-                    let limit = row_count.min(pushdown_remaining);
+                    let limit = effective_rows.min(pushdown_remaining);
                     pushdown_remaining = pushdown_remaining.saturating_sub(limit);
                     limit
                 });
@@ -492,6 +599,7 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                     projection: projection.clone(),
                     row_group,
                     row_limit,
+                    row_selection,
                 };
                 if pushdown_remaining == 0 {
                     break;
@@ -600,6 +708,15 @@ fn file_projection(file_schema: &Schema, output_schema: &Schema) -> Vec<usize> {
         .collect()
 }
 
+#[cfg(test)]
+#[path = "parquet_bloom_read_tests.rs"]
+mod bloom_read_tests;
+#[cfg(test)]
+#[path = "parquet_decimal_pruning_tests.rs"]
+mod decimal_pruning_tests;
+#[cfg(test)]
+#[path = "parquet_deep_pruning_tests.rs"]
+mod deep_pruning_tests;
 #[cfg(test)]
 #[path = "parquet_tests.rs"]
 mod tests;

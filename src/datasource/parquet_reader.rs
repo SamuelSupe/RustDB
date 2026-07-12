@@ -1,6 +1,6 @@
 use std::{ops::Range, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, future::BoxFuture};
 use object_store::{GetOptions, GetRange, ObjectStore, path::Path};
 use parquet::{
@@ -31,11 +31,48 @@ pub(super) struct SnapshotParquetReader {
 pub(super) struct QueryIo {
     control: QueryControl,
     metrics: QueryMetrics,
+    purpose: IoPurpose,
+}
+
+#[derive(Clone, Copy)]
+enum IoPurpose {
+    General,
+    PageIndex,
+    BloomFilter,
 }
 
 impl QueryIo {
     pub(super) fn new(control: QueryControl, metrics: QueryMetrics) -> Self {
-        Self { control, metrics }
+        Self {
+            control,
+            metrics,
+            purpose: IoPurpose::General,
+        }
+    }
+
+    pub(super) fn for_page_index(control: QueryControl, metrics: QueryMetrics) -> Self {
+        Self {
+            control,
+            metrics,
+            purpose: IoPurpose::PageIndex,
+        }
+    }
+
+    pub(super) fn for_bloom_filter(control: QueryControl, metrics: QueryMetrics) -> Self {
+        Self {
+            control,
+            metrics,
+            purpose: IoPurpose::BloomFilter,
+        }
+    }
+
+    fn record_bytes(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        match self.purpose {
+            IoPurpose::General => {}
+            IoPurpose::PageIndex => self.metrics.add_parquet_page_index_bytes_read(bytes),
+            IoPurpose::BloomFilter => self.metrics.add_parquet_bloom_filter_bytes_read(bytes),
+        }
     }
 }
 
@@ -56,6 +93,37 @@ impl SnapshotParquetReader {
     }
 
     async fn read_range(&self, range: Range<u64>) -> ParquetResult<Bytes> {
+        const MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
+        if range.start > range.end {
+            return Err(external_error(Error::Execution(format!(
+                "invalid byte range for {}: {range:?}",
+                self.uri
+            ))));
+        }
+        if range.start == range.end {
+            return Ok(Bytes::new());
+        }
+        if range.end - range.start <= MAX_RANGE_BYTES {
+            return self.read_range_once(range).await;
+        }
+
+        let capacity = usize::try_from(range.end - range.start).map_err(|_| {
+            external_error(Error::ResourceExhausted(format!(
+                "byte range for {} is too large for this platform: {range:?}",
+                self.uri
+            )))
+        })?;
+        let mut output = BytesMut::with_capacity(capacity);
+        let mut start = range.start;
+        while start < range.end {
+            let end = start.saturating_add(MAX_RANGE_BYTES).min(range.end);
+            output.extend_from_slice(&self.read_range_once(start..end).await?);
+            start = end;
+        }
+        Ok(output.freeze())
+    }
+
+    async fn read_range_once(&self, range: Range<u64>) -> ParquetResult<Bytes> {
         if let Some(query) = &self.query {
             query.control.check_cancelled().map_err(external_error)?;
             if self.s3 {
@@ -91,6 +159,10 @@ impl SnapshotParquetReader {
             response.bytes().await
         }
         .map_err(|error| object_error(&self.uri, error))?;
+
+        if let Some(query) = &self.query {
+            query.record_bytes(bytes.len());
+        }
 
         if self.s3
             && let Some(query) = &self.query
@@ -253,6 +325,32 @@ mod tests {
         let error = reader.get_bytes(0..1).await.unwrap_err();
         assert!(error.to_string().contains("query cancelled"));
         assert_eq!(metrics.snapshot().s3_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn splits_large_ranges_into_four_mib_requests() {
+        const FOUR_MIB: usize = 4 * 1024 * 1024;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("large.bin");
+        fs::write(&path, vec![7_u8; FOUR_MIB + 1]).unwrap();
+        let source = resolve(&path).await;
+        let snapshot = source.head_snapshot().await.unwrap();
+        let metrics = QueryMetrics::new();
+        let query = QueryIo::new(QueryControl::new(), metrics.clone());
+        let mut reader = SnapshotParquetReader::new(&source, snapshot, Some(query));
+        reader.s3 = true;
+
+        let bytes = reader
+            .get_bytes(0..u64::try_from(FOUR_MIB + 1).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.len(), FOUR_MIB + 1);
+        assert_eq!(metrics.snapshot().s3_requests, 2);
+        assert_eq!(
+            metrics.snapshot().s3_bytes_transferred,
+            (FOUR_MIB + 1) as u64
+        );
     }
 
     async fn resolve(path: &std::path::Path) -> crate::storage::ObjectSource {

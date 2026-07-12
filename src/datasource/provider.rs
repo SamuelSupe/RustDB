@@ -29,8 +29,15 @@ pub enum PredicateValue {
     UInt64(u64),
     Float64(f64),
     Utf8(String),
+    #[allow(dead_code)]
+    Binary(Vec<u8>),
     Date32(i32),
-    Decimal128(i128),
+    TimestampMicros(i64),
+    Decimal128 {
+        value: i128,
+        precision: u8,
+        scale: i8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

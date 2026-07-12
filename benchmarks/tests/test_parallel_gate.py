@@ -40,7 +40,7 @@ class GateFixture:
         self._write_variant(
             "candidate",
             CANDIDATE,
-            "0.3.0-alpha.1",
+            "0.4.0-alpha.1",
             {("scan-filter", 1): 105, ("scan-filter", 4): 50,
              ("aggregate", 1): 210, ("aggregate", 4): 100},
         )
@@ -220,6 +220,17 @@ class ParallelGateTests(unittest.TestCase):
         result = self.evaluate()
         self.assertEqual(result["status"], "pass")
         self.assertAlmostEqual(result["cases"]["scan-filter"]["throughput_multiplier"], 2.1)
+
+    def test_v03_candidate_report_is_rejected(self):
+        path = self.fixture.reports[("candidate", "scan-filter", 1)]
+        report = json.loads(path.read_text(encoding="utf-8"))
+        report["engine_version"] = "0.3.0-alpha.1"
+        path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaisesRegex(
+            GateError,
+            "engine_version: expected '0.4.0-alpha.1'",
+        ):
+            self.evaluate()
 
     def test_missing_required_entry_fails(self):
         del self.fixture.entries[("candidate", "aggregate", 4)]

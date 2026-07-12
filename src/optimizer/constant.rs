@@ -68,6 +68,23 @@ pub(super) fn fold_plan(plan: &mut LogicalPlan) {
                 }
             }
         }
+        LogicalPlan::Append { inputs, .. } => inputs.iter_mut().for_each(fold_plan),
+        LogicalPlan::Window {
+            input, expressions, ..
+        } => {
+            fold_plan(input);
+            for expression in expressions {
+                if let crate::sql::WindowFunction::Aggregate(aggregate) = &mut expression.function
+                    && let Some(argument) = &mut aggregate.expr
+                {
+                    fold_expr(argument);
+                }
+                expression.partition_by.iter_mut().for_each(fold_expr);
+                for order in &mut expression.order_by {
+                    fold_expr(&mut order.expr);
+                }
+            }
+        }
         LogicalPlan::Sort {
             input, expressions, ..
         } => {

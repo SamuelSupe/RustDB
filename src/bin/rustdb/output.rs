@@ -102,7 +102,7 @@ fn write_table_batch(batch: &RecordBatch, header: bool) -> Result<()> {
 pub fn print_metrics(result: &QueryResult) {
     let metrics = result.metrics().snapshot();
     eprintln!(
-        "elapsed={:?} rows={} scanned_rows={} scanned_bytes={} discovered_files={} peak_memory={} peak_lanes={} scheduler_wait={:?} spill_bytes={} spill_read={} spill_write={} spill_files={} quota_rejections={} s3_requests={} s3_bytes={}",
+        "elapsed={:?} rows={} scanned_rows={} scanned_bytes={} discovered_files={} peak_memory={} peak_lanes={} scheduler_wait={:?} spill_bytes={} spill_read={} spill_write={} spill_files={} quota_rejections={} parquet_index_bytes={} parquet_bloom_bytes={} pages_pruned={} page_rows_pruned={} bloom_row_groups_pruned={} pruning_budget_skips={} s3_requests={} s3_bytes={}",
         metrics.elapsed,
         metrics.rows_returned,
         metrics.rows_scanned,
@@ -116,6 +116,12 @@ pub fn print_metrics(result: &QueryResult) {
         metrics.spill_write_bytes,
         metrics.spill_files,
         metrics.spill_quota_rejections,
+        metrics.parquet_page_index_bytes_read,
+        metrics.parquet_bloom_filter_bytes_read,
+        metrics.parquet_pages_pruned,
+        metrics.parquet_page_rows_pruned,
+        metrics.parquet_bloom_row_groups_pruned,
+        metrics.parquet_pruning_budget_skips,
         metrics.s3_requests,
         metrics.s3_bytes_transferred,
     );

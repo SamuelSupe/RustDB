@@ -2,13 +2,9 @@ use std::{collections::HashSet, sync::Arc};
 
 mod walk;
 
-use sqlparser::{
-    ast::{
-        Expr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart, Statement,
-        TableFactor, Value,
-    },
-    dialect::DuckDbDialect,
-    parser::Parser,
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart, Statement, TableFactor,
+    Value,
 };
 use uuid::Uuid;
 
@@ -57,7 +53,7 @@ pub(crate) async fn prepare_with_cache_for_query(
     sql: &str,
     context: Option<Arc<QueryContext>>,
 ) -> Result<PreparedSql> {
-    let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql)?;
+    let mut statements = crate::sql::parse_statements(sql)?;
     if statements.len() != 1 {
         return Err(Error::InvalidArgument(
             "exactly one SQL statement is required".to_owned(),

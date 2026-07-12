@@ -107,6 +107,7 @@ fn lower_direct_marker(plan: LogicalPlan, negated: bool) -> Result<LogicalPlan> 
                 left,
                 right,
                 on,
+                null_equal_keys: false,
                 residual,
                 null_aware,
                 join_type,

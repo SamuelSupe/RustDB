@@ -9,6 +9,9 @@ use sqlparser::ast::{
 use crate::{Error, Result};
 
 mod deferred;
+mod query_kind;
+
+pub(super) use query_kind::is_aggregate_query;
 
 use super::functions::bind_scalar_expr_with;
 use super::{
@@ -20,14 +23,6 @@ use super::{
     },
     coercion::{cast, is_numeric},
 };
-
-pub(super) fn is_aggregate_query(
-    group_exprs: &[Expr],
-    projection: &[SelectItem],
-    having: Option<&Expr>,
-) -> bool {
-    !group_exprs.is_empty() || having.is_some() || projection.iter().any(select_item_has_aggregate)
-}
 
 pub(super) fn plan_aggregate_projection(
     input: LogicalPlan,
@@ -109,7 +104,7 @@ pub(super) fn plan_aggregate_projection(
     })
 }
 
-fn bind_after_aggregate(
+pub(super) fn bind_after_aggregate(
     expr: &Expr,
     input_schema: &PlanSchema,
     group_ast: &[Expr],
@@ -440,7 +435,7 @@ fn defer_result_columns(
     Ok(())
 }
 
-fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result<AggregateExpr> {
+pub(super) fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result<AggregateExpr> {
     if function.over.is_some()
         || function.filter.is_some()
         || !function.within_group.is_empty()
@@ -530,6 +525,74 @@ fn aggregate_type(
     })
 }
 
+pub(super) fn bind_window_aggregate(
+    function: &Function,
+    bind: &mut impl FnMut(&Expr) -> Result<BoundExpr>,
+) -> Result<AggregateExpr> {
+    if function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(&function.parameters, FunctionArguments::None)
+    {
+        return Err(Error::Unsupported(
+            "window aggregate FILTER, ordered arguments, parameters, and NULL treatment are not supported"
+                .into(),
+        ));
+    }
+    let aggregate = aggregate_function(function).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "window function {} is not supported",
+            function.name
+        ))
+    })?;
+    let FunctionArguments::List(arguments) = &function.args else {
+        return Err(Error::InvalidArgument(format!(
+            "window aggregate {} requires parentheses",
+            function.name
+        )));
+    };
+    if !arguments.clauses.is_empty()
+        || arguments.duplicate_treatment == Some(DuplicateTreatment::Distinct)
+    {
+        return Err(Error::Unsupported(
+            "DISTINCT and ordered window aggregates are not supported".into(),
+        ));
+    }
+    let expr = match arguments.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => Some(bind(expr)?),
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+            if aggregate == AggregateFunction::Count =>
+        {
+            None
+        }
+        [] if aggregate == AggregateFunction::Count => None,
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "window aggregate {} expects one expression (or * for count)",
+                function.name
+            )));
+        }
+    };
+    if matches!(aggregate, AggregateFunction::Sum | AggregateFunction::Avg)
+        && !expr
+            .as_ref()
+            .is_some_and(|expression| is_numeric(&expression.data_type))
+    {
+        return Err(Error::InvalidArgument(format!(
+            "{} requires a numeric argument",
+            function.name
+        )));
+    }
+    let data_type = aggregate_type(aggregate, expr.as_ref(), function)?;
+    Ok(AggregateExpr {
+        function: aggregate,
+        expr,
+        distinct: false,
+        data_type,
+        display_name: function.to_string(),
+    })
+}
+
 fn aggregate_schema(groups: &[BoundExpr], aggregates: &[AggregateExpr]) -> PlanSchema {
     let fields = groups
         .iter()
@@ -574,8 +637,12 @@ fn select_item_has_aggregate(item: &SelectItem) -> bool {
 pub(super) fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Function(function) => {
-            aggregate_function(function).is_some()
+            (function.over.is_none() && aggregate_function(function).is_some())
                 || function_arguments(function).any(contains_aggregate)
+                || function
+                    .over
+                    .as_ref()
+                    .is_some_and(query_kind::window_type_has_aggregate)
         }
         Expr::BinaryOp { left, right, .. }
         | Expr::Like {

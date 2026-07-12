@@ -192,7 +192,11 @@ fn select_schema(schema: &PlanSchema, indices: &[usize]) -> PlanSchema {
         .iter()
         .map(|index| schema.qualifier(*index).map(str::to_owned))
         .collect();
-    PlanSchema::new(Arc::new(Schema::new(fields)), qualifiers)
+    let visible = indices
+        .iter()
+        .map(|index| schema.is_visible(*index))
+        .collect();
+    PlanSchema::new_with_visibility(Arc::new(Schema::new(fields)), qualifiers, visible)
 }
 
 fn remap_columns(expr: &mut BoundExpr, mapping: &[usize]) -> Result<()> {

@@ -12,7 +12,9 @@ a `BatchEnvelope` carrying its query-memory lease. Fused Scan/Filter/Projection
 pipelines claim independent tasks across
 `min(compute_threads, runnable Scan tasks)` lanes;
 Aggregate, Join build, Sort, and scalar-subquery materialization remain
-pipeline breakers. Bounded envelope queues apply consumer backpressure.
+pipeline breakers; Window adds a shared Sort plus partition spool, while
+`UNION ALL` Append remains streaming. Bounded envelope queues apply consumer
+backpressure.
 Object-store work is asynchronous and source fan-out is capped by
 `io_concurrency`. `compute_threads` is an upper bound, not a promise that every
 plan has that many simultaneously runnable lanes. The query scheduler also
@@ -25,8 +27,9 @@ stable output order.
 
 Every asynchronous worker belongs to the query's `TaskGroup`, including the
 public-stream producer, Scan lanes, Aggregate partial lanes, Hash/Grace Join
-workers, and Sort run generators. The first worker error or panic records one
-terminal failure and cancels its siblings. Normal completion and error paths
+workers, Sort run generators, and Window partition workers. The first worker
+error or panic records one terminal failure and cancels its siblings. Normal
+completion and error paths
 wait for every registered task to unwind before removing query Spill files;
 consumer abandonment starts the same convergence through a background reaper,
 so `QueryResult::cancel()` remains a non-blocking signal.
@@ -55,6 +58,27 @@ probe when it fits, Grace partitions on pressure, and switches to external
 sort-merge after two seeds do not shrink a partition. Duplicate-key groups are
 replayed in bounded chunks. Sort creates lane-local memory blocks or LZ4 Arrow
 IPC runs and performs a bounded k-way merge.
+
+`UNION ALL` compiles to a streaming Append over type-aligned inputs. DISTINCT
+set operations reuse the existing reservation-accounted Aggregate and Join
+operators: `UNION DISTINCT` groups the appended rows, while `INTERSECT` and
+`EXCEPT` de-duplicate both sides and use NULL-equal Semi or Anti joins.
+Query-level sorting and limiting run after the complete recursive set tree.
+
+Window execution sorts once for each shared `(PARTITION BY, ORDER BY, frame)`
+specification. It detects partition boundaries from evaluated keys, writes a
+bounded query-scoped partition spool, and evaluates independent partitions on
+the query TaskGroup. Ranking functions and prefix/whole-partition aggregate
+frames stream their results back as Arrow batches; peer-aware `RANGE` frames
+retain only their required sidecar state. `QUALIFY` is a post-window Filter,
+and hidden window columns are removed by the final Projection.
+
+Parser-visible `RIGHT` and `FULL` joins use the same hash, Grace, and external
+sort-merge machinery as existing equi joins. Match tracking is charged to the
+query and preserves unmatched build rows across parallel and Spill paths.
+Residual predicates are evaluated before a pair is marked as matched. `USING`
+adds one visible key column followed by non-key columns from each side; the
+visible key of a full join is a typed `COALESCE` of both inputs.
 
 Aggregate DISTINCT uses a tagged `(group, aggregate-id, value)` key, so
 multiple DISTINCT aggregates share one de-duplication stage without
@@ -119,9 +143,10 @@ Once a result batch is yielded, memory retained by the embedding caller is
 outside the engine's ownership and budget; benchmark reports record RSS
 separately.
 
-Local contents rely on the operating-system page cache. The only engine cache
-holds Parquet schema/footer metadata under an approximate byte-bounded LRU.
-Keys contain URI, size, ETag, and version; no decoded data page is retained.
+Local contents rely on the operating-system page cache. The engine cache holds
+Parquet schema/footer metadata and separately keyed footer-plus-page-index
+metadata under an approximate byte-bounded LRU. Keys contain URI, size, ETag,
+and version; no decoded data page is retained.
 File discovery has a separate Engine-memory-derived metadata cap and avoids a
 second de-duplication set. Query snapshot entries retain memory reservations.
 Parquet reads its fixed trailer and reserves a conservative footer expansion
@@ -129,6 +154,17 @@ before decoding; the resulting lease stays live through every row-group
 morsel. Row-group pruning iterates indices directly instead of materializing a
 file-sized selected list. Decoder and public output batches remain
 structurally bounded by `io_concurrency`, channel capacity, and `batch_size`.
+
+When enabled in `Auto` mode and useful for a supported predicate, Parquet deep
+pruning loads page indexes or split-block Bloom filters through the same
+conditional object reader. Page min/max and null counts produce an Arrow
+`RowSelection`; a negative Bloom lookup removes a whole row group. Missing or
+unsupported metadata is only a missed optimization, every residual SQL filter
+remains executable, and invalid field combinations or malformed encoded
+metadata are input errors. A legal legacy Bloom offset without its optional
+length remains a bounded conservative skip. The
+pruning pool is bounded per query and per file, and metadata reads, rejected
+budgets, and eliminated pages/rows/groups are visible in query metrics.
 
 Before any physical input stream is polled, RustDB walks every Scan in the
 query (including dynamic views), captures each object's fresh identity, and

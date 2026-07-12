@@ -24,7 +24,8 @@ use crate::{
 
 use super::{
     CellValue, EvaluatedKeys, ProbeCursor, condition::JoinPredicates, evaluate_keys_accounted,
-    evaluate_optional_values, optional_array, optional_memory, probe::GlobalMembershipState,
+    evaluate_optional_values, matched::BuildMatchTracker, optional_array, optional_memory,
+    output::build_unmatched_right_envelope, probe::GlobalMembershipState,
 };
 
 const MIN_PARALLEL_MEMORY: usize = 64 << 20;
@@ -34,6 +35,8 @@ pub(super) struct FrozenBuild {
     hash_table: HashMap<Vec<CellValue>, Vec<u32>>,
     right_values: Option<EvaluatedKeys>,
     global_membership: Option<GlobalMembershipState>,
+    null_equal_keys: bool,
+    matched_build: Option<BuildMatchTracker>,
     _memory: MemoryReservation,
 }
 
@@ -43,6 +46,8 @@ impl FrozenBuild {
         hash_table: HashMap<Vec<CellValue>, Vec<u32>>,
         right_values: Option<EvaluatedKeys>,
         global_membership: Option<GlobalMembershipState>,
+        null_equal_keys: bool,
+        matched_build: Option<BuildMatchTracker>,
         memory: MemoryReservation,
     ) -> Self {
         Self {
@@ -50,6 +55,8 @@ impl FrozenBuild {
             hash_table,
             right_values,
             global_membership,
+            null_equal_keys,
+            matched_build,
             _memory: memory,
         }
     }
@@ -74,6 +81,7 @@ pub(super) fn probe(
     build: FrozenBuild,
     predicates: JoinPredicates,
     join_type: JoinType,
+    left_schema: arrow::datatypes::SchemaRef,
     schema: arrow::datatypes::SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
@@ -105,7 +113,6 @@ pub(super) fn probe(
             ))?;
         }
         drop(input);
-        drop(build);
         // Keep the coordinator sender alive across worker unwinding so query
         // cancellation exposes TaskGroup's real panic/error before the result
         // channel can appear generically closed.
@@ -129,6 +136,29 @@ pub(super) fn probe(
                         "parallel hash join stopped after {completed} of {lanes} lanes completed"
                     )))?;
                 }
+            }
+        }
+        if let Some(matched) = &build.matched_build {
+            let mut start = 0;
+            loop {
+                let indices = matched
+                    .unmatched_from(
+                        start,
+                        batch_size.max(1),
+                        &context,
+                        build.memory_size(),
+                    )
+                    .await?;
+                let Some(last) = indices.last().copied() else { break };
+                start = last as usize + 1;
+                yield build_unmatched_right_envelope(
+                    &left_schema,
+                    &build.batch,
+                    &indices,
+                    Arc::clone(&schema),
+                    &context,
+                    build.memory_size().saturating_add(indices.memory_size()),
+                ).await?;
             }
         }
         drop(sender);
@@ -247,6 +277,8 @@ async fn run_lane_inner(
             optional_array(&left_values),
             optional_array(&build.right_values),
             build.global_membership,
+            build.null_equal_keys,
+            build.matched_build.clone(),
             join_type,
             Arc::clone(schema),
             batch_size,

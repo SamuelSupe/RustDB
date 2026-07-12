@@ -81,6 +81,29 @@ fn collect_outer_refs(plan: &LogicalPlan, output: &mut Vec<(u8, usize)>) {
             }
             collect_outer_refs(input, output);
         }
+        LogicalPlan::Append { inputs, .. } => {
+            for input in inputs {
+                collect_outer_refs(input, output);
+            }
+        }
+        LogicalPlan::Window {
+            input, expressions, ..
+        } => {
+            for expression in expressions {
+                if let crate::sql::WindowFunction::Aggregate(aggregate) = &expression.function
+                    && let Some(argument) = &aggregate.expr
+                {
+                    argument.outer_references(output);
+                }
+                for partition in &expression.partition_by {
+                    partition.outer_references(output);
+                }
+                for order in &expression.order_by {
+                    order.expr.outer_references(output);
+                }
+            }
+            collect_outer_refs(input, output);
+        }
         LogicalPlan::Sort {
             input, expressions, ..
         } => {

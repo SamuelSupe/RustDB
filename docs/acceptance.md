@@ -71,9 +71,11 @@ tools/sql/differential.sh
 ```
 
 It compares truth predicates, projection aliases, grouping ordinals, HAVING
-aliases, hidden sort expressions, v0.3 scalar/temporal functions, aggregate
-DISTINCT, and correlated scalar/IN/EXISTS NULL semantics through canonicalized
-result checksums. Runtime cardinality failures are required outcomes, not
+aliases, hidden sort expressions, scalar/temporal functions, aggregate
+DISTINCT, correlated scalar/IN/EXISTS NULL semantics, v0.4 window and
+`QUALIFY` behavior, DISTINCT-core set operations, and `RIGHT`/`FULL`/`USING`
+joins through canonicalized result checksums. Runtime cardinality failures and
+explicitly unsupported `ALL`/frame cases are required outcomes, not
 allow-failure cases.
 
 The 22-query checksum gate is deliberately a separate, single Linux x64 job.
@@ -114,6 +116,39 @@ URL. Provenance records the exact Git/worktree state, binary and query hashes,
 dataset manifest, data root, and execution configuration even when
 `TPCH_SKIP_BUILD=1` is used.
 
+## v0.4 operator and pruning gates
+
+The v0.4 differential cases must cover recursive/parenthesized set trees,
+positional type coercion, NULL equality, output-name/ordinal sorting, window
+peer ties and empty partitions, aggregate windows before and after grouped
+aggregation, named windows, `QUALIFY` aliases, outer-join residuals, duplicate
+keys, NULL keys, and `USING` output layout. Run focused operator tests under a
+64/128 MiB query budget and require non-zero Spill where the fixture exceeds
+the budget. The complete result must match DuckDB, peak reservation must stay
+within the configured limit, and query directories must be removed after
+success, failure, cancellation, panic, and abandoned consumers.
+
+Parquet deep-pruning acceptance runs both local and live MinIO fixtures. It
+must demonstrate all of the following from `QueryMetricsSnapshot` and the
+object-store request/byte counters:
+
+- unfiltered zero-column `COUNT(*)` reads no page index or Bloom filter;
+- page-index selection reduces decoded rows without changing the residual
+  predicate result;
+- a negative Bloom lookup removes an equality row group, while a positive or
+  unsupported lookup keeps it;
+- `Disabled` mode returns the same result without deep-metadata reads;
+- exhausted query/per-file metadata budgets increment the skip metric and do
+  not change results;
+- invalid index fields, a Bloom length without an offset, or a malformed Bloom
+  header returns a structured error; the legal legacy offset-only Bloom layout
+  remains a bounded conservative skip;
+- conditional S3 reads still fail if the query-fixed object changes.
+
+The Arrow/Parquet `59.1.0`, object-store `0.13.2`, and sqlparser `0.62.0`
+pins are part of the release gate. A dependency update must be handled as a
+separate coordinated compatibility change.
+
 ## Resource and performance gates
 
 SF10 and fixed-hardware measurements are not routine hosted-CI jobs: the 14 GB
@@ -125,8 +160,8 @@ the nominated machine:
 benchmarks/run_low_memory.sh data/tpch-sf10
 ```
 
-The v0.3 correlated/DISTINCT constrained suite runs the selected TPC-H queries
-with the same checksum comparison and a hard 128 MiB query budget:
+The correlated/DISTINCT constrained regression suite runs selected TPC-H
+queries with the same checksum comparison and a hard 128 MiB query budget:
 
 ```sh
 TPCH_MEMORY_LIMIT_BYTES=134217728 TPCH_REQUIRE_SPILL=1 \
@@ -139,7 +174,8 @@ The constrained checksum command writes its status and checksums below
 writes timestamped manifests and per-case JSON reports below
 `benchmarks/results/low-memory/`. Before an alpha is promoted, verify:
 
-- Sort, Aggregate, Inner Join, and Left Join checksums are correct.
+- Sort, Aggregate, Inner/Left/Right/Full Join, DISTINCT set operation, and
+  Window checksums are correct.
 - Each checksum execution uses its stated 64/128 MiB limit and must itself
   report non-zero Spill before the separately measured run is accepted.
 - Peak engine reservation stays within the configured memory limit.
@@ -176,7 +212,7 @@ THREADS_LIST=1 BATCH_SIZES=1024 CACHE_MODES=cold \
   --output benchmarks/results/smoke-forward
 ```
 
-The release-blocking parallel performance sample is local SF10 on an Apple M5
+The v0.4 release-blocking parallel performance sample is local SF10 on an Apple M5
 Max. Capture the candidate with only the required matrix dimensions (the
 baseline suite may still emit its other query cases; the gate ignores them):
 

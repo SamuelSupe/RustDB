@@ -10,6 +10,21 @@ pub enum OutputFormat {
     Jsonl,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum PruningModeArg {
+    Auto,
+    Disabled,
+}
+
+impl From<PruningModeArg> for rustdb::ParquetPruningMode {
+    fn from(value: PruningModeArg) -> Self {
+        match value {
+            PruningModeArg::Auto => Self::Auto,
+            PruningModeArg::Disabled => Self::Disabled,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rustdb",
@@ -52,6 +67,18 @@ pub struct Args {
     /// Parquet metadata cache limit, for example 64MiB or 0 to disable.
     #[arg(long, value_parser = parse_bytes)]
     pub metadata_cache: Option<usize>,
+
+    /// Parquet page-index pruning policy.
+    #[arg(long, value_enum)]
+    pub parquet_page_index: Option<PruningModeArg>,
+
+    /// Parquet Bloom-filter pruning policy.
+    #[arg(long, value_enum)]
+    pub parquet_bloom_filter: Option<PruningModeArg>,
+
+    /// Query-level upper bound for optional Parquet pruning metadata.
+    #[arg(long, value_parser = parse_bytes)]
+    pub parquet_pruning_metadata: Option<usize>,
 
     /// Maximum admitted queries for embedded or scripted concurrent use.
     #[arg(long)]

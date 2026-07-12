@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::{
     array::new_null_array,
-    datatypes::{Schema, SchemaRef},
+    datatypes::{DataType, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
 
@@ -176,9 +176,50 @@ fn column_index(expr: &BoundExpr) -> Option<usize> {
 fn literal(expr: &BoundExpr) -> Option<PredicateValue> {
     match &expr.kind {
         ExprKind::Literal(value) => predicate_value(value),
-        ExprKind::Cast { expr } => literal(expr),
+        ExprKind::Cast { expr: input } => cast_predicate_value(literal(input)?, &expr.data_type),
         _ => None,
     }
+}
+
+fn cast_predicate_value(value: PredicateValue, target: &DataType) -> Option<PredicateValue> {
+    let DataType::Decimal128(precision, scale) = target else {
+        return Some(value);
+    };
+    let (value, source_scale) = match value {
+        PredicateValue::Int64(value) => (i128::from(value), 0),
+        PredicateValue::UInt64(value) => (i128::from(value), 0),
+        PredicateValue::Decimal128 { value, scale, .. } => (value, scale),
+        _ => return None,
+    };
+    let value = rescale_decimal(value, source_scale, *scale)?;
+    decimal_fits_precision(value, *precision).then_some(PredicateValue::Decimal128 {
+        value,
+        precision: *precision,
+        scale: *scale,
+    })
+}
+
+fn rescale_decimal(value: i128, source_scale: i8, target_scale: i8) -> Option<i128> {
+    let difference = i16::from(target_scale) - i16::from(source_scale);
+    if difference == 0 {
+        return Some(value);
+    }
+    let exponent = u32::from(difference.unsigned_abs());
+    let factor = 10_i128.checked_pow(exponent)?;
+    if difference > 0 {
+        value.checked_mul(factor)
+    } else if value % factor == 0 {
+        Some(value / factor)
+    } else {
+        None
+    }
+}
+
+fn decimal_fits_precision(value: i128, precision: u8) -> bool {
+    (1..=38).contains(&precision)
+        && 10_u128
+            .checked_pow(u32::from(precision))
+            .is_some_and(|limit| value.unsigned_abs() < limit)
 }
 
 fn predicate_value(value: &ScalarValue) -> Option<PredicateValue> {
@@ -188,11 +229,18 @@ fn predicate_value(value: &ScalarValue) -> Option<PredicateValue> {
         ScalarValue::Int64(value) => Some(PredicateValue::Int64(*value)),
         ScalarValue::UInt64(value) => Some(PredicateValue::UInt64(*value)),
         ScalarValue::Float64(value) => Some(PredicateValue::Float64(*value)),
-        ScalarValue::Decimal128 { value, .. } => Some(PredicateValue::Decimal128(*value)),
+        ScalarValue::Decimal128 {
+            value,
+            precision,
+            scale,
+        } => Some(PredicateValue::Decimal128 {
+            value: *value,
+            precision: *precision,
+            scale: *scale,
+        }),
         ScalarValue::Date32(value) => Some(PredicateValue::Date32(*value)),
-        ScalarValue::DayInterval(_)
-        | ScalarValue::MonthInterval(_)
-        | ScalarValue::TimestampMicrosecond(_) => None,
+        ScalarValue::TimestampMicrosecond(value) => Some(PredicateValue::TimestampMicros(*value)),
+        ScalarValue::DayInterval(_) | ScalarValue::MonthInterval(_) => None,
         ScalarValue::Utf8(value) => Some(PredicateValue::Utf8(value.clone())),
     }
 }
@@ -229,7 +277,11 @@ mod tests {
         record_batch::{RecordBatch, RecordBatchOptions},
     };
 
-    use super::expand_projection;
+    use super::{expand_projection, predicate_value, to_scan_predicate};
+    use crate::{
+        datasource::{ComparisonOp, PredicateValue, ScanPredicate},
+        sql::{BinaryOp, BoundExpr, ExprKind, ScalarValue},
+    };
 
     #[test]
     fn empty_projection_stays_zero_column_and_preserves_rows() {
@@ -247,5 +299,63 @@ mod tests {
         assert_eq!(expanded.num_columns(), 0);
         assert!(expanded.schema().fields().is_empty());
         assert_eq!(expanded.get_array_memory_size(), 0);
+    }
+
+    #[test]
+    fn decimal_scan_predicate_preserves_precision_and_scale() {
+        assert_eq!(
+            predicate_value(&ScalarValue::Decimal128 {
+                value: 1,
+                precision: 1,
+                scale: 0,
+            }),
+            Some(PredicateValue::Decimal128 {
+                value: 1,
+                precision: 1,
+                scale: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn decimal_scan_predicate_applies_literal_cast_scale() {
+        let column = BoundExpr::column(0, DataType::Decimal128(10, 2), "amount");
+        let integer = BoundExpr::literal(ScalarValue::Int64(1));
+        let decimal_integer = BoundExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(integer),
+            },
+            data_type: DataType::Decimal128(1, 0),
+            display_name: "1".into(),
+        };
+        let scaled = BoundExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(decimal_integer),
+            },
+            data_type: DataType::Decimal128(3, 2),
+            display_name: "1".into(),
+        };
+        let comparison = BoundExpr {
+            kind: ExprKind::Binary {
+                left: Box::new(column),
+                op: BinaryOp::Eq,
+                right: Box::new(scaled),
+            },
+            data_type: DataType::Boolean,
+            display_name: "amount = 1".into(),
+        };
+
+        assert_eq!(
+            to_scan_predicate(&comparison),
+            Some(ScanPredicate::Comparison {
+                column: 0,
+                op: ComparisonOp::Eq,
+                value: PredicateValue::Decimal128 {
+                    value: 100,
+                    precision: 3,
+                    scale: 2,
+                },
+            })
+        );
     }
 }

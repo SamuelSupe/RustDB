@@ -7,6 +7,7 @@ use arrow::{
 };
 use async_stream::try_stream;
 use futures::{StreamExt, stream::BoxStream};
+use parquet::arrow::arrow_reader::RowSelection;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 
 use super::{
@@ -29,6 +30,7 @@ pub(super) struct ParquetMorsel {
     pub(super) projection: Vec<usize>,
     pub(super) row_group: usize,
     pub(super) row_limit: Option<usize>,
+    pub(super) row_selection: Option<RowSelection>,
 }
 
 pub(super) type ParquetMorselStream = BoxStream<'static, Result<ParquetMorsel>>;
@@ -108,6 +110,9 @@ pub(super) fn morsel_stream(
         .with_batch_size(batch_size)
         .with_projection(mask)
         .with_row_groups(vec![morsel.row_group]);
+        if let Some(selection) = morsel.row_selection {
+            builder = builder.with_row_selection(selection);
+        }
         if let Some(limit) = morsel.row_limit {
             builder = builder.with_limit(limit);
         }

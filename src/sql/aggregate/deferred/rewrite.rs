@@ -113,6 +113,30 @@ pub(super) fn remap_outer_plan(plan: &mut LogicalPlan, mapping: &[(usize, usize)
             }
             remap_outer_plan(input, mapping)
         }
+        LogicalPlan::Append { inputs, .. } => {
+            for input in inputs {
+                remap_outer_plan(input, mapping)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::Window {
+            input, expressions, ..
+        } => {
+            for expression in expressions {
+                if let crate::sql::WindowFunction::Aggregate(aggregate) = &mut expression.function
+                    && let Some(argument) = &mut aggregate.expr
+                {
+                    remap_outer_expr(argument, mapping)?;
+                }
+                for partition in &mut expression.partition_by {
+                    remap_outer_expr(partition, mapping)?;
+                }
+                for order in &mut expression.order_by {
+                    remap_outer_expr(&mut order.expr, mapping)?;
+                }
+            }
+            remap_outer_plan(input, mapping)
+        }
         LogicalPlan::Sort {
             input, expressions, ..
         } => {
