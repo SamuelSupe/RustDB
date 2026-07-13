@@ -130,6 +130,11 @@ pub(super) fn to_scan_predicate(expr: &BoundExpr) -> Option<ScanPredicate> {
     match &expr.kind {
         ExprKind::Binary {
             left,
+            op: BinaryOp::Or,
+            right,
+        } => same_column_or(left, right),
+        ExprKind::Binary {
+            left,
             op: BinaryOp::And,
             right,
         } => Some(ScanPredicate::And(vec![
@@ -162,6 +167,44 @@ pub(super) fn to_scan_predicate(expr: &BoundExpr) -> Option<ScanPredicate> {
             }
         }),
         _ => None,
+    }
+}
+
+fn same_column_or(left: &BoundExpr, right: &BoundExpr) -> Option<ScanPredicate> {
+    const MAX_OR_TERMS: usize = 256;
+
+    let mut predicates = Vec::new();
+    flatten_or(to_scan_predicate(left)?, &mut predicates);
+    flatten_or(to_scan_predicate(right)?, &mut predicates);
+    if predicates.len() > MAX_OR_TERMS {
+        return None;
+    }
+    let column = predicate_column(predicates.first()?)?;
+    predicates
+        .iter()
+        .all(|predicate| predicate_column(predicate) == Some(column))
+        .then_some(ScanPredicate::Or(predicates))
+}
+
+fn flatten_or(predicate: ScanPredicate, output: &mut Vec<ScanPredicate>) {
+    match predicate {
+        ScanPredicate::Or(predicates) => output.extend(predicates),
+        predicate => output.push(predicate),
+    }
+}
+
+fn predicate_column(predicate: &ScanPredicate) -> Option<usize> {
+    match predicate {
+        ScanPredicate::Comparison { column, .. }
+        | ScanPredicate::IsNull { column }
+        | ScanPredicate::IsNotNull { column } => Some(*column),
+        ScanPredicate::And(predicates) | ScanPredicate::Or(predicates) => {
+            let column = predicate_column(predicates.first()?)?;
+            predicates
+                .iter()
+                .all(|predicate| predicate_column(predicate) == Some(column))
+                .then_some(column)
+        }
     }
 }
 
@@ -242,6 +285,7 @@ fn predicate_value(value: &ScalarValue) -> Option<PredicateValue> {
         ScalarValue::TimestampMicrosecond(value) => Some(PredicateValue::TimestampMicros(*value)),
         ScalarValue::DayInterval(_) | ScalarValue::MonthInterval(_) => None,
         ScalarValue::Utf8(value) => Some(PredicateValue::Utf8(value.clone())),
+        ScalarValue::Binary(_) => None,
     }
 }
 
@@ -357,5 +401,77 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn same_column_or_becomes_a_bounded_scan_disjunction() {
+        let comparison = |column, value| BoundExpr {
+            kind: ExprKind::Binary {
+                left: Box::new(BoundExpr::column(column, DataType::Int64, "id")),
+                op: BinaryOp::Eq,
+                right: Box::new(BoundExpr::literal(ScalarValue::Int64(value))),
+            },
+            data_type: DataType::Boolean,
+            display_name: format!("id = {value}"),
+        };
+        let predicate = BoundExpr {
+            kind: ExprKind::Binary {
+                left: Box::new(comparison(0, 1)),
+                op: BinaryOp::Or,
+                right: Box::new(comparison(0, 3)),
+            },
+            data_type: DataType::Boolean,
+            display_name: "id = 1 OR id = 3".into(),
+        };
+        assert!(matches!(
+            to_scan_predicate(&predicate),
+            Some(ScanPredicate::Or(predicates)) if predicates.len() == 2
+        ));
+
+        let mixed = BoundExpr {
+            kind: ExprKind::Binary {
+                left: Box::new(comparison(0, 1)),
+                op: BinaryOp::Or,
+                right: Box::new(comparison(1, 3)),
+            },
+            data_type: DataType::Boolean,
+            display_name: "a = 1 OR b = 3".into(),
+        };
+        assert!(to_scan_predicate(&mixed).is_none());
+    }
+
+    #[test]
+    fn same_column_or_and_lowered_in_stop_after_256_constants() {
+        fn equality(value: i64) -> BoundExpr {
+            BoundExpr {
+                kind: ExprKind::Binary {
+                    left: Box::new(BoundExpr::column(0, DataType::Int64, "id")),
+                    op: BinaryOp::Eq,
+                    right: Box::new(BoundExpr::literal(ScalarValue::Int64(value))),
+                },
+                data_type: DataType::Boolean,
+                display_name: format!("id = {value}"),
+            }
+        }
+
+        fn disjunction(terms: usize) -> BoundExpr {
+            (1..terms).fold(equality(0), |left, value| BoundExpr {
+                kind: ExprKind::Binary {
+                    left: Box::new(left),
+                    op: BinaryOp::Or,
+                    right: Box::new(equality(value as i64)),
+                },
+                data_type: DataType::Boolean,
+                display_name: "bounded constant disjunction".into(),
+            })
+        }
+
+        // IN lists are lowered by the binder to this same OR tree, so both SQL
+        // spellings share one metadata-analysis budget.
+        assert!(matches!(
+            to_scan_predicate(&disjunction(256)),
+            Some(ScanPredicate::Or(predicates)) if predicates.len() == 256
+        ));
+        assert!(to_scan_predicate(&disjunction(257)).is_none());
     }
 }

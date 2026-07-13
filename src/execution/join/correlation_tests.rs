@@ -347,7 +347,7 @@ async fn run_grace_null_aware(
     .unwrap();
     let tasks = spill::initial_tasks(
         left_spiller.finish().unwrap(),
-        right_spiller.finish().unwrap(),
+        right_spiller.finish_manifest().unwrap(),
     );
     let schema = output_schema(join_type, &left_schema, &right_schema);
     grace::join(
@@ -396,6 +396,7 @@ async fn run_fallback_null_aware(
     let task = spill::PartitionTask {
         left: vec![left_file],
         right: vec![right_file],
+        build: spill::BuildPartitionStats::rows_only(1),
         depth: spill::MAX_REPARTITION_DEPTH,
         stagnant_repartitions: 0,
     };
@@ -455,6 +456,7 @@ fn fallback_left_single_stream(
     let task = spill::PartitionTask {
         left: vec![left_file],
         right: vec![right_file],
+        build: spill::BuildPartitionStats::rows_only(2),
         depth: spill::MAX_REPARTITION_DEPTH,
         stagnant_repartitions: 0,
     };

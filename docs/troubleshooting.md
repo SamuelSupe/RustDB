@@ -42,15 +42,70 @@ reported instead of being silently ignored.
 - An "object changed during query" error is intentional consistency
   protection; retry after the writer has finished publishing the object.
 
-## CSV schema or UTF-8 errors
+## CSV input, schema, or memory errors
 
-CSV input is strict, UTF-8, and uncompressed in v0.4. Supply an explicit Arrow
-schema when sampling would infer an unwanted type. All matched files must have
-compatible columns; errors identify the URI and mismatched column. Use
-`REFRESH TABLE name` only when the visible schema should be re-inferred.
-Refresh keeps surviving columns in their previous order and appends new columns
-by name. Quoted newlines are supported, but one large CSV file is decoded
-sequentially; parallelism is across files.
+CSV remains strict UTF-8. Supply an explicit Arrow schema when sampling would
+infer an unwanted type. All matched files must have compatible columns; errors
+identify the URI and mismatched column. Use `REFRESH TABLE name` only when the
+visible schema should be re-inferred. Refresh keeps surviving columns in their
+previous order and appends new columns by name.
+
+`CsvCompression::Auto` and `read_csv(..., compression='auto')` inspect magic
+bytes rather than the filename. Use an explicit `none`, `gzip`, or `zstd` value
+when a producer or gateway changes the initial bytes. Truncated members/frames,
+bad checksums, or invalid compressed data are reported against the object URI.
+Concatenated gzip members and multi-frame zstd are supported.
+
+A single object is fetched and decompressed in order, then split only after a
+complete CSV record; quoted newlines are safe. The default 8 MiB target is not
+a maximum record size. A larger record remains one morsel and must fit the
+query memory budget. Raise the memory limit, reduce simultaneous lanes, or
+disable single-file parallel parsing when the source has unusually wide
+records.
+
+When that allocation fails, the error includes the object URI and decompressed
+offset of the buffered record, followed by the original query-limit and
+available-memory context.
+
+Configure a smaller morsel target or disable this parallel path with the public
+builders:
+
+```rust,no_run
+use rustdb::{CsvCompression, CsvOptions, EngineConfig};
+
+let config = EngineConfig::builder()
+    .csv_target_morsel_bytes(4 * 1024 * 1024)
+    .csv_parallel_single_file(false)
+    .build();
+let options = CsvOptions::builder()
+    .compression(CsvCompression::Auto)
+    .build();
+```
+
+For the CLI, use `--csv-target-morsel-bytes` or
+`--no-csv-parallel-single-file`. `--metrics` reports `csv_source_bytes`,
+`csv_decompressed_bytes`, `csv_morsels`, and `csv_parser_lanes`; a large
+decompressed/source ratio is expected for highly compressible input. See the
+[v0.5 migration guide](migration-v0.5.md) when replacing `CsvOptions` struct
+literals with the builder.
+
+## Adaptive execution settings
+
+`EngineConfig::execution` and its builder methods control the adaptive Spill
+partition target, maximum repartition depth, optional write-amplification
+limit, and Join runtime-filter budget. The corresponding CLI flags are
+`--spill-partition-target-bytes`, `--max-repartition-depth`,
+`--max-spill-write-amplification`, and `--runtime-filter-bytes`. A value of zero
+for the runtime-filter budget disables runtime filters; runtime filtering is
+only a pruning hint and does not replace residual SQL predicates.
+
+When diagnosing resource pressure, inspect active/peak Spill bytes and files,
+repartition bytes/depth, maximum partition size, quota rejections, runtime
+filter hits, metadata cache hits/misses, and singleflight wait alongside the
+CSV counters. These metrics distinguish source decompression pressure from a
+skewed blocking operator or concurrent metadata load.
+Singleflight followers count as cache misses with wait time; only a persistent
+LRU lookup counts as a hit.
 
 ## Reproduce a failure
 

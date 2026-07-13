@@ -4,8 +4,8 @@ use arrow::datatypes::Schema;
 
 use sqlparser::{
     ast::{
-        Distinct, Expr, LimitClause, ObjectName, OrderByKind, Query, Select, SetExpr, Spanned,
-        Statement, Value,
+        DataType as SqlDataType, Distinct, Expr, LimitClause, ObjectName, OrderByKind, Query,
+        Select, SetExpr, Spanned, Statement, Value,
     },
     tokenizer::Span,
 };
@@ -404,12 +404,26 @@ fn query_limit(query: &Query) -> Result<(usize, Option<usize>)> {
 }
 
 fn constant_usize(expr: &Expr, clause: &str) -> Result<usize> {
-    let Expr::Value(value) = expr else {
-        return Err(Error::InvalidArgument(format!(
-            "{clause} must be a non-negative integer literal"
-        )));
+    let value = match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(value, _) => Some(value.as_str()),
+            _ => None,
+        },
+        Expr::Cast {
+            expr,
+            data_type:
+                SqlDataType::BigInt(_) | SqlDataType::BigIntUnsigned(_) | SqlDataType::UBigInt,
+            ..
+        } => match expr.as_ref() {
+            Expr::Value(value) => match &value.value {
+                Value::SingleQuotedString(value) => Some(value.as_str()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
     };
-    let Value::Number(value, _) = &value.value else {
+    let Some(value) = value else {
         return Err(Error::InvalidArgument(format!(
             "{clause} must be a non-negative integer literal"
         )));

@@ -18,35 +18,67 @@ mod repartition;
 mod write;
 
 pub(super) use repartition::repartition_partition;
-pub(super) use write::{StateSpiller, spill_states};
+pub(super) use write::{StateSpiller, spill_largest_partition, spill_states};
 
 pub(super) const SPILL_PARTITIONS: usize = 32;
-const MAX_REPARTITION_DEPTH: usize = 4;
+const MAX_SPILL_PARTITIONS: usize = 256;
+
+/// Files for one hash partition plus its estimated merge-side hash footprint.
+///
+/// Keeping this estimate with the Spill manifest lets merge scheduling choose
+/// the largest partition without synchronously stat'ing compressed files.
+#[derive(Debug)]
+pub(super) struct SpillPartition {
+    pub(super) files: Vec<SpillFile>,
+    pub(super) estimated_bytes: u64,
+}
 
 pub(super) struct PartitionTask {
     pub(super) files: Vec<SpillFile>,
     depth: usize,
+    estimated_bytes: u64,
 }
 
 impl PartitionTask {
-    pub(super) fn initial(files: Vec<SpillFile>) -> Self {
-        Self { files, depth: 0 }
+    pub(super) fn initial(partition: SpillPartition) -> Self {
+        Self {
+            files: partition.files,
+            depth: 0,
+            estimated_bytes: partition.estimated_bytes,
+        }
     }
 
-    pub(super) fn child(files: Vec<SpillFile>, depth: usize) -> Self {
-        Self { files, depth }
+    pub(super) fn child(partition: SpillPartition, depth: usize) -> Self {
+        Self {
+            files: partition.files,
+            depth,
+            estimated_bytes: partition.estimated_bytes,
+        }
     }
 
-    pub(super) fn next_depth(&self) -> Result<usize> {
-        if self.depth >= MAX_REPARTITION_DEPTH {
+    pub(super) fn next_depth(&self, max_depth: usize) -> Result<usize> {
+        if self.depth >= max_depth {
             return Err(Error::ResourceExhausted(format!(
                 "aggregate spill partition still exceeds available memory after {} seeded \
                  repartition levels; increase the memory limit or reduce group-key skew",
-                MAX_REPARTITION_DEPTH
+                max_depth
             )));
         }
         Ok(self.depth + 1)
     }
+
+    pub(super) fn estimated_bytes(&self) -> usize {
+        usize::try_from(self.estimated_bytes).unwrap_or(usize::MAX)
+    }
+}
+
+pub(super) fn pop_largest_partition(tasks: &mut Vec<PartitionTask>) -> Option<PartitionTask> {
+    let largest = tasks
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, task)| task.estimated_bytes)
+        .map(|(index, _)| index)?;
+    Some(tasks.swap_remove(largest))
 }
 
 pub(super) enum MergeOutcome {
@@ -170,4 +202,53 @@ pub(super) fn partition_for_key(key: &[super::CellValue], partitions: usize, see
     seed.hash(&mut hasher);
     key.hash(&mut hasher);
     (hasher.finish() as usize) % partitions
+}
+
+pub(super) fn adaptive_spill_partitions(context: &QueryContext, estimated_bytes: usize) -> usize {
+    let lanes = context.scheduler.partitioning_lanes();
+    let default_target = context
+        .memory
+        .limit()
+        .checked_div(lanes.saturating_mul(2))
+        .unwrap_or(0)
+        .clamp(8 << 20, 64 << 20);
+    let target = context
+        .execution
+        .spill_partition_target_bytes
+        .unwrap_or(default_target)
+        .max(1);
+    estimated_bytes
+        .max(1)
+        .div_ceil(target)
+        .checked_next_power_of_two()
+        .unwrap_or(MAX_SPILL_PARTITIONS)
+        .clamp(2, MAX_SPILL_PARTITIONS)
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+
+    #[test]
+    fn merge_pops_largest_partition_first() {
+        let task = |estimated_bytes| {
+            PartitionTask::initial(SpillPartition {
+                files: Vec::new(),
+                estimated_bytes,
+            })
+        };
+        let mut tasks = vec![task(4), task(32), task(16)];
+        assert_eq!(
+            pop_largest_partition(&mut tasks).unwrap().estimated_bytes,
+            32
+        );
+        assert_eq!(
+            pop_largest_partition(&mut tasks).unwrap().estimated_bytes,
+            16
+        );
+        assert_eq!(
+            pop_largest_partition(&mut tasks).unwrap().estimated_bytes,
+            4
+        );
+    }
 }

@@ -119,6 +119,10 @@ pub(super) fn remap_outer_plan(plan: &mut LogicalPlan, mapping: &[(usize, usize)
             }
             Ok(())
         }
+        LogicalPlan::Repeat { input, count, .. } => {
+            remap_outer_expr(count, mapping)?;
+            remap_outer_plan(input, mapping)
+        }
         LogicalPlan::Window {
             input, expressions, ..
         } => {

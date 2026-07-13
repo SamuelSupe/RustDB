@@ -263,6 +263,12 @@ impl Planner<'_> {
                     (JoinType::Right, constraint)
                 }
                 JoinOperator::FullOuter(constraint) => (JoinType::Full, constraint),
+                JoinOperator::Semi(constraint) | JoinOperator::LeftSemi(constraint) => {
+                    (JoinType::Semi, constraint)
+                }
+                JoinOperator::Anti(constraint) | JoinOperator::LeftAnti(constraint) => {
+                    (JoinType::Anti, constraint)
+                }
                 other => {
                     return Err(Error::Unsupported(format!(
                         "join type {other:?} is not supported"
@@ -302,14 +308,18 @@ impl Planner<'_> {
                 join_type,
                 schema,
             };
-            left = apply_using_projection(
-                joined,
-                join_type,
-                &left_schema,
-                &right_schema,
-                &using_columns,
-                &using_keys,
-            )?;
+            left = if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+                joined
+            } else {
+                apply_using_projection(
+                    joined,
+                    join_type,
+                    &left_schema,
+                    &right_schema,
+                    &using_columns,
+                    &using_keys,
+                )?
+            };
         }
         Ok(left)
     }

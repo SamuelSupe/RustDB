@@ -47,6 +47,41 @@ pub(super) fn try_build_hash_table_with_nulls(
     null_equal_keys: bool,
     reservation: &mut MemoryReservation,
 ) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
+    try_build_summarized_hash_table_with_nulls(
+        key_arrays,
+        rows,
+        deduplicate,
+        null_equal_keys,
+        None,
+        reservation,
+    )
+}
+
+pub(super) fn try_build_existence_hash_table_with_nulls(
+    key_arrays: &[ArrayRef],
+    rows: usize,
+    null_equal_keys: bool,
+    summary_values: &ArrayRef,
+    reservation: &mut MemoryReservation,
+) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
+    try_build_summarized_hash_table_with_nulls(
+        key_arrays,
+        rows,
+        false,
+        null_equal_keys,
+        Some(summary_values),
+        reservation,
+    )
+}
+
+fn try_build_summarized_hash_table_with_nulls(
+    key_arrays: &[ArrayRef],
+    rows: usize,
+    deduplicate: bool,
+    null_equal_keys: bool,
+    summary_values: Option<&ArrayRef>,
+    reservation: &mut MemoryReservation,
+) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
     let initial_reservation = reservation.size();
     let mut hash_table: HashMap<Vec<CellValue>, Vec<u32>> = HashMap::new();
     for row in 0..rows {
@@ -69,6 +104,26 @@ pub(super) fn try_build_hash_table_with_nulls(
                 ));
             }
         };
+        if let Some(summary_values) = summary_values {
+            let value = match cell(summary_values, row) {
+                Ok(value) => value,
+                Err(error) => {
+                    reset_hash_build(&mut hash_table, reservation, initial_reservation)?;
+                    return Err(error);
+                }
+            };
+            if value.is_null() {
+                continue;
+            }
+            if let Some(matches) = hash_table.get(&key)
+                && (matches.len() >= 2
+                    || matches.iter().try_fold(false, |duplicate, index| {
+                        Ok::<_, Error>(duplicate || cell(summary_values, *index as usize)? == value)
+                    })?)
+            {
+                continue;
+            }
+        }
         if hash_table.contains_key(&key) {
             let (length, capacity) = {
                 let matches = hash_table.get(&key).expect("occupied hash key");
@@ -391,6 +446,9 @@ impl<'a> ProbeCursor<'a> {
                         self.right_values,
                     )?
                 };
+                context
+                    .metrics
+                    .add_join_candidates(u64::try_from(outcomes.len()).unwrap_or(u64::MAX));
                 for group in &candidate_groups {
                     let mut state = group.state;
                     for candidate in group.start..group.end {
@@ -430,7 +488,18 @@ impl<'a> ProbeCursor<'a> {
                             }
                         }
                     }
-                    if group.complete {
+                    if group.complete || result_is_decided(self.join_type, &state) {
+                        // Semi/Anti/Mark joins need only an existence answer. Once a
+                        // qualifying candidate is observed, do not rescan a large
+                        // duplicate-key group in subsequent batches. Q21's supplier
+                        // inequality predicates benefit directly while general residual
+                        // semantics stay intact.
+                        if !group.complete {
+                            context.metrics.add_join_short_circuits(1);
+                            self.row = self.row.saturating_add(1);
+                            self.match_index = 0;
+                            self.current_state = RowState::default();
+                        }
                         finish_row(
                             group.left_row,
                             self.join_type,
@@ -514,6 +583,19 @@ impl<'a> ProbeCursor<'a> {
     }
 }
 
+fn result_is_decided(join_type: JoinType, state: &RowState) -> bool {
+    match join_type {
+        JoinType::Semi | JoinType::Anti | JoinType::Mark => state.matches != 0,
+        // UNKNOWN can still be replaced by a later exact membership match.
+        JoinType::NullAwareAnti => state.matches != 0,
+        JoinType::Inner
+        | JoinType::Left
+        | JoinType::Right
+        | JoinType::Full
+        | JoinType::LeftSingle => false,
+    }
+}
+
 fn finish_row(
     row: usize,
     join_type: JoinType,
@@ -559,4 +641,50 @@ fn finish_row(
 
 fn marker_slice(join_type: JoinType, markers: &[Option<bool>]) -> Option<&[Option<bool>]> {
     (join_type == JoinType::Mark).then_some(markers)
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array};
+
+    use super::{RowState, result_is_decided, try_build_existence_hash_table_with_nulls};
+    use crate::runtime::MemoryPool;
+    use crate::sql::JoinType;
+
+    #[test]
+    fn existence_hash_keeps_two_distinct_non_null_values_per_key() {
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1, 1, 1, 1, 1]))];
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(10),
+            Some(10),
+            Some(20),
+            Some(30),
+            None,
+        ]));
+        let pool = MemoryPool::new(1 << 20);
+        let mut reservation = pool.reservation();
+        let hash =
+            try_build_existence_hash_table_with_nulls(&keys, 5, false, &values, &mut reservation)
+                .unwrap()
+                .unwrap();
+        let representatives = hash.values().next().unwrap();
+        assert_eq!(representatives.as_slice(), &[0, 2]);
+    }
+
+    #[test]
+    fn null_aware_unknown_does_not_short_circuit_before_exact_match() {
+        let unknown = RowState {
+            matches: 0,
+            first_right: None,
+            unknown: true,
+        };
+        assert!(!result_is_decided(JoinType::NullAwareAnti, &unknown));
+        let matched = RowState {
+            matches: 1,
+            ..unknown
+        };
+        assert!(result_is_decided(JoinType::NullAwareAnti, &matched));
+    }
 }

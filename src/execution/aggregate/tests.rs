@@ -8,7 +8,8 @@ use arrow::{
 use futures::TryStreamExt;
 
 use super::{
-    OutputMode, aggregate, build_output_envelope, build_partial_batch, partial_schema, spill,
+    OutputMode, aggregate, build_output_envelope, build_partial_batch, output_chunk_len,
+    partial_schema, spill,
     state::{AggregateState, GroupState},
 };
 use crate::{
@@ -55,6 +56,29 @@ async fn output_materialization_transfers_its_workspace_into_the_batch_lease() {
     assert_eq!(context.memory.used(), output.memory_size());
     drop(output);
     assert_eq!(context.memory.used(), 0);
+}
+
+#[test]
+fn output_chunks_are_bounded_by_estimated_variable_width_workspace() {
+    let aggregates = vec![AggregateExpr {
+        function: AggregateFunction::Count,
+        expr: None,
+        distinct: false,
+        data_type: DataType::Int64,
+        display_name: "count(*)".into(),
+    }];
+    let states = (0..16)
+        .map(|index| {
+            GroupState::new(
+                vec![CellValue::Utf8(format!("{index}-{}", "x".repeat(2 << 10)))],
+                &aggregates,
+            )
+        })
+        .collect::<Vec<_>>();
+    let one = states[0].output_workspace_bytes(2);
+    let rows = output_chunk_len(&states, 8_192, 2, one.saturating_mul(3));
+
+    assert_eq!(rows, 2);
 }
 
 #[test]

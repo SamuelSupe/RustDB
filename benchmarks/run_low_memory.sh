@@ -9,8 +9,8 @@ usage() {
   cat >&2 <<'EOF'
 usage: benchmarks/run_low_memory.sh TPCH_PARQUET_ROOT [OUTPUT_DIR]
 
-Runs Sort, Aggregate, Inner/Left/Right/Full Join, DISTINCT set operation, and
-Window workloads at 64 MiB and 128 MiB.
+Runs Sort, Aggregate, Inner/Left/Right/Full/Semi/Anti Join, DISTINCT and ALL
+set operations (including Repeat), and Window workloads at 64 MiB and 128 MiB.
 TPCH_PARQUET_ROOT must be workspace-relative, below /workspace, or an s3:// URI.
 
 Environment overrides:

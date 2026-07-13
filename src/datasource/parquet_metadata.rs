@@ -5,9 +5,9 @@ use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 
 use super::{
     MetadataCache,
-    metadata_cache::metadata_weight,
+    metadata_cache::{MetadataLoad, metadata_weight},
     parquet_pruning_budget::PruningLease,
-    parquet_reader::{QueryIo, SnapshotParquetReader},
+    parquet_reader::{QueryIo, SnapshotParquetReader, into_query_error},
 };
 use crate::{
     EngineConfig, Error, Result,
@@ -135,27 +135,67 @@ pub(super) async fn load_parquet_metadata(
     cache: &MetadataCache,
     registration_limit: usize,
 ) -> Result<ParquetMetadata> {
-    if let Some(metadata) = cache.get_footer(file, &snapshot) {
-        return lease_metadata(file, &snapshot, metadata, context, registration_limit);
+    let control = context.map(|context| &context.control);
+    let load_guard = match cache.acquire_footer(file, &snapshot, control).await? {
+        MetadataLoad::Cached { metadata, wait } => {
+            if let Some(context) = context {
+                context.metrics.record_metadata_cache_hit();
+                if !wait.is_zero() {
+                    context.metrics.record_metadata_singleflight_wait(wait);
+                }
+            }
+            return lease_metadata(file, &snapshot, metadata, context, registration_limit);
+        }
+        MetadataLoad::Shared { metadata, wait } => {
+            if let Some(context) = context {
+                context.metrics.record_metadata_cache_miss();
+                context.metrics.record_metadata_singleflight_wait(wait);
+            }
+            return lease_metadata(file, &snapshot, metadata, context, registration_limit);
+        }
+        MetadataLoad::Leader { guard, wait } => {
+            if let Some(context) = context {
+                context.metrics.record_metadata_cache_miss();
+                if !wait.is_zero() {
+                    context.metrics.record_metadata_singleflight_wait(wait);
+                }
+            }
+            guard
+        }
+    };
+
+    let loaded: Result<_> = async {
+        let query =
+            context.map(|context| QueryIo::new(context.control.clone(), context.metrics.clone()));
+        let mut reader = SnapshotParquetReader::new(file, snapshot.clone(), query);
+        let footer_len = reader
+            .footer_metadata_len()
+            .await
+            .map_err(into_query_error)?;
+        let estimated = estimated_metadata_bytes(footer_len);
+        let mut reservation =
+            reserve_before_load(file.uri(), estimated, context, registration_limit)?;
+
+        let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default())
+            .await
+            .map_err(into_query_error)?;
+        let actual = metadata_weight(file, &snapshot, &metadata);
+        resize_after_load(
+            file.uri(),
+            actual,
+            context,
+            registration_limit,
+            reservation.as_mut(),
+        )?;
+        Ok((metadata, reservation))
     }
-
-    let query =
-        context.map(|context| QueryIo::new(context.control.clone(), context.metrics.clone()));
-    let mut reader = SnapshotParquetReader::new(file, snapshot.clone(), query);
-    let footer_len = reader.footer_metadata_len().await?;
-    let estimated = estimated_metadata_bytes(footer_len);
-    let mut reservation = reserve_before_load(file.uri(), estimated, context, registration_limit)?;
-
-    let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
-    let actual = metadata_weight(file, &snapshot, &metadata);
-    resize_after_load(
-        file.uri(),
-        actual,
-        context,
-        registration_limit,
-        reservation.as_mut(),
-    )?;
+    .await;
+    let (metadata, reservation) = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => return Err(load_guard.fail(error)),
+    };
     cache.insert_footer(file, &snapshot, metadata.clone());
+    load_guard.succeed(metadata.clone());
     Ok(ParquetMetadata::new(metadata, reservation, None))
 }
 

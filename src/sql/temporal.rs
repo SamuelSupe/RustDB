@@ -25,14 +25,11 @@ pub(crate) fn parse_timestamp_microsecond(value: &str) -> Result<i64> {
         return Err(invalid_timestamp(value));
     }
     let micros = parse_fraction(fraction, value)?;
-    days.checked_mul(MICROS_PER_DAY)
-        .and_then(|base| {
-            let seconds = i64::from(hour * 3_600 + minute * 60 + second);
-            base.checked_add(seconds * 1_000_000 + micros)
-        })
-        .ok_or_else(|| {
-            Error::InvalidArgument(format!("TIMESTAMP literal '{value}' is out of range"))
-        })
+    let seconds = i128::from(hour * 3_600 + minute * 60 + second);
+    let timestamp =
+        i128::from(days) * i128::from(MICROS_PER_DAY) + seconds * 1_000_000 + i128::from(micros);
+    i64::try_from(timestamp)
+        .map_err(|_| Error::InvalidArgument(format!("TIMESTAMP literal '{value}' is out of range")))
 }
 
 pub(crate) fn format_date32(days: i32) -> String {
@@ -102,13 +99,19 @@ pub(crate) fn truncate_timestamp(value: i64, part: super::DateTimePart) -> Resul
 }
 
 fn parse_date(value: &str) -> Result<(i32, u32, u32)> {
-    let mut parts = value.split('-');
+    let (year_sign, value_without_sign) = value
+        .strip_prefix('-')
+        .map_or((1_i64, value), |value| (-1_i64, value));
+    let mut parts = value_without_sign.split('-');
     let year = parts
         .next()
         .filter(|part| !part.is_empty())
         .ok_or_else(|| invalid_date(value))?
-        .parse::<i32>()
-        .map_err(|_| Error::InvalidArgument(format!("'{value}' has an invalid year")))?;
+        .parse::<i64>()
+        .ok()
+        .and_then(|year| year.checked_mul(year_sign))
+        .and_then(|year| i32::try_from(year).ok())
+        .ok_or_else(|| Error::InvalidArgument(format!("'{value}' has an invalid year")))?;
     let month = parse_part(parts.next(), "month", value)?;
     let day = parse_part(parts.next(), "day", value)?;
     if parts.next().is_some()
@@ -206,6 +209,23 @@ mod tests {
             assert_eq!(
                 parse_timestamp_microsecond(&format_timestamp_microsecond(parsed)).unwrap(),
                 parsed
+            );
+        }
+    }
+
+    #[test]
+    fn date32_boundaries_round_trip() {
+        for value in [i32::MIN, i32::MAX] {
+            assert_eq!(parse_date32(&format_date32(value)).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn timestamp_boundaries_round_trip() {
+        for value in [i64::MIN, i64::MAX] {
+            assert_eq!(
+                parse_timestamp_microsecond(&format_timestamp_microsecond(value)).unwrap(),
+                value
             );
         }
     }

@@ -2,7 +2,7 @@ use std::{fs::File, hint::black_box, io::Read, path::PathBuf, time::Instant};
 
 use clap::Parser;
 use futures::StreamExt;
-use rustdb::{Engine, EngineConfig, Error, Result};
+use rustdb::{Engine, EngineConfig, Error, QueryMetricsSnapshot, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -107,6 +107,12 @@ struct ConfigReport {
     batch_size: usize,
     io_concurrency: usize,
     metadata_cache_bytes: usize,
+    csv_parallel_single_file: bool,
+    csv_target_morsel_bytes: usize,
+    spill_partition_target_bytes: Option<usize>,
+    max_repartition_depth: usize,
+    max_spill_write_amplification: Option<f64>,
+    runtime_filter_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +134,7 @@ struct RunReport {
     rows_per_second: f64,
     scanned_rows: u64,
     scanned_bytes: u64,
+    current_memory_bytes: u64,
     peak_memory_bytes: u64,
     peak_active_lanes: u64,
     scheduler_wait_ms: f64,
@@ -135,9 +142,29 @@ struct RunReport {
     spill_bytes: u64,
     spill_read_bytes: u64,
     spill_write_bytes: u64,
+    spill_logical_input_bytes: u64,
+    spill_write_amplification_millionths: u64,
     spill_files: u64,
+    active_spill_bytes: u64,
+    peak_active_spill_bytes: u64,
+    active_spill_files: u64,
+    peak_active_spill_files: u64,
+    spill_repartition_bytes: u64,
+    max_repartition_depth: u64,
+    max_spill_partition_bytes: u64,
     spill_quota_rejections: u64,
     spill_partitions: u64,
+    join_candidate_pairs: u64,
+    join_short_circuits: u64,
+    runtime_filter_hits: u64,
+    csv_source_bytes: u64,
+    csv_decompressed_bytes: u64,
+    csv_morsels: u64,
+    peak_csv_parser_lanes: u64,
+    metadata_cache_hits: u64,
+    metadata_cache_misses: u64,
+    metadata_singleflight_wait_ms: f64,
+    cancel_to_quiesce_ms: f64,
     parquet_page_index_bytes_read: u64,
     parquet_bloom_filter_bytes_read: u64,
     parquet_pages_pruned: u64,
@@ -206,6 +233,12 @@ async fn run(args: Args) -> Result<()> {
         batch_size: config.batch_size,
         io_concurrency: config.io_concurrency,
         metadata_cache_bytes: config.metadata_cache_bytes,
+        csv_parallel_single_file: config.csv_scan.parallel_single_file,
+        csv_target_morsel_bytes: config.csv_scan.target_morsel_bytes,
+        spill_partition_target_bytes: config.execution.spill_partition_target_bytes,
+        max_repartition_depth: config.execution.max_repartition_depth,
+        max_spill_write_amplification: config.execution.max_spill_write_amplification,
+        runtime_filter_bytes: config.execution.runtime_filter_bytes,
     };
     let temp_dir = config.spill.directory.clone();
     let memory_limit = config.memory_limit;
@@ -293,8 +326,8 @@ async fn run_once(
         black_box(batch);
     }
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    let metrics = metrics.snapshot();
     drop(result);
+    let metrics = metrics.snapshot();
     if metrics.peak_memory_bytes > u64::try_from(memory_limit).unwrap_or(u64::MAX) {
         return Err(Error::ResourceExhausted(format!(
             "query {query_id} reserved {} bytes above the configured {} byte limit",
@@ -306,10 +339,14 @@ async fn run_once(
             "query {query_id} completed without spilling while --require-spill was set"
         )));
     }
-    if query_dir.exists() {
+    let spill_cleaned = terminal_resources_clean(&metrics, &query_dir);
+    if !spill_cleaned {
         return Err(Error::Execution(format!(
-            "query {query_id} left spill directory {} behind",
-            query_dir.display()
+            "query {query_id} did not release terminal resources: current memory {} bytes, active Spill {} bytes in {} files, spill directory exists={}",
+            metrics.current_memory_bytes,
+            metrics.active_spill_bytes,
+            metrics.active_spill_files,
+            query_dir.exists(),
         )));
     }
     Ok(RunReport {
@@ -325,6 +362,7 @@ async fn run_once(
         },
         scanned_rows: metrics.rows_scanned,
         scanned_bytes: metrics.bytes_scanned,
+        current_memory_bytes: metrics.current_memory_bytes,
         peak_memory_bytes: metrics.peak_memory_bytes,
         peak_active_lanes: metrics.peak_active_lanes,
         scheduler_wait_ms: metrics.scheduler_wait.as_secs_f64() * 1_000.0,
@@ -332,9 +370,29 @@ async fn run_once(
         spill_bytes: metrics.spill_bytes,
         spill_read_bytes: metrics.spill_read_bytes,
         spill_write_bytes: metrics.spill_write_bytes,
+        spill_logical_input_bytes: metrics.spill_logical_input_bytes,
+        spill_write_amplification_millionths: metrics.spill_write_amplification_millionths,
         spill_files: metrics.spill_files,
+        active_spill_bytes: metrics.active_spill_bytes,
+        peak_active_spill_bytes: metrics.peak_active_spill_bytes,
+        active_spill_files: metrics.active_spill_files,
+        peak_active_spill_files: metrics.peak_active_spill_files,
+        spill_repartition_bytes: metrics.spill_repartition_bytes,
+        max_repartition_depth: metrics.max_repartition_depth,
+        max_spill_partition_bytes: metrics.max_spill_partition_bytes,
         spill_quota_rejections: metrics.spill_quota_rejections,
         spill_partitions: metrics.spill_partitions,
+        join_candidate_pairs: metrics.join_candidate_pairs,
+        join_short_circuits: metrics.join_short_circuits,
+        runtime_filter_hits: metrics.runtime_filter_hits,
+        csv_source_bytes: metrics.csv_source_bytes,
+        csv_decompressed_bytes: metrics.csv_decompressed_bytes,
+        csv_morsels: metrics.csv_morsels,
+        peak_csv_parser_lanes: metrics.peak_csv_parser_lanes,
+        metadata_cache_hits: metrics.metadata_cache_hits,
+        metadata_cache_misses: metrics.metadata_cache_misses,
+        metadata_singleflight_wait_ms: metrics.metadata_singleflight_wait.as_secs_f64() * 1_000.0,
+        cancel_to_quiesce_ms: metrics.cancel_to_quiesce.as_secs_f64() * 1_000.0,
         parquet_page_index_bytes_read: metrics.parquet_page_index_bytes_read,
         parquet_bloom_filter_bytes_read: metrics.parquet_bloom_filter_bytes_read,
         parquet_pages_pruned: metrics.parquet_pages_pruned,
@@ -343,8 +401,15 @@ async fn run_once(
         parquet_pruning_budget_skips: metrics.parquet_pruning_budget_skips,
         s3_requests: metrics.s3_requests,
         s3_bytes_transferred: metrics.s3_bytes_transferred,
-        spill_cleaned: true,
+        spill_cleaned,
     })
+}
+
+fn terminal_resources_clean(metrics: &QueryMetricsSnapshot, query_dir: &std::path::Path) -> bool {
+    metrics.current_memory_bytes == 0
+        && metrics.active_spill_bytes == 0
+        && metrics.active_spill_files == 0
+        && !query_dir.exists()
 }
 
 fn environment_report(cpu_model: Option<String>) -> EnvironmentReport {
@@ -383,7 +448,9 @@ fn percentile(sorted: &[f64], percentile: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_sha256, percentile};
+    use rustdb::{Engine, EngineConfig, QueryMetricsSnapshot};
+
+    use super::{file_sha256, percentile, run_once, terminal_resources_clean};
 
     #[test]
     fn percentile_uses_nearest_rank() {
@@ -400,5 +467,43 @@ mod tests {
             file_sha256(&path).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn terminal_resource_check_requires_every_counter_and_directory_to_be_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let query_dir = directory.path().join("query-test");
+        let mut metrics = QueryMetricsSnapshot::default();
+        assert!(terminal_resources_clean(&metrics, &query_dir));
+
+        metrics.current_memory_bytes = 1;
+        assert!(!terminal_resources_clean(&metrics, &query_dir));
+        metrics.current_memory_bytes = 0;
+        metrics.active_spill_bytes = 1;
+        assert!(!terminal_resources_clean(&metrics, &query_dir));
+        metrics.active_spill_bytes = 0;
+        metrics.active_spill_files = 1;
+        assert!(!terminal_resources_clean(&metrics, &query_dir));
+        metrics.active_spill_files = 0;
+        std::fs::create_dir(&query_dir).unwrap();
+        assert!(!terminal_resources_clean(&metrics, &query_dir));
+    }
+
+    #[tokio::test]
+    async fn completed_run_reports_released_query_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = EngineConfig::default();
+        config.memory_limit = 8 << 20;
+        config.spill.directory = directory.path().to_path_buf();
+        let session = Engine::new(config).unwrap().session();
+
+        let report = run_once(&session, "SELECT 1", directory.path(), 8 << 20, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.current_memory_bytes, 0);
+        assert_eq!(report.active_spill_bytes, 0);
+        assert_eq!(report.active_spill_files, 0);
+        assert!(report.spill_cleaned);
     }
 }

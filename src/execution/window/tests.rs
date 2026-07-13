@@ -32,6 +32,19 @@ async fn ranks_rows_and_peers_per_partition() {
 }
 
 #[tokio::test]
+async fn distributes_rows_and_reports_relative_rank() {
+    let batches = run("SELECT g, v, \
+         ntile(2) OVER (PARTITION BY g ORDER BY v) AS tile, \
+         percent_rank() OVER (PARTITION BY g ORDER BY v) AS percent, \
+         cume_dist() OVER (PARTITION BY g ORDER BY v) AS cumulative \
+         FROM events ORDER BY g, v, row_number() OVER (PARTITION BY g ORDER BY v)")
+    .await;
+    assert_eq!(ints(&batches, 2), vec![1, 1, 2, 1]);
+    assert_eq!(floats(&batches, 3), vec![0.0, 0.0, 1.0, 0.0]);
+    assert_eq!(floats(&batches, 4), vec![2.0 / 3.0, 2.0 / 3.0, 1.0, 1.0]);
+}
+
+#[tokio::test]
 async fn executes_default_range_rows_and_whole_partition_frames() {
     let batches = run(
         "SELECT g, v, \
@@ -362,6 +375,8 @@ fn rejects_window_contexts_and_unsupported_frames() {
         "SELECT sum(v) OVER (ORDER BY v GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM events",
         "SELECT count(DISTINCT v) OVER () FROM events",
         "SELECT row_number() OVER (ORDER BY rank() OVER ()) FROM events",
+        "SELECT ntile(0) OVER () FROM events",
+        "SELECT ntile(v) OVER () FROM events",
     ] {
         assert!(plan_sql(&catalog, sql).is_err(), "{sql}");
     }

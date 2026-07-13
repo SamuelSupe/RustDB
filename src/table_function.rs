@@ -1,16 +1,16 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, ops::ControlFlow, sync::Arc};
 
 mod walk;
 
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart, Statement, TableFactor,
-    Value,
+    Value, Visit, Visitor,
 };
 use uuid::Uuid;
 
 use crate::{
-    Catalog, CsvHeader, CsvOptions, EngineConfig, Error, ParquetOptions, ParquetSchemaMode, Result,
-    TableEntry,
+    Catalog, CsvCompression, CsvHeader, CsvOptions, EngineConfig, Error, ParquetOptions,
+    ParquetSchemaMode, Result, TableEntry,
     datasource::{CsvTable, MetadataCache, ParquetTable, TableProvider},
     runtime::QueryContext,
 };
@@ -24,6 +24,79 @@ use crate::{
 pub(crate) struct PreparedSql {
     pub(crate) statement: Statement,
     pub(crate) generated_tables: Vec<String>,
+}
+
+pub(crate) struct GeneratedTablesGuard {
+    catalog: Catalog,
+    names: Vec<String>,
+}
+
+impl GeneratedTablesGuard {
+    pub(crate) fn new(catalog: &Catalog, names: Vec<String>) -> Self {
+        Self {
+            catalog: catalog.clone(),
+            names,
+        }
+    }
+}
+
+impl Drop for GeneratedTablesGuard {
+    fn drop(&mut self) {
+        for name in &self.names {
+            self.catalog.unregister(name);
+        }
+    }
+}
+
+pub(crate) fn reject_parameterized_file_functions(statement: &Statement) -> Result<()> {
+    walk::visit(statement, &mut |factor| {
+        let TableFactor::Table {
+            name,
+            args: Some(arguments),
+            ..
+        } = factor
+        else {
+            return Ok(());
+        };
+        if file_kind(name).is_none() {
+            return Ok(());
+        }
+        if arguments.args.iter().any(argument_has_placeholder) {
+            return Err(Error::InvalidArgument(
+                "prepared parameters are not allowed in read_csv/read_parquet arguments".into(),
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn argument_has_placeholder(argument: &FunctionArg) -> bool {
+    let expression = match argument {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expression))
+        | FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(expression),
+            ..
+        }
+        | FunctionArg::ExprNamed {
+            arg: FunctionArgExpr::Expr(expression),
+            ..
+        } => expression,
+        _ => return false,
+    };
+    struct Finder;
+    impl Visitor for Finder {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(expression, Expr::Value(value) if matches!(value.value, Value::Placeholder(_)))
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    matches!(expression.visit(&mut Finder), ControlFlow::Break(()))
 }
 
 #[cfg(test)]
@@ -59,7 +132,18 @@ pub(crate) async fn prepare_with_cache_for_query(
             "exactly one SQL statement is required".to_owned(),
         ));
     }
-    let mut statement = statements.remove(0);
+    let statement = statements.remove(0);
+    prepare_statement_with_cache_for_query(catalog, config, metadata_cache, statement, context)
+        .await
+}
+
+pub(crate) async fn prepare_statement_with_cache_for_query(
+    catalog: &Catalog,
+    config: &EngineConfig,
+    metadata_cache: &MetadataCache,
+    mut statement: Statement,
+    context: Option<Arc<QueryContext>>,
+) -> Result<PreparedSql> {
     let specs = collect_specs(&statement)?;
     if specs.is_empty() {
         return Ok(PreparedSql {
@@ -71,9 +155,17 @@ pub(crate) async fn prepare_with_cache_for_query(
     // Build every provider before mutating the session catalog. A failed file
     // leaves no partially registered generated tables behind.
     let mut prepared = Vec::with_capacity(specs.len());
+    let mut shared = Vec::<(FileSpec, Arc<dyn TableProvider>)>::new();
     let mut names = HashSet::with_capacity(specs.len());
     for spec in specs {
-        let provider = build_provider(spec, config, metadata_cache, context.clone()).await?;
+        let provider = if let Some((_, provider)) = shared.iter().find(|(seen, _)| seen == &spec) {
+            Arc::clone(provider)
+        } else {
+            let provider =
+                build_provider(spec.clone(), config, metadata_cache, context.clone()).await?;
+            shared.push((spec, Arc::clone(&provider)));
+            provider
+        };
         let name = generated_name(catalog, &mut names);
         prepared.push((name, provider));
     }
@@ -113,7 +205,7 @@ enum FileKind {
     Parquet,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum FileSpec {
     Csv {
         location: String,
@@ -213,6 +305,7 @@ fn parse_factor(factor: &TableFactor) -> Result<Option<FileSpec>> {
                     "header" => options.header = csv_header(value)?,
                     "delimiter" => options.delimiter = delimiter(value)?,
                     "sample_size" => options.sample_size = positive_usize(value, "sample_size")?,
+                    "compression" => options.compression = csv_compression(value)?,
                     _ => return Err(unknown_argument(kind, &name)),
                 }
             }
@@ -414,6 +507,21 @@ fn delimiter(argument: &FunctionArgExpr) -> Result<u8> {
     Ok(bytes[0])
 }
 
+fn csv_compression(argument: &FunctionArgExpr) -> Result<CsvCompression> {
+    match literal_string(argument, "compression")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => Ok(CsvCompression::Auto),
+        "none" | "uncompressed" => Ok(CsvCompression::None),
+        "gzip" | "gz" => Ok(CsvCompression::Gzip),
+        "zstd" | "zst" => Ok(CsvCompression::Zstd),
+        value => Err(Error::InvalidArgument(format!(
+            "CSV compression must be AUTO, NONE, GZIP, or ZSTD; found '{value}'"
+        ))),
+    }
+}
+
 fn positive_usize(argument: &FunctionArgExpr, name: &str) -> Result<usize> {
     let Value::Number(value, _) = literal_value(argument, name)? else {
         return Err(Error::InvalidArgument(format!(
@@ -488,175 +596,5 @@ fn generated_name(catalog: &Catalog, generated: &mut HashSet<String>) -> String 
 }
 
 #[cfg(test)]
-mod tests {
-    use sqlparser::{ast::Statement, dialect::DuckDbDialect, parser::Parser};
-
-    use super::{FileSpec, collect_specs, parse_factor, prepare};
-    use crate::{Catalog, CsvHeader, EngineConfig, Error, ParquetSchemaMode};
-
-    fn factor(sql: &str) -> sqlparser::ast::TableFactor {
-        let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql).expect("parse SQL");
-        let Statement::Query(query) = statements.remove(0) else {
-            panic!("query expected");
-        };
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("select expected");
-        };
-        select.from[0].relation.clone()
-    }
-
-    #[test]
-    fn parses_supported_csv_and_parquet_options() {
-        let csv = factor(
-            "SELECT * FROM read_csv('data.csv', header = 'present', delimiter = '|', sample_size = 42)",
-        );
-        let Some(FileSpec::Csv { options, .. }) = parse_factor(&csv).expect("CSV spec") else {
-            panic!("CSV spec expected");
-        };
-        assert_eq!(options.header, CsvHeader::Present);
-        assert_eq!(options.delimiter, b'|');
-        assert_eq!(options.sample_size, 42);
-
-        let parquet = factor(
-            "SELECT * FROM read_parquet('data.parquet', union_by_name = true, hive_partitioning = 'auto')",
-        );
-        let Some(FileSpec::Parquet { options, .. }) = parse_factor(&parquet).expect("Parquet spec")
-        else {
-            panic!("Parquet spec expected");
-        };
-        assert!(options.union_by_name);
-        assert!(options.hive_partitioning);
-
-        let widening =
-            factor("SELECT * FROM read_parquet('data.parquet', schema_mode = 'safe_widening')");
-        let Some(FileSpec::Parquet { options, .. }) = parse_factor(&widening).unwrap() else {
-            panic!("Parquet spec expected");
-        };
-        assert_eq!(options.schema_mode, ParquetSchemaMode::SafeWidening);
-    }
-
-    #[test]
-    fn rejects_conflicting_parquet_schema_options() {
-        let factor = factor(
-            "SELECT * FROM read_parquet('data.parquet', union_by_name = true, schema_mode = 'union')",
-        );
-        assert!(matches!(
-            parse_factor(&factor),
-            Err(Error::InvalidArgument(message)) if message.contains("conflict")
-        ));
-    }
-
-    #[test]
-    fn rejects_unknown_and_credential_arguments_before_io() {
-        let unknown = factor("SELECT * FROM read_csv('missing.csv', typo = true)");
-        assert!(matches!(
-            parse_factor(&unknown),
-            Err(Error::InvalidArgument(message)) if message.contains("unknown read_csv argument")
-        ));
-
-        let secret = factor(
-            "SELECT * FROM read_parquet('s3://bucket/data.parquet', secret_access_key = 'x')",
-        );
-        assert!(matches!(
-            parse_factor(&secret),
-            Err(Error::InvalidArgument(message)) if message.contains("credential argument")
-        ));
-    }
-
-    #[test]
-    fn discovers_file_functions_inside_scalar_subqueries() {
-        let mut statements = Parser::parse_sql(
-            &DuckDbDialect {},
-            "SELECT (SELECT count(*) FROM read_parquet('inner.parquet')) \
-             FROM read_csv('outer.csv')",
-        )
-        .unwrap();
-        let specs = collect_specs(&statements.remove(0)).unwrap();
-        assert_eq!(specs.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn prepares_csv_registers_generated_table_and_preserves_alias() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("data.csv");
-        std::fs::write(&path, "id,name\n1,alice\n2,bob\n").expect("write CSV");
-        let sql = format!(
-            "SELECT source.id FROM read_csv('{}', header = true) AS source",
-            path.display()
-        );
-        let catalog = Catalog::default();
-
-        let prepared = prepare(&catalog, &EngineConfig::default(), &sql)
-            .await
-            .expect("prepare file function");
-        let names = catalog.table_names();
-        assert_eq!(names.len(), 1);
-        assert!(names[0].starts_with("__rustdb_file_"));
-        assert_eq!(prepared.generated_tables, names);
-        let rewritten = prepared.statement.to_string();
-        assert!(rewritten.contains(&names[0]));
-        assert!(rewritten.contains("source"));
-        assert!(!rewritten.to_ascii_lowercase().contains("read_csv"));
-    }
-
-    #[tokio::test]
-    async fn rewrites_from_and_join_inside_explain_query() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("join.csv");
-        std::fs::write(&path, "id\n1\n2\n").expect("write CSV");
-        let sql = format!(
-            "EXPLAIN SELECT * FROM read_csv('{}', header = true) AS left_file \
-             INNER JOIN read_csv('{}', header = true) AS right_file \
-             ON left_file.id = right_file.id",
-            path.display(),
-            path.display()
-        );
-        let catalog = Catalog::default();
-
-        let prepared = prepare(&catalog, &EngineConfig::default(), &sql)
-            .await
-            .expect("prepare join functions");
-        assert_eq!(catalog.table_names().len(), 2);
-        assert_eq!(prepared.generated_tables.len(), 2);
-        let rewritten = prepared.statement.to_string();
-        assert!(rewritten.starts_with("EXPLAIN"));
-        assert!(rewritten.contains("left_file"));
-        assert!(rewritten.contains("right_file"));
-        assert!(!rewritten.to_ascii_lowercase().contains("read_csv"));
-    }
-
-    #[tokio::test]
-    async fn rewrites_file_functions_inside_ctes_and_derived_tables() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("nested.csv");
-        std::fs::write(&path, "id\n1\n2\n").expect("write CSV");
-        let sql = format!(
-            "WITH base AS (SELECT * FROM read_csv('{}', header = true)) \
-             SELECT nested.id FROM base \
-             JOIN (SELECT * FROM read_csv('{}', header = true)) nested \
-             ON base.id = nested.id",
-            path.display(),
-            path.display(),
-        );
-        let catalog = Catalog::default();
-
-        let prepared = prepare(&catalog, &EngineConfig::default(), &sql)
-            .await
-            .expect("prepare nested file functions");
-        assert_eq!(prepared.generated_tables.len(), 2);
-        let rewritten = prepared.statement.to_string();
-        assert!(!rewritten.to_ascii_lowercase().contains("read_csv"));
-        crate::sql::plan_sql(&catalog, &rewritten).expect("plan rewritten nested query");
-    }
-
-    #[tokio::test]
-    async fn requires_exactly_one_statement() {
-        let result = prepare(
-            &Catalog::default(),
-            &EngineConfig::default(),
-            "SELECT 1; SELECT 2",
-        )
-        .await;
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
-    }
-}
+#[path = "table_function/tests.rs"]
+mod tests;

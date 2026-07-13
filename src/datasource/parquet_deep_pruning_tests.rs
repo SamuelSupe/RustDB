@@ -258,8 +258,48 @@ async fn bloom_filter_proves_missing_equality_without_data_pages() {
         .unwrap();
     assert_eq!(positive_rows, 100);
     let positive_metrics = positive_context.metrics.snapshot();
-    assert!(positive_metrics.parquet_bloom_filter_bytes_read > 0);
+    assert_eq!(positive_metrics.parquet_bloom_filter_bytes_read, 0);
+    assert!(positive_metrics.metadata_cache_hits > 0);
     assert_eq!(positive_metrics.parquet_bloom_row_groups_pruned, 0);
+
+    for (values, expected_rows, expected_pruned) in [
+        ([51_i64, 53_i64], 0_usize, 1_u64),
+        ([50_i64, 51_i64], 100_usize, 0_u64),
+    ] {
+        let or_context = Arc::new(
+            QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap(),
+        );
+        table.prepare(Arc::clone(&or_context)).await.unwrap();
+        or_context.seal_object_snapshots();
+        let mut request = ScanRequest::new(100);
+        request.predicate = Some(ScanPredicate::Or(
+            values
+                .into_iter()
+                .map(|value| ScanPredicate::Comparison {
+                    column: 0,
+                    op: ComparisonOp::Eq,
+                    value: PredicateValue::Int64(value),
+                })
+                .collect(),
+        ));
+        let rows = table
+            .scan(request, Arc::clone(&or_context))
+            .await
+            .unwrap()
+            .try_fold(0_usize, |rows, batch| async move {
+                Ok(rows.saturating_add(batch.num_rows()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, expected_rows);
+        assert_eq!(
+            or_context
+                .metrics
+                .snapshot()
+                .parquet_bloom_row_groups_pruned,
+            expected_pruned
+        );
+    }
 
     let mut disabled_config = config;
     disabled_config.parquet_scan.bloom_filter = ParquetPruningMode::Disabled;

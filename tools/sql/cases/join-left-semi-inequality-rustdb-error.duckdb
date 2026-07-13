@@ -1,0 +1,8 @@
+WITH left_rows AS (
+    SELECT x FROM read_csv('__DATA__', header = true)
+), right_rows AS (
+    SELECT x FROM read_csv('__DATA__', header = true)
+)
+SELECT left_rows.x
+FROM left_rows
+SEMI JOIN right_rows ON left_rows.x < right_rows.x;

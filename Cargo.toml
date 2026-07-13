@@ -1,6 +1,6 @@
 [package]
 name = "rustdb"
-version = "0.4.0-alpha.1"
+version = "0.5.0-alpha.1"
 edition = "2024"
 description = "A single-node, read-only OLAP engine for local and object-store files"
 license = "Apache-2.0"
@@ -21,6 +21,7 @@ path = "src/bin/rustdb-bench.rs"
 ahash = "0.8"
 arrow = { version = "=59.1.0", features = ["chrono-tz", "csv", "ipc", "ipc_compression", "prettyprint"] }
 async-stream = "0.3"
+async-compression = { version = "=0.4.42", default-features = false, features = ["tokio", "gzip", "zstd"] }
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -39,7 +40,7 @@ sysinfo = "0.37"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"

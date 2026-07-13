@@ -69,6 +69,10 @@ pub(super) fn fold_plan(plan: &mut LogicalPlan) {
             }
         }
         LogicalPlan::Append { inputs, .. } => inputs.iter_mut().for_each(fold_plan),
+        LogicalPlan::Repeat { input, count, .. } => {
+            fold_plan(input);
+            fold_expr(count);
+        }
         LogicalPlan::Window {
             input, expressions, ..
         } => {

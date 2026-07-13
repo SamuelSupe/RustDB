@@ -58,7 +58,8 @@ async fn exercise_bloom_matrix(endpoint: &str, uri: &str) -> Result<()> {
 
     let (present, positive) = count(&session, uri, "id = 50").await?;
     assert_eq!(present, 1);
-    assert!(positive.parquet_bloom_filter_bytes_read > 0);
+    assert_eq!(positive.parquet_bloom_filter_bytes_read, 0);
+    assert!(positive.metadata_cache_hits > 0);
     assert_eq!(positive.parquet_bloom_row_groups_pruned, 0);
     assert_eq!(positive.rows_scanned, parquet_pruning::ROWS as u64);
     assert_s3_read(&positive);

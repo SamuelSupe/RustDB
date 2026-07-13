@@ -15,7 +15,9 @@ scripts/ci/orbstack.sh all
 ```
 
 It runs formatting, strict Clippy, all Cargo targets, required MinIO tests, and
-the portable release build. `scripts/ci/check.sh` contains the same Cargo
+the portable release build. Thin-LTO release targets are linked one at a time
+by default to stay within the pinned OrbStack VM memory; set
+`RUSTDB_RELEASE_BUILD_JOBS` explicitly on a larger builder. `scripts/ci/check.sh` contains the same Cargo
 commands without depending on a particular CI product. To run the live MinIO
 test gate directly on a Linux Docker host:
 
@@ -75,8 +77,8 @@ aliases, hidden sort expressions, scalar/temporal functions, aggregate
 DISTINCT, correlated scalar/IN/EXISTS NULL semantics, v0.4 window and
 `QUALIFY` behavior, DISTINCT-core set operations, and `RIGHT`/`FULL`/`USING`
 joins through canonicalized result checksums. Runtime cardinality failures and
-explicitly unsupported `ALL`/frame cases are required outcomes, not
-allow-failure cases.
+explicitly unsupported frame cases are required outcomes, not allow-failure
+cases; `INTERSECT ALL` and `EXCEPT ALL` are positive compatibility cases.
 
 The 22-query checksum gate is deliberately a separate, single Linux x64 job.
 Run the fast local development gate with:
@@ -145,9 +147,145 @@ object-store request/byte counters:
   remains a bounded conservative skip;
 - conditional S3 reads still fail if the query-fixed object changes.
 
-The Arrow/Parquet `59.1.0`, object-store `0.13.2`, and sqlparser `0.62.0`
-pins are part of the release gate. A dependency update must be handled as a
-separate coordinated compatibility change.
+The Arrow/Parquet `59.1.0`, object-store `0.13.2`, sqlparser `0.62.0`, and
+async-compression `0.4.42` pins are part of the release gate. A dependency
+update must be handled as a separate coordinated compatibility change.
+
+## v0.5 low-amplification and CSV gates
+
+The SQL differential suite additionally covers multiset `INTERSECT`/`EXCEPT`,
+parser-visible Left Semi/Anti joins, and `ntile`/`percent_rank`/`cume_dist`.
+Its final case executes RustDB through `PreparedStatement::execute` and DuckDB
+through SQL `PREPARE`/`EXECUTE`, then compares the canonicalized typed result.
+
+CSV acceptance runs through the ordinary local and required-MinIO OrbStack
+gate. Raw, concatenated gzip, and multi-frame zstd inputs must return identical
+checksums. Tests include magic detection without a matching extension, quoted
+newlines across source chunks, a record larger than the morsel target, bounded
+sampling, slow consumers, `LIMIT`, cancellation, and abandoned results.
+Metrics must distinguish transferred source bytes from decompressed bytes and
+report real parser lanes and record-aligned morsels.
+
+Parquet tests cover same-column constant OR/IN pruning at row-group, page-index,
+and Bloom levels, including mixed positive/negative candidates and the empty
+runtime-filter set. Runtime filters are optimization-only: disabled and budget-
+rejected runs must have the same result and residual SQL filter. Concurrent
+footer/page-index misses must produce one loader; waiters must cancel promptly
+and object-identity changes must use a different cache key.
+
+On the fixed M5 Max SF10 release machine, a 128 MiB query budget must meet:
+
+- Q17 cumulative Spill writes at most 8 GiB, active Spill peak at most 2 GiB,
+  and maximum repartition depth one;
+- Q21 p50 at least 50% below `v0.4.0-alpha.1`, with p95/p50 at most 1.30;
+- Join Spill writes at most three times scanned input, and no more than 512
+  active Spill files per query; Spill reads are recorded but have no 3x cap;
+- a 10 GiB single uncompressed CSV reaches at least 1.8x parser throughput with
+  four compute threads versus one.
+
+Generate (or reuse) the deterministic 10 GiB fixture and enforce that CSV gate
+with:
+
+```sh
+benchmarks/run_csv_scaling.sh
+```
+
+This command is the strict release mode. It refuses a dirty or non-40-character
+candidate, non-M5-Max hardware, a non-10-GiB fixture, a version other than
+`0.5.0-alpha.1`, non-native/non-release builds, or reports that do not share the
+current executable SHA-256. It fixes the engine settings to 1 GiB, batch 8192,
+I/O concurrency 32, metadata cache zero, an 8 MiB CSV morsel, two warmups and
+five measured runs; the 1.8x threshold and these settings cannot be weakened by
+environment variables.
+
+The gate checks every measured iteration: one and four threads must return the
+fixture's expected row count, agree on batches, and each report a complete
+source/decompressed-byte read with cross-thread-identical counters before the
+throughput ratio is accepted. Counters may exceed the fixture size because
+schema sampling uses the same measured input path. Configurable harness checks
+must use `benchmarks/run_csv_scaling.sh --smoke`; their summary is explicitly
+marked `"mode": "smoke"` and `"release_qualified": false` and is not release
+evidence.
+
+Generate and validate the SF10 resource evidence from a clean candidate commit
+with the repeatable runner. Supply the completed low-memory run from the same
+commit so its six 128 MiB Join reports can be reused:
+
+```sh
+LOW='benchmarks/results/low-memory/<candidate-low-memory-run>'
+benchmarks/run_v05_resource_gate.sh \
+  --dataset-root data/tpch-sf10 \
+  --low-memory-run "$LOW" \
+  --output benchmarks/results/v05/<candidate-resource-run>
+```
+
+The runner fixes metadata cache to zero and all other resource settings to 128
+MiB / four compute lanes / batch 8192 / I/O concurrency 32. It measures Q17 and
+candidate Q21, runs each through `tools/tpch/compare_query.sh` and saves the
+DuckDB-matched checksum, creates a temporary detached `v0.4.0-alpha.1`
+worktree for the comparable Q21 baseline, emits enclosing dataset manifests,
+and calls the strict checker. The output path must not already exist. The
+runner cleans only its uniquely-created temporary worktree and never pushes or
+tags; a failed evidence directory is retained for diagnosis and cannot be
+silently reused.
+
+The candidate Q17 and Q21 reports must live below a run directory whose
+`manifest.json` contains the same complete `dataset` object as the clean
+candidate low-memory manifest. Keep the rendered canonical `q17.sql` and
+`q21.sql` files referenced by the reports; the checker validates their full
+contents and common dataset root, not just their filenames.
+
+The checker validates all 24 low-memory manifest entries: exactly 12 cases at
+64 and 128 MiB, verified correctness and cleanup assertions, `require_spill`,
+unique existing reports/checksum artifacts, candidate build/binary/config,
+memory bounds, terminal cleanup, and non-zero Spill read/write evidence. The
+six Join arguments must be exactly the 128 MiB Join entries from that manifest.
+The manual checker invocation below replays already-captured evidence:
+
+```sh
+V05='benchmarks/results/v05/<candidate-resource-run>'
+LOW_RUN='benchmarks/results/low-memory/<candidate-low-memory-run>'
+LOW="$LOW_RUN/reports"
+python3 -B benchmarks/check_v05_resource_gate.py \
+  --q17 "$V05/q17.json" \
+  --q17-checksum "$V05/q17.checksum.txt" \
+  --q21-candidate "$V05/q21.json" \
+  --q21-checksum "$V05/q21.checksum.txt" \
+  --q21-baseline "$V05/baseline/q21.json" \
+  --low-memory-manifest "$LOW_RUN/manifest.json" \
+  --join "$LOW/inner-join-134217728.json" \
+  --join "$LOW/left-join-134217728.json" \
+  --join "$LOW/right-join-134217728.json" \
+  --join "$LOW/full-join-134217728.json" \
+  --join "$LOW/semi-join-134217728.json" \
+  --join "$LOW/anti-join-134217728.json"
+```
+
+The default checker is release-strict. It requires an Apple M5 Max; a clean,
+exact 40-character candidate commit; native release reports from one rebuilt
+candidate binary; SF10 manifest provenance; and 128 MiB / four compute lanes /
+batch 8192 / I/O concurrency 32. Q21 candidate and baseline must additionally
+use comparable build, environment, and metadata-cache settings, with two
+warmups and five measured iterations. It resolves the local
+`v0.4.0-alpha.1` tag and rejects a baseline from another commit.
+Candidate Q17, Q21, and the low-memory run must have an identical complete
+dataset generation object and manifest digest. Dataset paths may differ only
+in spelling or location; their referenced manifest contents must hash to the
+recorded digest.
+
+The v0.4 benchmark JSON schema did not carry dataset provenance. Prefer an
+enclosing manifest with the same SF10 `dataset` object. If the original v0.4
+JSON cannot be enriched, preserve its canonical rendered `q21.sql` next to
+`q21.json` and add `--allow-legacy-v04-missing-dataset`. This switch relaxes
+only the baseline dataset field, is never implicit, emits a warning, and sets
+`legacy_v04_missing_dataset` in the result. Candidate or Join provenance is
+never waived. Record use of this compatibility exception in the release
+report.
+
+Every constrained run must match its reference checksum, remain within the
+query reservation, end with zero active task/reservation/Spill/I/O jobs, and
+leave no query directory. Hardware thresholds are release evidence, not hosted
+CI timing gates.
 
 ## Resource and performance gates
 
@@ -174,8 +312,12 @@ The constrained checksum command writes its status and checksums below
 writes timestamped manifests and per-case JSON reports below
 `benchmarks/results/low-memory/`. Before an alpha is promoted, verify:
 
-- Sort, Aggregate, Inner/Left/Right/Full Join, DISTINCT set operation, and
-  Window checksums are correct.
+- Sort, Aggregate, Inner/Left/Right/Full/Semi/Anti Join, DISTINCT and ALL set
+  operations (including Repeat), and Window checksums are correct.
+- The Semi/Anti RustDB templates intentionally exercise parser-visible Left
+  Semi/Anti Join with `LEFT SEMI JOIN` and `LEFT ANTI JOIN`. Their `.duckdb.sql`
+  companions express the same semantics with `EXISTS` and `NOT EXISTS`; the
+  checksum runner selects those companions only for DuckDB 1.4.3.
 - Each checksum execution uses its stated 64/128 MiB limit and must itself
   report non-zero Spill before the separately measured run is accepted.
 - Peak engine reservation stays within the configured memory limit.
@@ -212,7 +354,7 @@ THREADS_LIST=1 BATCH_SIZES=1024 CACHE_MODES=cold \
   --output benchmarks/results/smoke-forward
 ```
 
-The v0.4 release-blocking parallel performance sample is local SF10 on an Apple M5
+The v0.5 release-blocking parallel performance sample is local SF10 on an Apple M5
 Max. Capture the candidate with only the required matrix dimensions (the
 baseline suite may still emit its other query cases; the gate ignores them):
 
@@ -225,10 +367,10 @@ benchmarks/run_baseline.sh \
 
 python3 -B benchmarks/check_parallel_gate.py \
   --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
-  --baseline benchmarks/results/baseline/<v02-sf10-run>/manifest.json
+  --baseline benchmarks/results/baseline/v04-9e1b98c-sf10-strict/manifest.json
 ```
 
-The baseline must come from a clean `v0.2.0-alpha.1` build over the same SF10
+The baseline must come from a clean `v0.4.0-alpha.1` build over the same SF10
 manifest. The gate resolves that local tag and rejects a different baseline
 build identifier. The candidate must be the exact 40-character commit of the
 current clean worktree. Each target/thread/batch configuration is checksum-run
@@ -248,7 +390,7 @@ its manifest. Missing evidence is a failure, never a pass.
 For both `scan-filter` and `aggregate`, the candidate must satisfy:
 
 - `t1_p50 / t4_p50 >= 2.0` (the four-thread throughput multiplier);
-- candidate one-thread p50 no more than 10% slower than v0.2;
+- candidate one-thread p50 no more than 10% slower than v0.4;
 - identical result checksums for candidate/baseline at one and four threads.
 
 The runner refuses an existing output directory, builds `rustdb-bench` with
@@ -259,5 +401,5 @@ use native CPU flags, and hosted CI checks parallel correctness without using
 this hardware timing gate.
 
 SF1 remains the routine TPC-H correctness gate. SF10 is the separately recorded
-resource/performance release gate; absence of its dataset, v0.2 baseline, or
+resource/performance release gate; absence of its dataset, v0.4 baseline, or
 nominated hardware must be reported as not run, never as a pass.

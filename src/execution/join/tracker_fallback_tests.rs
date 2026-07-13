@@ -132,6 +132,7 @@ async fn terminal_skew_group_uses_bounded_tracker_with_residual() {
         let task = spill::PartitionTask {
             left: vec![left_file],
             right: vec![right_file],
+            build: spill::BuildPartitionStats::rows_only(RIGHT_ROWS),
             depth: spill::MAX_REPARTITION_DEPTH,
             stagnant_repartitions: 2,
         };

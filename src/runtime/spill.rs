@@ -467,7 +467,11 @@ impl State {
         })?;
         // Retained quota charges are released only after physical deletion has
         // succeeded (or the path was already absent).
-        self.files.remove(&path);
+        if let Some(bytes) = self.files.remove(&path)
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.remove_active_spill(bytes, 1);
+        }
         Ok(())
     }
 
@@ -517,6 +521,9 @@ impl State {
             }
         })?;
         self.files.clear();
+        if let Some(metrics) = &self.metrics {
+            metrics.clear_active_spill();
+        }
         self.io_pool
             .run_cleanup(move || io::sync_parent_directory(&sync_path))?;
         self.cleanup_completed.store(true, Ordering::Release);

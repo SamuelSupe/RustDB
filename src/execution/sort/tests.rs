@@ -210,6 +210,74 @@ async fn parallel_lanes_generate_runs_for_a_global_merge() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_spill_compacts_runs_while_input_is_still_arriving() {
+    const BATCHES: usize = 40;
+    const KEY_BYTES: usize = 1 << 20;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Utf8,
+        false,
+    )]));
+    let input_batches = (0..BATCHES)
+        .rev()
+        .map(|value| {
+            let key = format!("{value:04}{}", "x".repeat(KEY_BYTES));
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(StringArray::from(vec![key]))],
+            )
+            .unwrap())
+        })
+        .collect::<Vec<_>>();
+    let directory = tempdir().unwrap();
+    let context = Arc::new(QueryContext::new(MemoryPool::new(64 << 20), directory.path()).unwrap());
+    context.configure_compute_lanes(4);
+    let input = boxed_record_batch_stream(stream::iter(input_batches));
+    let expression = SortExpr {
+        expr: BoundExpr::column(0, DataType::Utf8, "value"),
+        descending: false,
+        nulls_first: false,
+    };
+
+    let batches = sort(
+        input,
+        vec![expression],
+        None,
+        schema,
+        Arc::clone(&context),
+        64,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+    let prefixes = batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            values.iter().map(|value| value.unwrap()[..4].to_owned())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        prefixes,
+        (0..BATCHES)
+            .map(|value| format!("{value:04}"))
+            .collect::<Vec<_>>()
+    );
+    let metrics = context.metrics.snapshot();
+    assert!(metrics.spill_files > MAX_PENDING_RUNS as u64);
+    assert!(metrics.peak_active_spill_files <= (MAX_PENDING_RUNS * 2) as u64);
+    assert_eq!(metrics.active_spill_files, 0);
+    assert_eq!(context.tasks.active_tasks(), 0);
+    assert_eq!(context.memory.used(), 0);
+}
+
 #[tokio::test]
 async fn spills_and_merges_top_k_with_bounded_memory() {
     let schema = Arc::new(Schema::new(vec![Field::new(

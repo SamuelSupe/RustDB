@@ -33,6 +33,28 @@ fn using_preserves_side_types_and_selects_the_join_specific_merged_type() {
     }
 }
 
+#[test]
+fn exposes_left_semi_and_anti_joins_with_left_only_schema() {
+    let catalog = Catalog::default();
+    register_schema(&catalog, "l", DataType::Int64);
+    register_schema(&catalog, "r", DataType::Int64);
+    for (join, explain_name) in [
+        ("LEFT SEMI JOIN", "SemiJoin"),
+        ("LEFT ANTI JOIN", "AntiJoin"),
+    ] {
+        let sql = format!("SELECT l.id FROM l {join} r ON l.id = r.id");
+        let StatementPlan::Query(plan) = plan_sql(&catalog, &sql).unwrap() else {
+            panic!("expected query plan");
+        };
+        assert_eq!(plan.schema().arrow().fields().len(), 1, "{join}");
+        assert!(
+            plan.explain().contains(explain_name),
+            "{join}: {}",
+            plan.explain()
+        );
+    }
+}
+
 fn register_schema(catalog: &Catalog, name: &str, data_type: DataType) {
     let schema = Arc::new(Schema::new(vec![Field::new("id", data_type, false)]));
     catalog

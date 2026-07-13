@@ -52,6 +52,15 @@ pub(super) fn apply(plan: LogicalPlan) -> LogicalPlan {
             inputs: inputs.into_iter().map(apply).collect(),
             schema,
         },
+        LogicalPlan::Repeat {
+            input,
+            count,
+            schema,
+        } => LogicalPlan::Repeat {
+            input: Box::new(apply(*input)),
+            count,
+            schema,
+        },
         LogicalPlan::Window {
             input,
             expressions,
@@ -115,6 +124,97 @@ fn relocate(
         return filter(input, predicate, schema);
     }
     match input {
+        LogicalPlan::Projection {
+            input,
+            expressions,
+            schema: projection_schema,
+        } if expressions
+            .iter()
+            .all(BoundExpr::is_structurally_infallible) =>
+        {
+            let Some(mapped) = remap_projection_columns(&predicate, &expressions) else {
+                return filter(
+                    LogicalPlan::Projection {
+                        input,
+                        expressions,
+                        schema: projection_schema,
+                    },
+                    predicate,
+                    schema,
+                );
+            };
+            // Deferred aggregate planning reorders generated subquery marker
+            // columns through this projection. Moving the marker predicate
+            // below it would let decorrelation lower Mark to a left-only
+            // Semi/Anti join while this projection still consumes the marker.
+            if references_generated_attachment(&mapped, input.schema()) {
+                return filter(
+                    LogicalPlan::Projection {
+                        input,
+                        expressions,
+                        schema: projection_schema,
+                    },
+                    predicate,
+                    schema,
+                );
+            }
+            let input_schema = input.schema().clone();
+            LogicalPlan::Projection {
+                input: Box::new(relocate(mapped, *input, input_schema)),
+                expressions,
+                schema: projection_schema,
+            }
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            null_equal_keys,
+            residual,
+            null_aware,
+            join_type: JoinType::Left,
+            schema: join_schema,
+        } if inner_predicates_infallible(&on, residual.as_ref(), null_aware.as_ref())
+            && references_only_left(&predicate, &left) =>
+        {
+            let left_schema = left.schema().clone();
+            LogicalPlan::Join {
+                left: Box::new(relocate(predicate, *left, left_schema)),
+                right,
+                on,
+                null_equal_keys,
+                residual,
+                null_aware,
+                join_type: JoinType::Left,
+                schema: join_schema,
+            }
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            null_equal_keys,
+            residual,
+            null_aware,
+            join_type: JoinType::Right,
+            schema: join_schema,
+        } if inner_predicates_infallible(&on, residual.as_ref(), null_aware.as_ref())
+            && references_only_right(&predicate, &left, &right) =>
+        {
+            let right_schema = right.schema().clone();
+            let mut predicate = predicate;
+            rebase_right_columns(&mut predicate, left.schema().arrow().fields().len());
+            LogicalPlan::Join {
+                left,
+                right: Box::new(relocate(predicate, *right, right_schema)),
+                on,
+                null_equal_keys,
+                residual,
+                null_aware,
+                join_type: JoinType::Right,
+                schema: join_schema,
+            }
+        }
         LogicalPlan::Join {
             left,
             right,
@@ -188,6 +288,72 @@ fn relocate(
             }
         }
         input => filter(input, predicate, schema),
+    }
+}
+
+fn references_generated_attachment(
+    expression: &BoundExpr,
+    schema: &crate::sql::PlanSchema,
+) -> bool {
+    let mut columns = Vec::new();
+    expression.referenced_columns(&mut columns);
+    columns.into_iter().any(|index| {
+        schema
+            .arrow()
+            .fields()
+            .get(index)
+            .is_some_and(|field| field.name().starts_with("__rustdb_scalar_subquery_"))
+    })
+}
+
+/// Alias, subquery attachment, and derived-table planning introduce
+/// projections between a filter and its source. A predicate can cross one
+/// when every referenced output is a direct input column.
+pub(super) fn remap_projection_columns(
+    expression: &BoundExpr,
+    projection: &[BoundExpr],
+) -> Option<BoundExpr> {
+    let mut mapped = expression.clone();
+    match &mut mapped.kind {
+        ExprKind::Column(index) => {
+            let source = projection.get(*index)?;
+            matches!(&source.kind, ExprKind::Column(_)).then(|| source.clone())
+        }
+        ExprKind::OuterRef { .. } | ExprKind::DeferredGroup(_) | ExprKind::DeferredAggregate(_) => {
+            None
+        }
+        ExprKind::Literal(_) => Some(mapped),
+        ExprKind::Binary { left, right, .. } => {
+            **left = remap_projection_columns(left, projection)?;
+            **right = remap_projection_columns(right, projection)?;
+            Some(mapped)
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Cast { expr } => {
+            **expr = remap_projection_columns(expr, projection)?;
+            Some(mapped)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            **expr = remap_projection_columns(expr, projection)?;
+            **pattern = remap_projection_columns(pattern, projection)?;
+            Some(mapped)
+        }
+        ExprKind::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (when, then) in when_then {
+                *when = remap_projection_columns(when, projection)?;
+                *then = remap_projection_columns(then, projection)?;
+            }
+            **else_expr = remap_projection_columns(else_expr, projection)?;
+            Some(mapped)
+        }
+        ExprKind::ScalarFunction { args, .. } => {
+            for argument in args {
+                *argument = remap_projection_columns(argument, projection)?;
+            }
+            Some(mapped)
+        }
     }
 }
 

@@ -214,6 +214,13 @@ pub enum LogicalPlan {
         inputs: Vec<LogicalPlan>,
         schema: PlanSchema,
     },
+    /// Repeats each input row by a non-negative integer expression. The count
+    /// is planner-generated for multiset set operations and is never exposed.
+    Repeat {
+        input: Box<LogicalPlan>,
+        count: BoundExpr,
+        schema: PlanSchema,
+    },
     /// Appends one column per bound window expression to the input.
     Window {
         input: Box<LogicalPlan>,
@@ -259,6 +266,7 @@ impl LogicalPlan {
             | Self::DependentJoin { schema, .. }
             | Self::Aggregate { schema, .. }
             | Self::Append { schema, .. }
+            | Self::Repeat { schema, .. }
             | Self::Window { schema, .. }
             | Self::Sort { schema, .. }
             | Self::Limit { schema, .. }
@@ -292,6 +300,7 @@ impl LogicalPlan {
             | Self::Projection { input, .. }
             | Self::Scalarize { input, .. }
             | Self::Aggregate { input, .. }
+            | Self::Repeat { input, .. }
             | Self::Window { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.freeze_query_statistics(context),
@@ -315,6 +324,7 @@ impl LogicalPlan {
             | Self::Projection { input, .. }
             | Self::Scalarize { input, .. }
             | Self::Aggregate { input, .. }
+            | Self::Repeat { input, .. }
             | Self::Window { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. } => input.collect_scan_providers(providers),
@@ -339,13 +349,18 @@ impl LogicalPlan {
             Self::Empty { .. } => output.push_str(&format!("{indent}Empty\n")),
             Self::Scan {
                 table_name,
+                provider,
                 statistics,
                 projection,
                 limit,
                 ..
             } => {
+                let source = provider
+                    .explain_scan()
+                    .map(|details| format!(" {details}"))
+                    .unwrap_or_default();
                 output.push_str(&format!(
-                    "{indent}Scan table={table_name} projection={projection:?} limit={limit:?} rows={:?} bytes={:?} files={} pipeline=fused lane_limit={lanes}\n",
+                    "{indent}Scan table={table_name} projection={projection:?} limit={limit:?} rows={:?} bytes={:?} files={} pipeline=fused lane_limit={lanes}{source}\n",
                     statistics.row_count,
                     statistics.total_byte_size,
                     statistics.file_count,
@@ -409,8 +424,21 @@ impl LogicalPlan {
                         "distinct=count:{distinct},dedup:tagged_full_key,partition:(group,aggregate_id,value),spill:recursive_hash"
                     )
                 };
+                let rewrite = if aggregate_exprs
+                    .iter()
+                    .any(|aggregate| aggregate.display_name.starts_with("__q21_"))
+                {
+                    " rewrite=existence_summary shared_build=true"
+                } else if aggregate_exprs
+                    .iter()
+                    .any(|aggregate| aggregate.display_name.starts_with("__direct_correlated_"))
+                {
+                    " rewrite=direct_correlated_aggregate"
+                } else {
+                    ""
+                };
                 output.push_str(&format!(
-                    "{indent}Aggregate groups={groups:?} aggregates={aggregates:?} {distinct_stage} partial_lane_limit={lanes} final=merge spill=recursive_hash\n"
+                    "{indent}Aggregate groups={groups:?} aggregates={aggregates:?} {distinct_stage}{rewrite} partial_lane_limit={lanes} final=merge spill=recursive_hash victim=largest_partition fanout=adaptive(2..256) target=configured_or_auto(query_memory/(2*active_lanes),clamp=8..64MiB) repartition=bounded_seeded\n"
                 ));
                 input.write_explain(depth + 1, lane_limit, output);
             }
@@ -422,6 +450,13 @@ impl LogicalPlan {
                 for input in inputs {
                     input.write_explain(depth + 1, lane_limit, output);
                 }
+            }
+            Self::Repeat { input, count, .. } => {
+                output.push_str(&format!(
+                    "{indent}Repeat count={} mode=streaming\n",
+                    count.display_name
+                ));
+                input.write_explain(depth + 1, lane_limit, output);
             }
             Self::Window {
                 input, expressions, ..
@@ -472,8 +507,14 @@ impl LogicalPlan {
                 if on.is_empty() && matches!(right.as_ref(), Self::Scalarize { .. }) {
                     output.push_str(&format!("{indent}ScalarBroadcast build=right\n"));
                 } else {
+                    let runtime_filter =
+                        if matches!(join_type, JoinType::Inner | JoinType::Semi) && on.len() == 1 {
+                            "eligible"
+                        } else {
+                            "not_applicable"
+                        };
                     output.push_str(&format!(
-                        "{indent}{join_type:?}Join keys={} null_equal_keys={} residual={} null_aware={} build=right decorrelation=complete strategy=hash_partition lane_limit={lanes} partitions=64 spill=grace_hash repartition_seeds=2 fallback=sort_merge\n",
+                        "{indent}{join_type:?}Join keys={} null_equal_keys={} residual={} null_aware={} build=right decorrelation=complete strategy=hash_partition lane_limit={lanes} partitions=adaptive(2..256) fanout=footprint runtime_filter={runtime_filter} spill=grace_hash repartition=bounded fallback=sort_merge\n",
                         on.len(),
                         null_equal_keys,
                         residual.is_some(),

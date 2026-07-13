@@ -9,10 +9,12 @@ use arrow::datatypes::SchemaRef;
 use crate::{Error, ParquetSchemaMode, Result};
 
 mod builder;
-pub use builder::EngineConfigBuilder;
+pub use builder::{CsvOptionsBuilder, EngineConfigBuilder};
 
 const DEFAULT_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_PARQUET_PRUNING_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_CSV_MORSEL_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_RUNTIME_FILTER_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -36,6 +38,73 @@ impl Default for ParquetScanConfig {
             page_index: ParquetPruningMode::Auto,
             bloom_filter: ParquetPruningMode::Auto,
             max_pruning_metadata_bytes: DEFAULT_PARQUET_PRUNING_METADATA_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct CsvScanConfig {
+    pub target_morsel_bytes: usize,
+    pub parallel_single_file: bool,
+}
+
+impl CsvScanConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.target_morsel_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "csv_scan.target_morsel_bytes must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CsvScanConfig {
+    fn default() -> Self {
+        Self {
+            target_morsel_bytes: DEFAULT_CSV_MORSEL_BYTES,
+            parallel_single_file: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ExecutionConfig {
+    pub spill_partition_target_bytes: Option<usize>,
+    pub max_repartition_depth: usize,
+    pub max_spill_write_amplification: Option<f64>,
+    pub runtime_filter_bytes: usize,
+}
+
+impl ExecutionConfig {
+    pub fn validate(&self) -> Result<()> {
+        if matches!(self.spill_partition_target_bytes, Some(0)) {
+            return Err(Error::InvalidArgument(
+                "execution.spill_partition_target_bytes must be greater than zero when configured"
+                    .to_owned(),
+            ));
+        }
+        if let Some(limit) = self.max_spill_write_amplification
+            && (!limit.is_finite() || limit < 1.0)
+        {
+            return Err(Error::InvalidArgument(
+                "execution.max_spill_write_amplification must be finite and at least 1.0"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            spill_partition_target_bytes: None,
+            max_repartition_depth: 2,
+            max_spill_write_amplification: None,
+            runtime_filter_bytes: DEFAULT_RUNTIME_FILTER_BYTES,
         }
     }
 }
@@ -126,6 +195,8 @@ pub struct EngineConfig {
     pub max_concurrent_queries: usize,
     pub metadata_cache_bytes: usize,
     pub parquet_scan: ParquetScanConfig,
+    pub csv_scan: CsvScanConfig,
+    pub execution: ExecutionConfig,
     pub s3: S3Config,
     pub spill: SpillConfig,
 }
@@ -149,6 +220,8 @@ impl Default for EngineConfig {
             max_concurrent_queries: 1,
             metadata_cache_bytes: 64 * 1024 * 1024,
             parquet_scan: ParquetScanConfig::default(),
+            csv_scan: CsvScanConfig::default(),
+            execution: ExecutionConfig::default(),
             s3: S3Config::default(),
             spill,
         }
@@ -196,7 +269,18 @@ pub enum CsvHeader {
     Absent,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CsvCompression {
+    #[default]
+    Auto,
+    None,
+    Gzip,
+    Zstd,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CsvOptions {
     pub schema: Option<SchemaRef>,
     pub header: CsvHeader,
@@ -204,6 +288,7 @@ pub struct CsvOptions {
     pub quote: u8,
     pub escape: Option<u8>,
     pub sample_size: usize,
+    pub compression: CsvCompression,
 }
 
 impl Default for CsvOptions {
@@ -215,11 +300,18 @@ impl Default for CsvOptions {
             quote: b'"',
             escape: None,
             sample_size: 10_000,
+            compression: CsvCompression::Auto,
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+impl CsvOptions {
+    pub fn builder() -> CsvOptionsBuilder {
+        CsvOptionsBuilder::default()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParquetOptions {
     pub schema: Option<Arc<arrow::datatypes::Schema>>,
     pub union_by_name: bool,
@@ -243,7 +335,10 @@ impl ParquetOptions {
 mod tests {
     use std::{path::PathBuf, time::Duration};
 
-    use super::{ParquetPruningMode, ParquetScanConfig, S3Config, SpillConfig};
+    use super::{
+        CsvScanConfig, ExecutionConfig, ParquetPruningMode, ParquetScanConfig, S3Config,
+        SpillConfig,
+    };
     use crate::Error;
 
     #[test]
@@ -263,6 +358,42 @@ mod tests {
         assert_eq!(config.page_index, ParquetPruningMode::Auto);
         assert_eq!(config.bloom_filter, ParquetPruningMode::Auto);
         assert_eq!(config.max_pruning_metadata_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn csv_and_execution_defaults_are_bounded() {
+        let csv = CsvScanConfig::default();
+        assert_eq!(csv.target_morsel_bytes, 8 * 1024 * 1024);
+        assert!(csv.parallel_single_file);
+        csv.validate().unwrap();
+
+        let execution = ExecutionConfig::default();
+        assert_eq!(execution.spill_partition_target_bytes, None);
+        assert_eq!(execution.max_repartition_depth, 2);
+        assert_eq!(execution.max_spill_write_amplification, None);
+        assert_eq!(execution.runtime_filter_bytes, 8 * 1024 * 1024);
+        execution.validate().unwrap();
+    }
+
+    #[test]
+    fn csv_and_execution_validation_reject_zero_or_invalid_values() {
+        let csv = CsvScanConfig {
+            target_morsel_bytes: 0,
+            ..CsvScanConfig::default()
+        };
+        assert!(matches!(csv.validate(), Err(Error::InvalidArgument(_))));
+
+        let mut execution = ExecutionConfig {
+            max_repartition_depth: 0,
+            runtime_filter_bytes: 0,
+            ..ExecutionConfig::default()
+        };
+        execution.validate().unwrap();
+        execution.max_spill_write_amplification = Some(f64::NAN);
+        assert!(matches!(
+            execution.validate(),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]

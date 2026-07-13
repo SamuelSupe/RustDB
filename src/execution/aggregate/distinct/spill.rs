@@ -12,6 +12,7 @@ use crate::{
     runtime::{MemoryPool, MemoryReservation, QueryContext, SpillFile, SpillWriter},
 };
 
+use crate::execution::aggregate::spill::{SpillPartition, adaptive_spill_partitions};
 use crate::execution::value::CellValue;
 
 mod codec;
@@ -21,7 +22,6 @@ use codec::{
     try_build_batch,
 };
 
-const MAX_REPARTITION_DEPTH: usize = 6;
 const SEED_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -59,6 +59,7 @@ pub(super) struct DistinctSpiller {
     writer: Option<SpillWriter>,
     headroom: MemoryReservation,
     copy_headroom_bytes: usize,
+    run_bytes: u64,
 }
 
 impl DistinctSpiller {
@@ -84,6 +85,7 @@ impl DistinctSpiller {
             writer: None,
             headroom,
             copy_headroom_bytes,
+            run_bytes: 0,
         })
     }
 
@@ -121,16 +123,59 @@ impl DistinctSpiller {
             context,
             &mut self.headroom,
             self.copy_headroom_bytes,
+            &mut self.run_bytes,
         )?;
         Ok(())
     }
 
-    pub(super) fn finish(mut self, context: &QueryContext) -> Result<Vec<Vec<SpillFile>>> {
+    pub(super) fn spill_largest_partition(
+        &mut self,
+        keys: &mut HashSet<DistinctKey>,
+        context: &QueryContext,
+    ) -> Result<usize> {
+        let mut partition_bytes = vec![0usize; self.partitions];
+        for key in keys.iter() {
+            let partition = partition_for(key, self.partitions, 0);
+            partition_bytes[partition] =
+                partition_bytes[partition].saturating_add(key.memory_size());
+        }
+        let victim = partition_bytes
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, bytes)| *bytes)
+            .map(|(partition, _)| partition)
+            .ok_or_else(|| {
+                Error::Internal("DISTINCT key victim selection has no partitions".into())
+            })?;
+
+        let survivor_count = keys
+            .iter()
+            .filter(|key| partition_for(key, self.partitions, 0) != victim)
+            .count();
+        let mut victim_keys = HashSet::new();
+        let mut survivors = HashSet::with_capacity(survivor_count);
+        for key in std::mem::take(keys) {
+            if partition_for(&key, self.partitions, 0) == victim {
+                victim_keys.insert(key);
+            } else {
+                survivors.insert(key);
+            }
+        }
+        let resident_bytes = survivors
+            .iter()
+            .fold(0usize, |bytes, key| bytes.saturating_add(key.memory_size()));
+        *keys = survivors;
+        self.spill(victim_keys, context)?;
+        Ok(resident_bytes)
+    }
+
+    pub(super) fn finish(mut self, context: &QueryContext) -> Result<Vec<SpillPartition>> {
         if let Some(writer) = self.writer.take() {
             self.headroom.try_resize(0)?;
             self.runs.push(writer.finish(1)?);
+            context.check_spill_write_amplification("DistinctAggregate", 0, 0, self.run_bytes)?;
         }
-        let output = partition_files(&self.runs, self.partitions, 0, "distinct", context)?;
+        let output = partition_files(&self.runs, self.partitions, 0, 0, "distinct", context)?;
         for run in &self.runs {
             context.spill.remove_file(run)?;
         }
@@ -152,8 +197,11 @@ impl DistinctSpiller {
 
 struct PartitionSpiller {
     seed: u64,
+    depth: usize,
     label: String,
     clock: u64,
+    partition_bytes: Vec<u64>,
+    partition_estimates: Vec<u64>,
     sinks: Vec<PartitionSink>,
 }
 
@@ -161,19 +209,24 @@ struct PartitionSink {
     files: Vec<SpillFile>,
     writer: Option<SpillWriter>,
     last_used: u64,
+    uncompressed_bytes: u64,
 }
 
 impl PartitionSpiller {
-    fn new(partitions: usize, seed: u64, label: impl Into<String>) -> Self {
+    fn new(partitions: usize, seed: u64, depth: usize, label: impl Into<String>) -> Self {
         Self {
             seed,
+            depth,
             label: label.into(),
             clock: 0,
+            partition_bytes: vec![0; partitions],
+            partition_estimates: vec![0; partitions],
             sinks: (0..partitions)
                 .map(|_| PartitionSink {
                     files: Vec::new(),
                     writer: None,
                     last_used: 0,
+                    uncompressed_bytes: 0,
                 })
                 .collect(),
         }
@@ -223,6 +276,22 @@ impl PartitionSpiller {
                 rows = rows.div_ceil(2);
             };
             self.ensure_copy_headroom(partition, context)?;
+            let bytes = u64::try_from(batch.get_array_memory_size().max(1)).unwrap_or(u64::MAX);
+            let merge_bytes = keys[offset..offset + rows]
+                .iter()
+                .map(DistinctKey::memory_size)
+                .fold(0usize, usize::saturating_add);
+            let merge_bytes = u64::try_from(merge_bytes.max(1)).unwrap_or(u64::MAX);
+            let projected_partition = self.partition_bytes[partition].saturating_add(bytes);
+            let projected_estimate =
+                self.partition_estimates[partition].saturating_add(merge_bytes);
+            let max_partition = self
+                .partition_estimates
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(projected_estimate);
             let first = self.sinks[partition]
                 .writer
                 .as_mut()
@@ -238,6 +307,18 @@ impl PartitionSpiller {
                     .expect("current DISTINCT writer remains active")
                     .write_batch(&batch)?;
             }
+            self.partition_bytes[partition] = projected_partition;
+            self.partition_estimates[partition] = projected_estimate;
+            self.sinks[partition].uncompressed_bytes = self.sinks[partition]
+                .uncompressed_bytes
+                .saturating_add(bytes);
+            let pending_write_bytes = self.pending_write_bytes();
+            context.check_spill_write_amplification(
+                "DistinctAggregate",
+                pending_write_bytes,
+                self.depth,
+                max_partition,
+            )?;
             drop(memory);
             offset += rows;
         }
@@ -290,16 +371,48 @@ impl PartitionSpiller {
             .take()
             .expect("active DISTINCT writer was selected");
         self.sinks[index].files.push(writer.finish(1)?);
+        self.sinks[index].uncompressed_bytes = 0;
         Ok(true)
     }
 
-    fn finish(mut self) -> Result<Vec<Vec<SpillFile>>> {
+    fn pending_write_bytes(&self) -> u64 {
+        self.sinks
+            .iter()
+            .filter_map(|sink| sink.writer.as_ref())
+            .map(SpillWriter::pending_write_bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    fn finish(mut self, context: &QueryContext) -> Result<Vec<SpillPartition>> {
         for sink in &mut self.sinks {
             if let Some(writer) = sink.writer.take() {
                 sink.files.push(writer.finish(1)?);
+                sink.uncompressed_bytes = 0;
             }
         }
-        Ok(self.sinks.into_iter().map(|sink| sink.files).collect())
+        context.check_spill_write_amplification(
+            "DistinctAggregate",
+            0,
+            self.depth,
+            self.partition_estimates.iter().copied().max().unwrap_or(0),
+        )?;
+        context.metrics.record_repartition(
+            self.partition_bytes
+                .iter()
+                .copied()
+                .fold(0u64, u64::saturating_add),
+            self.depth,
+            self.partition_bytes.iter().copied().max().unwrap_or(0),
+        );
+        Ok(self
+            .sinks
+            .into_iter()
+            .zip(self.partition_estimates)
+            .map(|(sink, estimated_bytes)| SpillPartition {
+                files: sink.files,
+                estimated_bytes,
+            })
+            .collect())
     }
 }
 
@@ -310,6 +423,7 @@ fn write_run_batches(
     context: &QueryContext,
     headroom: &mut MemoryReservation,
     copy_headroom_bytes: usize,
+    run_bytes: &mut u64,
 ) -> Result<()> {
     let mut offset = 0;
     while offset < keys.len() {
@@ -330,7 +444,17 @@ fn write_run_batches(
             rows = rows.div_ceil(2);
         };
         headroom.try_resize(0)?;
+        let bytes = u64::try_from(batch.get_array_memory_size().max(1)).unwrap_or(u64::MAX);
+        context.record_spill_logical_input_bytes(bytes);
+        let projected = run_bytes.saturating_add(bytes);
         writer.write_batch(&batch)?;
+        context.check_spill_write_amplification(
+            "DistinctAggregate",
+            writer.pending_write_bytes(),
+            0,
+            projected,
+        )?;
+        *run_bytes = projected;
         drop(memory);
         headroom.try_resize(copy_headroom_bytes).map_err(|_| {
             resource_error(
@@ -348,10 +472,11 @@ fn partition_files(
     files: &[SpillFile],
     partitions: usize,
     seed: u64,
+    depth: usize,
     label: &str,
     context: &QueryContext,
-) -> Result<Vec<Vec<SpillFile>>> {
-    let mut spiller = PartitionSpiller::new(partitions, seed, label);
+) -> Result<Vec<SpillPartition>> {
+    let mut spiller = PartitionSpiller::new(partitions, seed, depth, label);
     for file in files {
         for batch in context.spill.read_file(file)? {
             context.check_cancelled()?;
@@ -370,31 +495,7 @@ fn partition_files(
             spiller.write_keys(keys, context)?;
         }
     }
-    spiller.finish()
-}
-
-pub(super) struct DistinctPartitionTask {
-    pub(super) files: Vec<SpillFile>,
-    depth: usize,
-}
-
-impl DistinctPartitionTask {
-    pub(super) fn initial(files: Vec<SpillFile>) -> Self {
-        Self { files, depth: 0 }
-    }
-
-    pub(super) fn child(files: Vec<SpillFile>, depth: usize) -> Self {
-        Self { files, depth }
-    }
-
-    pub(super) fn next_depth(&self) -> Result<usize> {
-        if self.depth >= MAX_REPARTITION_DEPTH {
-            return Err(Error::ResourceExhausted(format!(
-                "DISTINCT spill partition exceeds memory after {MAX_REPARTITION_DEPTH} full-key repartition levels"
-            )));
-        }
-        Ok(self.depth + 1)
-    }
+    spiller.finish(context)
 }
 
 pub(super) enum MergeDistinct {
@@ -473,17 +574,46 @@ pub(super) fn load_partition(
 
 pub(super) fn repartition(
     files: &[SpillFile],
+    estimated_bytes: usize,
     depth: usize,
-    partitions: usize,
+    _partitions: usize,
     context: &QueryContext,
-) -> Result<Vec<Vec<SpillFile>>> {
+) -> Result<Vec<SpillPartition>> {
+    let partitions = recursive_spill_partitions(context, estimated_bytes);
     partition_files(
         files,
         partitions,
         SEED_STEP.wrapping_mul(depth as u64),
+        depth,
         &format!("distinct-r{depth}"),
         context,
     )
+}
+
+fn recursive_spill_partitions(context: &QueryContext, source_bytes: usize) -> usize {
+    let lanes = context.scheduler.partitioning_lanes();
+    let default_target = context
+        .memory
+        .limit()
+        .checked_div(lanes.saturating_mul(2))
+        .unwrap_or(0)
+        .clamp(8 << 20, 64 << 20);
+    let target = context
+        .execution
+        .spill_partition_target_bytes
+        .unwrap_or(default_target)
+        .max(1);
+    let memory_pressure_floor = target
+        .div_ceil(context.memory.limit().max(1))
+        .checked_next_power_of_two()
+        .unwrap_or(256)
+        .clamp(2, 256);
+    let memory_pressure_floor = if target > context.memory.limit() {
+        memory_pressure_floor.max(32)
+    } else {
+        memory_pressure_floor
+    };
+    adaptive_spill_partitions(context, source_bytes).max(memory_pressure_floor)
 }
 
 fn partition_for(key: &DistinctKey, partitions: usize, seed: u64) -> usize {
@@ -510,65 +640,4 @@ fn resource_error(kind: &str, bytes: usize, context: &QueryContext) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use super::*;
-    use crate::runtime::{MemoryPool, QueryContext};
-
-    #[test]
-    fn aggregate_id_is_part_of_the_identity() {
-        let left = DistinctKey::new(Vec::new(), 0, CellValue::Int64(1));
-        let right = DistinctKey::new(Vec::new(), 1, CellValue::Int64(1));
-        assert_ne!(left, right);
-    }
-
-    #[test]
-    fn high_cardinality_single_group_repartitions_by_complete_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let context = QueryContext::new(MemoryPool::new(16 << 20), temp.path()).unwrap();
-        let keys = (0..10_000_i64)
-            .map(|value| DistinctKey::new(Vec::new(), 0, CellValue::Int64(value)))
-            .collect::<HashSet<_>>();
-        let mut spiller = DistinctSpiller::new(1, &context).unwrap();
-        spiller.spill(keys, &context).unwrap();
-        let mut partitions = spiller.finish(&context).unwrap();
-        let source = partitions.pop().unwrap();
-        assert!(matches!(
-            load_partition(
-                &source,
-                1,
-                &context,
-                context.memory.child("tiny-distinct-test", 4 << 10),
-            )
-            .unwrap(),
-            MergeDistinct::Repartition
-        ));
-
-        let children = repartition(&source, 1, 32, &context).unwrap();
-        for file in &source {
-            context.spill.remove_file(file).unwrap();
-        }
-        let mut total = 0;
-        for files in children.into_iter().filter(|files| !files.is_empty()) {
-            let MergeDistinct::Merged(loaded) = load_partition(
-                &files,
-                1,
-                &context,
-                context.memory.child("child-distinct-test", 512 << 10),
-            )
-            .unwrap() else {
-                panic!("repartitioned complete identities should fit");
-            };
-            let (keys, memory) = loaded.into_parts();
-            total += keys.len();
-            drop(keys);
-            drop(memory);
-            for file in &files {
-                context.spill.remove_file(file).unwrap();
-            }
-        }
-        assert_eq!(total, 10_000);
-        assert_eq!(context.memory.used(), 0);
-    }
-}
+mod tests;

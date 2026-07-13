@@ -50,16 +50,16 @@ fn q21_shaped_filters_move_below_semi_and_anti_joins() {
                      AND a.receipt > a.commit \
                  )";
     let explain = format!("{:?}", crate::sql::plan_sql(&catalog, sql).unwrap());
-    let anti = position(&explain, "AntiJoin");
-    let semi = position(&explain, "SemiJoin");
+    let summary = position(&explain, "LeftJoin");
     let order_status = position(&explain, "Filter orderstatus = 1");
     let receipt = position(&explain, "Filter receipt > commit");
     let nation = position(&explain, "Filter nation = 20");
     let scan = position(&explain, "Scan table=relocation_q21_left");
 
-    assert!(anti < semi, "{explain}");
+    assert!(!explain.contains("SemiJoin"), "{explain}");
+    assert!(!explain.contains("AntiJoin"), "{explain}");
     assert!(
-        semi < order_status && semi < receipt && semi < nation,
+        summary < order_status && summary < receipt && summary < nation,
         "{explain}"
     );
     assert!(

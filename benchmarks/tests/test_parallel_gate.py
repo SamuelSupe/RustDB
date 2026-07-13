@@ -14,6 +14,7 @@ from check_parallel_gate import clean_candidate_build_id  # noqa: E402
 
 SHA = "a" * 64
 CANDIDATE = "c" * 40
+BASELINE_BINARY = "8" * 64
 CANDIDATE_BINARY = "9" * 64
 
 
@@ -31,7 +32,7 @@ class GateFixture:
         self._write_variant(
             "baseline",
             baseline_placeholder,
-            "0.2.0-alpha.1",
+            "0.4.0-alpha.1",
             {("scan-filter", 1): 100, ("scan-filter", 4): 90,
              ("aggregate", 1): 200, ("aggregate", 4): 180},
         )
@@ -40,7 +41,7 @@ class GateFixture:
         self._write_variant(
             "candidate",
             CANDIDATE,
-            "0.4.0-alpha.1",
+            "0.5.0-alpha.1",
             {("scan-filter", 1): 105, ("scan-filter", 4): 50,
              ("aggregate", 1): 210, ("aggregate", 4): 100},
         )
@@ -68,6 +69,10 @@ class GateFixture:
             "rustc_version": "rustc fixture",
         }
         entries = []
+        binary_sha256 = {
+            "baseline": BASELINE_BINARY,
+            "candidate": CANDIDATE_BINARY,
+        }[variant]
         for (case, threads), p50 in timings.items():
             report_path = reports / f"{case}-t{threads}.json"
             checksum_path = reports / f"{case}-t{threads}.checksum.txt"
@@ -87,9 +92,8 @@ class GateFixture:
                 "environment": {"cpu_model": "Apple M5 Max"},
                 "p50_ms": p50,
                 "runs": [{"elapsed_ms": p50} for _ in range(5)],
+                "binary_sha256": binary_sha256,
             }
-            if variant == "candidate":
-                report["binary_sha256"] = CANDIDATE_BINARY
             report_path.write_text(json.dumps(report), encoding="utf-8")
             checksum_path.write_text(f"{SHA}\n", encoding="utf-8")
             entry = {
@@ -110,6 +114,7 @@ class GateFixture:
             "suite": "rustdb-baseline-v1",
             "memory_limit_bytes": 1_073_741_824,
             "rustdb_build_id": build_id,
+            "benchmark_binary_sha256": binary_sha256,
             "build": build,
             "harness": {
                 field: file_sha256(path) for field, path in harness_paths.items()
@@ -122,8 +127,6 @@ class GateFixture:
             "correctness": {"verified": True, "targets": ["local"]},
             "runs": entries,
         }
-        if variant == "candidate":
-            manifest["benchmark_binary_sha256"] = CANDIDATE_BINARY
         manifest_path = directory / "manifest.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         self.manifests[variant] = manifest_path
@@ -219,16 +222,38 @@ class ParallelGateTests(unittest.TestCase):
     def test_valid_fixture_passes(self):
         result = self.evaluate()
         self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["baseline_engine_version"], "0.4.0-alpha.1")
+        self.assertEqual(result["candidate_engine_version"], "0.5.0-alpha.1")
         self.assertAlmostEqual(result["cases"]["scan-filter"]["throughput_multiplier"], 2.1)
 
-    def test_v03_candidate_report_is_rejected(self):
+    def test_explicit_version_pair_is_supported(self):
+        for (variant, _, _), path in self.fixture.reports.items():
+            report = json.loads(path.read_text(encoding="utf-8"))
+            report["engine_version"] = {
+                "baseline": "7.0.0-alpha.1",
+                "candidate": "8.0.0-alpha.1",
+            }[variant]
+            path.write_text(json.dumps(report), encoding="utf-8")
+
+        result = evaluate(
+            self.fixture.manifests["candidate"],
+            self.fixture.manifests["baseline"],
+            self.fixture.baseline_build_id,
+            CANDIDATE,
+            baseline_engine_version="7.0.0-alpha.1",
+            candidate_engine_version="8.0.0-alpha.1",
+        )
+        self.assertEqual(result["baseline_engine_version"], "7.0.0-alpha.1")
+        self.assertEqual(result["candidate_engine_version"], "8.0.0-alpha.1")
+
+    def test_wrong_candidate_report_version_is_rejected(self):
         path = self.fixture.reports[("candidate", "scan-filter", 1)]
         report = json.loads(path.read_text(encoding="utf-8"))
-        report["engine_version"] = "0.3.0-alpha.1"
+        report["engine_version"] = "0.4.0-alpha.1"
         path.write_text(json.dumps(report), encoding="utf-8")
         with self.assertRaisesRegex(
             GateError,
-            "engine_version: expected '0.4.0-alpha.1'",
+            "engine_version: expected '0.5.0-alpha.1'",
         ):
             self.evaluate()
 
@@ -252,6 +277,14 @@ class ParallelGateTests(unittest.TestCase):
         report["binary_sha256"] = "8" * 64
         path.write_text(json.dumps(report), encoding="utf-8")
         with self.assertRaisesRegex(GateError, "binary_sha256"):
+            self.evaluate()
+
+    def test_baseline_binary_digest_must_match_every_report(self):
+        path = self.fixture.reports[("baseline", "scan-filter", 1)]
+        report = json.loads(path.read_text(encoding="utf-8"))
+        report["binary_sha256"] = "7" * 64
+        path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaisesRegex(GateError, "baseline.*binary_sha256"):
             self.evaluate()
 
     def test_candidate_binary_must_match_clean_rebuild(self):

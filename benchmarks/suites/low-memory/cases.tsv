@@ -5,5 +5,9 @@ inner-join|inner_join.sql
 left-join|left_join.sql
 right-join|right_join.sql
 full-join|full_join.sql
+semi-join|semi_join.sql
+anti-join|anti_join.sql
 distinct-set|distinct_set.sql
+repeat-intersect-all|repeat_intersect_all.sql
+repeat-except-all|repeat_except_all.sql
 window|window.sql

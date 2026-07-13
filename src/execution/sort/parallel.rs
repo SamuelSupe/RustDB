@@ -14,6 +14,7 @@ use crate::{
     sql::SortExpr,
 };
 
+use super::run::MAX_PENDING_RUNS;
 use super::{
     MERGE_FAN_IN, MemoryRun, MergeIterator, MergeRun, RunCleanup, available_workspace,
     compact_pending_runs, compact_runs, estimate_sort_bytes, make_converter, reserve_workspace,
@@ -101,8 +102,10 @@ pub(super) fn sort(
                 }
 
                 if !memory_runs.is_empty() {
-                    spill_memory_run(
-                        memory_runs.remove(0),
+                    spill_memory_runs(
+                        &mut memory_runs,
+                        &expressions,
+                        fetch,
                         &schema,
                         &context,
                         &sort_pool,
@@ -133,6 +136,21 @@ pub(super) fn sort(
                 outstanding -= 1;
                 memory_runs.push(generated);
             }
+            bound_pending_runs(
+                &mut receiver,
+                &cancellation,
+                &context,
+                &mut outstanding,
+                &mut memory_runs,
+                &expressions,
+                fetch,
+                &schema,
+                &sort_pool,
+                spill_headroom,
+                batch_size,
+                &mut cleanup,
+                &mut spill_batch_rows,
+            ).await?;
         }
         drain_runs(
             &mut receiver,
@@ -239,6 +257,77 @@ pub(super) fn sort(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn bound_pending_runs(
+    receiver: &mut mpsc::Receiver<Result<MemoryRun>>,
+    cancellation: &CancellationToken,
+    context: &Arc<QueryContext>,
+    outstanding: &mut usize,
+    memory_runs: &mut Vec<MemoryRun>,
+    expressions: &[SortExpr],
+    fetch: Option<usize>,
+    schema: &arrow::datatypes::SchemaRef,
+    sort_pool: &MemoryPool,
+    spill_headroom: usize,
+    batch_size: usize,
+    cleanup: &mut RunCleanup,
+    spill_batch_rows: &mut usize,
+) -> Result<()> {
+    if memory_runs.len().saturating_add(*outstanding) < MAX_PENDING_RUNS {
+        return Ok(());
+    }
+    drain_runs(receiver, cancellation, context, outstanding, memory_runs).await?;
+
+    // Preserve a pure-memory path by carrying one pair whenever eight sorted
+    // lane results accumulate. Once a pair cannot fit, externalize every
+    // retained run so the merge pool is empty before disk compaction starts.
+    if cleanup.is_empty() {
+        while memory_runs.len() >= MAX_PENDING_RUNS {
+            let right = memory_runs.pop().expect("two memory runs are available");
+            let left = memory_runs.pop().expect("two memory runs are available");
+            match try_merge_memory_runs(
+                left,
+                right,
+                expressions,
+                fetch,
+                schema,
+                context,
+                sort_pool,
+                spill_headroom,
+            )? {
+                Ok(run) => memory_runs.push(run),
+                Err((left, right)) => {
+                    spill_memory_run(
+                        left,
+                        schema,
+                        context,
+                        sort_pool,
+                        batch_size,
+                        cleanup,
+                        spill_batch_rows,
+                    )?;
+                    memory_runs.push(right);
+                    break;
+                }
+            }
+        }
+    }
+    if !cleanup.is_empty() {
+        spill_memory_runs(
+            memory_runs,
+            expressions,
+            fetch,
+            schema,
+            context,
+            sort_pool,
+            batch_size,
+            cleanup,
+            spill_batch_rows,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn try_merge_memory_runs(
     left: MemoryRun,
     right: MemoryRun,
@@ -296,6 +385,40 @@ fn spill_memory_run(
     // after they have all been released or spilled; otherwise the merge
     // cursor can fail despite the query having a valid external-sort path.
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spill_memory_runs(
+    memory_runs: &mut Vec<MemoryRun>,
+    expressions: &[SortExpr],
+    fetch: Option<usize>,
+    schema: &arrow::datatypes::SchemaRef,
+    context: &Arc<QueryContext>,
+    sort_pool: &MemoryPool,
+    batch_size: usize,
+    cleanup: &mut RunCleanup,
+    spill_batch_rows: &mut usize,
+) -> Result<()> {
+    while let Some(run) = memory_runs.pop() {
+        spill_memory_run(
+            run,
+            schema,
+            context,
+            sort_pool,
+            batch_size,
+            cleanup,
+            spill_batch_rows,
+        )?;
+    }
+    compact_pending_runs(
+        cleanup,
+        expressions,
+        fetch,
+        schema,
+        context,
+        sort_pool,
+        *spill_batch_rows,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

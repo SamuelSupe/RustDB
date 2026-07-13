@@ -86,6 +86,10 @@ fn collect_outer_refs(plan: &LogicalPlan, output: &mut Vec<(u8, usize)>) {
                 collect_outer_refs(input, output);
             }
         }
+        LogicalPlan::Repeat { input, count, .. } => {
+            count.outer_references(output);
+            collect_outer_refs(input, output);
+        }
         LogicalPlan::Window {
             input, expressions, ..
         } => {

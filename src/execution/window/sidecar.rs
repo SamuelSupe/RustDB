@@ -39,7 +39,10 @@ pub(super) fn build(
         .enumerate()
         .filter_map(|(index, expression)| is_range_aggregate(expression).then_some(index))
         .collect::<Vec<_>>();
-    if range_indices.is_empty() {
+    let needs_peer_lengths = expressions
+        .iter()
+        .any(|expression| matches!(expression.function, WindowFunction::CumeDist));
+    if range_indices.is_empty() && !needs_peer_lengths {
         return Ok(None);
     }
     let schema = sidecar_schema(expressions, &range_indices);

@@ -82,6 +82,54 @@ async fn queries_parquet_with_projection_pruning_and_sort() -> Result<()> {
 }
 
 #[tokio::test]
+async fn hash_join_runtime_filter_reaches_parquet_row_group_pruning() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("runtime-filter.parquet");
+    write_fixture(&path)?;
+
+    let session = Engine::new(EngineConfig::default())?.session();
+    session
+        .register_parquet(
+            "runtime_filter_fact",
+            [path.to_string_lossy().into_owned()],
+            ParquetOptions::default(),
+        )
+        .await?;
+    let mut result = session
+        .execute(
+            "SELECT f.id FROM runtime_filter_fact f \
+             JOIN (SELECT 1 AS id) d ON f.id = d.id",
+        )
+        .await?;
+    let metrics = result.metrics();
+    let mut rows = 0usize;
+    while let Some(batch) = result.stream().next().await {
+        rows = rows.saturating_add(batch?.num_rows());
+    }
+    assert_eq!(rows, 1);
+    let metrics = metrics.snapshot();
+    assert!(metrics.runtime_filter_hits >= 1, "{metrics:?}");
+    assert!(metrics.row_groups_pruned >= 1, "{metrics:?}");
+
+    let mut empty = session
+        .execute(
+            "SELECT f.id FROM runtime_filter_fact f \
+             JOIN (SELECT 1 AS id WHERE FALSE) d ON f.id = d.id",
+        )
+        .await?;
+    let empty_metrics = empty.metrics();
+    let mut empty_rows = 0usize;
+    while let Some(batch) = empty.stream().next().await {
+        empty_rows = empty_rows.saturating_add(batch?.num_rows());
+    }
+    assert_eq!(empty_rows, 0);
+    let empty_metrics = empty_metrics.snapshot();
+    assert!(empty_metrics.runtime_filter_hits >= 1, "{empty_metrics:?}");
+    assert!(empty_metrics.row_groups_pruned >= 2, "{empty_metrics:?}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn queries_parquet_file_function() -> Result<()> {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("metrics.parquet");

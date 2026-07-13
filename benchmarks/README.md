@@ -47,8 +47,8 @@ and parallelism checks.
 ## Low-memory acceptance suite
 
 The SF10 resource gate runs full Sort, high-cardinality Aggregate,
-Inner/Left/Right/Full Join, DISTINCT set-operation, and Window workloads at
-both 64 MiB and 128 MiB:
+Inner/Left/Right/Full/Semi/Anti Join, DISTINCT and ALL set operations, and
+Window workloads at both 64 MiB and 128 MiB:
 
 ```sh
 benchmarks/run_low_memory.sh data/tpch-sf10
@@ -82,6 +82,103 @@ same executable digest, host CPU model, and engine config.
 An output directory must not already exist, preventing a failed rerun from
 leaving an older successful manifest in place.
 
+The Semi and Anti cases deliberately keep parser-visible `LEFT SEMI JOIN` and
+`LEFT ANTI JOIN` in the RustDB templates. `tools/tpch/compare_query.sh` detects
+the matching `semi_join.duckdb.sql` and `anti_join.duckdb.sql` companions and
+uses their equivalent `EXISTS`/`NOT EXISTS` forms only for DuckDB 1.4.3. RustDB
+still executes the original Join syntax, and the canonical checksums must
+match.
+
+## v0.5 SF10 resource evidence
+
+Collect the fixed-hardware resource reports only after creating a clean
+candidate commit. Q17, Q21, and all selected Join reports must name that exact
+40-character commit and the same native-release `rustdb-bench` SHA-256. First
+run the complete low-memory suite from that commit, then use its run directory:
+
+```sh
+LOW='benchmarks/results/low-memory/<candidate-low-memory-run>'
+benchmarks/run_v05_resource_gate.sh \
+  --dataset-root data/tpch-sf10 \
+  --low-memory-run "$LOW" \
+  --output benchmarks/results/v05/<candidate-resource-run>
+```
+
+The runner records candidate Q17 and Q21, runs both queries through
+`tools/tpch/compare_query.sh` at the same 128 MiB / four-lane settings, builds
+and records Q21 from a detached local `v0.4.0-alpha.1` worktree, writes
+enclosing dataset provenance, and invokes the strict checker. It fixes batch
+8192, I/O concurrency 32, and metadata cache 0. The output path must not exist.
+Its temporary worktree has an isolated target directory and is removed on
+success, failure, or interruption; it never creates a tag or pushes.
+Store the candidate reports and rendered SQL below the generated run directory:
+
+```text
+benchmarks/results/v05/<candidate-resource-run>/
+  manifest.json
+  q17.json
+  q17.checksum.txt
+  q21.json
+  q21.checksum.txt
+  baseline/q21.json
+  baseline/q21.sql
+  rendered/q17.sql
+  rendered/q21.sql
+```
+
+The enclosing `manifest.json` must contain the same complete `dataset` object
+as the clean candidate low-memory manifest, including SF10 generation metadata,
+the workspace-relative `data/tpch-sf10/manifest.sha256` path, and that file's
+SHA-256. The gate resolves this enclosing object for Q17/Q21 and resolves the
+low-memory suite manifest for Join reports. Keep every rendered SQL file named
+by `query_file`; the checker compares its full contents with the canonical
+template and verifies that all candidate queries use one dataset root.
+
+The checker consumes the complete low-memory manifest, not only six loose JSON
+files. It requires the exact 12-case by 64/128 MiB matrix (24 unique entries),
+verified correctness and cleanup assertions, one existing report and one
+single-line checksum per entry, and one candidate build/binary/config across
+all reports. Every constrained report must stay within its memory limit, end
+with zero retained resources, and show non-zero Spill read and write bytes.
+The six `--join` arguments must be exactly the 128 MiB Join entries named by
+that manifest. To replay only the final check without rerunning measurements:
+
+```sh
+V05='benchmarks/results/v05/<candidate-resource-run>'
+LOW_RUN='benchmarks/results/low-memory/<candidate-low-memory-run>'
+LOW="$LOW_RUN/reports"
+python3 -B benchmarks/check_v05_resource_gate.py \
+  --q17 "$V05/q17.json" \
+  --q17-checksum "$V05/q17.checksum.txt" \
+  --q21-candidate "$V05/q21.json" \
+  --q21-checksum "$V05/q21.checksum.txt" \
+  --q21-baseline "$V05/baseline/q21.json" \
+  --low-memory-manifest "$LOW_RUN/manifest.json" \
+  --join "$LOW/inner-join-134217728.json" \
+  --join "$LOW/left-join-134217728.json" \
+  --join "$LOW/right-join-134217728.json" \
+  --join "$LOW/full-join-134217728.json" \
+  --join "$LOW/semi-join-134217728.json" \
+  --join "$LOW/anti-join-134217728.json"
+```
+
+The checker requires an Apple M5 Max and rejects a dirty worktree. It resolves
+the local `v0.4.0-alpha.1` tag, rebuilds the clean candidate with
+`-C target-cpu=native`, hashes the authoritative SF10 manifest, and requires
+128 MiB, four compute lanes, batch size 8192, and I/O concurrency 32. The Q21
+baseline and candidate must also agree on metadata-cache size, warmup count,
+five measured iterations, compiler, native flags, OS, architecture, and CPU.
+The candidate and low-memory manifests must contain the same complete SF10
+generation object and manifest digest; dataset path spelling is not compared.
+
+Prefer a v0.4 Q21 report with an enclosing SF10 `dataset` object. If the
+original v0.4 JSON cannot be enriched, retain the canonical rendered `q21.sql`
+next to the preserved `q21.json` and pass
+`--allow-legacy-v04-missing-dataset`. This explicit compatibility switch
+waives only the old baseline dataset field; it never permits missing candidate
+or Join provenance. A passing result emits a warning and records
+`legacy_v04_missing_dataset: true`, which must be disclosed in release notes.
+
 ## Local and MinIO baseline matrix
 
 Run the fixed-hardware local/MinIO matrix with matching datasets:
@@ -108,8 +205,8 @@ checksum runner used to produce the evidence. An explicitly supplied build ID
 or CPU model is accepted only when it matches the current worktree or detected
 host, so an environment override cannot silently relabel a run.
 
-For the v0.4 M5 Max gate, capture the local SF10 candidate and compare it with
-the clean `v0.2.0-alpha.1` SF10 manifest:
+For the v0.5 M5 Max gate, capture the local SF10 candidate and compare it with
+the clean `v0.4.0-alpha.1` SF10 manifest:
 
 ```sh
 THREADS_LIST="1 4" BATCH_SIZES=8192 CACHE_MODES=warm \
@@ -119,12 +216,16 @@ benchmarks/run_baseline.sh --local-root data/tpch-sf10 \
 
 python3 -B benchmarks/check_parallel_gate.py \
   --candidate benchmarks/results/baseline/<candidate-run>/manifest.json \
-  --baseline benchmarks/results/baseline/<v02-sf10-run>/manifest.json
+  --baseline benchmarks/results/baseline/v04-9e1b98c-sf10-strict/manifest.json
 ```
 
-The checker requires `0.4.0-alpha.1` candidate reports and a
-`0.2.0-alpha.1` baseline; a report produced by another engine release is not
-accepted as either side of the comparison.
+The checker defaults to `0.5.0-alpha.1` candidate reports, a
+`0.4.0-alpha.1` baseline, and the local `v0.4.0-alpha.1` tag. Explicit
+`--candidate-engine-version`, `--baseline-engine-version`, and
+`--baseline-tag` arguments allow the same strict harness to be reused by a
+future release without weakening report validation. Both manifests and every
+selected report must carry the matching benchmark executable SHA-256; the
+checker prints the exact version pair in both human and JSON output.
 
 The checker reads only local, metadata-warm, batch-8192 reports for
 `scan-filter` and `aggregate` at one and four threads. It requires M5 Max,
@@ -137,6 +238,34 @@ field fails. The host-side checker reads the CPU model from `sysctl`, rebuilds
 the candidate native-release executable in OrbStack, compares its digest with
 every candidate report, and re-hashes both repositories' harness and dataset
 manifest files rather than trusting stored digest strings.
+
+The v0.5 single-file CSV gate is separate from the TPC-H matrix:
+
+```sh
+benchmarks/run_csv_scaling.sh
+```
+
+The default is the release gate, not a configurable benchmark. It requires a
+clean 40-character candidate commit on an Apple M5 Max, version
+`0.5.0-alpha.1`, the fixed 10 GiB deterministic 64-byte-record fixture, one
+native-release executable SHA-256 for both reports, 1 GiB, batch 8192, I/O 32,
+an 8 MiB CSV morsel, no metadata cache, two warmups, five measurements, and at
+least 1.8x four-thread/one-thread throughput. Release settings cannot be
+lowered with environment variables.
+
+Every measured run must return the expected rows, agree on batch count, scan
+the complete source, and agree on source/decompressed byte counts. Schema
+sampling may make those counters exceed the fixture size. For a configurable,
+non-release harness check, opt in explicitly:
+
+```sh
+TARGET_BYTES=67108864 WARMUP=0 ITERATIONS=1 MINIMUM_SPEEDUP=1.0 \
+  benchmarks/run_csv_scaling.sh --smoke \
+  data/csv-scaling-smoke.csv benchmarks/results/csv-scaling/smoke
+```
+
+The smoke summary always records `"mode": "smoke"` and
+`"release_qualified": false`; it cannot be presented as release evidence.
 
 For the repository-generated TPC-H datasets, upload the matching scale first:
 

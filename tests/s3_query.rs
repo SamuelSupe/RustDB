@@ -5,6 +5,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use async_compression::tokio::write::{GzipEncoder, ZstdEncoder};
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::{ObjectStoreExt, aws::AmazonS3Builder, path::Path};
@@ -13,6 +14,7 @@ use rustdb::{
     CsvHeader, CsvOptions, Engine, EngineConfig, Error, ParquetOptions, ParquetSchemaMode, Result,
     S3Config,
 };
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 mod support;
@@ -23,6 +25,65 @@ const BUCKET: &str = "rustdb-tests";
 const PUBLIC_BUCKET: &str = "rustdb-public";
 const ROW_GROUP_ROWS: usize = 1_024;
 const ROW_GROUPS: usize = 8;
+
+#[tokio::test]
+async fn reads_magic_detected_multi_member_csv_from_minio() -> Result<()> {
+    let Some(endpoint) = minio_endpoint() else {
+        return Ok(());
+    };
+    let prefix = format!("integration/csv-compressed/{}/", Uuid::new_v4());
+    let gzip_path = Path::from(format!("{prefix}gzip.csv"));
+    let zstd_path = Path::from(format!("{prefix}zstd.data"));
+    let store = AmazonS3Builder::from_env()
+        .with_bucket_name(BUCKET)
+        .with_region("us-east-1")
+        .with_endpoint(&endpoint)
+        .with_allow_http(true)
+        .with_virtual_hosted_style_request(false)
+        .build()?;
+    let first = format!("id,payload\n1,{}\n", "a".repeat(2_048));
+    let second = format!("2,{}\n", "b".repeat(2_048));
+    let gzip = [
+        encode_gzip(first.as_bytes()).await,
+        encode_gzip(second.as_bytes()).await,
+    ]
+    .concat();
+    let zstd = [
+        encode_zstd(first.as_bytes()).await,
+        encode_zstd(second.as_bytes()).await,
+    ]
+    .concat();
+    store.put(&gzip_path, Bytes::from(gzip).into()).await?;
+    store.put(&zstd_path, Bytes::from(zstd).into()).await?;
+
+    let config = EngineConfig::builder()
+        .s3(S3Config {
+            endpoint: Some(endpoint),
+            region: Some("us-east-1".to_owned()),
+            force_path_style: true,
+            allow_http: true,
+            ..S3Config::default()
+        })
+        .build();
+    let session = Engine::new(config)?.session();
+    for path in [&gzip_path, &zstd_path] {
+        let mut result = session
+            .execute(&format!(
+                "SELECT count(*) FROM read_csv('s3://{BUCKET}/{path}', header = true, compression = 'auto')"
+            ))
+            .await?;
+        let metrics = result.metrics();
+        assert_eq!(int64_value(&result.stream().next().await.unwrap()?), 2);
+        drop(result);
+        let metrics = metrics.snapshot();
+        assert!(metrics.csv_source_bytes > 0);
+        assert!(metrics.csv_decompressed_bytes > metrics.csv_source_bytes);
+    }
+
+    store.delete(&gzip_path).await?;
+    store.delete(&zstd_path).await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn queries_csv_and_parquet_from_minio() -> Result<()> {
@@ -93,10 +154,7 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
         .register_csv(
             "dynamic_s3",
             [format!("s3://{BUCKET}/{prefix}dynamic/*.csv")],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
     assert_eq!(query_count(&session, "dynamic_s3").await?, 1);
@@ -470,6 +528,20 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
     store.delete(&widening_d).await?;
     public_store.delete(&public_path).await?;
     Ok(())
+}
+
+async fn encode_gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = GzipEncoder::new(Vec::new());
+    encoder.write_all(bytes).await.unwrap();
+    encoder.shutdown().await.unwrap();
+    encoder.into_inner()
+}
+
+async fn encode_zstd(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = ZstdEncoder::new(Vec::new());
+    encoder.write_all(bytes).await.unwrap();
+    encoder.shutdown().await.unwrap();
+    encoder.into_inner()
 }
 
 fn minio_endpoint() -> Option<String> {

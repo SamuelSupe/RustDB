@@ -1,17 +1,21 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem::size_of,
     path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use parking_lot::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::{Error, Result, datasource::TableProvider, sql::LogicalPlan, storage::ObjectSnapshot};
+use crate::{
+    Error, ExecutionConfig, Result, datasource::TableProvider, sql::LogicalPlan,
+    storage::ObjectSnapshot,
+};
 
 use super::{
     MemoryPool, MemoryReservation, QueryControl, QueryMetrics, QueryScheduler, QuerySpillQuota,
@@ -25,10 +29,12 @@ pub struct QueryContext {
     pub metrics: QueryMetrics,
     pub memory: MemoryPool,
     pub spill: SpillManager,
+    pub(crate) execution: ExecutionConfig,
     pub(crate) scheduler: QueryScheduler,
     pub(crate) tasks: TaskGroup,
     cleanup: Arc<QueryCleanup>,
     view_depth: Arc<AtomicUsize>,
+    preparing_views: Arc<Mutex<HashSet<String>>>,
     object_snapshots: RwLock<ObjectSnapshots>,
     object_snapshots_sealed: AtomicBool,
     view_plans: RwLock<HashMap<String, LogicalPlan>>,
@@ -71,7 +77,13 @@ impl QueryContext {
             Some(metrics.clone()),
         )?;
         Ok(Self::from_runtime_parts(
-            query_id, memory, batch_size, control, metrics, spill,
+            query_id,
+            memory,
+            batch_size,
+            control,
+            metrics,
+            spill,
+            ExecutionConfig::default(),
         ))
     }
 
@@ -84,6 +96,7 @@ impl QueryContext {
         batch_size: usize,
         spill_quota: QuerySpillQuota,
         spill_io: SpillIoPool,
+        execution: ExecutionConfig,
     ) -> Result<Self> {
         let control = QueryControl::new();
         let metrics = QueryMetrics::with_memory_pool(memory.clone());
@@ -97,7 +110,7 @@ impl QueryContext {
             spill_io,
         )?;
         Ok(Self::from_runtime_parts(
-            query_id, memory, batch_size, control, metrics, spill,
+            query_id, memory, batch_size, control, metrics, spill, execution,
         ))
     }
 
@@ -108,6 +121,7 @@ impl QueryContext {
         control: QueryControl,
         metrics: QueryMetrics,
         spill: SpillManager,
+        execution: ExecutionConfig,
     ) -> Self {
         let scheduler = QueryScheduler::new(metrics.clone());
         let tasks = TaskGroup::new(control.clone());
@@ -118,10 +132,13 @@ impl QueryContext {
         let cancel_metrics = metrics.clone();
         control.register_cleanup(move || {
             cancel_metrics.finish();
+            let quiesce_started = Instant::now();
             let Some(cleanup) = weak_cleanup.upgrade() else {
                 return;
             };
+            let quiesce_metrics = cancel_metrics.clone();
             weak_tasks.reap(move || {
+                quiesce_metrics.record_cancel_to_quiesce(quiesce_started.elapsed());
                 if let Err(error) = cleanup.run() {
                     tracing::error!(
                         %error,
@@ -140,10 +157,12 @@ impl QueryContext {
             metrics,
             memory,
             spill,
+            execution,
             scheduler,
             tasks,
             cleanup,
             view_depth: Arc::new(AtomicUsize::new(0)),
+            preparing_views: Arc::new(Mutex::new(HashSet::new())),
             object_snapshots: RwLock::new(ObjectSnapshots {
                 entries: HashMap::new(),
                 memory: snapshot_memory,
@@ -165,6 +184,43 @@ impl QueryContext {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn record_spill_logical_input_bytes(&self, bytes: u64) {
+        self.metrics.add_spill_logical_input_bytes(bytes);
+    }
+
+    /// Checks the hard write-amplification limit.
+    ///
+    /// `unaccounted_write_bytes` must contain only serialized output still
+    /// buffered above the Spill I/O layer. Flushed bytes are already present
+    /// in `QueryMetrics` and adding an operator's cumulative run size would
+    /// count them twice.
+    pub(crate) fn check_spill_write_amplification(
+        &self,
+        operator: &str,
+        unaccounted_write_bytes: u64,
+        depth: usize,
+        max_partition_bytes: u64,
+    ) -> Result<()> {
+        let Some(limit) = self.execution.max_spill_write_amplification else {
+            return Ok(());
+        };
+        let (exceeds, logical_bytes, projected_total) = self
+            .metrics
+            .projected_spill_write_amplification_exceeds(unaccounted_write_bytes, limit);
+        if !exceeds {
+            return Ok(());
+        }
+        self.metrics.add_spill_quota_rejection();
+        let amplification = if logical_bytes == 0 {
+            "infinite".to_owned()
+        } else {
+            format!("{:.3}", projected_total as f64 / logical_bytes as f64)
+        };
+        Err(Error::ResourceExhausted(format!(
+            "{operator} Spill write amplification {amplification}x exceeds limit {limit:.3}x at repartition depth {depth} (logical input {logical_bytes} bytes, projected physical writes {projected_total} bytes, maximum partition {max_partition_bytes} bytes)"
+        )))
     }
 
     pub(crate) async fn reserve_memory(
@@ -312,6 +368,21 @@ impl QueryContext {
         })
     }
 
+    pub(crate) fn enter_view_preparation(&self, name: &str) -> Result<ViewPreparation> {
+        let name = name.to_ascii_lowercase();
+        let mut active = self.preparing_views.lock();
+        if !active.insert(name.clone()) {
+            return Err(crate::Error::Catalog(format!(
+                "temporary view cycle detected while preparing '{name}'"
+            )));
+        }
+        drop(active);
+        Ok(ViewPreparation {
+            name,
+            active: Arc::clone(&self.preparing_views),
+        })
+    }
+
     pub(crate) fn register_object_snapshot(
         &self,
         uri: &str,
@@ -431,6 +502,17 @@ fn snapshot_entry_bytes(uri: &str, snapshot: &ObjectSnapshot) -> usize {
 
 pub(crate) struct ViewExpansion {
     depth: Arc<AtomicUsize>,
+}
+
+pub(crate) struct ViewPreparation {
+    name: String,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for ViewPreparation {
+    fn drop(&mut self) {
+        self.active.lock().remove(&self.name);
+    }
 }
 
 impl Drop for ViewExpansion {
@@ -735,5 +817,40 @@ mod tests {
         assert!(context.object_snapshot(failed_uri).is_err());
         drop(context);
         assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
+    fn spill_write_amplification_limit_reports_operator_context() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut context = QueryContext::new(MemoryPool::new(128), root.path()).expect("context");
+        context.execution.max_spill_write_amplification = Some(1.5);
+        context.record_spill_logical_input_bytes(100);
+        context.metrics.add_spill_write_bytes(100);
+
+        context
+            .check_spill_write_amplification("HashJoin", 50, 1, 80)
+            .expect("the configured boundary is inclusive");
+        let error = context
+            .check_spill_write_amplification("HashJoin", 51, 2, 80)
+            .unwrap_err();
+        assert!(matches!(error, Error::ResourceExhausted(_)));
+        let message = error.to_string();
+        assert!(message.contains("HashJoin"));
+        assert!(message.contains("1.510x"));
+        assert!(message.contains("depth 2"));
+        assert!(message.contains("maximum partition 80 bytes"));
+        assert_eq!(context.metrics.snapshot().spill_quota_rejections, 1);
+    }
+
+    #[test]
+    fn spill_write_amplification_requires_logical_input_when_limited() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut context = QueryContext::new(MemoryPool::new(128), root.path()).expect("context");
+        context.execution.max_spill_write_amplification = Some(4.0);
+
+        let error = context
+            .check_spill_write_amplification("Sort", 1, 0, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("infinite"));
     }
 }

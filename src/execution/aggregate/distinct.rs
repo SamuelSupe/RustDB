@@ -14,7 +14,7 @@ use crate::{
 
 use super::spill::remove_files;
 use super::{
-    GroupState, MergeOutcome, OutputMode, PartitionTask, SPILL_PARTITIONS, StateSpiller,
+    GroupState, MergeOutcome, OutputMode, StateSpiller, adaptive_spill_partitions,
     build_output_envelope, cell, merge_partition, partial_schema, repartition_partition,
     spill_states,
 };
@@ -22,6 +22,10 @@ use super::{
 mod parallel;
 mod spill;
 mod state;
+mod task;
+
+#[cfg(test)]
+mod tests;
 
 use spill::{DistinctKey, DistinctSpiller};
 
@@ -172,7 +176,10 @@ pub(super) fn aggregate(
         }
 
         let active_spiller = state_spiller.get_or_insert_with(|| {
-            StateSpiller::new(&context, SPILL_PARTITIONS)
+            StateSpiller::new(
+                &context,
+                adaptive_spill_partitions(&context, state_memory.size()),
+            )
         });
         spill_states(
             &mut states,
@@ -190,7 +197,7 @@ pub(super) fn aggregate(
                 distinct_spiller.spill(distinct_keys, &context)?;
             }
             distinct_memory.try_resize(0)?;
-            active_spiller.close_writers()?;
+            active_spiller.close_writers(&context)?;
             parallel::merge_partitions(
                 distinct_spiller.finish(&context)?,
                 &groups,
@@ -218,13 +225,13 @@ pub(super) fn aggregate(
         let mut pending = state_spiller
             .take()
             .expect("DISTINCT aggregate created a state spiller above")
-            .finish()?
+            .finish(&context)?
             .into_iter()
-            .rev()
-            .filter(|files| !files.is_empty())
-            .map(PartitionTask::initial)
+            .filter(|partition| !partition.files.is_empty())
+            .map(task::StatePartitionTask::initial)
             .collect::<Vec<_>>();
-        while let Some(task) = pending.pop() {
+        while let Some(pending_task) = task::pop_largest(&mut pending) {
+            let task = pending_task.task;
             context.check_cancelled()?;
             match merge_partition(
                 &task.files,
@@ -250,17 +257,19 @@ pub(super) fn aggregate(
                 }
                 MergeOutcome::Repartition => {
                     state_memory.try_resize(0)?;
-                    let depth = task.next_depth()?;
+                    let depth = task.next_depth(context.execution.max_repartition_depth)?;
                     let children = repartition_partition(
                         &task.files,
+                        task.estimated_bytes(),
                         &groups,
+                        &aggregates,
                         depth,
                         &context,
                     )?;
                     remove_files(&context, &task.files)?;
-                    for files in children.into_iter().rev() {
-                        if !files.is_empty() {
-                            pending.push(PartitionTask::child(files, depth));
+                    for partition in children {
+                        if !partition.files.is_empty() {
+                            pending.push(task::StatePartitionTask::child(partition, depth));
                         }
                     }
                 }

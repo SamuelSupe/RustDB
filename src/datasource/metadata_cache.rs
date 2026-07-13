@@ -1,10 +1,22 @@
-use std::{fmt, mem::size_of, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    mem::size_of,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use lru::LruCache;
 use parking_lot::Mutex;
-use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use parquet::{arrow::arrow_reader::ArrowReaderMetadata, bloom_filter::Sbbf};
+use tokio::sync::watch;
 
 use crate::storage::{ObjectSnapshot, ObjectSource};
+use crate::{Result, runtime::QueryControl};
+
+mod singleflight;
+
+use singleflight::{BloomFlight, BloomLoadGuard, MetadataFlight, MetadataLoadGuard};
 
 #[derive(Clone)]
 pub(crate) struct MetadataCache {
@@ -15,6 +27,9 @@ struct CacheState {
     max_bytes: usize,
     used_bytes: usize,
     entries: LruCache<MetadataKey, CacheEntry>,
+    in_flight: HashMap<MetadataKey, watch::Sender<MetadataFlight>>,
+    bloom_entries: LruCache<BloomKey, BloomEntry>,
+    bloom_in_flight: HashMap<BloomKey, watch::Sender<BloomFlight>>,
     #[cfg(test)]
     hits: u64,
     #[cfg(test)]
@@ -41,6 +56,20 @@ struct CacheEntry {
     weight: usize,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BloomKey {
+    object: MetadataKey,
+    row_group: usize,
+    leaf: usize,
+    offset: u64,
+    length: usize,
+}
+
+struct BloomEntry {
+    filter: Arc<Sbbf>,
+    weight: usize,
+}
+
 impl MetadataCache {
     pub(crate) fn new(max_bytes: usize) -> Self {
         Self {
@@ -48,6 +77,9 @@ impl MetadataCache {
                 max_bytes,
                 used_bytes: 0,
                 entries: LruCache::unbounded(),
+                in_flight: HashMap::new(),
+                bloom_entries: LruCache::unbounded(),
+                bloom_in_flight: HashMap::new(),
                 #[cfg(test)]
                 hits: 0,
                 #[cfg(test)]
@@ -56,6 +88,7 @@ impl MetadataCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn get_footer(
         &self,
         source: &ObjectSource,
@@ -64,6 +97,7 @@ impl MetadataCache {
         self.get(source, snapshot, MetadataLevel::Footer)
     }
 
+    #[cfg(test)]
     pub(crate) fn get_page_index(
         &self,
         source: &ObjectSource,
@@ -72,6 +106,174 @@ impl MetadataCache {
         self.get(source, snapshot, MetadataLevel::PageIndex)
     }
 
+    pub(crate) async fn acquire_footer(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        control: Option<&QueryControl>,
+    ) -> Result<MetadataLoad> {
+        self.acquire(source, snapshot, MetadataLevel::Footer, control)
+            .await
+    }
+
+    pub(crate) async fn acquire_page_index(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        control: Option<&QueryControl>,
+    ) -> Result<MetadataLoad> {
+        self.acquire(source, snapshot, MetadataLevel::PageIndex, control)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn acquire_bloom(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        row_group: usize,
+        leaf: usize,
+        offset: u64,
+        length: usize,
+        control: Option<&QueryControl>,
+    ) -> Result<BloomLoad> {
+        let key = BloomKey::new(source, snapshot, row_group, leaf, offset, length);
+        let mut wait_started = None;
+        loop {
+            if let Some(control) = control {
+                control.check_cancelled()?;
+            }
+            let wait = {
+                let mut state = self.inner.lock();
+                if let Some(filter) = state
+                    .bloom_entries
+                    .get(&key)
+                    .map(|entry| Arc::clone(&entry.filter))
+                {
+                    #[cfg(test)]
+                    {
+                        state.hits = state.hits.saturating_add(1);
+                    }
+                    return Ok(BloomLoad::Cached {
+                        filter: Some(filter),
+                        wait: elapsed(wait_started),
+                    });
+                }
+                #[cfg(test)]
+                {
+                    state.misses = state.misses.saturating_add(1);
+                }
+                if let Some(sender) = state.bloom_in_flight.get(&key) {
+                    Some(sender.subscribe())
+                } else {
+                    let (sender, _) = watch::channel(BloomFlight::Loading);
+                    state.bloom_in_flight.insert(key.clone(), sender);
+                    return Ok(BloomLoad::Leader {
+                        guard: BloomLoadGuard::new(self.clone(), key),
+                        wait: elapsed(wait_started),
+                    });
+                }
+            };
+            let mut wait = wait.expect("non-leader Bloom load has a waiter");
+            wait_started.get_or_insert_with(Instant::now);
+            let changed = if let Some(control) = control {
+                tokio::select! {
+                    _ = control.cancelled() => {
+                        control.check_cancelled()?;
+                        continue;
+                    },
+                    changed = wait.changed() => changed
+                }
+            } else {
+                wait.changed().await
+            };
+            if changed.is_err() {
+                continue;
+            }
+            match wait.borrow().clone() {
+                BloomFlight::Ready(Ok(filter)) => {
+                    return Ok(BloomLoad::Shared {
+                        filter,
+                        wait: elapsed(wait_started),
+                    });
+                }
+                BloomFlight::Ready(Err(error)) => return Err(error.into_error()),
+                BloomFlight::Loading | BloomFlight::Retry => {}
+            }
+        }
+    }
+
+    async fn acquire(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        level: MetadataLevel,
+        control: Option<&QueryControl>,
+    ) -> Result<MetadataLoad> {
+        let key = MetadataKey::new(source, snapshot, level);
+        let mut wait_started = None;
+        loop {
+            if let Some(control) = control {
+                control.check_cancelled()?;
+            }
+            let wait = {
+                let mut state = self.inner.lock();
+                if let Some(metadata) = state.entries.get(&key).map(|entry| entry.metadata.clone())
+                {
+                    #[cfg(test)]
+                    {
+                        state.hits = state.hits.saturating_add(1);
+                    }
+                    return Ok(MetadataLoad::Cached {
+                        metadata,
+                        wait: elapsed(wait_started),
+                    });
+                }
+                #[cfg(test)]
+                {
+                    state.misses = state.misses.saturating_add(1);
+                }
+                if let Some(sender) = state.in_flight.get(&key) {
+                    Some(sender.subscribe())
+                } else {
+                    let (sender, _) = watch::channel(MetadataFlight::Loading);
+                    state.in_flight.insert(key.clone(), sender);
+                    return Ok(MetadataLoad::Leader {
+                        guard: MetadataLoadGuard::new(self.clone(), key),
+                        wait: elapsed(wait_started),
+                    });
+                }
+            };
+            let mut wait = wait.expect("non-leader metadata load has a waiter");
+            wait_started.get_or_insert_with(Instant::now);
+            let changed = if let Some(control) = control {
+                tokio::select! {
+                    _ = control.cancelled() => {
+                        control.check_cancelled()?;
+                        continue;
+                    },
+                    changed = wait.changed() => changed
+                }
+            } else {
+                wait.changed().await
+            };
+            if changed.is_err() {
+                continue;
+            }
+            match wait.borrow().clone() {
+                MetadataFlight::Ready(Ok(metadata)) => {
+                    return Ok(MetadataLoad::Shared {
+                        metadata,
+                        wait: elapsed(wait_started),
+                    });
+                }
+                MetadataFlight::Ready(Err(error)) => return Err(error.into_error()),
+                MetadataFlight::Loading | MetadataFlight::Retry => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn get(
         &self,
         source: &ObjectSource,
@@ -108,6 +310,30 @@ impl MetadataCache {
         self.insert(source, snapshot, MetadataLevel::PageIndex, metadata);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_bloom(
+        &self,
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        row_group: usize,
+        leaf: usize,
+        offset: u64,
+        length: usize,
+        filter: Arc<Sbbf>,
+    ) {
+        let key = BloomKey::new(source, snapshot, row_group, leaf, offset, length);
+        let weight = bloom_weight(&key);
+        let mut state = self.inner.lock();
+        if state.max_bytes == 0 || weight > state.max_bytes {
+            return;
+        }
+        if let Some((_, previous)) = state.bloom_entries.push(key, BloomEntry { filter, weight }) {
+            state.used_bytes = state.used_bytes.saturating_sub(previous.weight);
+        }
+        state.used_bytes = state.used_bytes.saturating_add(weight);
+        evict_to_budget(&mut state);
+    }
+
     fn insert(
         &self,
         source: &ObjectSource,
@@ -125,14 +351,22 @@ impl MetadataCache {
             state.used_bytes = state.used_bytes.saturating_sub(previous.weight);
         }
         state.used_bytes = state.used_bytes.saturating_add(weight);
-        while state.used_bytes > state.max_bytes {
-            let Some((_, evicted)) = state.entries.pop_lru() else {
-                state.used_bytes = 0;
-                break;
-            };
-            state.used_bytes = state.used_bytes.saturating_sub(evicted.weight);
-        }
+        evict_to_budget(&mut state);
         debug_assert!(state.used_bytes <= state.max_bytes);
+    }
+
+    fn finish_metadata(&self, key: &MetadataKey, outcome: MetadataFlight) {
+        let mut state = self.inner.lock();
+        if let Some(sender) = state.in_flight.remove(key) {
+            sender.send_replace(outcome);
+        }
+    }
+
+    fn finish_bloom(&self, key: &BloomKey, outcome: BloomFlight) {
+        let mut state = self.inner.lock();
+        if let Some(sender) = state.bloom_in_flight.remove(key) {
+            sender.send_replace(outcome);
+        }
     }
 
     #[cfg(test)]
@@ -145,6 +379,56 @@ impl MetadataCache {
             misses: state.misses,
         }
     }
+}
+
+fn evict_to_budget(state: &mut CacheState) {
+    while state.used_bytes > state.max_bytes {
+        let weight = state
+            .bloom_entries
+            .pop_lru()
+            .map(|(_, entry)| entry.weight)
+            .or_else(|| state.entries.pop_lru().map(|(_, entry)| entry.weight));
+        let Some(weight) = weight else {
+            state.used_bytes = 0;
+            break;
+        };
+        state.used_bytes = state.used_bytes.saturating_sub(weight);
+    }
+    debug_assert!(state.used_bytes <= state.max_bytes);
+}
+
+pub(crate) enum MetadataLoad {
+    Cached {
+        metadata: ArrowReaderMetadata,
+        wait: Duration,
+    },
+    Shared {
+        metadata: ArrowReaderMetadata,
+        wait: Duration,
+    },
+    Leader {
+        guard: MetadataLoadGuard,
+        wait: Duration,
+    },
+}
+
+pub(crate) enum BloomLoad {
+    Cached {
+        filter: Option<Arc<Sbbf>>,
+        wait: Duration,
+    },
+    Shared {
+        filter: Option<Arc<Sbbf>>,
+        wait: Duration,
+    },
+    Leader {
+        guard: BloomLoadGuard,
+        wait: Duration,
+    },
+}
+
+fn elapsed(started: Option<Instant>) -> Duration {
+    started.map_or(Duration::ZERO, |started| started.elapsed())
 }
 
 /// Conservative live weight used both by the cache and by query-scoped
@@ -171,6 +455,35 @@ impl MetadataKey {
             level,
         }
     }
+}
+
+impl BloomKey {
+    fn new(
+        source: &ObjectSource,
+        snapshot: &ObjectSnapshot,
+        row_group: usize,
+        leaf: usize,
+        offset: u64,
+        length: usize,
+    ) -> Self {
+        Self {
+            object: MetadataKey::new(source, snapshot, MetadataLevel::Footer),
+            row_group,
+            leaf,
+            offset,
+            length,
+        }
+    }
+}
+
+fn bloom_weight(key: &BloomKey) -> usize {
+    size_of::<BloomEntry>()
+        .saturating_add(size_of::<BloomKey>())
+        .saturating_add(key.object.uri.len())
+        .saturating_add(key.object.e_tag.as_ref().map_or(0, String::len))
+        .saturating_add(key.object.version.as_ref().map_or(0, String::len))
+        .saturating_add(key.length)
+        .saturating_add(256)
 }
 
 fn entry_weight(key: &MetadataKey, metadata: &ArrowReaderMetadata) -> usize {
@@ -214,112 +527,9 @@ struct CacheStats {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{fs::File, sync::Arc};
+#[path = "metadata_cache/tests.rs"]
+mod tests;
 
-    use arrow::{
-        array::Int64Array,
-        datatypes::{DataType, Field, Schema},
-        record_batch::RecordBatch,
-    };
-    use parquet::{
-        arrow::{ArrowWriter, arrow_reader::ArrowReaderMetadata},
-        file::reader::{FileReader, SerializedFileReader},
-    };
-    use tempfile::tempdir;
-
-    use super::{MetadataCache, MetadataKey, MetadataLevel, entry_weight};
-    use crate::{S3Config, storage::LocationResolver};
-
-    #[tokio::test]
-    async fn hits_and_invalidates_on_object_identity() {
-        let (source, metadata) = fixture().await;
-        let snapshot = source.snapshot().clone();
-        let cache = MetadataCache::new(usize::MAX);
-        assert!(cache.get_footer(&source, &snapshot).is_none());
-        cache.insert_footer(&source, &snapshot, metadata.clone());
-        assert!(cache.get_footer(&source, &snapshot).is_some());
-        assert!(cache.get_page_index(&source, &snapshot).is_none());
-
-        let mut changed = snapshot.clone();
-        changed.e_tag = Some("new-etag".to_owned());
-        assert!(cache.get_footer(&source, &changed).is_none());
-        let stats = cache.stats();
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 3);
-    }
-
-    #[tokio::test]
-    async fn footer_and_page_index_entries_are_distinct() {
-        let (source, metadata) = fixture().await;
-        let snapshot = source.snapshot().clone();
-        let cache = MetadataCache::new(usize::MAX);
-
-        cache.insert_footer(&source, &snapshot, metadata.clone());
-        assert!(cache.get_footer(&source, &snapshot).is_some());
-        assert!(cache.get_page_index(&source, &snapshot).is_none());
-
-        cache.insert_page_index(&source, &snapshot, metadata);
-        assert!(cache.get_footer(&source, &snapshot).is_some());
-        assert!(cache.get_page_index(&source, &snapshot).is_some());
-        assert_eq!(cache.stats().entries, 2);
-    }
-
-    #[tokio::test]
-    async fn evicts_lru_without_exceeding_byte_limit() {
-        let (source, metadata) = fixture().await;
-        let first = source.snapshot().clone();
-        let mut second = first.clone();
-        second.version = Some("v2".to_owned());
-        let mut third = first.clone();
-        third.version = Some("v3".to_owned());
-        let first_weight = entry_weight(
-            &MetadataKey::new(&source, &first, MetadataLevel::Footer),
-            &metadata,
-        );
-        let second_weight = entry_weight(
-            &MetadataKey::new(&source, &second, MetadataLevel::Footer),
-            &metadata,
-        );
-        let limit = first_weight.saturating_add(second_weight);
-        let cache = MetadataCache::new(limit);
-
-        cache.insert_footer(&source, &first, metadata.clone());
-        cache.insert_footer(&source, &second, metadata.clone());
-        assert!(cache.get_footer(&source, &first).is_some());
-        cache.insert_footer(&source, &third, metadata);
-
-        let stats = cache.stats();
-        assert_eq!(stats.entries, 2);
-        assert!(stats.used_bytes <= limit);
-        assert!(cache.get_footer(&source, &first).is_some());
-        assert!(cache.get_footer(&source, &second).is_none());
-        assert!(cache.get_footer(&source, &third).is_some());
-    }
-
-    async fn fixture() -> (crate::storage::ObjectSource, ArrowReaderMetadata) {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("cache.parquet");
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
-        )
-        .unwrap();
-        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
-        let metadata =
-            ArrowReaderMetadata::try_new(Arc::new(reader.metadata().clone()), Default::default())
-                .unwrap();
-        let source = LocationResolver::new(S3Config::default())
-            .resolve(&[path.display().to_string()])
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        (source, metadata)
-    }
-}
+#[cfg(test)]
+#[path = "metadata_cache/singleflight_tests.rs"]
+mod singleflight_tests;

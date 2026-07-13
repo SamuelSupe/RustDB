@@ -14,6 +14,8 @@ use super::rewrite::{
 };
 
 mod compact;
+mod direct;
+mod lineage;
 
 pub(super) fn is_aggregate(plan: &LogicalPlan) -> bool {
     let LogicalPlan::Projection { input, .. } = plan else {
@@ -39,6 +41,20 @@ pub(super) fn rewrite(
     let original_group_count = groups.len();
     let aggregate_count = aggregates.len();
     let pulled = compact::apply(pull(input)?, &mut groups, &mut aggregates)?;
+    if original_group_count == 0
+        && having.is_none()
+        && let Some(plan) = direct::rewrite(
+            left.clone(),
+            &pulled,
+            &aggregates,
+            &projection,
+            &kind,
+            guard.clone(),
+            &output_schema,
+        )?
+    {
+        return Ok(plan);
+    }
     let parameters = correlation_parameters(&pulled.correlations)?;
     if parameters.is_empty() {
         return Err(Error::Internal(
@@ -243,16 +259,18 @@ fn correlation_parameters(correlations: &[Correlation]) -> Result<Vec<usize>> {
 }
 
 fn build_domain(left: LogicalPlan, parameters: &[usize]) -> Result<LogicalPlan> {
-    let expressions = parameters
+    let source = lineage::minimum(&left, parameters);
+    let expressions = source
+        .parameters
         .iter()
         .map(|index| {
-            let field = left.schema().arrow().field(*index);
+            let field = source.plan.schema().arrow().field(*index);
             BoundExpr::column(*index, field.data_type().clone(), field.name().clone())
         })
         .collect::<Vec<_>>();
     let schema = expression_schema(&expressions);
     let projection = LogicalPlan::Projection {
-        input: Box::new(left),
+        input: Box::new(source.plan),
         expressions,
         schema: schema.clone(),
     };

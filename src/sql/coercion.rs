@@ -305,6 +305,7 @@ fn arrow_type(data_type: &SqlDataType) -> Result<DataType> {
         | SqlDataType::UInt16
         | SqlDataType::UInt32
         | SqlDataType::UInt64
+        | SqlDataType::UBigInt
         | SqlDataType::BigIntUnsigned(_)
         | SqlDataType::Unsigned
         | SqlDataType::UnsignedInteger => DataType::UInt64,
@@ -329,6 +330,13 @@ fn arrow_type(data_type: &SqlDataType) -> Result<DataType> {
         | SqlDataType::Nvarchar(_)
         | SqlDataType::Text
         | SqlDataType::String(_) => DataType::Utf8,
+        SqlDataType::Binary(_)
+        | SqlDataType::Varbinary(_)
+        | SqlDataType::Blob(_)
+        | SqlDataType::TinyBlob
+        | SqlDataType::MediumBlob
+        | SqlDataType::LongBlob
+        | SqlDataType::Bytes(_) => DataType::Binary,
         SqlDataType::Date | SqlDataType::Date32 => DataType::Date32,
         SqlDataType::Timestamp(precision, timezone) => {
             if precision.is_some_and(|precision| precision > 6) {

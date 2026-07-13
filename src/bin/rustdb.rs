@@ -55,6 +55,12 @@ async fn run(args: Args) -> Result<()> {
     if let Some(metadata_cache) = args.metadata_cache {
         config.metadata_cache_bytes = metadata_cache;
     }
+    if let Some(bytes) = args.csv_target_morsel_bytes {
+        config.csv_scan.target_morsel_bytes = bytes;
+    }
+    if args.no_csv_parallel_single_file {
+        config.csv_scan.parallel_single_file = false;
+    }
     if let Some(mode) = args.parquet_page_index {
         config.parquet_scan.page_index = mode.into();
     }
@@ -81,6 +87,18 @@ async fn run(args: Args) -> Result<()> {
     }
     if let Some(threads) = args.spill_io_threads {
         config.spill.io_threads = threads;
+    }
+    if let Some(bytes) = args.spill_partition_target_bytes {
+        config.execution.spill_partition_target_bytes = Some(bytes);
+    }
+    if let Some(depth) = args.max_repartition_depth {
+        config.execution.max_repartition_depth = depth;
+    }
+    if let Some(amplification) = args.max_spill_write_amplification {
+        config.execution.max_spill_write_amplification = Some(amplification);
+    }
+    if let Some(bytes) = args.runtime_filter_bytes {
+        config.execution.runtime_filter_bytes = bytes;
     }
     config.s3.region = args.s3_region;
     config.s3.endpoint = args.s3_endpoint;

@@ -88,6 +88,12 @@ pub(super) fn remap_predicate(
                 .map(|predicate| remap_predicate(predicate, logical, physical))
                 .collect::<Result<Vec<_>>>()?,
         )),
+        ScanPredicate::Or(predicates) => Ok(ScanPredicate::Or(
+            predicates
+                .iter()
+                .map(|predicate| remap_predicate(predicate, logical, physical))
+                .collect::<Result<Vec<_>>>()?,
+        )),
     }
 }
 

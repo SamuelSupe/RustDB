@@ -9,7 +9,9 @@ use super::{
 };
 use crate::{
     CsvHeader, CsvOptions, EngineConfig, Error, Result,
-    datasource::{CsvTable, ScanRequest, ScanTask, TableProvider, TableStatistics},
+    datasource::{
+        CsvTable, ScanRequest, ScanTask, TableProvider, TableSourceIdentity, TableStatistics,
+    },
     runtime::{QueryContext, RecordBatchStream},
 };
 
@@ -125,6 +127,30 @@ impl TableProvider for RegisteredCsvTable {
 
     fn statistics(&self) -> TableStatistics {
         self.statistics.clone()
+    }
+
+    fn source_identity(&self) -> Option<TableSourceIdentity> {
+        Some(TableSourceIdentity::from_spec(
+            "csv",
+            &self.locations,
+            format!(
+                "refresh={:?};query={:?};schema={:?}",
+                self.refresh_options, self.query_options, self.schema
+            ),
+        ))
+    }
+
+    fn explain_scan(&self) -> Option<String> {
+        Some(format!(
+            "format=csv codec={:?} record_morsel_target={} parser_lanes={}",
+            self.refresh_options.compression,
+            self.config.csv_scan.target_morsel_bytes,
+            if self.config.csv_scan.parallel_single_file {
+                "runtime"
+            } else {
+                "1"
+            }
+        ))
     }
 
     fn query_statistics(&self, context: &QueryContext) -> TableStatistics {

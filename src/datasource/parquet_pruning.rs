@@ -47,6 +47,16 @@ fn can_prune(
                 predicate,
             )
         }),
+        ScanPredicate::Or(predicates) => predicates.iter().all(|predicate| {
+            can_prune(
+                metadata,
+                parquet_schema,
+                file_schema,
+                table_schema,
+                row_group,
+                predicate,
+            )
+        }),
         ScanPredicate::Comparison { column, op, value } => column_statistics(
             metadata,
             parquet_schema,

@@ -1,5 +1,7 @@
+use std::{mem, ops::ControlFlow};
+
 use sqlparser::{
-    ast::{Spanned, Statement},
+    ast::{BinaryOperator, Expr, Spanned, Statement, Value, VisitMut, VisitorMut},
     dialect::DuckDbDialect,
     parser::Parser,
     tokenizer::{Location, Token, Tokenizer},
@@ -20,17 +22,74 @@ pub(crate) fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
         if parser.peek_token().token == Token::EOF {
             break;
         }
-        let statement = if parser.peek_token().token == Token::LParen {
+        let mut statement = if parser.peek_token().token == Token::LParen {
             Statement::Query(parser.parse_query()?)
         } else {
             parser.parse_statement()?
         };
+        balance_boolean_chains(&mut statement);
         statements.push(statement);
         if parser.peek_token().token != Token::EOF && !parser.consume_token(&Token::SemiColon) {
             parser.expect_token(&Token::EOF)?;
         }
     }
     Ok(statements)
+}
+
+fn balance_boolean_chains(statement: &mut Statement) {
+    struct Balancer;
+    impl VisitorMut for Balancer {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            balance_boolean_chain(expr);
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = statement.visit(&mut Balancer);
+}
+
+fn balance_boolean_chain(expr: &mut Expr) {
+    let operator = match expr {
+        Expr::BinaryOp {
+            op: BinaryOperator::And,
+            ..
+        } => BinaryOperator::And,
+        Expr::BinaryOp {
+            op: BinaryOperator::Or,
+            ..
+        } => BinaryOperator::Or,
+        _ => return,
+    };
+    let mut pending = vec![mem::replace(expr, Expr::Value(Value::Null.into()))];
+    let mut terms = Vec::new();
+    while let Some(term) = pending.pop() {
+        match term {
+            Expr::BinaryOp { left, op, right } if op == operator => {
+                pending.push(*right);
+                pending.push(*left);
+            }
+            term => terms.push(term),
+        }
+    }
+    while terms.len() > 1 {
+        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+        let mut current = terms.into_iter();
+        while let Some(left) = current.next() {
+            next.push(match current.next() {
+                Some(right) => Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: operator.clone(),
+                    right: Box::new(right),
+                },
+                None => left,
+            });
+        }
+        terms = next;
+    }
+    *expr = terms
+        .pop()
+        .expect("boolean chain contains at least two terms");
 }
 
 pub(crate) fn split_statement_text(sql: &str) -> Result<Vec<String>> {

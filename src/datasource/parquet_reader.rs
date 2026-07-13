@@ -254,6 +254,16 @@ fn external_error(error: Error) -> ParquetError {
     ParquetError::External(Box::new(error))
 }
 
+pub(super) fn into_query_error(error: ParquetError) -> Error {
+    match error {
+        ParquetError::External(source) => match source.downcast::<Error>() {
+            Ok(error) => *error,
+            Err(source) => Error::Parquet(ParquetError::External(source)),
+        },
+        error => Error::Parquet(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -261,12 +271,24 @@ mod tests {
     use parquet::arrow::async_reader::AsyncFileReader;
     use tempfile::tempdir;
 
-    use super::{QueryIo, SnapshotParquetReader};
+    use super::{QueryIo, SnapshotParquetReader, external_error, into_query_error};
     use crate::{
-        S3Config,
+        Error, S3Config,
         runtime::{QueryControl, QueryMetrics},
         storage::LocationResolver,
     };
+
+    #[test]
+    fn query_errors_survive_the_parquet_async_reader_boundary() {
+        assert!(matches!(
+            into_query_error(external_error(Error::Cancelled)),
+            Error::Cancelled
+        ));
+        assert!(matches!(
+            into_query_error(external_error(Error::ResourceExhausted("query budget".into()))),
+            Error::ResourceExhausted(message) if message == "query budget"
+        ));
+    }
 
     #[tokio::test]
     async fn conditional_range_rejects_a_changed_object() {

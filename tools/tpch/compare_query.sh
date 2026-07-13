@@ -32,6 +32,11 @@ case "$rustdb_root" in
 esac
 
 [ -f "$query_template" ] || tpch_die "missing query template: $query_argument"
+duckdb_template=$query_template
+duckdb_companion=${query_template%.sql}.duckdb.sql
+if [ -f "$duckdb_companion" ]; then
+  duckdb_template=$duckdb_companion
+fi
 [ -d "$TPCH_ROOT/$reference_relative" ] || tpch_die "missing dataset: $reference_relative"
 case "$rustdb_argument" in
   s3://*) ;;
@@ -61,7 +66,7 @@ spill_root="$work/spill"
 mkdir -p "$spill_root"
 
 sed "s|__TPCH_ROOT__|$rustdb_root|g" "$query_template" > "$rustdb_query"
-sed "s|__TPCH_ROOT__|/workspace/$reference_relative|g" "$query_template" > "$duckdb_query"
+sed "s|__TPCH_ROOT__|/workspace/$reference_relative|g" "$duckdb_template" > "$duckdb_query"
 
 set -- docker compose --project-directory "$TPCH_ROOT" run --rm --no-deps --no-TTY dev \
   /workspace/target/release/rustdb --format csv --csv-null __RUSTDB_NULL__

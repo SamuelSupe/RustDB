@@ -21,12 +21,11 @@ async fn explicit_schema_header_and_delimiter_execute_end_to_end() -> Result<()>
         .register_csv(
             "people",
             [path.to_string_lossy()],
-            CsvOptions {
-                schema: Some(schema),
-                header: CsvHeader::Present,
-                delimiter: b'|',
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder()
+                .schema(schema)
+                .header(CsvHeader::Present)
+                .delimiter(b'|')
+                .build(),
         )
         .await?;
 
@@ -68,6 +67,53 @@ async fn rejects_malformed_records_with_the_source_uri() {
 }
 
 #[tokio::test]
+async fn parallel_decode_error_reports_uri_and_decompressed_offset() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("parallel-malformed.csv");
+    let mut contents = String::from("id,name\n");
+    for id in 0..10_100 {
+        contents.push_str(&format!("{id},valid\n"));
+    }
+    contents.push_str("10101,Ada,extra\n");
+    fs::write(&path, contents).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let config = EngineConfig::builder()
+        .compute_threads(4)
+        .io_concurrency(4)
+        .csv_target_morsel_bytes(8)
+        .build();
+    let session = Engine::new(config).unwrap().session();
+    session
+        .register_csv(
+            "invalid_parallel",
+            [path.to_string_lossy()],
+            CsvOptions::builder()
+                .schema(schema)
+                .header(CsvHeader::Present)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let mut result = session
+        .execute("SELECT * FROM invalid_parallel")
+        .await
+        .unwrap();
+    let error = loop {
+        match result.stream().next().await {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error.to_string(),
+            None => panic!("malformed morsel unexpectedly reached EOF"),
+        }
+    };
+    assert!(error.contains("parallel-malformed.csv"), "{error}");
+    assert!(error.contains("decompressed offset"), "{error}");
+}
+
+#[tokio::test]
 async fn rejects_incompatible_schemas_across_files() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("a.csv"), "id,value\n1,10\n").unwrap();
@@ -77,10 +123,7 @@ async fn rejects_incompatible_schemas_across_files() {
         .register_csv(
             "mixed",
             [format!("{}/*.csv", directory.path().display())],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await
         .unwrap_err()
@@ -98,10 +141,7 @@ async fn registration_error(path: &std::path::Path) -> String {
         .register_csv(
             "invalid",
             [path.to_string_lossy()],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await
     {

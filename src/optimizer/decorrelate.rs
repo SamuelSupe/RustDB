@@ -60,6 +60,15 @@ fn rewrite_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
                 .collect::<Result<Vec<_>>>()?,
             schema,
         },
+        LogicalPlan::Repeat {
+            input,
+            count,
+            schema,
+        } => LogicalPlan::Repeat {
+            input: Box::new(rewrite_plan(*input)?),
+            count,
+            schema,
+        },
         LogicalPlan::Window {
             input,
             expressions,
@@ -413,6 +422,15 @@ fn lower_mark_filters(plan: LogicalPlan) -> Result<LogicalPlan> {
                 .into_iter()
                 .map(lower_mark_filters)
                 .collect::<Result<Vec<_>>>()?,
+            schema,
+        },
+        LogicalPlan::Repeat {
+            input,
+            count,
+            schema,
+        } => LogicalPlan::Repeat {
+            input: Box::new(lower_mark_filters(*input)?),
+            count,
             schema,
         },
         LogicalPlan::Window {

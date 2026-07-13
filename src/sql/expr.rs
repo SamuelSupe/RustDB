@@ -19,6 +19,7 @@ pub enum ScalarValue {
     DayInterval(i32),
     MonthInterval(i32),
     Utf8(String),
+    Binary(Vec<u8>),
 }
 
 impl ScalarValue {
@@ -37,6 +38,7 @@ impl ScalarValue {
             Self::DayInterval(_) => DataType::Interval(IntervalUnit::DayTime),
             Self::MonthInterval(_) => DataType::Interval(IntervalUnit::YearMonth),
             Self::Utf8(_) => DataType::Utf8,
+            Self::Binary(_) => DataType::Binary,
         }
     }
 }
@@ -59,6 +61,13 @@ impl fmt::Display for ScalarValue {
             Self::DayInterval(value) => write!(formatter, "INTERVAL '{value}' DAY"),
             Self::MonthInterval(value) => write!(formatter, "INTERVAL '{value}' MONTH"),
             Self::Utf8(value) => write!(formatter, "'{value}'"),
+            Self::Binary(value) => {
+                formatter.write_str("X'")?;
+                for byte in value {
+                    write!(formatter, "{byte:02X}")?;
+                }
+                formatter.write_str("'")
+            }
         }
     }
 }
@@ -243,18 +252,37 @@ impl BoundExpr {
                     | BinaryOp::Or,
                 right,
             } => left.is_structurally_infallible() && right.is_structurally_infallible(),
+            ExprKind::Binary {
+                left,
+                op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply,
+                right,
+            } if matches!(self.data_type, DataType::Float32 | DataType::Float64) => {
+                left.is_structurally_infallible() && right.is_structurally_infallible()
+            }
             ExprKind::Unary {
                 op: UnaryOp::Not,
                 expr,
             }
             | ExprKind::IsNull { expr, .. } => expr.is_structurally_infallible(),
+            ExprKind::Case {
+                when_then,
+                else_expr,
+            } => {
+                when_then.iter().all(|(when, then)| {
+                    when.is_structurally_infallible() && then.is_structurally_infallible()
+                }) && else_expr.is_structurally_infallible()
+            }
+            ExprKind::Cast { expr }
+                if matches!(expr.kind, ExprKind::Literal(ScalarValue::Null)) =>
+            {
+                true
+            }
             ExprKind::OuterRef { .. }
             | ExprKind::DeferredGroup(_)
             | ExprKind::DeferredAggregate(_)
             | ExprKind::Binary { .. }
             | ExprKind::Unary { .. }
             | ExprKind::Like { .. }
-            | ExprKind::Case { .. }
             | ExprKind::Cast { .. }
             | ExprKind::ScalarFunction { .. } => false,
         }

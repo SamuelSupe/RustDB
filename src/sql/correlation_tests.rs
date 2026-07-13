@@ -62,13 +62,125 @@ fn compacts_correlated_aggregate_input_before_the_domain_join() {
          FROM (SELECT 1 AS partkey) AS d",
     );
     assert!(
-        plan.contains("Projection [\"partkey\", \"quantity\", \"__rustdb_inner_match\"]"),
+        plan.contains("Projection [\"partkey\", \"quantity\"]"),
         "{plan}"
     );
     assert!(
         !plan.contains(
             "Projection [\"partkey\", \"quantity\", \"unused_payload\", \"__rustdb_inner_match\"]"
         ),
+        "{plan}"
+    );
+}
+
+#[test]
+fn scalar_aggregate_equality_correlation_skips_outer_domain_scan() {
+    let plan = explain(
+        "SELECT d.partkey, \
+                (SELECT avg(i.quantity) \
+                 FROM (SELECT 1 AS partkey, 10 AS quantity) AS i \
+                 WHERE i.partkey = d.partkey) \
+         FROM (SELECT 1 AS partkey) AS d",
+    );
+    assert_eq!(
+        plan.matches("Aggregate groups=[\"partkey\"]").count(),
+        1,
+        "{plan}"
+    );
+    assert!(!plan.contains("__rustdb_inner_match"), "{plan}");
+    assert!(plan.contains("LeftJoin keys=1"), "{plan}");
+    assert!(
+        plan.contains("rewrite=direct_correlated_aggregate"),
+        "{plan}"
+    );
+}
+
+#[test]
+fn guarded_scalar_aggregate_uses_direct_grouped_rewrite() {
+    let plan = explain(
+        "SELECT d.key FROM (SELECT 1 AS key, true AS enabled) AS d \
+         WHERE d.enabled AND 5 < (SELECT 0.2 * avg(i.quantity) \
+         FROM (SELECT 1 AS key, 30 AS quantity) AS i WHERE i.key = d.key)",
+    );
+    assert!(
+        plan.contains("rewrite=direct_correlated_aggregate"),
+        "{plan}"
+    );
+    assert!(!plan.contains("__rustdb_domain_value"), "{plan}");
+}
+
+#[test]
+fn direct_scalar_aggregate_handles_count_sum_and_multiple_results() {
+    for sql in [
+        "SELECT (SELECT count(*) FROM (SELECT 1 AS key) AS i WHERE i.key = d.key) \
+         FROM (SELECT 2 AS key) AS d",
+        "SELECT (SELECT sum(i.value) FROM (SELECT 1 AS key, 4 AS value) AS i \
+         WHERE i.key = d.key) FROM (SELECT 2 AS key) AS d",
+        "SELECT (SELECT count(*) + sum(i.value) \
+         FROM (SELECT 1 AS key, 4 AS value) AS i WHERE i.key = d.key) \
+         FROM (SELECT 1 AS key) AS d",
+    ] {
+        let plan = explain(sql);
+        assert_eq!(
+            plan.matches("Aggregate groups=[\"key\"]").count(),
+            1,
+            "{plan}"
+        );
+        assert!(!plan.contains("__rustdb_inner_match"), "{plan}");
+    }
+}
+
+#[test]
+fn direct_correlated_aggregate_accepts_infallible_expression_arguments() {
+    for sql in [
+        "SELECT (SELECT count(1) \
+         FROM (SELECT 1 AS key) AS i WHERE i.key = d.key) \
+         FROM (SELECT 1 AS key) AS d",
+        "SELECT (SELECT sum(i.value * 1e0) \
+         FROM (SELECT 1 AS key, 2e0 AS value) AS i WHERE i.key = d.key) \
+         FROM (SELECT 1 AS key) AS d",
+    ] {
+        let plan = explain(sql);
+        assert!(
+            plan.contains("rewrite=direct_correlated_aggregate"),
+            "{sql}\n{plan}"
+        );
+        assert!(!plan.contains("__rustdb_inner_match"), "{sql}\n{plan}");
+    }
+}
+
+#[test]
+fn fallible_correlated_aggregate_expression_keeps_the_domain_path() {
+    for sql in [
+        "SELECT (SELECT sum(i.value + 1) \
+         FROM (SELECT 1 AS key, 2 AS value) AS i WHERE i.key = d.key) \
+         FROM (SELECT 1 AS key) AS d",
+        "SELECT (SELECT avg(CAST(i.value AS DOUBLE)) \
+         FROM (SELECT 1 AS key, 2 AS value) AS i WHERE i.key = d.key) \
+         FROM (SELECT 1 AS key) AS d",
+        "SELECT (SELECT avg(10 / i.value) \
+         FROM (SELECT 1 AS key, 2 AS value) AS i WHERE i.key = d.key) \
+         FROM (SELECT 1 AS key) AS d",
+    ] {
+        let plan = explain(sql);
+        assert!(plan.contains("__rustdb_inner_match"), "{sql}\n{plan}");
+        assert!(
+            !plan.contains("rewrite=direct_correlated_aggregate"),
+            "{sql}\n{plan}"
+        );
+    }
+}
+
+#[test]
+fn guarded_fallible_correlated_aggregate_keeps_the_domain_path() {
+    let plan = explain(
+        "SELECT CASE WHEN d.enabled THEN (SELECT avg(10 / i.value) \
+         FROM (SELECT 1 AS key, 2 AS value) AS i WHERE i.key = d.key) ELSE 0 END \
+         FROM (SELECT 1 AS key, false AS enabled) AS d",
+    );
+    assert!(plan.contains("__rustdb_inner_match"), "{plan}");
+    assert!(
+        !plan.contains("rewrite=direct_correlated_aggregate"),
         "{plan}"
     );
 }
@@ -180,11 +292,17 @@ fn stages_direct_in_before_a_following_correlated_aggregate() {
          )",
     );
     assert!(!plan.contains("MarkJoin keys=0"), "{plan}");
-    assert!(
-        plan.matches("SemiJoin keys=1").count() >= 2,
-        "the original input and correlation domain must both use keyed membership:\n{plan}"
+    assert_eq!(
+        plan.matches("SemiJoin keys=1").count(),
+        1,
+        "direct aggregation must not rebuild the membership-filtered correlation domain:\n{plan}"
     );
     assert!(plan.contains("LeftJoin keys=2"), "{plan}");
+    assert!(
+        plan.contains("rewrite=direct_correlated_aggregate"),
+        "{plan}"
+    );
+    assert!(!plan.contains("__rustdb_domain_value"), "{plan}");
 }
 
 #[test]
@@ -344,6 +462,38 @@ async fn nested_scalar_correlation_does_not_escape_into_enclosing_in_rhs() {
 }
 
 #[tokio::test]
+async fn executes_parser_visible_left_semi_and_anti_joins() {
+    let semi = run("SELECT l.id \
+         FROM (SELECT 1 AS id UNION ALL SELECT 2 UNION ALL SELECT 2) AS l \
+         LEFT SEMI JOIN (SELECT 2 AS id UNION ALL SELECT 3) AS r ON l.id = r.id \
+         ORDER BY l.id")
+    .await;
+    assert_eq!(
+        semi.iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+        vec![2, 2]
+    );
+
+    let anti = run("SELECT l.id \
+         FROM (SELECT 1 AS id UNION ALL SELECT 2 UNION ALL SELECT 2) AS l \
+         LEFT ANTI JOIN (SELECT 2 AS id UNION ALL SELECT 3) AS r ON l.id = r.id \
+         ORDER BY l.id")
+    .await;
+    assert_eq!(int64_value(&anti[0], 0), 1);
+}
+
+#[tokio::test]
 async fn exists_never_evaluates_its_visible_projection() {
     let batches = run(
         "SELECT EXISTS (SELECT 1 / 0 FROM (SELECT 1 AS key) AS i) AS plain_exists, \
@@ -423,6 +573,36 @@ async fn correlated_scalar_aggregate_uses_sql_empty_group_defaults() {
         .unwrap();
     assert_eq!(count.value(0), 0);
     assert!(maximum.is_null(0));
+}
+
+#[tokio::test]
+async fn direct_scalar_aggregate_preserves_count_sum_and_multiple_aggregate_semantics() {
+    let batches = run("SELECT (SELECT count(*) \
+             FROM (SELECT 1 AS key) AS i WHERE i.key = d.key) AS empty_count, \
+            (SELECT sum(i.value) \
+             FROM (SELECT 1 AS key, 4 AS value) AS i WHERE i.key = d.key) AS empty_sum, \
+            (SELECT count(*) + sum(i.value) \
+             FROM (SELECT 2 AS key, 4 AS value) AS i WHERE i.key = d.key) AS combined \
+         FROM (SELECT 2 AS key) AS d")
+    .await;
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sum = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let combined = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 0);
+    assert!(sum.is_null(0));
+    assert_eq!(combined.value(0), 5);
 }
 
 async fn run(sql: &str) -> Vec<arrow::record_batch::RecordBatch> {

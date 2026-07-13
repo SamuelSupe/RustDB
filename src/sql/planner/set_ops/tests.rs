@@ -35,6 +35,20 @@ fn plans_set_operations_with_expected_physical_shapes() {
     assert!(explain.starts_with("Aggregate"), "{explain}");
     assert!(explain.contains("Append"), "{explain}");
 
+    for sql in [
+        "SELECT 1 AS n INTERSECT ALL SELECT 1",
+        "SELECT 1 AS n EXCEPT ALL SELECT 1",
+    ] {
+        let StatementPlan::Query(plan) = plan_sql(&catalog, sql).unwrap() else {
+            panic!("expected query plan");
+        };
+        assert!(
+            plan.explain().contains("Repeat"),
+            "{sql}: {}",
+            plan.explain()
+        );
+    }
+
     for (sql, join) in [
         ("SELECT 1 AS n INTERSECT SELECT 1", "SemiJoin"),
         ("SELECT 1 AS n EXCEPT SELECT 1", "AntiJoin"),
@@ -52,8 +66,6 @@ fn plans_set_operations_with_expected_physical_shapes() {
 fn validates_set_shapes_and_output_only_ordering() {
     let catalog = Catalog::default();
     for sql in [
-        "SELECT 1 INTERSECT ALL SELECT 1",
-        "SELECT 1 EXCEPT ALL SELECT 1",
         "SELECT 1 UNION BY NAME SELECT 1",
         "SELECT 1 UNION ALL SELECT 1, 2",
         "SELECT 1 UNION ALL SELECT CAST(1 AS DOUBLE)",
@@ -95,6 +107,18 @@ async fn executes_distinct_null_semantics_and_query_level_limit() {
     assert_eq!(rows("SELECT NULL AS n UNION SELECT NULL").await, 1);
     assert_eq!(rows("SELECT NULL AS n INTERSECT SELECT NULL").await, 1);
     assert_eq!(rows("SELECT NULL AS n EXCEPT SELECT NULL").await, 0);
+    assert_eq!(
+        rows("(SELECT 1 AS n UNION ALL SELECT 1) INTERSECT ALL (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1)").await,
+        2
+    );
+    assert_eq!(
+        rows("(SELECT 1 AS n UNION ALL SELECT 1) EXCEPT ALL SELECT 1").await,
+        1
+    );
+    assert_eq!(
+        rows("(SELECT NULL AS n UNION ALL SELECT NULL) EXCEPT ALL SELECT NULL").await,
+        1
+    );
     assert_eq!(
         rows("(SELECT 1 UNION ALL SELECT 1) INTERSECT SELECT 1").await,
         1

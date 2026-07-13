@@ -68,6 +68,14 @@ pub struct Args {
     #[arg(long, value_parser = parse_bytes)]
     pub metadata_cache: Option<usize>,
 
+    /// Target decompressed bytes per record-aligned CSV parser morsel.
+    #[arg(long, value_parser = parse_bytes)]
+    pub csv_target_morsel_bytes: Option<usize>,
+
+    /// Disable parallel parsing of record-aligned morsels from one CSV object.
+    #[arg(long)]
+    pub no_csv_parallel_single_file: bool,
+
     /// Parquet page-index pruning policy.
     #[arg(long, value_enum)]
     pub parquet_page_index: Option<PruningModeArg>,
@@ -103,6 +111,22 @@ pub struct Args {
     /// Number of dedicated blocking Spill I/O threads.
     #[arg(long)]
     pub spill_io_threads: Option<usize>,
+
+    /// Target logical bytes per adaptive Spill hash partition.
+    #[arg(long, value_parser = parse_bytes)]
+    pub spill_partition_target_bytes: Option<usize>,
+
+    /// Maximum recursive hash repartition depth; zero goes directly to fallback.
+    #[arg(long)]
+    pub max_repartition_depth: Option<usize>,
+
+    /// Optional maximum cumulative Spill write amplification.
+    #[arg(long)]
+    pub max_spill_write_amplification: Option<f64>,
+
+    /// Memory budget for Join runtime filters; zero disables them.
+    #[arg(long, value_parser = parse_bytes)]
+    pub runtime_filter_bytes: Option<usize>,
 
     /// AWS region override.
     #[arg(long)]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validation logic for the RustDB v0.4 fixed-hardware performance gate."""
+"""Validation logic for RustDB fixed-hardware performance gates."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from typing import Any
 CASES = ("scan-filter", "aggregate")
 THREADS = (1, 4)
 MEMORY_LIMIT = 1_073_741_824
-BASELINE_ENGINE_VERSION = "0.2.0-alpha.1"
-CANDIDATE_ENGINE_VERSION = "0.4.0-alpha.1"
+DEFAULT_BASELINE_ENGINE_VERSION = "0.4.0-alpha.1"
+DEFAULT_CANDIDATE_ENGINE_VERSION = "0.5.0-alpha.1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 NATIVE = re.compile(r"(?:^|\s)-C(?:\s+)?target-cpu=native(?:\s|$)")
@@ -240,13 +240,8 @@ def inspect_manifest(
     build = validate_build(manifest.get("build"), label)
     validate_harness(manifest, path, label, build_id)
     binary_sha256 = manifest.get("benchmark_binary_sha256")
-    if label == "candidate":
-        if not isinstance(binary_sha256, str) or SHA256.fullmatch(binary_sha256) is None:
-            fail(f"{label}.benchmark_binary_sha256 must be a lowercase SHA-256")
-    elif binary_sha256 is not None and (
-        not isinstance(binary_sha256, str) or SHA256.fullmatch(binary_sha256) is None
-    ):
-        fail(f"{label}.benchmark_binary_sha256 must be a lowercase SHA-256 when present")
+    if not isinstance(binary_sha256, str) or SHA256.fullmatch(binary_sha256) is None:
+        fail(f"{label}.benchmark_binary_sha256 must be a lowercase SHA-256")
 
     dataset = manifest.get("dataset")
     if not isinstance(dataset, dict) or not isinstance(dataset.get("generation"), dict):
@@ -312,7 +307,7 @@ def inspect_manifest(
                 build=build,
                 threads=threads,
                 engine_version=engine_version,
-                binary_sha256=binary_sha256 if label == "candidate" else None,
+                binary_sha256=binary_sha256,
                 actual_cpu_model=actual_cpu_model,
             )
             checksum_path = resolve_artifact(
@@ -347,22 +342,24 @@ def evaluate(
     candidate_build_id: str | None = None,
     candidate_binary_sha256: str | None = None,
     actual_cpu_model: str | None = None,
+    baseline_engine_version: str = DEFAULT_BASELINE_ENGINE_VERSION,
+    candidate_engine_version: str = DEFAULT_CANDIDATE_ENGINE_VERSION,
 ) -> dict[str, Any]:
     baseline = inspect_manifest(
         baseline_path,
         label="baseline",
-        engine_version=BASELINE_ENGINE_VERSION,
+        engine_version=baseline_engine_version,
         actual_cpu_model=actual_cpu_model,
     )
     candidate = inspect_manifest(
         candidate_path,
         label="candidate",
-        engine_version=CANDIDATE_ENGINE_VERSION,
+        engine_version=candidate_engine_version,
         actual_cpu_model=actual_cpu_model,
     )
     if baseline["build_id"] != baseline_build_id:
         fail(
-            "baseline build id does not match v0.2.0-alpha.1: "
+            f"baseline build id does not match {baseline_engine_version}: "
             f"expected {baseline_build_id}, got {baseline['build_id']}"
         )
     actual_candidate_id = candidate["build_id"]
@@ -381,7 +378,7 @@ def evaluate(
             f"got {candidate['binary_sha256']}"
         )
     if candidate["dataset"] != baseline["dataset"]:
-        fail("candidate and v0.2 baseline dataset fingerprints differ")
+        fail("candidate and baseline dataset fingerprints differ")
 
     results: dict[str, Any] = {}
     for case in CASES:
@@ -410,6 +407,8 @@ def evaluate(
         }
     return {
         "status": "pass",
+        "baseline_engine_version": baseline_engine_version,
+        "candidate_engine_version": candidate_engine_version,
         "baseline_build_id": baseline["build_id"],
         "candidate_build_id": candidate["build_id"],
         "dataset_manifest_sha256": candidate["dataset"]["manifest_sha256"],

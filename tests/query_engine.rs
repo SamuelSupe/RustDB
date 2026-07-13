@@ -28,10 +28,7 @@ async fn session_with_employees() -> Result<rustdb::Session> {
         .register_csv(
             "employees",
             [fixture("employees.csv").to_string_lossy().into_owned()],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
     Ok(session)
@@ -43,10 +40,7 @@ async fn session_with_company() -> Result<rustdb::Session> {
         .register_csv(
             "departments",
             [fixture("departments.csv").to_string_lossy().into_owned()],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
     Ok(session)
@@ -214,10 +208,7 @@ async fn csv_refresh_preserves_old_column_order_and_maps_the_new_header() -> Res
         .register_csv(
             "dynamic",
             [path.to_string_lossy()],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
 
@@ -271,10 +262,7 @@ async fn csv_refresh_reports_incompatible_file_uri_and_column() -> Result<()> {
         .register_csv(
             "dynamic",
             [format!("{}/*.csv", data.display())],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
 
@@ -388,10 +376,7 @@ async fn join_streams_high_fanout_in_configured_batches() -> Result<()> {
             .build(),
     )?
     .session();
-    let options = CsvOptions {
-        header: CsvHeader::Present,
-        ..CsvOptions::default()
-    };
+    let options = CsvOptions::builder().header(CsvHeader::Present).build();
     session
         .register_csv("left_rows", [left.to_string_lossy()], options.clone())
         .await?;

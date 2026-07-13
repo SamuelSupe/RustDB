@@ -4,9 +4,10 @@ use arrow::{
     csv::reader::Format,
     datatypes::{DataType, Schema, SchemaRef},
 };
-use bytes::Bytes;
-use object_store::GetRange;
+use bytes::{Bytes, BytesMut};
+use tokio::io::AsyncReadExt;
 
+use super::csv_input::{input_error, open_csv_input};
 use crate::{
     CsvHeader, CsvOptions, Error, Result,
     runtime::{MemoryReservation, QueryContext},
@@ -156,75 +157,71 @@ async fn read_sample(
         return Ok(CsvSample::empty());
     }
 
-    let cap = u64::try_from(sample_byte_cap).unwrap_or(u64::MAX);
-    let mut end = file.snapshot().size.min(INITIAL_SAMPLE_BYTES).min(cap);
+    let mut reserved = sample_byte_cap.min(INITIAL_SAMPLE_BYTES as usize);
+    let mut memory = match context {
+        Some(context) => Some(
+            context
+                .memory
+                .try_reserve(reserved)
+                .map_err(|error| csv_sample_memory_error(file.uri(), reserved, context, error))?,
+        ),
+        None => None,
+    };
+    // Schema inference runs before query snapshots are sealed. The source was
+    // just resolved and its conditional identity is the preparation snapshot.
+    let snapshot = file.snapshot().clone();
+    let query = context.map(|context| (&context.control, &context.metrics));
+    let mut input = open_csv_input(file, &snapshot, options.compression, query).await?;
+    let mut bytes = BytesMut::with_capacity(reserved);
     loop {
         if let Some(context) = context {
             context.check_cancelled()?;
         }
-        let mut memory = match context {
-            Some(context) => Some(context.memory.try_reserve(end as usize).map_err(|error| {
-                csv_sample_memory_error(file.uri(), end as usize, context, error)
-            })?),
-            None => None,
-        };
-        if let Some(context) = context
-            && file.is_s3()
-        {
-            context.metrics.add_s3_requests(1);
-        }
-        let mut get_options = file.get_options_for(file.snapshot());
-        get_options.range = Some(GetRange::Bounded(0..end));
-        let request = async {
-            let response = file
-                .store()
-                .get_opts(file.location(), get_options)
-                .await
-                .map_err(Error::from)?;
-            file.snapshot()
-                .validate_get_response(file.uri(), &response.meta)?;
-            response.bytes().await.map_err(Error::from)
-        };
-        let bytes = match context {
-            Some(context) => tokio::select! {
-                _ = context.control.cancelled() => Err(Error::Cancelled),
-                result = request => result,
-            },
-            None => request.await,
-        }
-        .map_err(|error| csv_sample_error(file.uri(), error))?;
-        if let (Some(memory), Some(context)) = (&mut memory, context) {
-            memory.try_resize(bytes.len()).map_err(|error| {
-                csv_sample_memory_error(file.uri(), bytes.len(), context, error)
-            })?;
-        }
-        if file.is_s3()
-            && let Some(context) = context
-        {
+        let before = bytes.len();
+        let remaining = reserved.saturating_sub(bytes.len());
+        let mut limited = input.as_mut().take(remaining as u64);
+        let read = limited
+            .read_buf(&mut bytes)
+            .await
+            .map_err(|error| input_error(file.uri(), error))?;
+        if let Some(context) = context {
             context
                 .metrics
-                .add_s3_bytes_transferred(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                .add_csv_decompressed_bytes(u64::try_from(read).unwrap_or(u64::MAX));
         }
-        let (complete_end, records) = complete_prefix(
-            &bytes,
-            options.quote,
-            options.escape,
-            end == file.snapshot().size,
-        );
-        if records >= required_records || end == file.snapshot().size {
+        let at_eof = read == 0;
+        let (complete_end, records) =
+            complete_prefix(&bytes, options.quote, options.escape, at_eof);
+        if records >= required_records || at_eof {
             return Ok(CsvSample {
-                bytes,
+                bytes: bytes.freeze(),
                 complete_end,
                 _memory: memory,
             });
         }
-        if end >= cap {
+        if bytes.len() >= sample_byte_cap {
             return Err(Error::ResourceExhausted(format!(
                 "CSV schema/header sample for {} reached its {sample_byte_cap}-byte limit before finding {required_records} complete record(s); provide an explicit schema/header or increase the engine memory limit",
                 file.uri()
             )));
         }
-        end = end.saturating_mul(2).min(file.snapshot().size).min(cap);
+        if bytes.len() == before {
+            return Err(Error::Execution(format!(
+                "CSV sample reader made no progress for {}",
+                file.uri()
+            )));
+        }
+        if bytes.len() == reserved {
+            let next = reserved.saturating_mul(2).min(sample_byte_cap);
+            let additional = next.saturating_sub(reserved);
+            if let (Some(memory), Some(context)) = (&mut memory, context) {
+                memory
+                    .try_grow(additional)
+                    .map_err(|error| csv_sample_memory_error(file.uri(), next, context, error))?;
+            }
+            bytes.reserve(next.saturating_sub(bytes.len()));
+            reserved = next;
+        }
     }
 }
 
@@ -314,23 +311,6 @@ fn validate_header_names(
 
 fn csv_schema_error(uri: &str, error: Error) -> Error {
     Error::Execution(format!("CSV schema read failed for {uri}: {error}"))
-}
-
-fn csv_sample_error(uri: &str, error: Error) -> Error {
-    let changed = match &error {
-        Error::ObjectStore(source) => matches!(
-            source,
-            object_store::Error::Precondition { .. } | object_store::Error::NotFound { .. }
-        ),
-        _ => false,
-    };
-    if changed {
-        Error::Execution(format!(
-            "object changed during query preparation: {uri}: {error}"
-        ))
-    } else {
-        Error::Execution(format!("CSV sample read failed for {uri}: {error}"))
-    }
 }
 
 fn validate_schema(actual: &Schema, expected: &Schema, uri: &str) -> Result<()> {

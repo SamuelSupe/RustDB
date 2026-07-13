@@ -19,11 +19,13 @@ pub(super) struct PendingPartition {
     whole_states: Vec<Option<AggregateState>>,
     retained_payload: Vec<usize>,
     memory: MemoryReservation,
+    rows: u64,
 }
 
 pub(super) struct CompletedPartition {
     pub(super) file: SpillFile,
     pub(super) whole_values: Vec<Option<CellValue>>,
+    pub(super) rows: u64,
     memory: MemoryReservation,
 }
 
@@ -64,6 +66,7 @@ impl PendingPartition {
             whole_states,
             retained_payload: vec![0; expressions.len()],
             memory,
+            rows: 0,
         })
     }
 
@@ -79,6 +82,14 @@ impl PendingPartition {
         expressions: &[WindowExpr],
         aggregate_inputs: &[Option<ArrayRef>],
     ) -> Result<()> {
+        self.rows = self
+            .rows
+            .checked_add(u64::try_from(len).map_err(|_| {
+                Error::Execution("window partition row count overflowed UINT64".into())
+            })?)
+            .ok_or_else(|| {
+                Error::Execution("window partition row count overflowed UINT64".into())
+            })?;
         for row in start..start + len {
             for (index, state) in self.whole_states.iter_mut().enumerate() {
                 let Some(state) = state else { continue };
@@ -133,6 +144,7 @@ impl PendingPartition {
         Ok(CompletedPartition {
             file: self.writer.finish(1)?,
             whole_values,
+            rows: self.rows,
             memory: self.memory,
         })
     }

@@ -43,27 +43,54 @@ handoff remains single-slot. Every queued envelope retains its memory lease;
 when downstream is slow, cancellation-aware memory waiters resume on lease
 release instead of treating temporary queue pressure as out-of-memory.
 
-Parquet morsels are file plus row group and may execute concurrently. CSV
-morsels are files; one CSV remains sequential so quoted records cannot be split
-incorrectly. Projection, row-group statistics, Hive partitions, and limits are
-applied before decoding where safe. Residual SQL filters always remain in the
-plan, so a source hint can never silently change query results.
+Parquet morsels are file plus row group and may execute concurrently. For one
+CSV object, one ordered producer performs a conditional GET, detects raw,
+gzip, or zstd input from magic bytes, and decompresses concatenated gzip
+members or zstd frames. A quote/escape-aware framer emits morsels only at full
+record boundaries, including across source chunks and quoted newlines, then
+round-robins those morsels over single-slot parser queues. The header is removed
+once before distribution. Multiple matched CSV files instead remain independent
+file tasks.
+
+`CsvScanConfig` enables single-file parallel parsing by default and targets
+8 MiB of decompressed data per morsel. The producer's source buffer, retained
+framing buffer, queued morsels, and decoder outputs are charged to query memory;
+a record larger than the target stays intact and must fit the available budget.
+If it cannot fit, the resource error carries the object URI and the buffered
+record's decompressed offset while preserving the underlying budget details.
+LIMIT or cancellation stops the producer and parser lanes through the same
+query `TaskGroup`. Projection, row-group statistics, Hive partitions, and
+limits are applied before decoding where safe. Residual SQL filters always
+remain in the plan, so a source hint can never silently change query results.
 
 Blocking operators reserve retained state through a hierarchical engine/query
 memory pool. When the multi-lane Aggregate path is eligible, every supported
 aggregate (`COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`) produces lane-local partial
-states and a final merge; its hash partitions can Spill and recursively
-repartition with a new seed. Join uses an immutable shared build for parallel
-probe when it fits, Grace partitions on pressure, and switches to external
-sort-merge after two seeds do not shrink a partition. Duplicate-key groups are
-replayed in bounded chunks. Sort creates lane-local memory blocks or LZ4 Arrow
-IPC runs and performs a bounded k-way merge.
+states and a final merge. On pressure Aggregate evicts only its largest victim
+partition; survivors remain resident. Aggregate and Join choose a power-of-two
+fanout from 2 through 256 using measured bytes, recursively repartition with a
+new seed, and reuse one IPC stream per lane/partition/generation up to a 256 MiB
+rotation target. Join uses an immutable shared build for parallel probe when it
+fits, processes the largest spilled build partition first, admits lanes by
+estimated footprint, and switches to external sort-merge after repeated seeds
+do not shrink a partition. Duplicate-key groups are replayed in bounded chunks.
+Sort creates lane-local memory blocks or LZ4 Arrow IPC runs and performs a
+bounded k-way merge.
+
+`EngineConfig::execution` keeps the adaptive partition target, maximum
+repartition depth, optional Spill write-amplification limit, and runtime-filter
+memory budget together. `EngineConfig::csv_scan` separately controls
+single-file CSV parallelism and the decompressed morsel target. Both public
+configuration structs are non-exhaustive and have builder methods.
 
 `UNION ALL` compiles to a streaming Append over type-aligned inputs. DISTINCT
 set operations reuse the existing reservation-accounted Aggregate and Join
 operators: `UNION DISTINCT` groups the appended rows, while `INTERSECT` and
 `EXCEPT` de-duplicate both sides and use NULL-equal Semi or Anti joins.
-Query-level sorting and limiting run after the complete recursive set tree.
+`INTERSECT ALL`/`EXCEPT ALL` count NULL-equal whole rows on both sides and use a
+bounded streaming `Repeat` operator for the resulting multiplicity; they never
+collect the result. Query-level sorting and limiting run after the complete
+recursive set tree.
 
 Window execution sorts once for each shared `(PARTITION BY, ORDER BY, frame)`
 specification. It detects partition boundaries from evaluated keys, writes a
@@ -97,6 +124,14 @@ appear later in an `AND` chain, so they lower directly to membership, Semi, or
 Anti joins without retaining marker columns between filters. The physical-plan
 verifier rejects every remaining `OuterRef` or `DependentJoin`, so execution
 never falls back to evaluating a subquery once per outer row.
+
+A scalar aggregate with only equality correlation keys is grouped directly on
+the inner keys and left-joined once, avoiding an outer-domain distinct scan;
+COUNT restores the empty-group value zero while the other aggregates remain
+NULL. The Q21 `EXISTS value <> outer` plus late-filtered `NOT EXISTS` pair has a
+narrow identity-gated rewrite: identical table-function specs share one
+provider, one grouped scan computes all-row and late-row min/max summaries, and
+one left join evaluates both existence conditions with SQL NULL semantics.
 
 In the current alpha, parallel Aggregate and Sort, and the shared-build hash
 Join probe, require more than one configured lane and at least a 64 MiB query
@@ -144,9 +179,14 @@ outside the engine's ownership and budget; benchmark reports record RSS
 separately.
 
 Local contents rely on the operating-system page cache. The engine cache holds
-Parquet schema/footer metadata and separately keyed footer-plus-page-index
-metadata under an approximate byte-bounded LRU. Keys contain URI, size, ETag,
-and version; no decoded data page is retained.
+Parquet schema/footer, page-index, and Bloom metadata under one shared byte
+budget. Footer/page-index entries and Bloom entries maintain separate LRU
+orders; Bloom entries are evicted first so broadly reused file metadata stays
+resident. Keys contain URI, size, ETag, and version; Bloom keys also contain
+row-group/column/range identity. Concurrent misses are singleflighted with
+cancellation-aware waiters. A leader's query-local cancellation or memory
+failure is retried by a healthy waiter rather than shared. No decoded data page
+is retained.
 File discovery has a separate Engine-memory-derived metadata cap and avoids a
 second de-duplication set. Query snapshot entries retain memory reservations.
 Parquet reads its fixed trailer and reserves a conservative footer expansion
@@ -176,6 +216,10 @@ Scan nodes before join ordering and EXPLAIN; they never overwrite the shared
 Catalog entry or another concurrent query's snapshot.
 Cancellation races outstanding object requests, and S3 metrics include logical
 resolution, metadata, snapshot, and data requests plus transferred body bytes.
+CSV metrics separately report compressed/source bytes, decompressed bytes,
+record-aligned morsels, and peak parser lanes. Metadata metrics expose cache
+hits, misses, and time waiting on a shared in-flight metadata load; execution
+metrics also expose adaptive Spill/repartitioning and runtime-filter activity.
 
 Registered CSV tables keep a stable logical schema between explicit refreshes
 and require every newly discovered file to match the current physical CSV

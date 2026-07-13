@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict fixed-hardware parallel performance gate for RustDB v0.4."""
+"""Strict fixed-hardware parallel performance gate for RustDB releases."""
 
 from __future__ import annotations
 
@@ -12,23 +12,29 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
-from parallel_gate import GateError, evaluate
+from parallel_gate import (
+    DEFAULT_BASELINE_ENGINE_VERSION,
+    DEFAULT_CANDIDATE_ENGINE_VERSION,
+    GateError,
+    evaluate,
+)
 
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+DEFAULT_BASELINE_TAG = "v0.4.0-alpha.1"
 
 
-def baseline_build_id() -> str:
+def baseline_build_id(tag: str) -> str:
     try:
         return subprocess.run(
-            ["git", "rev-parse", "v0.2.0-alpha.1^{commit}"],
+            ["git", "rev-parse", f"{tag}^{{commit}}"],
             cwd=Path(__file__).resolve().parent.parent,
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as error:
-        raise GateError(f"cannot resolve local v0.2.0-alpha.1 tag: {error}") from error
+        raise GateError(f"cannot resolve local {tag} tag: {error}") from error
 
 
 def clean_candidate_build_id(root: Path | None = None) -> str:
@@ -116,7 +122,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", type=Path, required=True, help="candidate manifest.json")
     parser.add_argument(
-        "--baseline", type=Path, required=True, help="v0.2.0-alpha.1 manifest.json"
+        "--baseline", type=Path, required=True, help="baseline manifest.json"
+    )
+    parser.add_argument("--baseline-tag", default=DEFAULT_BASELINE_TAG)
+    parser.add_argument(
+        "--baseline-engine-version", default=DEFAULT_BASELINE_ENGINE_VERSION
+    )
+    parser.add_argument(
+        "--candidate-engine-version", default=DEFAULT_CANDIDATE_ENGINE_VERSION
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable results")
     args = parser.parse_args()
@@ -126,12 +139,14 @@ def main() -> int:
         cpu_model = actual_cpu_model()
         binary_sha256 = rebuild_candidate_binary_sha256(root)
         result = evaluate(
-            args.candidate.resolve(),
-            args.baseline.resolve(),
-            baseline_build_id(),
-            candidate_build_id,
-            binary_sha256,
-            cpu_model,
+            candidate_path=args.candidate.resolve(),
+            baseline_path=args.baseline.resolve(),
+            baseline_build_id=baseline_build_id(args.baseline_tag),
+            candidate_build_id=candidate_build_id,
+            candidate_binary_sha256=binary_sha256,
+            actual_cpu_model=cpu_model,
+            baseline_engine_version=args.baseline_engine_version,
+            candidate_engine_version=args.candidate_engine_version,
         )
     except GateError as error:
         print(f"parallel performance gate: FAIL: {error}", file=sys.stderr)
@@ -139,6 +154,10 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
+        print(
+            f"{result['candidate_engine_version']} versus "
+            f"{result['baseline_engine_version']}"
+        )
         for case, values in result["cases"].items():
             print(
                 f"{case}: {values['throughput_multiplier']:.3f}x parallel, "

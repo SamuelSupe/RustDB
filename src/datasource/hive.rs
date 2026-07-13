@@ -189,6 +189,9 @@ impl HivePartitions {
             ScanPredicate::And(predicates) => predicates
                 .iter()
                 .any(|predicate| self.predicate_prunes(file, predicate)),
+            ScanPredicate::Or(predicates) => predicates
+                .iter()
+                .all(|predicate| self.predicate_prunes(file, predicate)),
             ScanPredicate::Comparison { column, op, value } => {
                 let Some(partition) = column.checked_sub(self.physical_columns) else {
                     return false;

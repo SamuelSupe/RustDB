@@ -103,6 +103,28 @@ pub(super) fn pull(plan: LogicalPlan) -> Result<Pulled> {
                 scalar_aggregate: false,
             })
         }
+        LogicalPlan::Repeat {
+            input,
+            count,
+            schema,
+        } => {
+            let child = pull(*input)?;
+            if !child.correlations.is_empty() || count.contains_outer_ref() {
+                return Err(Error::Unsupported(
+                    "multiset set operations in a correlated subquery are not supported".into(),
+                ));
+            }
+            Ok(Pulled {
+                old_to_new: identity(schema.arrow().fields().len()),
+                plan: LogicalPlan::Repeat {
+                    input: Box::new(child.plan),
+                    count,
+                    schema,
+                },
+                correlations: Vec::new(),
+                scalar_aggregate: false,
+            })
+        }
         LogicalPlan::Window {
             input,
             expressions,

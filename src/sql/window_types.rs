@@ -7,6 +7,9 @@ pub(crate) enum WindowFunction {
     RowNumber,
     Rank,
     DenseRank,
+    Ntile(u64),
+    PercentRank,
+    CumeDist,
     Aggregate(AggregateExpr),
 }
 

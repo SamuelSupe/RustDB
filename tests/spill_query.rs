@@ -111,10 +111,7 @@ async fn high_cardinality_aggregate_spills_and_cleans_query_directory() -> Resul
         .register_csv(
             "events",
             [csv.to_string_lossy().into_owned()],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
 
@@ -183,10 +180,7 @@ async fn hash_join_spills_and_cleans_query_directory() -> Result<()> {
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
     let spill_root = config.spill.directory.clone();
     let session = Engine::new(config)?.session();
-    let csv_options = CsvOptions {
-        header: CsvHeader::Present,
-        ..CsvOptions::default()
-    };
+    let csv_options = CsvOptions::builder().header(CsvHeader::Present).build();
     session
         .register_csv(
             "left_rows",
@@ -274,10 +268,7 @@ async fn left_hash_join_spills_preserves_unmatched_rows_and_cleans_up() -> Resul
     let config = low_memory_config(temp.path(), MEMORY_LIMIT);
     let spill_root = config.spill.directory.clone();
     let session = Engine::new(config)?.session();
-    let csv_options = CsvOptions {
-        header: CsvHeader::Present,
-        ..CsvOptions::default()
-    };
+    let csv_options = CsvOptions::builder().header(CsvHeader::Present).build();
     session
         .register_csv(
             "left_outer_rows",
@@ -380,10 +371,7 @@ async fn order_by_top_k_and_full_sort_spill_and_cleanup() -> Result<()> {
             csv_files
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned()),
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
 
@@ -467,10 +455,7 @@ async fn dropping_a_partially_consumed_spilling_query_reaps_after_quiescence() -
             csv_files
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned()),
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
 
@@ -527,10 +512,7 @@ async fn cancelling_a_spilling_distinct_query_releases_its_directory() -> Result
         .register_csv(
             "distinct_cancel",
             [csv.to_string_lossy().into_owned()],
-            CsvOptions {
-                header: CsvHeader::Present,
-                ..CsvOptions::default()
-            },
+            CsvOptions::builder().header(CsvHeader::Present).build(),
         )
         .await?;
 

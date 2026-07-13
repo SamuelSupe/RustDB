@@ -153,25 +153,38 @@ pub(super) fn compact_pending_runs(
     pool: &MemoryPool,
     batch_size: usize,
 ) -> Result<()> {
-    if cleanup.len() <= MAX_PENDING_RUNS {
-        return Ok(());
+    while let Some((level, group)) = cleanup.compaction_group() {
+        context.check_cancelled()?;
+        let merge = MergeIterator::new(
+            &group,
+            expressions.to_vec(),
+            fetch,
+            Arc::clone(schema),
+            Arc::clone(context),
+            pool.reservation(),
+            batch_size,
+        )?;
+        let merged = context
+            .spill
+            .write_batches("sort-merge", Arc::clone(schema), merge)?;
+        // Publish the replacement before removing its inputs so any cleanup
+        // or deletion failure still leaves every live file owned by the query.
+        cleanup.add_at_level(merged, level.saturating_add(1));
+        for old in &group {
+            cleanup.remove(old)?;
+        }
     }
-    compact_runs(
-        cleanup.files(),
-        cleanup,
-        expressions,
-        fetch,
-        schema,
-        context,
-        pool,
-        batch_size,
-    )?;
     Ok(())
 }
 
 pub(super) struct RunCleanup {
     spill: SpillManager,
-    files: Vec<SpillFile>,
+    files: Vec<TrackedRun>,
+}
+
+struct TrackedRun {
+    file: SpillFile,
+    level: usize,
 }
 
 impl RunCleanup {
@@ -183,21 +196,40 @@ impl RunCleanup {
     }
 
     pub(super) fn add(&mut self, file: SpillFile) {
-        self.files.push(file);
+        self.add_at_level(file, 0);
+    }
+
+    fn add_at_level(&mut self, file: SpillFile, level: usize) {
+        self.files.push(TrackedRun { file, level });
     }
 
     fn remove(&mut self, file: &SpillFile) -> Result<()> {
         self.spill.remove_file(file)?;
-        self.files.retain(|candidate| candidate != file);
+        self.files.retain(|candidate| &candidate.file != file);
         Ok(())
     }
 
     pub(super) fn files(&self) -> Vec<SpillFile> {
-        self.files.clone()
+        self.files
+            .iter()
+            .map(|tracked| tracked.file.clone())
+            .collect()
     }
 
-    fn len(&self) -> usize {
-        self.files.len()
+    fn compaction_group(&self) -> Option<(usize, Vec<SpillFile>)> {
+        let mut levels = self.files.iter().map(|run| run.level).collect::<Vec<_>>();
+        levels.sort_unstable();
+        levels.dedup();
+        levels.into_iter().find_map(|level| {
+            let group = self
+                .files
+                .iter()
+                .filter(|run| run.level == level)
+                .take(MERGE_FAN_IN)
+                .map(|run| run.file.clone())
+                .collect::<Vec<_>>();
+            (group.len() == MERGE_FAN_IN).then_some((level, group))
+        })
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -207,9 +239,9 @@ impl RunCleanup {
 
 impl Drop for RunCleanup {
     fn drop(&mut self) {
-        for file in &self.files {
-            if let Err(error) = self.spill.remove_file(file) {
-                tracing::error!(%error, path = %file.path().display(), "failed to remove spill run");
+        for run in &self.files {
+            if let Err(error) = self.spill.remove_file(&run.file) {
+                tracing::error!(%error, path = %run.file.path().display(), "failed to remove spill run");
             }
         }
     }

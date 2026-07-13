@@ -1,8 +1,8 @@
-use std::{collections::VecDeque, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Barrier, Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -11,21 +11,24 @@ use crate::{
     sql::{BoundExpr, JoinType},
 };
 
+mod admission;
+mod build;
+
+use admission::BuildAdmission;
+use build::{TaskHashBuild, load_with_admission};
+
 use super::{
-    EvaluatedKeys, ProbeCursor,
+    ProbeCursor,
     condition::JoinPredicates,
-    evaluate_keys_accounted, evaluate_optional_values,
-    matched::BuildMatchTracker,
-    optional_array, optional_memory,
+    evaluate_keys_accounted, evaluate_optional_values, optional_array, optional_memory,
     output::build_unmatched_right_envelope,
-    probe::try_build_hash_table_with_nulls,
     sort_merge,
-    spill::{self, BuildPartition, MAX_REPARTITION_DEPTH, PartitionTask},
+    spill::{self, PartitionTask},
 };
 
 const MIN_MEMORY_PER_LANE: usize = 512 << 10;
 
-pub(super) fn is_supported(context: &QueryContext, tasks: usize) -> bool {
+pub(super) fn is_supported(context: &QueryContext, tasks: &[PartitionTask]) -> bool {
     lane_count(context, tasks) > 1
 }
 
@@ -44,14 +47,16 @@ pub(super) fn join(
     batch_size: usize,
 ) -> MemoryBatchStream {
     boxed_memory_batch_stream(async_stream::try_stream! {
-        let lanes = lane_count(&context, tasks.len());
-        let pending = Arc::new(Mutex::new(VecDeque::from(tasks)));
+        let lanes = lane_count(&context, &tasks);
+        let admission = BuildAdmission::new(context.memory.limit());
+        let pending = Arc::new(Mutex::new(tasks));
+        let workers_ready = Arc::new(Barrier::new(lanes));
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = CancelOnDrop(cancellation.clone());
         let (sender, mut receiver) = mpsc::channel(lanes.saturating_mul(2).max(2));
 
         for _ in 0..lanes {
-            context.tasks.spawn("grace-join-worker", run_worker(
+            let worker = run_worker(
                 Arc::clone(&pending),
                 sender.clone(),
                 cancellation.clone(),
@@ -65,8 +70,13 @@ pub(super) fn join(
                 Arc::clone(&schema),
                 Arc::clone(&context),
                 batch_size.max(1),
-                lanes,
-            ))?;
+                admission.clone(),
+                Arc::clone(&workers_ready),
+            );
+            if let Err(error) = context.tasks.spawn("grace-join-worker", worker) {
+                cancellation.cancel();
+                Err(error)?;
+            }
         }
         drop(pending);
         // Keep the coordinator sender alive until all workers report Done.
@@ -104,7 +114,7 @@ enum WorkerMessage {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_worker(
-    pending: Arc<Mutex<VecDeque<PartitionTask>>>,
+    pending: Arc<Mutex<Vec<PartitionTask>>>,
     sender: mpsc::Sender<WorkerMessage>,
     cancellation: CancellationToken,
     left_key_expressions: Vec<BoundExpr>,
@@ -117,8 +127,14 @@ async fn run_worker(
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
-    worker_lanes: usize,
+    admission: BuildAdmission,
+    workers_ready: Arc<Barrier>,
 ) -> Result<()> {
+    tokio::select! {
+        _ = workers_ready.wait() => {}
+        _ = cancellation.cancelled() => return Err(Error::Cancelled),
+        _ = context.control.cancelled() => return Err(Error::Cancelled),
+    }
     run_worker_inner(
         pending,
         &sender,
@@ -133,7 +149,7 @@ async fn run_worker(
         &schema,
         &context,
         batch_size,
-        worker_lanes,
+        &admission,
     )
     .await?;
     sender
@@ -144,7 +160,7 @@ async fn run_worker(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_worker_inner(
-    pending: Arc<Mutex<VecDeque<PartitionTask>>>,
+    pending: Arc<Mutex<Vec<PartitionTask>>>,
     sender: &mpsc::Sender<WorkerMessage>,
     cancellation: &CancellationToken,
     left_key_expressions: &[BoundExpr],
@@ -157,78 +173,30 @@ async fn run_worker_inner(
     schema: &SchemaRef,
     context: &Arc<QueryContext>,
     batch_size: usize,
-    worker_lanes: usize,
+    admission: &BuildAdmission,
 ) -> Result<()> {
     loop {
-        let task = { pending.lock().await.pop_front() };
+        let task = {
+            let mut pending = pending.lock().await;
+            spill::pop_largest_task(&mut pending)
+        };
         let Some(task) = task else { break };
         let mut local = vec![task];
-        let worker_pool = context.memory.child(
-            format!("Grace-join-worker-{}", context.query_id),
-            grace_worker_limit(context.memory.limit(), worker_lanes),
-        );
-        let mut reservation = worker_pool.reservation();
-        while let Some(task) = local.pop() {
+        while let Some(task) = spill::pop_largest_task(&mut local) {
             check_running(cancellation, context)?;
-            let build = {
-                let _active = context.scheduler.enter_lane();
-                match spill::load_build_partition(
-                    &task.right,
-                    right_schema,
-                    context,
-                    &mut reservation,
-                )? {
-                    BuildPartition::Loaded(right_batch) => {
-                        let right_keys = evaluate_keys_accounted(
-                            right_key_expressions,
-                            &right_batch,
-                            context,
-                            "Grace join build keys",
-                        )?;
-                        let rows = right_batch.num_rows();
-                        let hash_table = try_build_hash_table_with_nulls(
-                            &right_keys,
-                            rows,
-                            super::can_deduplicate_build(join_type, predicates),
-                            null_equal_keys,
-                            &mut reservation,
-                        )?;
-                        drop(right_keys);
-                        let right_values = evaluate_optional_values(
-                            predicates.right_value(),
-                            &right_batch,
-                            context,
-                            "Grace join build membership value",
-                        )?;
-                        match hash_table {
-                            Some(hash_table)
-                                if let Some(matched_build) = super::try_build_match_tracker(
-                                    join_type,
-                                    rows,
-                                    &mut reservation,
-                                ) =>
-                            {
-                                TaskHashBuild::Ready(
-                                    right_batch,
-                                    hash_table,
-                                    right_values,
-                                    matched_build,
-                                )
-                            }
-                            Some(hash_table) => {
-                                drop(hash_table);
-                                drop(right_values);
-                                TaskHashBuild::TooLarge(rows)
-                            }
-                            None => {
-                                drop(right_values);
-                                TaskHashBuild::TooLarge(rows)
-                            }
-                        }
-                    }
-                    BuildPartition::TooLarge { rows } => TaskHashBuild::TooLarge(rows),
-                }
-            };
+            let (build, mut reservation, build_permit) = load_with_admission(
+                &task,
+                admission,
+                cancellation,
+                right_key_expressions,
+                right_schema,
+                predicates,
+                null_equal_keys,
+                join_type,
+                left_schema.fields().len(),
+                context,
+            )
+            .await?;
             match build {
                 TaskHashBuild::Ready(right_batch, hash_table, right_values, matched_build) => {
                     for file in &task.left {
@@ -310,7 +278,9 @@ async fn run_worker_inner(
                 }
                 TaskHashBuild::TooLarge(rows) => {
                     reservation.try_resize(0)?;
-                    if task.depth < MAX_REPARTITION_DEPTH {
+                    drop(reservation);
+                    drop(build_permit);
+                    if task.depth < context.execution.max_repartition_depth {
                         let next_depth = task.depth + 1;
                         let repartitioned = {
                             let _active = context.scheduler.enter_lane();
@@ -332,7 +302,7 @@ async fn run_worker_inner(
                             } else {
                                 task.stagnant_repartitions + 1
                             };
-                            local.extend(repartitioned.tasks.into_iter().rev().map(|mut child| {
+                            local.extend(repartitioned.tasks.into_iter().map(|mut child| {
                                 child.stagnant_repartitions = stagnant;
                                 child
                             }));
@@ -357,7 +327,6 @@ async fn run_worker_inner(
                     while let Some(output) = fallback.next().await {
                         send(sender, output?, cancellation, context).await?;
                     }
-                    reservation.try_resize(0)?;
                 }
             }
         }
@@ -365,24 +334,11 @@ async fn run_worker_inner(
     Ok(())
 }
 
-fn grace_worker_limit(query_limit: usize, lanes: usize) -> usize {
-    // Bound all concurrent partition hash tables to three quarters of the
-    // query budget, leaving room for decoded probe batches, output queues,
-    // and downstream operators such as COUNT(*).
-    query_limit
-        .checked_div(4)
-        .unwrap_or(0)
-        .saturating_mul(3)
-        .checked_div(lanes.max(1))
-        .unwrap_or(0)
-        .max(1)
-}
-
-fn lane_count(context: &QueryContext, tasks: usize) -> usize {
+fn lane_count(context: &QueryContext, tasks: &[PartitionTask]) -> usize {
     memory_bounded_lane_count(
         context.memory.limit(),
         context.scheduler.configured_lanes(),
-        tasks,
+        tasks.len(),
     )
 }
 
@@ -392,16 +348,6 @@ fn memory_bounded_lane_count(query_limit: usize, configured_lanes: usize, tasks:
         .unwrap_or(0)
         .max(1);
     configured_lanes.min(tasks).min(memory_lanes).max(1)
-}
-
-enum TaskHashBuild {
-    Ready(
-        arrow::record_batch::RecordBatch,
-        std::collections::HashMap<Vec<super::CellValue>, Vec<u32>>,
-        Option<EvaluatedKeys>,
-        Option<BuildMatchTracker>,
-    ),
-    TooLarge(usize),
 }
 
 async fn send(
@@ -438,17 +384,12 @@ impl Drop for CancelOnDrop {
 
 #[cfg(test)]
 mod tests {
-    use super::{grace_worker_limit, memory_bounded_lane_count};
+    use super::memory_bounded_lane_count;
 
     #[test]
-    fn low_memory_limits_lanes_and_splits_the_build_budget_across_actual_workers() {
+    fn low_memory_limits_worker_count() {
         let memory_limit = 2 << 20;
-        let lanes = memory_bounded_lane_count(memory_limit, 18, 64);
-        assert_eq!(lanes, 4);
-        assert_eq!(
-            grace_worker_limit(memory_limit, lanes) * lanes,
-            3 * (memory_limit / 4)
-        );
+        assert_eq!(memory_bounded_lane_count(memory_limit, 18, 64), 4);
     }
 
     #[test]
@@ -456,5 +397,10 @@ mod tests {
         assert_eq!(memory_bounded_lane_count(128 << 20, 18, 64), 18);
         assert_eq!(memory_bounded_lane_count(128 << 20, 18, 2), 2);
         assert_eq!(memory_bounded_lane_count(128 << 20, 1, 64), 1);
+    }
+
+    #[test]
+    fn footprint_is_admitted_dynamically_instead_of_pre_slicing_workers() {
+        assert_eq!(memory_bounded_lane_count(64 << 20, 8, 8), 8);
     }
 }

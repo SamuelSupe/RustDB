@@ -69,9 +69,10 @@ async fn optimizer_prunes_q20_shaped_subquery_attachments() {
         explain.contains("Scan table=partsupp_pruning projection=Some([0, 1, 2])"),
         "{explain}"
     );
-    assert!(
-        explain.contains("Scan table=partsupp_pruning projection=Some([0, 1])"),
-        "{explain}"
+    assert_eq!(
+        explain.matches("Scan table=partsupp_pruning").count(),
+        1,
+        "direct equality aggregation must not clone the outer domain scan:\n{explain}"
     );
     assert!(
         !explain.contains("Scan table=partsupp_pruning projection=Some([0, 1, 2, 3, 4])"),

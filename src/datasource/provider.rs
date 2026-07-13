@@ -10,7 +10,7 @@ use crate::{
         BatchEnvelope, MemoryBatchStream, QueryContext, RecordBatchStream,
         boxed_memory_batch_stream, estimate_schema_batch_bytes,
     },
-    storage::ObjectSource,
+    storage::{ObjectSnapshot, ObjectSource},
 };
 
 /// Coarse statistics available before a scan starts.
@@ -19,6 +19,50 @@ pub struct TableStatistics {
     pub row_count: Option<u64>,
     pub total_byte_size: Option<u64>,
     pub file_count: usize,
+}
+
+/// Stable identity for scans that read the same object snapshot or unresolved
+/// location specification with equivalent source semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableSourceIdentity {
+    format: &'static str,
+    sources: SourceSetIdentity,
+    semantics: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceSetIdentity {
+    Objects(Vec<(String, ObjectSnapshot)>),
+    Locations(Vec<String>),
+}
+
+impl TableSourceIdentity {
+    pub(crate) fn from_objects(
+        format: &'static str,
+        files: &[ObjectSource],
+        semantics: String,
+    ) -> Self {
+        let mut objects = files
+            .iter()
+            .map(|file| (file.uri().to_owned(), file.snapshot().clone()))
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| left.0.cmp(&right.0));
+        Self {
+            format,
+            sources: SourceSetIdentity::Objects(objects),
+            semantics,
+        }
+    }
+
+    pub(crate) fn from_spec(format: &'static str, locations: &[String], semantics: String) -> Self {
+        let mut locations = locations.to_vec();
+        locations.sort();
+        Self {
+            format,
+            sources: SourceSetIdentity::Locations(locations),
+            semantics,
+        }
+    }
 }
 
 /// A value that can be compared with file or row-group statistics.
@@ -66,6 +110,9 @@ pub enum ScanPredicate {
         column: usize,
     },
     And(Vec<ScanPredicate>),
+    /// A same-column disjunction. Sources may prune it only when every branch
+    /// is proven impossible; execution always retains the residual predicate.
+    Or(Vec<ScanPredicate>),
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +195,17 @@ pub trait TableProvider: Send + Sync {
     fn schema(&self) -> SchemaRef;
 
     fn statistics(&self) -> TableStatistics;
+
+    /// Identifies providers whose scans are semantically interchangeable for
+    /// one optimizer snapshot. Unknown providers retain pointer-only identity.
+    fn source_identity(&self) -> Option<TableSourceIdentity> {
+        None
+    }
+
+    /// Short source-specific details appended to a Scan in EXPLAIN.
+    fn explain_scan(&self) -> Option<String> {
+        None
+    }
 
     /// Returns statistics for the object set fixed in `context`. Registered
     /// external tables override this after query preparation; the default is

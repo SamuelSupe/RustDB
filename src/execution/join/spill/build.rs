@@ -1,15 +1,13 @@
 use std::{mem::size_of, sync::Arc};
 
-use arrow::{
-    array::{ArrayData, ArrayRef},
-    datatypes::SchemaRef,
-    record_batch::RecordBatch,
-};
+use arrow::{array::ArrayRef, datatypes::SchemaRef, record_batch::RecordBatch};
 
 use crate::{
     Result,
-    runtime::{BatchEnvelope, MemoryReservation, QueryContext, SpillFile},
+    runtime::{MemoryReservation, QueryContext, SpillFile},
 };
+
+use super::BuildPartitionStats;
 
 const COMPACTION_FAN_IN: usize = 64;
 const IPC_BLOCK_METADATA_BYTES: usize = 64;
@@ -20,54 +18,24 @@ pub(in crate::execution::join) enum BuildPartition {
     TooLarge { rows: usize },
 }
 
-#[derive(Default)]
-struct BuildFootprint {
-    buffer_bytes: usize,
-    rows: usize,
-    max_source_batch_bytes: usize,
-    max_file_reader_metadata: usize,
-}
-
-impl BuildFootprint {
-    fn observe_batch(&mut self, batch: &RecordBatch) {
-        self.buffer_bytes = self
-            .buffer_bytes
-            .saturating_add(batch_logical_buffer_bytes(batch));
-        self.rows = self.rows.saturating_add(batch.num_rows());
-        self.max_source_batch_bytes = self
-            .max_source_batch_bytes
-            .max(batch.get_array_memory_size());
-    }
-
-    fn finish_file(&mut self, source_batches: usize) {
-        self.max_file_reader_metadata = self
-            .max_file_reader_metadata
-            .max(source_batches.saturating_mul(IPC_BLOCK_METADATA_BYTES));
-    }
-}
-
 pub(in crate::execution::join) fn load_build_partition(
     files: &[SpillFile],
     schema: &SchemaRef,
     context: &QueryContext,
     reservation: &mut MemoryReservation,
+    stats: BuildPartitionStats,
 ) -> Result<BuildPartition> {
-    let mut footprint = BuildFootprint::default();
-    for file in files {
-        let mut source_batches = 0usize;
-        for batch in context.spill.read_file(file)? {
-            let batch =
-                BatchEnvelope::try_new(batch?, &context.memory, "join build footprint batch")?;
-            footprint.observe_batch(batch.batch());
-            source_batches = source_batches.saturating_add(1);
-        }
-        footprint.finish_file(source_batches);
-    }
-    let required = estimated_build_bytes(&footprint, files.len(), schema.fields().len());
+    // Manifest statistics replace the former measurement read. Reserve the
+    // retained buffers, one concat output, and IPC block metadata up front.
+    let required = compaction_reservation_bytes(
+        stats.data_bytes,
+        stats.batches,
+        stats.max_batch_bytes,
+        files.len(),
+        schema.fields().len(),
+    );
     if reservation.try_resize(required).is_err() {
-        return Ok(BuildPartition::TooLarge {
-            rows: footprint.rows,
-        });
+        return Ok(BuildPartition::TooLarge { rows: stats.rows });
     }
 
     let mut batches = Vec::with_capacity(files.len());
@@ -84,11 +52,29 @@ pub(in crate::execution::join) fn load_build_partition(
     {
         drop(batch);
         reservation.try_resize(0)?;
-        return Ok(BuildPartition::TooLarge {
-            rows: footprint.rows,
-        });
+        return Ok(BuildPartition::TooLarge { rows: stats.rows });
     }
     Ok(BuildPartition::Loaded(batch))
+}
+
+fn compaction_reservation_bytes(
+    data_bytes: usize,
+    batches: usize,
+    max_batch_bytes: usize,
+    files: usize,
+    columns: usize,
+) -> usize {
+    let retained_metadata = size_of::<RecordBatch>()
+        .saturating_add(
+            columns
+                .saturating_mul(size_of::<ArrayRef>().saturating_add(CONCAT_ARRAY_METADATA_BYTES)),
+        )
+        .saturating_mul(files.max(1));
+    data_bytes
+        .saturating_mul(2)
+        .saturating_add(max_batch_bytes)
+        .saturating_add(batches.saturating_mul(IPC_BLOCK_METADATA_BYTES))
+        .saturating_add(retained_metadata)
 }
 
 fn compact_spill_file(
@@ -135,46 +121,4 @@ fn compact_batches(
         batches = next;
     }
     Ok(batches.pop())
-}
-
-fn batch_logical_buffer_bytes(batch: &RecordBatch) -> usize {
-    batch.columns().iter().fold(0usize, |bytes, array| {
-        bytes.saturating_add(array_data_logical_buffer_bytes(&array.to_data()))
-    })
-}
-
-fn array_data_logical_buffer_bytes(data: &ArrayData) -> usize {
-    let buffers = data
-        .buffers()
-        .iter()
-        .fold(0usize, |bytes, buffer| bytes.saturating_add(buffer.len()));
-    let nulls = data.nulls().map(|nulls| nulls.buffer().len()).unwrap_or(0);
-    data.child_data()
-        .iter()
-        .fold(buffers.saturating_add(nulls), |bytes, child| {
-            bytes.saturating_add(array_data_logical_buffer_bytes(child))
-        })
-}
-
-fn estimated_build_bytes(
-    footprint: &BuildFootprint,
-    retained_batches: usize,
-    columns: usize,
-) -> usize {
-    let retained_metadata = size_of::<RecordBatch>()
-        .saturating_add(
-            columns
-                .saturating_mul(size_of::<ArrayRef>().saturating_add(CONCAT_ARRAY_METADATA_BYTES)),
-        )
-        .saturating_mul(retained_batches.max(1));
-    footprint
-        .buffer_bytes
-        .saturating_mul(2)
-        .saturating_add(retained_metadata)
-        .saturating_add(
-            footprint
-                .max_source_batch_bytes
-                .saturating_mul(COMPACTION_FAN_IN),
-        )
-        .saturating_add(footprint.max_file_reader_metadata)
 }

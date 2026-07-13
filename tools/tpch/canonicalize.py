@@ -27,8 +27,10 @@ def canonical_value(value: str) -> str:
         number = Decimal(value)
     except InvalidOperation:
         return value
-    if not number.is_finite():
-        return value
+    if number.is_nan():
+        return "nan"
+    if number.is_infinite():
+        return "-infinity" if number.is_signed() else "infinity"
     if number == number.to_integral_value():
         return str(number.quantize(Decimal(1)))
     rounded = number.quantize(QUANTUM, rounding=ROUND_HALF_EVEN)

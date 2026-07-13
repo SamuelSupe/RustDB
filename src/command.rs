@@ -312,10 +312,9 @@ impl ViewTable {
             statement,
             generated_tables,
         } = prepared;
+        let _generated_tables =
+            crate::table_function::GeneratedTablesGuard::new(&self.catalog, generated_tables);
         let planned = crate::sql::bind_statement(&self.catalog, statement);
-        for name in generated_tables {
-            self.catalog.unregister(&name);
-        }
         let StatementPlan::Query(plan) = planned? else {
             return Err(Error::Internal(
                 "temporary view query produced an EXPLAIN plan".into(),
@@ -384,7 +383,7 @@ impl TableProvider for ViewTable {
     }
 
     async fn prepare(&self, context: Arc<QueryContext>) -> Result<()> {
-        let _expansion = context.enter_view(&self.name)?;
+        let _preparation = context.enter_view_preparation(&self.name)?;
         if let Some(plan) = context.view_plan(&self.name) {
             return crate::execution::prepare_plan(&plan, context).await;
         }

@@ -96,9 +96,11 @@ impl ActiveFiles {
         Ok(())
     }
 
-    pub(super) fn remove(&self, path: &Path) {
-        let entry = self.entries.lock().remove(path);
+    pub(super) fn remove(&self, path: &Path) -> Option<u64> {
+        let entry = self.entries.lock().remove(path)?;
+        let bytes = entry.charge.as_ref().map(SpillCharge::bytes).unwrap_or(0);
         drop(entry);
+        Some(bytes)
     }
 
     pub(super) fn clear(&self) {

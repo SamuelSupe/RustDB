@@ -174,6 +174,15 @@ impl SpillWriter {
         }
     }
 
+    /// Bytes serialized into the buffered IPC stream but not yet charged to
+    /// Spill metrics by the I/O layer.
+    pub(crate) fn pending_write_bytes(&self) -> u64 {
+        self.writer
+            .as_ref()
+            .map(|writer| u64::try_from(writer.get_ref().buffer().len()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+
     pub(crate) fn finish(mut self, partitions: u64) -> Result<SpillFile> {
         self.state.ensure_active()?;
         self.install_copy_memory()?;

@@ -64,6 +64,17 @@ class CanonicalizeTests(unittest.TestCase):
 
             self.assertEqual(canonical_bytes(arrow), canonical_bytes(duckdb))
 
+    def test_special_float_spellings_are_case_insensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            arrow = Path(directory, "arrow.csv")
+            duckdb = Path(directory, "duckdb.csv")
+            arrow.write_text("value\nNaN\ninf\n-inf\n", encoding="utf-8")
+            duckdb.write_text(
+                "value\nnan\nInfinity\n-Infinity\n", encoding="utf-8"
+            )
+
+            self.assertEqual(canonical_bytes(arrow), canonical_bytes(duckdb))
+
 
 if __name__ == "__main__":
     unittest.main()

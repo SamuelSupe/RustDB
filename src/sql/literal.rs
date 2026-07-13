@@ -26,6 +26,7 @@ pub(super) fn bind_value(value: &Value) -> Result<BoundExpr> {
                 Error::InvalidArgument(format!("integer literal '{value}' is out of range"))
             })?),
         },
+        Value::HexStringLiteral(value) => ScalarValue::Binary(parse_hex(value)?),
         value if string_value(value).is_some() => ScalarValue::Utf8(
             string_value(value)
                 .expect("checked string literal")
@@ -38,6 +39,26 @@ pub(super) fn bind_value(value: &Value) -> Result<BoundExpr> {
         }
     };
     Ok(BoundExpr::literal(value))
+}
+
+fn parse_hex(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return Err(Error::InvalidArgument(
+            "hexadecimal binary literal must contain an even number of digits".into(),
+        ));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|digits| {
+            let text = std::str::from_utf8(digits).expect("hex literal is ASCII");
+            u8::from_str_radix(text, 16).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "hexadecimal binary literal contains invalid digits '{text}'"
+                ))
+            })
+        })
+        .collect()
 }
 
 pub(super) fn bind_typed_string(value: &TypedString) -> Result<BoundExpr> {

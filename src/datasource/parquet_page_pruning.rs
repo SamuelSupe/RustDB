@@ -21,6 +21,9 @@ pub(super) fn supports_page_index(predicate: Option<&ScanPredicate>) -> bool {
         ScanPredicate::And(predicates) => predicates
             .iter()
             .any(|predicate| supports_page_index(Some(predicate))),
+        ScanPredicate::Or(predicates) => predicates
+            .iter()
+            .all(|predicate| supports_page_index(Some(predicate))),
         ScanPredicate::Comparison { .. }
         | ScanPredicate::IsNull { .. }
         | ScanPredicate::IsNotNull { .. } => true,
@@ -44,15 +47,15 @@ pub(super) fn prune_pages(
     let mut ranges = vec![0..rows];
     let mut used_index = false;
     let mut pages_pruned = 0_u64;
-    for atom in atoms(predicate) {
-        let Some(atom_ranges) = atom_ranges(
+    for conjunct in conjuncts(predicate) {
+        let Some(atom_ranges) = predicate_ranges(
             uri,
             metadata,
             file_schema,
             table_schema,
             row_group,
             rows,
-            atom,
+            conjunct,
         )?
         else {
             continue;
@@ -78,6 +81,58 @@ pub(super) fn prune_pages(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn predicate_ranges(
+    uri: &str,
+    metadata: &ParquetMetaData,
+    file_schema: &Schema,
+    table_schema: &Schema,
+    row_group: usize,
+    rows: usize,
+    predicate: &ScanPredicate,
+) -> Result<Option<AtomRanges>> {
+    let ScanPredicate::Or(predicates) = predicate else {
+        return atom_ranges(
+            uri,
+            metadata,
+            file_schema,
+            table_schema,
+            row_group,
+            rows,
+            predicate,
+        );
+    };
+    if predicates.is_empty() {
+        return Ok(Some(AtomRanges {
+            ranges: Vec::new(),
+            pages_pruned: 0,
+        }));
+    }
+    let mut ranges = Vec::new();
+    for predicate in predicates {
+        let Some(branch) = predicate_ranges(
+            uri,
+            metadata,
+            file_schema,
+            table_schema,
+            row_group,
+            rows,
+            predicate,
+        )?
+        else {
+            return Ok(None);
+        };
+        ranges = union_ranges(&ranges, &branch.ranges);
+    }
+    Ok(Some(AtomRanges {
+        ranges,
+        // Different OR branches may exclude disjoint pages. Without carrying
+        // page identities through the union, zero is the only conservative
+        // metric even though the final RowSelection remains exact.
+        pages_pruned: 0,
+    }))
+}
+
 struct AtomRanges {
     ranges: Vec<Range<usize>>,
     pages_pruned: u64,
@@ -97,7 +152,7 @@ fn atom_ranges(
         ScanPredicate::Comparison { column, .. }
         | ScanPredicate::IsNull { column }
         | ScanPredicate::IsNotNull { column } => *column,
-        ScanPredicate::And(_) => return Ok(None),
+        ScanPredicate::And(_) | ScanPredicate::Or(_) => return Ok(None),
     };
     let Some((file_column, leaf)) = column_leaf(metadata, file_schema, table_schema, table_column)
     else {
@@ -171,17 +226,17 @@ fn atom_ranges(
     }))
 }
 
-fn atoms(predicate: &ScanPredicate) -> Vec<&ScanPredicate> {
+fn conjuncts(predicate: &ScanPredicate) -> Vec<&ScanPredicate> {
     let mut output = Vec::new();
-    collect_atoms(predicate, &mut output);
+    collect_conjuncts(predicate, &mut output);
     output
 }
 
-fn collect_atoms<'a>(predicate: &'a ScanPredicate, output: &mut Vec<&'a ScanPredicate>) {
+fn collect_conjuncts<'a>(predicate: &'a ScanPredicate, output: &mut Vec<&'a ScanPredicate>) {
     match predicate {
         ScanPredicate::And(predicates) => {
             for predicate in predicates {
-                collect_atoms(predicate, output);
+                collect_conjuncts(predicate, output);
             }
         }
         _ => output.push(predicate),
@@ -261,7 +316,7 @@ fn page_excluded(
         ScanPredicate::Comparison { op, value, .. } => {
             index.is_null_page(page) || comparison_excludes(index, data_type, *op, value, page)
         }
-        ScanPredicate::And(_) => false,
+        ScanPredicate::And(_) | ScanPredicate::Or(_) => false,
     }
 }
 
@@ -293,6 +348,26 @@ fn intersect_ranges(left: &[Range<usize>], right: &[Range<usize>]) -> Vec<Range<
     output
 }
 
+fn union_ranges(left: &[Range<usize>], right: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut ranges = left
+        .iter()
+        .chain(right)
+        .cloned()
+        .collect::<Vec<Range<usize>>>();
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut output: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = output.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            output.push(range);
+        }
+    }
+    output
+}
+
 fn page_error(uri: &str, row_group: usize, column: &str, reason: &str) -> Error {
     Error::Execution(format!(
         "invalid Parquet page index in '{uri}', row group {row_group}, column '{column}': {reason}"
@@ -301,7 +376,7 @@ fn page_error(uri: &str, row_group: usize, column: &str, reason: &str) -> Error 
 
 #[cfg(test)]
 mod tests {
-    use super::{intersect_ranges, page_error};
+    use super::{intersect_ranges, page_error, union_ranges};
 
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
@@ -309,6 +384,14 @@ mod tests {
         assert_eq!(
             intersect_ranges(&[0..10, 20..30], &[5..25]),
             vec![5..10, 20..25]
+        );
+    }
+
+    #[test]
+    fn unions_disjunctive_page_ranges_without_row_bitmaps() {
+        assert_eq!(
+            union_ranges(&[0..10, 20..30], &[5..25, 40..50]),
+            vec![0..30, 40..50]
         );
     }
 

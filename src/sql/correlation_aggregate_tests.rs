@@ -8,12 +8,12 @@ use arrow::{
 use async_trait::async_trait;
 use futures::{TryStreamExt, stream};
 
-use crate::datasource::{ScanRequest, TableProvider, TableStatistics};
+use crate::datasource::{ScanRequest, TableProvider, TableSourceIdentity, TableStatistics};
 use crate::execution::execute;
 use crate::runtime::{MemoryPool, QueryContext, RecordBatchStream, boxed_record_batch_stream};
 use crate::{Catalog, Error, Result, TableEntry};
 
-use super::plan_sql;
+use super::{StatementPlan, plan_sql};
 
 #[test]
 fn aggregate_projection_and_having_require_grouped_outer_dependencies() {
@@ -132,14 +132,11 @@ fn deferred_having_still_requires_boolean() {
 
 #[tokio::test]
 async fn aggregate_results_can_drive_uncorrelated_in_in_select_and_having() {
-    let batches = run(
-        &Catalog::default(),
-        "SELECT count(*) IN (SELECT 1) AS selected, \
+    let sql = "SELECT count(*) IN (SELECT 1) AS selected, \
                 (sum(o.value) + o.grp) IN (SELECT 2) AS grouped_expression \
          FROM (SELECT 1 AS grp, 1 AS value) AS o GROUP BY o.grp \
-         HAVING count(*) IN (SELECT 1)",
-    )
-    .await;
+         HAVING count(*) IN (SELECT 1)";
+    let batches = run(&Catalog::default(), sql).await;
     for column in 0..2 {
         let value = batches[0]
             .column(column)
@@ -635,6 +632,65 @@ async fn synthetic_left_row_never_contributes_to_aggregate_arguments() {
 }
 
 #[tokio::test]
+async fn correlated_aggregate_expression_arguments_preserve_empty_groups() {
+    let catalog = Catalog::default();
+    register(&catalog, "direct_outer", &["key"], vec![vec![1], vec![2]]);
+    register(
+        &catalog,
+        "direct_inner",
+        &["key", "value"],
+        vec![vec![1, 10], vec![1, 20]],
+    );
+    let batches = run(
+        &catalog,
+        "SELECT o.key, \
+                (SELECT sum(i.value + 1) FROM direct_inner AS i \
+                 WHERE i.key = o.key) AS sum_value, \
+                (SELECT avg(CAST(i.value AS DOUBLE)) FROM direct_inner AS i \
+                 WHERE i.key = o.key) AS avg_value, \
+                (SELECT count(1) FROM direct_inner AS i \
+                 WHERE i.key = o.key) AS count_value \
+         FROM direct_outer AS o ORDER BY o.key",
+    )
+    .await;
+    let keys = int64(&batches[0], 0);
+    let sums = int64(&batches[0], 1);
+    let averages = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let counts = int64(&batches[0], 3);
+    assert_eq!(keys.values(), &[1, 2]);
+    assert_eq!(sums.value(0), 32);
+    assert!(sums.is_null(1));
+    assert_eq!(averages.value(0), 15.0);
+    assert!(averages.is_null(1));
+    assert_eq!(counts.values(), &[2, 0]);
+}
+
+#[tokio::test]
+async fn unmatched_inner_key_does_not_evaluate_fallible_aggregate_argument() {
+    let catalog = Catalog::default();
+    let sql = "SELECT (SELECT sum(CAST(i.value AS BIGINT)) \
+               FROM (SELECT 2 AS key, 'bad' AS value) AS i \
+               WHERE i.key = o.key) AS value \
+               FROM (SELECT 1 AS key) AS o";
+    let StatementPlan::Query(plan) = plan_sql(&catalog, sql).unwrap() else {
+        panic!("expected query plan");
+    };
+    let explain = plan.explain();
+    assert!(explain.contains("__rustdb_inner_match"), "{explain}");
+    assert!(
+        !explain.contains("rewrite=direct_correlated_aggregate"),
+        "{explain}"
+    );
+
+    let batches = run(&catalog, sql).await;
+    assert!(int64(&batches[0], 0).is_null(0));
+}
+
+#[tokio::test]
 async fn applies_having_after_rebuilding_the_empty_group() {
     let batches = run(
         &Catalog::default(),
@@ -771,6 +827,61 @@ fn int64(batch: &RecordBatch, column: usize) -> &Int64Array {
         .unwrap()
 }
 
+#[tokio::test]
+async fn complex_residual_domain_uses_only_the_parameter_lineage() {
+    let catalog = Catalog::default();
+    register(
+        &catalog,
+        "domain_outer",
+        &["key", "threshold"],
+        vec![vec![1, 5], vec![2, 100]],
+    );
+    register(
+        &catalog,
+        "domain_payload",
+        &["key"],
+        vec![vec![1], vec![1], vec![3]],
+    );
+    register(
+        &catalog,
+        "domain_inner",
+        &["key", "value"],
+        vec![vec![1, 10], vec![1, 20], vec![2, 200]],
+    );
+    let sql = "SELECT o.key, (SELECT count(*) FROM domain_inner AS i \
+               WHERE i.key = o.key AND i.value > o.threshold) AS matches \
+               FROM domain_outer AS o LEFT JOIN domain_payload AS p ON o.key = p.key \
+               WHERE o.threshold > 0 ORDER BY o.key";
+    let StatementPlan::Query(plan) = plan_sql(&catalog, sql).unwrap() else {
+        panic!("expected query plan")
+    };
+    let explain = plan.explain();
+    assert_eq!(
+        explain.matches("Scan table=domain_payload").count(),
+        1,
+        "the parameter domain must not clone the irrelevant left-join branch:\n{explain}"
+    );
+    assert_eq!(
+        explain.matches("Scan table=domain_outer").count(),
+        2,
+        "{explain}"
+    );
+    assert!(!explain.contains("DependentJoin"), "{explain}");
+
+    let batches = run(&catalog, sql).await;
+    let actual = batches
+        .iter()
+        .flat_map(|batch| {
+            let keys = int64(batch, 0);
+            let matches = int64(batch, 1);
+            (0..batch.num_rows())
+                .map(|row| (keys.value(row), matches.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, vec![(1, 2), (1, 2), (2, 1)]);
+}
+
 fn register(catalog: &Catalog, name: &str, columns: &[&str], rows: Vec<Vec<i64>>) {
     let schema = Arc::new(Schema::new(
         columns
@@ -787,13 +898,184 @@ fn register(catalog: &Catalog, name: &str, columns: &[&str], rows: Vec<Vec<i64>>
         .collect();
     let batch = RecordBatch::try_new(schema, arrays).unwrap();
     catalog
-        .register(TableEntry::new(name, Arc::new(MemoryTable { batch })))
+        .register(TableEntry::new(
+            name,
+            Arc::new(MemoryTable {
+                batch,
+                source_identity: None,
+            }),
+        ))
         .unwrap();
+}
+
+#[tokio::test]
+async fn q21_pair_uses_one_shared_summary_scan_with_null_safe_existence_semantics() {
+    let catalog = Catalog::default();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("orderkey", DataType::Int64, false),
+        Field::new("suppkey", DataType::Int64, true),
+        Field::new("late", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![
+                1, 2, 2, 3, 3, 4, 4, 4, 6, 6, 7, 7, 8, 8, 8,
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(10),
+                Some(20),
+                Some(10),
+                Some(20),
+                Some(10),
+                Some(20),
+                Some(30),
+                None,
+                Some(20),
+                Some(10),
+                None,
+                Some(10),
+                None,
+                Some(20),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                2, 2, 0, 2, 1, 2, 0, 0, 2, 0, 2, 0, 2, 1, 0,
+            ])),
+        ],
+    )
+    .unwrap();
+    catalog
+        .register(TableEntry::new(
+            "q21_lines",
+            Arc::new(MemoryTable {
+                batch,
+                source_identity: None,
+            }),
+        ))
+        .unwrap();
+    let sql = "SELECT l1.orderkey FROM q21_lines AS l1 \
+        WHERE l1.late = 2 \
+          AND EXISTS (SELECT 1 FROM q21_lines AS l2 \
+                      WHERE l2.orderkey = l1.orderkey AND l2.suppkey <> l1.suppkey) \
+          AND NOT EXISTS (SELECT 1 FROM q21_lines AS l3 \
+                          WHERE l3.orderkey = l1.orderkey \
+                            AND l3.suppkey <> l1.suppkey AND l3.late = 1) \
+        ORDER BY l1.orderkey";
+    let StatementPlan::Query(plan) = plan_sql(&catalog, sql).unwrap() else {
+        panic!("expected query plan");
+    };
+    let explain = plan.explain();
+    assert_eq!(
+        explain.matches("Scan table=q21_lines").count(),
+        2,
+        "{explain}"
+    );
+    assert!(explain.contains("__q21_all_min"), "{explain}");
+    assert!(
+        explain.contains("rewrite=existence_summary shared_build=true"),
+        "{explain}"
+    );
+    assert!(!explain.contains("SemiJoin"), "{explain}");
+    assert!(!explain.contains("AntiJoin"), "{explain}");
+
+    let batches = run(&catalog, sql).await;
+    let actual = batches
+        .iter()
+        .flat_map(|batch| {
+            let values = int64(batch, 0);
+            (0..values.len())
+                .map(|row| values.value(row))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, vec![2, 4, 8]);
+}
+
+#[tokio::test]
+async fn q21_pair_shares_distinct_providers_for_the_same_source_spec() {
+    let catalog = Catalog::default();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("orderkey", DataType::Int64, false),
+        Field::new("suppkey", DataType::Int64, true),
+        Field::new("late", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(20),
+                Some(10),
+                Some(20),
+            ])),
+            Arc::new(Int64Array::from(vec![2, 0, 2, 1])),
+        ],
+    )
+    .unwrap();
+    let identity = TableSourceIdentity::from_spec(
+        "memory",
+        &["snapshot://q21-lines".to_owned()],
+        "schema=v1".to_owned(),
+    );
+    let all: Arc<dyn TableProvider> = Arc::new(MemoryTable {
+        batch: batch.clone(),
+        source_identity: Some(identity.clone()),
+    });
+    let late: Arc<dyn TableProvider> = Arc::new(MemoryTable {
+        batch: batch.clone(),
+        source_identity: Some(identity),
+    });
+    assert!(!Arc::ptr_eq(&all, &late));
+    for (name, provider) in [
+        (
+            "q21_identity_outer",
+            Arc::new(MemoryTable {
+                batch: batch.clone(),
+                source_identity: None,
+            }) as Arc<dyn TableProvider>,
+        ),
+        ("q21_identity_all", all),
+        ("q21_identity_late", late),
+    ] {
+        catalog.register(TableEntry::new(name, provider)).unwrap();
+    }
+
+    let sql = "SELECT l1.orderkey FROM q21_identity_outer AS l1 \
+        WHERE l1.late = 2 \
+          AND EXISTS (SELECT 1 FROM q21_identity_all AS l2 \
+                      WHERE l2.orderkey = l1.orderkey AND l2.suppkey <> l1.suppkey) \
+          AND NOT EXISTS (SELECT 1 FROM q21_identity_late AS l3 \
+                          WHERE l3.orderkey = l1.orderkey \
+                            AND l3.suppkey <> l1.suppkey AND l3.late = 1) \
+        ORDER BY l1.orderkey";
+    let StatementPlan::Query(plan) = plan_sql(&catalog, sql).unwrap() else {
+        panic!("expected query plan");
+    };
+    let explain = plan.explain();
+    assert!(
+        explain.contains("rewrite=existence_summary shared_build=true"),
+        "{explain}"
+    );
+    assert!(
+        !explain.contains("Scan table=q21_identity_all"),
+        "{explain}"
+    );
+    assert_eq!(
+        explain.matches("Scan table=q21_identity_late").count(),
+        1,
+        "{explain}"
+    );
+
+    let batches = run(&catalog, sql).await;
+    assert_eq!(int64(&batches[0], 0).values(), &[1]);
 }
 
 #[derive(Clone)]
 struct MemoryTable {
     batch: RecordBatch,
+    source_identity: Option<TableSourceIdentity>,
 }
 
 #[async_trait]
@@ -808,6 +1090,10 @@ impl TableProvider for MemoryTable {
             total_byte_size: Some(self.batch.get_array_memory_size() as u64),
             file_count: 1,
         }
+    }
+
+    fn source_identity(&self) -> Option<TableSourceIdentity> {
+        self.source_identity.clone()
     }
 
     async fn scan(

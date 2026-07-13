@@ -1,0 +1,17 @@
+WITH left_rows AS (
+    SELECT id, val
+    FROM read_csv('__NULL_DATA__', header = true)
+    WHERE id <= 5
+), right_rows AS (
+    SELECT id, val
+    FROM read_csv('__NULL_DATA__', header = true)
+    WHERE id BETWEEN 2 AND 4
+)
+SELECT 'semi' AS join_kind, left_rows.id
+FROM left_rows
+LEFT SEMI JOIN right_rows ON left_rows.val = right_rows.val
+UNION ALL
+SELECT 'anti' AS join_kind, left_rows.id
+FROM left_rows
+LEFT ANTI JOIN right_rows ON left_rows.val = right_rows.val
+ORDER BY join_kind, id;

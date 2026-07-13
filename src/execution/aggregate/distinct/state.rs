@@ -12,8 +12,11 @@ use crate::{
     sql::{AggregateExpr, BoundExpr},
 };
 
+use super::super::spill::partition_for_key;
 use super::{
-    super::{GroupState, SPILL_PARTITIONS, StateSpiller, estimate_group_bytes, spill_states},
+    super::{
+        GroupState, StateSpiller, adaptive_spill_partitions, estimate_group_bytes, spill_states,
+    },
     spill::{DistinctKey, DistinctSpiller},
 };
 
@@ -31,9 +34,17 @@ pub(super) fn insert_group(
 ) -> Result<usize> {
     let state = GroupState::new(key.clone(), aggregates);
     let bytes = estimate_group_bytes(&state).saturating_add(index_key_bytes(&key));
-    if memory.try_grow(bytes).is_err() {
-        let spiller = spiller.get_or_insert_with(|| StateSpiller::new(context, SPILL_PARTITIONS));
-        spill_states(
+    while memory.try_grow(bytes).is_err() {
+        if states.is_empty() {
+            return Err(Error::ResourceExhausted(format!(
+                "cannot reserve {bytes} bytes for one DISTINCT aggregate group (limit {})",
+                memory.pool().limit()
+            )));
+        }
+        let spiller = spiller.get_or_insert_with(|| {
+            StateSpiller::new(context, adaptive_spill_partitions(context, memory.size()))
+        });
+        let resident_bytes = spill_largest_group_partition(
             states,
             index,
             groups,
@@ -42,13 +53,7 @@ pub(super) fn insert_group(
             spiller,
             context,
         )?;
-        memory.try_resize(0)?;
-        memory.try_grow(bytes).map_err(|_| {
-            Error::ResourceExhausted(format!(
-                "cannot reserve {bytes} bytes for one DISTINCT aggregate group (limit {})",
-                memory.pool().limit()
-            ))
-        })?;
+        memory.try_resize(resident_bytes)?;
     }
     let position = states.len();
     states.push(state);
@@ -67,25 +72,20 @@ pub(super) fn insert_distinct(
         return Ok(());
     }
     let bytes = key.memory_size();
-    let mut candidate = memory.pool().try_reserve(bytes);
-    if candidate.is_err() {
+    let candidate = loop {
+        if let Ok(candidate) = memory.pool().try_reserve(bytes) {
+            break candidate;
+        }
         if keys.is_empty() {
             return Err(Error::ResourceExhausted(format!(
                 "one DISTINCT aggregate key requires {bytes} bytes (key budget {})",
                 memory.pool().limit()
             )));
         }
-        spiller.spill(std::mem::take(keys), context)?;
-        memory.try_resize(0)?;
-        candidate = memory.pool().try_reserve(bytes);
-        candidate.as_ref().map_err(|_| {
-            Error::ResourceExhausted(format!(
-                "one DISTINCT aggregate key requires {bytes} bytes (key budget {})",
-                memory.pool().limit()
-            ))
-        })?;
-    }
-    memory.absorb(candidate.expect("candidate reservation was checked above"))?;
+        let resident_bytes = spiller.spill_largest_partition(keys, context)?;
+        memory.try_resize(resident_bytes)?;
+    };
+    memory.absorb(candidate)?;
     keys.insert(key);
     Ok(())
 }
@@ -124,8 +124,13 @@ pub(super) fn contribute(
         } else {
             let state = GroupState::new(key.group.clone(), aggregates);
             let bytes = estimate_group_bytes(&state).saturating_add(index_key_bytes(&key.group));
-            if memory.try_grow(bytes).is_err() {
-                spill_states(
+            while memory.try_grow(bytes).is_err() {
+                if states.is_empty() {
+                    return Err(Error::ResourceExhausted(format!(
+                        "cannot reserve {bytes} bytes for one DISTINCT contribution group"
+                    )));
+                }
+                let resident_bytes = spill_largest_group_partition(
                     &mut states,
                     &mut index,
                     groups,
@@ -134,12 +139,7 @@ pub(super) fn contribute(
                     spiller,
                     context,
                 )?;
-                memory.try_resize(0)?;
-                memory.try_grow(bytes).map_err(|_| {
-                    Error::ResourceExhausted(format!(
-                        "cannot reserve {bytes} bytes for one DISTINCT contribution group"
-                    ))
-                })?;
+                memory.try_resize(resident_bytes)?;
             }
             let position = states.len();
             states.push(state);
@@ -210,3 +210,79 @@ fn index_key_bytes(key: &[super::super::CellValue]) -> usize {
         )
         .saturating_add(96)
 }
+
+#[allow(clippy::too_many_arguments)]
+fn spill_largest_group_partition(
+    states: &mut Vec<GroupState>,
+    group_index: &mut HashMap<Vec<super::super::CellValue>, usize>,
+    groups: &[BoundExpr],
+    aggregates: &[AggregateExpr],
+    schema: SchemaRef,
+    spiller: &mut StateSpiller,
+    context: &QueryContext,
+) -> Result<usize> {
+    let partitions = spiller.partition_count();
+    let mut partition_bytes = vec![0usize; partitions];
+    for state in states.iter() {
+        let partition = partition_for_key(&state.key, partitions, 0);
+        partition_bytes[partition] = partition_bytes[partition]
+            .saturating_add(estimate_group_bytes(state))
+            .saturating_add(index_key_bytes(&state.key));
+    }
+    let victim = partition_bytes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, bytes)| *bytes)
+        .map(|(partition, _)| partition)
+        .ok_or_else(|| {
+            Error::Internal("DISTINCT group victim selection has no partitions".into())
+        })?;
+
+    let survivor_count = states
+        .iter()
+        .filter(|state| partition_for_key(&state.key, partitions, 0) != victim)
+        .count();
+    let mut victim_states = Vec::new();
+    let mut survivors = Vec::with_capacity(survivor_count);
+    let mut remap = vec![usize::MAX; states.len()];
+    for (old_index, state) in std::mem::take(states).into_iter().enumerate() {
+        if partition_for_key(&state.key, partitions, 0) == victim {
+            victim_states.push(state);
+        } else {
+            remap[old_index] = survivors.len();
+            survivors.push(state);
+        }
+    }
+    let mut survivor_index = HashMap::with_capacity(survivor_count);
+    for (key, old_index) in std::mem::take(group_index) {
+        let new_index = remap.get(old_index).copied().unwrap_or(usize::MAX);
+        if new_index != usize::MAX {
+            survivor_index.insert(key, new_index);
+        }
+    }
+    *states = survivors;
+    *group_index = survivor_index;
+
+    let mut victim_index = HashMap::<u8, usize>::new();
+    spill_states(
+        &mut victim_states,
+        &mut victim_index,
+        groups,
+        aggregates,
+        schema,
+        spiller,
+        context,
+    )?;
+    Ok(resident_group_bytes(states))
+}
+
+fn resident_group_bytes(states: &[GroupState]) -> usize {
+    states.iter().fold(0usize, |bytes, state| {
+        bytes
+            .saturating_add(estimate_group_bytes(state))
+            .saturating_add(index_key_bytes(&state.key))
+    })
+}
+
+#[cfg(test)]
+mod tests;

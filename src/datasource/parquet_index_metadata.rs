@@ -7,10 +7,10 @@ use parquet::{
 
 use super::{
     MetadataCache,
-    metadata_cache::metadata_weight,
+    metadata_cache::{MetadataLoad, metadata_weight},
     parquet_metadata::ParquetMetadata,
     parquet_pruning_budget::{MAX_FILE_PAGE_INDEX_BYTES, PruningBudget},
-    parquet_reader::{QueryIo, SnapshotParquetReader},
+    parquet_reader::{QueryIo, SnapshotParquetReader, into_query_error},
 };
 use crate::{
     Error, Result,
@@ -52,35 +52,60 @@ pub(super) async fn load_page_index_metadata(
         ));
     }
 
-    if let Some(indexed) = cache.get_page_index(file, snapshot) {
-        let indexed_weight = metadata_weight(file, snapshot, &indexed);
-        let index_weight = indexed_weight.saturating_sub(footer_weight);
-        if index_weight > MAX_FILE_PAGE_INDEX_BYTES {
-            context.metrics.add_parquet_pruning_budget_skip();
-            return Ok(ParquetMetadata::new(
-                footer_metadata,
-                memory,
-                previous_lease,
-            ));
+    let load_guard = match cache
+        .acquire_page_index(file, snapshot, Some(&context.control))
+        .await?
+    {
+        ready @ (MetadataLoad::Cached { .. } | MetadataLoad::Shared { .. }) => {
+            let (indexed, wait, cache_hit) = match ready {
+                MetadataLoad::Cached { metadata, wait } => (metadata, wait, true),
+                MetadataLoad::Shared { metadata, wait } => (metadata, wait, false),
+                MetadataLoad::Leader { .. } => unreachable!(),
+            };
+            if cache_hit {
+                context.metrics.record_metadata_cache_hit();
+            } else {
+                context.metrics.record_metadata_cache_miss();
+            }
+            if !wait.is_zero() {
+                context.metrics.record_metadata_singleflight_wait(wait);
+            }
+            let indexed_weight = metadata_weight(file, snapshot, &indexed);
+            let index_weight = indexed_weight.saturating_sub(footer_weight);
+            if index_weight > MAX_FILE_PAGE_INDEX_BYTES {
+                context.metrics.add_parquet_pruning_budget_skip();
+                return Ok(ParquetMetadata::new(
+                    footer_metadata,
+                    memory,
+                    previous_lease,
+                ));
+            }
+            let Some(lease) = budget.try_reserve(index_weight) else {
+                context.metrics.add_parquet_pruning_budget_skip();
+                return Ok(ParquetMetadata::new(
+                    footer_metadata,
+                    memory,
+                    previous_lease,
+                ));
+            };
+            if !resize_optional_memory(&mut memory, indexed_weight) {
+                context.metrics.add_parquet_pruning_budget_skip();
+                return Ok(ParquetMetadata::new(
+                    footer_metadata,
+                    memory,
+                    previous_lease,
+                ));
+            }
+            return Ok(ParquetMetadata::new(indexed, memory, Some(lease)));
         }
-        let Some(lease) = budget.try_reserve(index_weight) else {
-            context.metrics.add_parquet_pruning_budget_skip();
-            return Ok(ParquetMetadata::new(
-                footer_metadata,
-                memory,
-                previous_lease,
-            ));
-        };
-        if !resize_optional_memory(&mut memory, indexed_weight) {
-            context.metrics.add_parquet_pruning_budget_skip();
-            return Ok(ParquetMetadata::new(
-                footer_metadata,
-                memory,
-                previous_lease,
-            ));
+        MetadataLoad::Leader { guard, wait } => {
+            context.metrics.record_metadata_cache_miss();
+            if !wait.is_zero() {
+                context.metrics.record_metadata_singleflight_wait(wait);
+            }
+            guard
         }
-        return Ok(ParquetMetadata::new(indexed, memory, Some(lease)));
-    }
+    };
 
     let Some(mut lease) = budget.try_reserve(estimated_index) else {
         context.metrics.add_parquet_pruning_budget_skip();
@@ -99,32 +124,36 @@ pub(super) async fn load_page_index_metadata(
         ));
     }
 
-    let parquet_metadata = footer_metadata.metadata().as_ref().clone();
-    let query = QueryIo::for_page_index(context.control.clone(), context.metrics.clone());
-    let mut reader = SnapshotParquetReader::new(file, snapshot.clone(), Some(query));
-    let mut loader = ParquetMetaDataReader::new_with_metadata(parquet_metadata)
-        .with_page_index_policy(PageIndexPolicy::Optional);
-    loader.load_page_index(&mut reader).await.map_err(|error| {
-        Error::Execution(format!(
-            "invalid Parquet page index for '{}': {error}",
-            file.uri()
-        ))
-    })?;
-    let indexed = ArrowReaderMetadata::try_new(
-        Arc::new(loader.finish().map_err(|error| {
-            Error::Execution(format!(
-                "invalid Parquet page index for '{}': {error}",
-                file.uri()
-            ))
-        })?),
-        ArrowReaderOptions::new(),
-    )?;
+    let loaded: Result<_> = async {
+        let parquet_metadata = footer_metadata.metadata().as_ref().clone();
+        let query = QueryIo::for_page_index(context.control.clone(), context.metrics.clone());
+        let mut reader = SnapshotParquetReader::new(file, snapshot.clone(), Some(query));
+        let mut loader = ParquetMetaDataReader::new_with_metadata(parquet_metadata)
+            .with_page_index_policy(PageIndexPolicy::Optional);
+        loader
+            .load_page_index(&mut reader)
+            .await
+            .map_err(|error| contextual_index_error(file.uri(), error))?;
+        ArrowReaderMetadata::try_new(
+            Arc::new(loader.finish().map_err(|error| {
+                Error::Execution(format!(
+                    "invalid Parquet page index for '{}': {error}",
+                    file.uri()
+                ))
+            })?),
+            ArrowReaderOptions::new(),
+        )
+        .map_err(Into::into)
+    }
+    .await;
+    let indexed = match loaded {
+        Ok(indexed) => indexed,
+        Err(error) => return Err(load_guard.fail(error)),
+    };
     let indexed_weight = metadata_weight(file, snapshot, &indexed);
     let index_weight = indexed_weight.saturating_sub(footer_weight);
-    if index_weight > MAX_FILE_PAGE_INDEX_BYTES
-        || !lease.try_resize(index_weight)
-        || !resize_optional_memory(&mut memory, indexed_weight)
-    {
+    if index_weight > MAX_FILE_PAGE_INDEX_BYTES {
+        load_guard.succeed(indexed);
         context.metrics.add_parquet_pruning_budget_skip();
         let _ = resize_optional_memory(&mut memory, footer_weight);
         return Ok(ParquetMetadata::new(
@@ -133,9 +162,25 @@ pub(super) async fn load_page_index_metadata(
             previous_lease,
         ));
     }
-
     cache.insert_page_index(file, snapshot, indexed.clone());
+    load_guard.succeed(indexed.clone());
+    if !lease.try_resize(index_weight) || !resize_optional_memory(&mut memory, indexed_weight) {
+        context.metrics.add_parquet_pruning_budget_skip();
+        let _ = resize_optional_memory(&mut memory, footer_weight);
+        return Ok(ParquetMetadata::new(
+            footer_metadata,
+            memory,
+            previous_lease,
+        ));
+    }
     Ok(ParquetMetadata::new(indexed, memory, Some(lease)))
+}
+
+fn contextual_index_error(uri: &str, error: parquet::errors::ParquetError) -> Error {
+    match into_query_error(error) {
+        error @ (Error::Cancelled | Error::ResourceExhausted(_)) => error,
+        error => Error::Execution(format!("invalid Parquet page index for '{uri}': {error}")),
+    }
 }
 
 fn resize_optional_memory(reservation: &mut Option<MemoryReservation>, bytes: usize) -> bool {
@@ -249,7 +294,19 @@ fn index_error(uri: &str, row_group: usize, column: &str, kind: &str, reason: &s
 
 #[cfg(test)]
 mod tests {
-    use super::index_range;
+    use parquet::errors::ParquetError;
+
+    use super::{contextual_index_error, index_range};
+    use crate::Error;
+
+    #[test]
+    fn query_local_page_index_errors_are_not_relabelled_as_corruption() {
+        let error = contextual_index_error(
+            "s3://bucket/data.parquet",
+            ParquetError::External(Box::new(Error::Cancelled)),
+        );
+        assert!(matches!(error, Error::Cancelled));
+    }
 
     #[test]
     fn malformed_advertised_index_includes_uri_and_kind() {

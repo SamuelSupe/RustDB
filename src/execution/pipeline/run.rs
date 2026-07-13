@@ -11,7 +11,7 @@ use crate::{
     sql::BoundExpr,
 };
 
-use super::{FusedPipeline, PipelineOperator, compact};
+use super::{FusedPipeline, PipelineOperator, compact, profile::PipelineProfile};
 use crate::execution::{expr, scan};
 
 enum LaneMessage {
@@ -24,10 +24,16 @@ struct LanePlan {
     compact_filters: Option<Vec<BoundExpr>>,
     projection: Option<Vec<usize>>,
     scan_schema: arrow::datatypes::SchemaRef,
+    profile: Arc<PipelineProfile>,
 }
 
-pub(super) fn execute(pipeline: FusedPipeline, context: Arc<QueryContext>) -> MemoryBatchStream {
+pub(super) fn execute(
+    pipeline: FusedPipeline,
+    context: Arc<QueryContext>,
+    parent_id: Option<u64>,
+) -> MemoryBatchStream {
     boxed_memory_batch_stream(async_stream::try_stream! {
+        let profile = Arc::new(PipelineProfile::new(&context, &pipeline, parent_id));
         let mut request = ScanRequest::new(context.batch_size);
         request.projection = pipeline.scan.projection.clone();
         request.predicate = pipeline
@@ -54,6 +60,7 @@ pub(super) fn execute(pipeline: FusedPipeline, context: Arc<QueryContext>) -> Me
             compact_filters,
             projection: pipeline.scan.projection,
             scan_schema: pipeline.scan.schema,
+            profile,
         });
         let pending = Arc::new(Mutex::new(VecDeque::from(tasks)));
         let cancellation = CancellationToken::new();
@@ -135,16 +142,21 @@ async fn run_lane_inner(
             // compute work.  Hold the metric guard while polling/decoding and
             // running fused kernels, then release it before the bounded send.
             let active = context.scheduler.enter_lane();
+            let scan_started = Instant::now();
             let next = input.next().await;
+            let scan_wait = scan_started.elapsed();
             let Some(batch) = next else {
                 drop(active);
                 break;
             };
             check_running(cancellation, context)?;
             let mut batch = batch?;
+            plan.profile.record_scan(batch.batch(), scan_wait);
             let mut emit = true;
             if let Some(filters) = plan.compact_filters.as_deref() {
-                for predicate in filters {
+                for (operator, predicate) in filters.iter().enumerate() {
+                    plan.profile.record_input(operator, batch.batch());
+                    let started = Instant::now();
                     let workspace = context
                         .reserve_memory_while_holding(
                             expr::filter_workspace_bytes(predicate, batch.batch()),
@@ -154,6 +166,8 @@ async fn run_lane_inner(
                         .await?;
                     let filtered = expr::filter(predicate, batch.batch())?;
                     if filtered.num_rows() == 0 {
+                        plan.profile
+                            .record_output(operator, None, started.elapsed());
                         emit = false;
                         break;
                     }
@@ -162,6 +176,8 @@ async fn run_lane_inner(
                         workspace,
                         "compact pipeline filter",
                     )?;
+                    plan.profile
+                        .record_output(operator, Some(batch.batch()), started.elapsed());
                 }
             }
             if !emit {
@@ -191,11 +207,14 @@ async fn run_lane_inner(
                     "scan projection expansion",
                 )?;
             }
-            for operator in plan
+            for (operator_index, operator) in plan
                 .operators
                 .iter()
                 .filter(|_| plan.compact_filters.is_none())
+                .enumerate()
             {
+                plan.profile.record_input(operator_index, batch.batch());
+                let started = Instant::now();
                 match operator {
                     PipelineOperator::Filter(predicate) => {
                         let workspace = context
@@ -207,6 +226,8 @@ async fn run_lane_inner(
                             .await?;
                         let filtered = expr::filter(predicate, batch.batch())?;
                         if filtered.num_rows() == 0 {
+                            plan.profile
+                                .record_output(operator_index, None, started.elapsed());
                             emit = false;
                             break;
                         }
@@ -215,6 +236,11 @@ async fn run_lane_inner(
                             workspace,
                             "pipeline filter",
                         )?;
+                        plan.profile.record_output(
+                            operator_index,
+                            Some(batch.batch()),
+                            started.elapsed(),
+                        );
                     }
                     PipelineOperator::Projection {
                         expressions,
@@ -234,6 +260,11 @@ async fn run_lane_inner(
                             workspace,
                             "pipeline projection",
                         )?;
+                        plan.profile.record_output(
+                            operator_index,
+                            Some(batch.batch()),
+                            started.elapsed(),
+                        );
                     }
                 }
             }

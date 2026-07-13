@@ -27,12 +27,14 @@ require_minio() {
 
 test_with_minio() {
   require_minio
-  run cargo test --locked --all-targets
+  test_jobs=${RUSTDB_TEST_JOBS:-1}
+  run cargo test --locked --all-targets --jobs "$test_jobs"
 }
 
 test_portable() {
   tool_tests
-  run cargo test --locked --all-targets
+  test_jobs=${RUSTDB_TEST_JOBS:-1}
+  run cargo test --locked --all-targets --jobs "$test_jobs"
 }
 
 tool_tests() {
@@ -42,7 +44,8 @@ tool_tests() {
 }
 
 release_build() {
-  run cargo build --locked --release --all-targets
+  release_jobs=${RUSTDB_RELEASE_BUILD_JOBS:-1}
+  run cargo build --locked --release --all-targets --jobs "$release_jobs"
 }
 
 usage() {

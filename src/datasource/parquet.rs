@@ -7,7 +7,7 @@ use futures::StreamExt;
 use tokio::sync::Semaphore;
 
 use super::{
-    MetadataCache, ScanRequest, ScanTask, TableProvider, TableStatistics,
+    MetadataCache, ScanRequest, ScanTask, TableProvider, TableSourceIdentity, TableStatistics,
     hive::HivePartitions,
     parquet_bloom::{bloom_prunes_row_group, supports_bloom},
     parquet_index_metadata::load_page_index_metadata,
@@ -259,6 +259,24 @@ impl TableProvider for ParquetTable {
 
     fn statistics(&self) -> TableStatistics {
         self.statistics.clone()
+    }
+
+    fn source_identity(&self) -> Option<TableSourceIdentity> {
+        Some(TableSourceIdentity::from_objects(
+            "parquet",
+            &self.files,
+            format!(
+                "schema={:?};physical_schema={:?};schema_mode={:?};hive={}",
+                self.schema,
+                self.physical_schema,
+                self.schema_mode,
+                self.hive.is_some()
+            ),
+        ))
+    }
+
+    fn explain_scan(&self) -> Option<String> {
+        Some("format=parquet morsel=row_group metadata=singleflight".to_owned())
     }
 
     async fn prepare(&self, context: Arc<QueryContext>) -> Result<()> {
@@ -521,6 +539,7 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                         row_group,
                         plan.request.predicate.as_ref(),
                         &plan.context,
+                        &plan.metadata_cache,
                         &pruning_budget,
                     ).await? {
                         plan.context.metrics.add_parquet_bloom_row_groups_pruned(1);
@@ -717,6 +736,9 @@ mod decimal_pruning_tests;
 #[cfg(test)]
 #[path = "parquet_deep_pruning_tests.rs"]
 mod deep_pruning_tests;
+#[cfg(test)]
+#[path = "parquet_predicate_budget_tests.rs"]
+mod predicate_budget_tests;
 #[cfg(test)]
 #[path = "parquet_tests.rs"]
 mod tests;

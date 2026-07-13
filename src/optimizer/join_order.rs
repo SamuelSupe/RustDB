@@ -11,6 +11,7 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Scalarize { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Repeat { input, .. }
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => choose_build_sides(input),
@@ -130,6 +131,7 @@ fn estimate(plan: &LogicalPlan) -> Estimate {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Repeat { input, .. }
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. } => estimate(input),
         LogicalPlan::Append { inputs, .. } => {

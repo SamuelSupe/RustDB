@@ -12,8 +12,10 @@ use crate::sql::{
     relation::CteScope,
 };
 
+mod multiset;
 mod types;
 
+use multiset::plan_multiset_operation;
 use types::{common_set_type, is_nested, supports_distinct_key};
 
 impl Planner<'_> {
@@ -129,11 +131,7 @@ fn plan_set_operation(
     let distinct = match (operator, quantifier) {
         (SetOperator::Union, SetQuantifier::All) => false,
         (SetOperator::Union, SetQuantifier::Distinct | SetQuantifier::None) => true,
-        (SetOperator::Intersect | SetOperator::Except, SetQuantifier::All) => {
-            return Err(Error::Unsupported(format!(
-                "{operator} ALL is not supported"
-            )));
-        }
+        (SetOperator::Intersect | SetOperator::Except, SetQuantifier::All) => false,
         (
             SetOperator::Intersect | SetOperator::Except,
             SetQuantifier::Distinct | SetQuantifier::None,
@@ -149,7 +147,7 @@ fn plan_set_operation(
     };
 
     let (left, right, schema) = align_inputs(left, right)?;
-    if distinct {
+    if distinct || matches!(operator, SetOperator::Intersect | SetOperator::Except) {
         validate_distinct_schema(&schema)?;
     }
     match operator {
@@ -163,6 +161,9 @@ fn plan_set_operation(
             } else {
                 append
             })
+        }
+        SetOperator::Intersect | SetOperator::Except if quantifier == SetQuantifier::All => {
+            plan_multiset_operation(left, right, schema, operator)
         }
         SetOperator::Intersect | SetOperator::Except => {
             let left = deduplicate(left);

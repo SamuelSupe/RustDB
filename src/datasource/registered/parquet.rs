@@ -9,8 +9,8 @@ use super::parquet_mapping::{nullable_schema, remap_predicate, remap_projection,
 use crate::{
     EngineConfig, Error, ParquetOptions, ParquetSchemaMode, Result,
     datasource::{
-        MetadataCache, ParquetTable, ScanRequest, ScanTask, TableProvider, TableStatistics,
-        schema_evolution::align_batch_to_schema,
+        MetadataCache, ParquetTable, ScanRequest, ScanTask, TableProvider, TableSourceIdentity,
+        TableStatistics, schema_evolution::align_batch_to_schema,
     },
     runtime::{
         QueryContext, RecordBatchStream, boxed_memory_batch_stream, boxed_record_batch_stream,
@@ -147,6 +147,21 @@ impl TableProvider for RegisteredParquetTable {
 
     fn statistics(&self) -> TableStatistics {
         self.statistics.clone()
+    }
+
+    fn source_identity(&self) -> Option<TableSourceIdentity> {
+        Some(TableSourceIdentity::from_spec(
+            "parquet",
+            &self.locations,
+            format!(
+                "options={:?};schema_mode={:?};schema={:?};physical_schema={:?}",
+                self.refresh_options, self.schema_mode, self.schema, self.physical_schema
+            ),
+        ))
+    }
+
+    fn explain_scan(&self) -> Option<String> {
+        Some("format=parquet morsel=row_group metadata=singleflight".to_owned())
     }
 
     fn query_statistics(&self, context: &QueryContext) -> TableStatistics {

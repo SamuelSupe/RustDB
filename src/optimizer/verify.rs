@@ -43,6 +43,10 @@ pub(super) fn executable(plan: &LogicalPlan) -> Result<()> {
                 executable(input)?;
             }
         }
+        LogicalPlan::Repeat { input, count, .. } => {
+            check(count)?;
+            executable(input)?;
+        }
         LogicalPlan::Window {
             input, expressions, ..
         } => {

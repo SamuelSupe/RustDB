@@ -77,22 +77,30 @@ fn fallback_impl(
         );
         let left_input = spill_input(task.left, Arc::clone(&context), "join sort left") ;
         let right_input = spill_input(task.right, Arc::clone(&context), "join sort right");
-        let left_sort = sort::sort(
-            left_input,
-            sort_keys(&left_expressions),
-            None,
-            Arc::clone(&left_schema),
-            Arc::clone(&context),
-            batch_size,
-        );
-        let right_sort = sort::sort(
-            right_input,
-            sort_keys(&right_expressions),
-            None,
-            Arc::clone(&right_schema),
-            Arc::clone(&context),
-            batch_size,
-        );
+        let left_sort = if left_expressions.is_empty() {
+            left_input
+        } else {
+            sort::sort(
+                left_input,
+                sort_keys(&left_expressions),
+                None,
+                Arc::clone(&left_schema),
+                Arc::clone(&context),
+                batch_size,
+            )
+        };
+        let right_sort = if right_expressions.is_empty() {
+            right_input
+        } else {
+            sort::sort(
+                right_input,
+                sort_keys(&right_expressions),
+                None,
+                Arc::clone(&right_schema),
+                Arc::clone(&context),
+                batch_size,
+            )
+        };
         let mut left = SortedCursor::new(
             left_sort,
             left_expressions,

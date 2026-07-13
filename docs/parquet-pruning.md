@@ -19,7 +19,7 @@ let config = EngineConfig::builder()
     .build();
 ```
 
-`Auto` uses metadata only for a supported constant predicate. `Disabled`
+`Auto` uses metadata only for a supported constant or runtime predicate. `Disabled`
 prevents the corresponding metadata reads. An unfiltered zero-column
 `COUNT(*)` reads neither page indexes nor Bloom filters.
 
@@ -34,22 +34,35 @@ filter.
 Page indexes support comparisons and NULL predicates over Boolean, integer,
 finite floating-point, Decimal128, UTF-8/Binary, Date, and Timestamp columns.
 The column and offset indexes are combined into an Arrow `RowSelection`, which
-is installed before the official Parquet reader fetches column data.
+is installed before the official Parquet reader fetches column data. Same-column
+constant `IN` and `OR` predicates union candidate page ranges, then adjacent
+ranges are merged. Static disjunction analysis is bounded at 256 values; larger
+expressions remain residual filters without deep metadata work.
 
-Bloom filters are checked after row-group min/max pruning and only for equality
-predicates. The first version supports integer, UTF-8/Binary, Date, and
-Timestamp values. A negative Bloom result can remove a row group; a positive
-result always keeps the residual filter. Older files that advertise a Bloom
+Bloom filters are checked after row-group min/max pruning for equality and
+bounded same-column disjunctions. The first version supports integer,
+UTF-8/Binary, Date, and Timestamp values. A row group is removed only when every
+candidate is definitely absent; a positive or unsupported result keeps the
+residual filter. Older files that advertise a Bloom
 offset without the optional encoded length are retained without a Bloom read:
 discovering their bitset size would otherwise bypass the pre-read metadata
 reservation. This conservative fallback increments the budget-skip metric.
 
-Footer-only and footer-plus-page-index metadata use distinct cache entries
-keyed by URI, size, ETag, and version. Index and Bloom reads use the same
-query-fixed object snapshot and conditional requests as data reads. Large
-ranges are split into requests of at most 4 MiB. Metadata advertised by a file
-but found to be malformed fails with the URI, row group, and column in the
-error.
+Footer-only, page-index, and Bloom metadata use distinct cache entries keyed by
+URI, size, ETag, and version. Concurrent misses for the same identity are
+singleflighted, so only one loader fetches and decodes the metadata. Index and
+Bloom reads use the same query-fixed object snapshot and conditional requests
+as data reads. Large ranges are split into requests of at most 4 MiB. Metadata
+advertised by a file but found to be malformed fails with the URI, row group,
+and column in the error.
+
+For an eligible single-key inner or semi hash join, a small build side publishes
+a query-scoped runtime filter. It always attempts a min/max range and may retain
+up to 65,536 exact keys within `execution.runtime_filter_bytes`. The filter can
+participate in Hive/file, row-group, page-index, and Bloom pruning, but never
+replaces the SQL residual predicate. A completed empty build publishes an empty
+filter and prunes the probe input for inner/semi joins. Unsupported, over-budget,
+or late filters transparently fall back to the normal scan.
 
 ## Metrics
 
@@ -61,3 +74,7 @@ error.
 - `parquet_page_rows_pruned`
 - `parquet_bloom_row_groups_pruned`
 - `parquet_pruning_budget_skips`
+- `runtime_filter_hits`
+- `metadata_cache_hits`
+- `metadata_cache_misses`
+- `metadata_singleflight_wait`

@@ -115,6 +115,16 @@ fn push(plan: &mut LogicalPlan, required: &[usize]) {
                 push(input, required);
             }
         }
+        LogicalPlan::Repeat {
+            input,
+            count,
+            schema,
+        } => {
+            let mut columns = required.to_vec();
+            count.referenced_columns(&mut columns);
+            *schema = nullable_unrequired(schema, required);
+            push(input, &columns);
+        }
         LogicalPlan::Window {
             input,
             expressions,

@@ -17,7 +17,8 @@ pub(crate) use compute::ComputeRuntime;
 pub use context::QueryContext;
 pub use control::QueryControl;
 pub use memory::{MemoryPool, MemoryReservation};
-pub use metrics::{QueryMetrics, QueryMetricsSnapshot};
+pub(crate) use metrics::OperatorHandle;
+pub use metrics::{OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot};
 pub(crate) use scheduler::QueryScheduler;
 pub(crate) use spill::{
     QuerySpillQuota, SpillIoPool, SpillQuotaPool, SpillWriter, scavenge_orphans,

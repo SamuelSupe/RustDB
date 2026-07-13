@@ -7,7 +7,10 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
-use crate::{Error, Result, sql::BoundExpr};
+use crate::{
+    Error, Result,
+    sql::{BinaryOp, BoundExpr, ExprKind, JoinType},
+};
 
 use super::{cell, evaluate};
 
@@ -52,6 +55,48 @@ impl JoinPredicates {
 
     pub(super) fn is_null_aware(&self) -> bool {
         self.null_aware.is_some()
+    }
+
+    /// Returns the RHS value for the Q21-style existence predicate
+    /// `left.value <> right.value`. Two distinct non-NULL RHS values per
+    /// equality key are sufficient to answer that predicate for every LHS
+    /// value, so the hash build may safely summarize duplicate rows.
+    pub(super) fn existence_inequality_right_value(
+        &self,
+        join_type: JoinType,
+        left_width: usize,
+    ) -> Option<BoundExpr> {
+        if !matches!(join_type, JoinType::Semi | JoinType::Anti) || self.null_aware.is_some() {
+            return None;
+        }
+        let ExprKind::Binary {
+            left,
+            op: BinaryOp::NotEq,
+            right,
+        } = &self.residual.as_ref()?.kind
+        else {
+            return None;
+        };
+        let (ExprKind::Column(left_index), ExprKind::Column(right_index)) =
+            (&left.kind, &right.kind)
+        else {
+            return None;
+        };
+        let joined_width = self.joined_schema.fields().len();
+        let right_joined_index = match (*left_index < left_width, *right_index < left_width) {
+            (true, false) => *right_index,
+            (false, true) => *left_index,
+            _ => return None,
+        };
+        if right_joined_index >= joined_width {
+            return None;
+        }
+        let field = self.joined_schema.field(right_joined_index);
+        Some(BoundExpr::column(
+            right_joined_index - left_width,
+            field.data_type().clone(),
+            field.name(),
+        ))
     }
 
     pub(super) fn evaluate_candidates(
@@ -222,5 +267,44 @@ mod tests {
         assert_eq!(outcomes[0].membership, Some(SqlTruth::True));
         assert!(!outcomes[1].qualifies);
         assert_eq!(outcomes[1].membership, None);
+    }
+
+    #[test]
+    fn recognizes_cross_side_inequality_for_existence_summary() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new(
+            "left_value",
+            DataType::Int64,
+            true,
+        )]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new(
+            "right_value",
+            DataType::Int64,
+            true,
+        )]));
+        let residual = BoundExpr {
+            kind: ExprKind::Binary {
+                left: Box::new(BoundExpr::column(0, DataType::Int64, "left_value")),
+                op: BinaryOp::NotEq,
+                right: Box::new(BoundExpr::column(1, DataType::Int64, "right_value")),
+            },
+            data_type: DataType::Boolean,
+            display_name: "left_value != right_value".into(),
+        };
+        let predicates = JoinPredicates::new(Some(residual), None, &left_schema, &right_schema);
+        let value = predicates
+            .existence_inequality_right_value(crate::sql::JoinType::Semi, 1)
+            .expect("simple inequality should be summarized");
+        assert!(matches!(value.kind, ExprKind::Column(0)));
+        assert!(
+            predicates
+                .existence_inequality_right_value(crate::sql::JoinType::Left, 1)
+                .is_none()
+        );
+        assert!(
+            predicates
+                .existence_inequality_right_value(crate::sql::JoinType::Mark, 1)
+                .is_none(),
+            "Mark must retain NULL candidates so it can return UNKNOWN"
+        );
     }
 }

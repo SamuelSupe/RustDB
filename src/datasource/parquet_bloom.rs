@@ -4,24 +4,16 @@ use parquet::{
 };
 
 use super::{
-    ComparisonOp, PredicateValue, ScanPredicate,
+    ComparisonOp, MetadataCache, PredicateValue, ScanPredicate,
+    metadata_cache::BloomLoad,
     parquet_metadata::ParquetMetadata,
     parquet_pruning_budget::{MAX_FILE_PAGE_INDEX_BYTES, PruningBudget},
-    parquet_reader::{QueryIo, SnapshotParquetReader},
+    parquet_reader::{QueryIo, SnapshotParquetReader, into_query_error},
 };
 use crate::{Error, Result, runtime::QueryContext, storage::ObjectSource};
 
 pub(super) fn supports_bloom(predicate: Option<&ScanPredicate>) -> bool {
-    predicate.is_some_and(|predicate| match predicate {
-        ScanPredicate::And(predicates) => predicates
-            .iter()
-            .any(|predicate| supports_bloom(Some(predicate))),
-        ScanPredicate::Comparison {
-            op: ComparisonOp::Eq,
-            ..
-        } => true,
-        _ => false,
-    })
+    predicate.is_some_and(|predicate| !equality_groups(predicate).is_empty())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -33,101 +25,204 @@ pub(super) async fn bloom_prunes_row_group(
     row_group: usize,
     predicate: Option<&ScanPredicate>,
     context: &QueryContext,
+    cache: &MetadataCache,
     budget: &PruningBudget,
 ) -> Result<bool> {
     let Some(predicate) = predicate else {
         return Ok(false);
     };
-    for predicate in equality_atoms(predicate) {
-        let ScanPredicate::Comparison { column, value, .. } = predicate else {
-            continue;
-        };
-        let parquet_metadata = metadata.reader_metadata().metadata();
-        let Some((file_column, leaf)) =
-            column_leaf(parquet_metadata, file_schema, table_schema, *column)
-        else {
-            continue;
-        };
-        let Some(value) = BloomValue::new(file_schema.field(file_column).data_type(), value) else {
-            continue;
-        };
-        if matches!(value, BloomValue::DefinitelyAbsent) {
-            return Ok(true);
-        }
-
-        let column_metadata = parquet_metadata.row_group(row_group).column(leaf);
-        let column_name = file_schema.field(file_column).name();
-        let Some((start, length)) = bloom_location(
-            file.uri(),
-            row_group,
-            column_name,
-            column_metadata.bloom_filter_offset(),
-            column_metadata.bloom_filter_length(),
-        )?
-        else {
-            continue;
-        };
-        // A Bloom offset without a length is the legal legacy layout. Parquet
-        // can discover its size from the header, but RustDB intentionally skips
-        // it because there is no trustworthy pre-read bound for query memory.
-        let Some(length) = length else {
-            context.metrics.add_parquet_pruning_budget_skip();
-            continue;
-        };
-        if length > MAX_FILE_PAGE_INDEX_BYTES {
-            context.metrics.add_parquet_pruning_budget_skip();
-            continue;
-        }
-        let snapshot = context.object_snapshot(file.uri())?;
-        let end = start
-            .checked_add(u64::try_from(length).unwrap_or(u64::MAX))
-            .ok_or_else(|| {
-                bloom_error(
-                    file.uri(),
-                    row_group,
-                    file_schema.field(file_column).name(),
-                    "filter range overflows u64",
-                )
-            })?;
-        if end > snapshot.size {
-            return Err(bloom_error(
-                file.uri(),
+    for group in equality_groups(predicate) {
+        let mut all_absent = true;
+        for predicate in group {
+            match equality_absent(
+                file,
+                metadata,
+                file_schema,
+                table_schema,
                 row_group,
-                file_schema.field(file_column).name(),
-                "filter range exceeds object size",
-            ));
+                predicate,
+                context,
+                cache,
+                budget,
+            )
+            .await?
+            {
+                Some(true) => {}
+                Some(false) | None => {
+                    all_absent = false;
+                    break;
+                }
+            }
         }
-        let Some(_budget_lease) = budget.try_reserve(length) else {
-            context.metrics.add_parquet_pruning_budget_skip();
-            continue;
-        };
-        let Ok(_memory) = context.memory.try_reserve(length) else {
-            context.metrics.add_parquet_pruning_budget_skip();
-            continue;
-        };
-
-        let query = QueryIo::for_bloom_filter(context.control.clone(), context.metrics.clone());
-        let reader = SnapshotParquetReader::new(file, snapshot, Some(query));
-        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
-            reader,
-            metadata.reader_metadata().clone(),
-        );
-        let filter = builder
-            .get_row_group_column_bloom_filter(row_group, leaf)
-            .await
-            .map_err(|error| {
-                bloom_error(
-                    file.uri(),
-                    row_group,
-                    file_schema.field(file_column).name(),
-                    &error.to_string(),
-                )
-            })?;
-        if filter.is_some_and(|filter| !value.might_be_present(&filter)) {
+        if all_absent {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn equality_absent(
+    file: &ObjectSource,
+    metadata: &ParquetMetadata,
+    file_schema: &Schema,
+    table_schema: &Schema,
+    row_group: usize,
+    predicate: &ScanPredicate,
+    context: &QueryContext,
+    cache: &MetadataCache,
+    budget: &PruningBudget,
+) -> Result<Option<bool>> {
+    let ScanPredicate::Comparison { column, value, .. } = predicate else {
+        return Ok(None);
+    };
+    let parquet_metadata = metadata.reader_metadata().metadata();
+    let Some((file_column, leaf)) =
+        column_leaf(parquet_metadata, file_schema, table_schema, *column)
+    else {
+        return Ok(None);
+    };
+    let Some(value) = BloomValue::new(file_schema.field(file_column).data_type(), value) else {
+        return Ok(None);
+    };
+    if matches!(value, BloomValue::DefinitelyAbsent) {
+        return Ok(Some(true));
+    }
+
+    let column_metadata = parquet_metadata.row_group(row_group).column(leaf);
+    let column_name = file_schema.field(file_column).name();
+    let Some((start, length)) = bloom_location(
+        file.uri(),
+        row_group,
+        column_name,
+        column_metadata.bloom_filter_offset(),
+        column_metadata.bloom_filter_length(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(length) = length else {
+        context.metrics.add_parquet_pruning_budget_skip();
+        return Ok(None);
+    };
+    if length > MAX_FILE_PAGE_INDEX_BYTES {
+        context.metrics.add_parquet_pruning_budget_skip();
+        return Ok(None);
+    }
+    let snapshot = context.object_snapshot(file.uri())?;
+    let end = start
+        .checked_add(u64::try_from(length).unwrap_or(u64::MAX))
+        .ok_or_else(|| {
+            bloom_error(
+                file.uri(),
+                row_group,
+                file_schema.field(file_column).name(),
+                "filter range overflows u64",
+            )
+        })?;
+    if end > snapshot.size {
+        return Err(bloom_error(
+            file.uri(),
+            row_group,
+            file_schema.field(file_column).name(),
+            "filter range exceeds object size",
+        ));
+    }
+    let Some(_budget_lease) = budget.try_reserve(length) else {
+        context.metrics.add_parquet_pruning_budget_skip();
+        return Ok(None);
+    };
+    let Ok(_memory) = context.memory.try_reserve(length) else {
+        context.metrics.add_parquet_pruning_budget_skip();
+        return Ok(None);
+    };
+
+    let _load_guard = match cache
+        .acquire_bloom(
+            file,
+            &snapshot,
+            row_group,
+            leaf,
+            start,
+            length,
+            Some(&context.control),
+        )
+        .await?
+    {
+        ready @ (BloomLoad::Cached { .. } | BloomLoad::Shared { .. }) => {
+            let (filter, wait, cache_hit) = match ready {
+                BloomLoad::Cached { filter, wait } => (filter, wait, true),
+                BloomLoad::Shared { filter, wait } => (filter, wait, false),
+                BloomLoad::Leader { .. } => unreachable!(),
+            };
+            if cache_hit {
+                context.metrics.record_metadata_cache_hit();
+            } else {
+                context.metrics.record_metadata_cache_miss();
+            }
+            if !wait.is_zero() {
+                context.metrics.record_metadata_singleflight_wait(wait);
+            }
+            return Ok(filter.map(|filter| !value.might_be_present(&filter)));
+        }
+        BloomLoad::Leader { guard, wait } => {
+            context.metrics.record_metadata_cache_miss();
+            if !wait.is_zero() {
+                context.metrics.record_metadata_singleflight_wait(wait);
+            }
+            guard
+        }
+    };
+
+    let query = QueryIo::for_bloom_filter(context.control.clone(), context.metrics.clone());
+    let reader = SnapshotParquetReader::new(file, snapshot.clone(), Some(query));
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+        reader,
+        metadata.reader_metadata().clone(),
+    );
+    let loaded = builder
+        .get_row_group_column_bloom_filter(row_group, leaf)
+        .await
+        .map_err(|error| {
+            contextual_bloom_error(
+                file.uri(),
+                row_group,
+                file_schema.field(file_column).name(),
+                error,
+            )
+        });
+    let filter = match loaded {
+        Ok(filter) => filter,
+        Err(error) => return Err(_load_guard.fail(error)),
+    };
+    let Some(filter) = filter else {
+        _load_guard.succeed(None);
+        return Ok(None);
+    };
+    let filter = std::sync::Arc::new(filter);
+    cache.insert_bloom(
+        file,
+        &snapshot,
+        row_group,
+        leaf,
+        start,
+        length,
+        std::sync::Arc::clone(&filter),
+    );
+    _load_guard.succeed(Some(std::sync::Arc::clone(&filter)));
+    Ok(Some(!value.might_be_present(&filter)))
+}
+
+fn contextual_bloom_error(
+    uri: &str,
+    row_group: usize,
+    column: &str,
+    error: parquet::errors::ParquetError,
+) -> Error {
+    match into_query_error(error) {
+        error @ (Error::Cancelled | Error::ResourceExhausted(_)) => error,
+        error => bloom_error(uri, row_group, column, &error.to_string()),
+    }
 }
 
 fn bloom_location(
@@ -179,25 +274,54 @@ fn bloom_location(
     Ok(Some((offset, length)))
 }
 
-fn equality_atoms(predicate: &ScanPredicate) -> Vec<&ScanPredicate> {
+fn equality_groups(predicate: &ScanPredicate) -> Vec<Vec<&ScanPredicate>> {
     let mut output = Vec::new();
-    collect_equalities(predicate, &mut output);
+    collect_equality_groups(predicate, &mut output);
     output
 }
 
-fn collect_equalities<'a>(predicate: &'a ScanPredicate, output: &mut Vec<&'a ScanPredicate>) {
+fn collect_equality_groups<'a>(
+    predicate: &'a ScanPredicate,
+    output: &mut Vec<Vec<&'a ScanPredicate>>,
+) {
     match predicate {
         ScanPredicate::And(predicates) => {
             for predicate in predicates {
-                collect_equalities(predicate, output);
+                collect_equality_groups(predicate, output);
+            }
+        }
+        ScanPredicate::Or(predicates) => {
+            if let Some(group) = same_column_equalities(predicates) {
+                output.push(group);
             }
         }
         ScanPredicate::Comparison {
             op: ComparisonOp::Eq,
             ..
-        } => output.push(predicate),
+        } => output.push(vec![predicate]),
         _ => {}
     }
+}
+
+fn same_column_equalities(predicates: &[ScanPredicate]) -> Option<Vec<&ScanPredicate>> {
+    let mut output = Vec::with_capacity(predicates.len());
+    let mut expected = None;
+    for predicate in predicates {
+        let ScanPredicate::Comparison {
+            column,
+            op: ComparisonOp::Eq,
+            ..
+        } = predicate
+        else {
+            return None;
+        };
+        if expected.is_some_and(|expected| expected != *column) {
+            return None;
+        }
+        expected = Some(*column);
+        output.push(predicate);
+    }
+    (!output.is_empty()).then_some(output)
 }
 
 fn column_leaf(
@@ -287,9 +411,23 @@ fn bloom_error(uri: &str, row_group: usize, column: &str, reason: &str) -> Error
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
+    use parquet::errors::ParquetError;
 
-    use super::{BloomValue, bloom_error, bloom_location, timestamp_physical};
-    use crate::datasource::PredicateValue;
+    use super::{
+        BloomValue, bloom_error, bloom_location, contextual_bloom_error, timestamp_physical,
+    };
+    use crate::{Error, datasource::PredicateValue};
+
+    #[test]
+    fn query_local_bloom_errors_are_not_relabelled_as_corruption() {
+        let error = contextual_bloom_error(
+            "s3://bucket/data.parquet",
+            0,
+            "id",
+            ParquetError::External(Box::new(Error::ResourceExhausted("query budget".into()))),
+        );
+        assert!(matches!(error, Error::ResourceExhausted(_)));
+    }
 
     #[test]
     fn timestamp_bloom_conversion_requires_exact_coarse_units() {

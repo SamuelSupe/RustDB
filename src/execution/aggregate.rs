@@ -18,6 +18,7 @@ use super::{
     value::{CellValue, cell, values_to_array},
 };
 
+mod admission;
 mod distinct;
 mod key;
 mod parallel;
@@ -27,10 +28,11 @@ pub(super) mod state;
 #[cfg(test)]
 mod tests;
 
+use admission::PartialMergeAdmission;
 use key::{GroupKey, GroupKeyEncoder};
 use spill::{
-    MergeOutcome, PartitionTask, SPILL_PARTITIONS, StateSpiller, merge_partition,
-    repartition_partition, spill_states,
+    MergeOutcome, PartitionTask, StateSpiller, adaptive_spill_partitions, merge_partition,
+    pop_largest_partition, repartition_partition, spill_largest_partition, spill_states,
 };
 use state::{GroupState, estimate_group_bytes};
 
@@ -91,6 +93,7 @@ fn serial_aggregate(
         batch_size,
         InputMode::Raw,
         OutputMode::Final,
+        None,
     )
 }
 
@@ -100,6 +103,7 @@ fn serial_partial_aggregate(
     aggregates: Vec<AggregateExpr>,
     context: Arc<QueryContext>,
     batch_size: usize,
+    partial_merge_admission: PartialMergeAdmission,
 ) -> MemoryBatchStream {
     let schema = partial_schema(&groups, &aggregates);
     aggregate_with_modes(
@@ -111,6 +115,7 @@ fn serial_partial_aggregate(
         batch_size,
         InputMode::Raw,
         OutputMode::Partial,
+        Some(partial_merge_admission),
     )
 }
 
@@ -131,6 +136,7 @@ fn merge_partial_aggregate(
         batch_size,
         InputMode::Partial,
         OutputMode::Final,
+        None,
     )
 }
 
@@ -156,6 +162,7 @@ fn aggregate_with_modes(
     batch_size: usize,
     input_mode: InputMode,
     output_mode: OutputMode,
+    partial_merge_admission: Option<PartialMergeAdmission>,
 ) -> MemoryBatchStream {
     boxed_memory_batch_stream(async_stream::try_stream! {
         let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
@@ -249,11 +256,21 @@ fn aggregate_with_modes(
                     let state = GroupState::new(state_key, &aggregates);
                     let bytes = estimate_group_bytes(&state)
                         .saturating_add(index_key.memory_size());
-                    if reservation.try_grow(bytes).is_err() {
+                    while reservation.try_grow(bytes).is_err() {
+                        if states.is_empty() {
+                            Err(spill::single_group_error(
+                                bytes,
+                                &context,
+                                reservation.pool().limit(),
+                            ))?;
+                        }
                         let spiller = spilled.get_or_insert_with(|| {
-                            StateSpiller::new(&context, SPILL_PARTITIONS)
+                            StateSpiller::new(
+                                &context,
+                                adaptive_spill_partitions(&context, reservation.size()),
+                            )
                         });
-                        spill_states(
+                        let resident_bytes = spill_largest_partition(
                             &mut states,
                             &mut group_index,
                             &groups,
@@ -262,12 +279,7 @@ fn aggregate_with_modes(
                             spiller,
                             &context,
                         )?;
-                        reservation.try_resize(0)?;
-                        reservation
-                            .try_grow(bytes)
-                            .map_err(|_| {
-                                spill::single_group_error(bytes, &context, reservation.pool().limit())
-                            })?;
+                        reservation.try_resize(resident_bytes)?;
                     }
                     let index = states.len();
                     states.push(state);
@@ -297,7 +309,7 @@ fn aggregate_with_modes(
             }
         }
 
-        if let Some(mut spiller) = spilled {
+        let mut spilled_partitions = if let Some(mut spiller) = spilled {
             spill_states(
                 &mut states,
                 &mut group_index,
@@ -308,14 +320,66 @@ fn aggregate_with_modes(
                 &context,
             )?;
             reservation.try_resize(0)?;
-            let mut pending = spiller
-                .finish()?
+            let partitions = spiller.finish(&context)?;
+            if let Some(admission) = partial_merge_admission.as_ref() {
+                admission.mark_spilled();
+            }
+            Some(partitions)
+        } else {
+            None
+        };
+        if let Some(admission) = partial_merge_admission.as_ref() {
+            admission.wait_ready(&context).await?;
+            if admission.any_spilled() && spilled_partitions.is_none() {
+                let mut spiller = StateSpiller::new(
+                    &context,
+                    adaptive_spill_partitions(&context, reservation.size()),
+                );
+                spill_states(
+                    &mut states,
+                    &mut group_index,
+                    &groups,
+                    &aggregates,
+                    Arc::clone(&partial_schema),
+                    &mut spiller,
+                    &context,
+                )?;
+                reservation.try_resize(0)?;
+                spilled_partitions = Some(spiller.finish(&context)?);
+            }
+            admission.wait_ready(&context).await?;
+        }
+
+        if let Some(partitions) = spilled_partitions {
+            let partial_merge_permit = if let Some(admission) = partial_merge_admission.as_ref() {
+                Some(admission.acquire_merge(&context).await?)
+            } else {
+                None
+            };
+            if matches!(output_mode, OutputMode::Final) {
+                reservation = context
+                    .memory
+                    .child(
+                        format!("aggregate-merge-{}", context.query_id),
+                        aggregate_merge_state_limit(context.memory.limit()),
+                    )
+                    .reservation();
+            } else if partial_merge_permit.is_some() {
+                reservation = context
+                    .memory
+                    .child(
+                        format!("aggregate-partial-merge-{}", context.query_id),
+                        aggregate_partial_merge_state_limit(context.memory.limit()),
+                    )
+                    .reservation();
+            }
+            let mut pending = partitions
                 .into_iter()
                 .rev()
-                .filter(|files| !files.is_empty())
+                .filter(|partition| !partition.files.is_empty())
                 .map(PartitionTask::initial)
                 .collect::<Vec<_>>();
-            while let Some(task) = pending.pop() {
+            while let Some(task) = pop_largest_partition(&mut pending) {
                 context.check_cancelled()?;
                 match merge_partition(
                     &task.files,
@@ -325,9 +389,22 @@ fn aggregate_with_modes(
                     &mut reservation,
                 )? {
                     MergeOutcome::Merged(partition_states) => {
+                        // merge_partition's hash index has been dropped. Keep
+                        // charging the returned states, but release the index
+                        // copy before output backpressure can overlap this
+                        // partial merge with the downstream final aggregate.
+                        reservation.try_resize(retained_group_state_bytes(&partition_states))?;
                         spill::remove_files(&context, &task.files)?;
-                        for chunk in partition_states.chunks(batch_size.max(1)) {
+                        let mut offset = 0;
+                        while offset < partition_states.len() {
                             context.check_cancelled()?;
+                            let chunk_len = output_chunk_len(
+                                &partition_states[offset..],
+                                batch_size,
+                                schema.fields().len(),
+                                aggregate_output_workspace_limit(context.memory.limit()),
+                            );
+                            let chunk = &partition_states[offset..offset + chunk_len];
                             yield build_output_envelope(
                                 chunk,
                                 &groups,
@@ -337,30 +414,43 @@ fn aggregate_with_modes(
                                 &context,
                                 reservation.size(),
                             ).await?;
+                            offset += chunk_len;
                         }
                         reservation.try_resize(0)?;
                     }
                     MergeOutcome::Repartition => {
                         reservation.try_resize(0)?;
-                        let next_depth = task.next_depth()?;
+                        let next_depth =
+                            task.next_depth(context.execution.max_repartition_depth)?;
                         let child_partitions = repartition_partition(
                             &task.files,
+                            task.estimated_bytes(),
                             &groups,
+                            &aggregates,
                             next_depth,
                             &context,
                         )?;
                         spill::remove_files(&context, &task.files)?;
-                        for files in child_partitions.into_iter().rev() {
-                            if !files.is_empty() {
-                                pending.push(PartitionTask::child(files, next_depth));
+                        for partition in child_partitions.into_iter().rev() {
+                            if !partition.files.is_empty() {
+                                pending.push(PartitionTask::child(partition, next_depth));
                             }
                         }
                     }
                 }
             }
+            drop(partial_merge_permit);
         } else {
-            for chunk in states.chunks(batch_size.max(1)) {
+            let mut offset = 0;
+            while offset < states.len() {
                 context.check_cancelled()?;
+                let chunk_len = output_chunk_len(
+                    &states[offset..],
+                    batch_size,
+                    schema.fields().len(),
+                    aggregate_output_workspace_limit(context.memory.limit()),
+                );
+                let chunk = &states[offset..offset + chunk_len];
                 yield build_output_envelope(
                     chunk,
                     &groups,
@@ -370,6 +460,7 @@ fn aggregate_with_modes(
                     &context,
                     reservation.size(),
                 ).await?;
+                offset += chunk_len;
             }
         }
     })
@@ -384,6 +475,32 @@ fn aggregate_workspace_estimate(batch: &RecordBatch, groups: &[BoundExpr]) -> us
                 .saturating_mul(groups.len().saturating_mul(16).saturating_add(8)),
         )
         .max(1)
+}
+
+fn retained_group_state_bytes(states: &[GroupState]) -> usize {
+    states
+        .iter()
+        .map(estimate_group_bytes)
+        .fold(0usize, usize::saturating_add)
+}
+
+fn output_chunk_len(
+    states: &[GroupState],
+    max_rows: usize,
+    output_columns: usize,
+    workspace_limit: usize,
+) -> usize {
+    let mut bytes = output_columns.saturating_mul(512).saturating_add(1);
+    let mut rows = 0;
+    for state in states.iter().take(max_rows.max(1)) {
+        let next = bytes.saturating_add(state.output_workspace_bytes(output_columns));
+        if rows != 0 && next > workspace_limit {
+            break;
+        }
+        bytes = next;
+        rows += 1;
+    }
+    rows.max(1).min(states.len())
 }
 
 fn retained_workspace_bytes(
@@ -462,14 +579,33 @@ fn count_star_only(aggregates: &[AggregateExpr]) -> bool {
 }
 
 fn aggregate_state_limit(query_limit: usize, output_mode: OutputMode, lanes: usize) -> usize {
-    // Keep enough room for one leased input/workspace batch and the active
-    // partition writers while resident states are serialized.
+    // Resident input states coexist with active partition writers. Partial
+    // lanes also coexist with each other, so each gets a smaller share.
     let divisor = if matches!(output_mode, OutputMode::Partial) {
         lanes.max(1).saturating_mul(2)
     } else {
         3
     };
     query_limit.checked_div(divisor).unwrap_or(0).max(1)
+}
+
+fn aggregate_merge_state_limit(query_limit: usize) -> usize {
+    // Spill writers are closed before final partition merge. Keep the other
+    // half for decoded IPC input, output materialization, and downstream work.
+    query_limit.checked_div(2).unwrap_or(0).max(1)
+}
+
+fn aggregate_partial_merge_state_limit(query_limit: usize) -> usize {
+    // Partial lanes close their writers before entering a query-wide
+    // single-lane merge gate. Match the serial aggregate state budget while
+    // retaining two thirds for sibling lanes, IPC input, and output batches.
+    query_limit.checked_div(3).unwrap_or(0).max(1)
+}
+
+fn aggregate_output_workspace_limit(query_limit: usize) -> usize {
+    // Partial and final aggregate states may overlap under backpressure. Keep
+    // each output materialization small enough to make progress beside both.
+    query_limit.checked_div(8).unwrap_or(0).max(1)
 }
 
 fn build_batch(

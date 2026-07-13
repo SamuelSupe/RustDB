@@ -44,7 +44,7 @@ fn only_structurally_infallible_predicates_can_move() {
         .is_structurally_infallible()
     );
     assert!(
-        !BoundExpr {
+        BoundExpr {
             kind: ExprKind::Case {
                 when_then: vec![(comparison, column.clone())],
                 else_expr: Box::new(column),
@@ -74,6 +74,156 @@ fn moves_and_rebases_an_infallible_right_predicate_below_an_inner_join() {
     };
     assert!(matches!(*left, LogicalPlan::Empty { .. }));
     assert_filter_columns(*right, &[0]);
+}
+
+#[test]
+fn moves_a_direct_column_predicate_through_an_infallible_projection() {
+    let left_schema = one_column_schema("left_key");
+    let right_schema = one_column_schema("right_key");
+    let schema = PlanSchema::join(&left_schema, &right_schema);
+    let join = LogicalPlan::Join {
+        left: Box::new(empty(left_schema)),
+        right: Box::new(empty(right_schema)),
+        on: safe_keys(),
+        null_equal_keys: false,
+        residual: None,
+        null_aware: None,
+        join_type: JoinType::Inner,
+        schema: schema.clone(),
+    };
+    let plan = apply(LogicalPlan::Filter {
+        input: Box::new(LogicalPlan::Projection {
+            input: Box::new(join),
+            expressions: vec![column(0), column(1)],
+            schema: schema.clone(),
+        }),
+        predicate: comparison(1, 7),
+        schema,
+    });
+
+    let LogicalPlan::Projection { input, .. } = plan else {
+        panic!("expected projection above relocated filter")
+    };
+    let LogicalPlan::Join { right, .. } = *input else {
+        panic!("expected join below projection")
+    };
+    assert_filter_columns(*right, &[0]);
+}
+
+#[test]
+fn keeps_a_generated_marker_predicate_above_its_reordering_projection() {
+    let left_schema = one_column_schema("left_key");
+    let right_schema = one_column_schema("right_value");
+    let marker_name = "__rustdb_scalar_subquery_0";
+    let join_schema = PlanSchema::unqualified(Arc::new(Schema::new(vec![
+        Field::new("left_key", DataType::Int64, false),
+        Field::new(marker_name, DataType::Boolean, true),
+    ])));
+    let projection_schema = PlanSchema::unqualified(Arc::new(Schema::new(vec![
+        Field::new(marker_name, DataType::Boolean, true),
+        Field::new("left_key", DataType::Int64, false),
+    ])));
+    let plan = apply(LogicalPlan::Filter {
+        input: Box::new(LogicalPlan::Projection {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(empty(left_schema)),
+                right: Box::new(empty(right_schema)),
+                on: Vec::new(),
+                null_equal_keys: false,
+                residual: None,
+                null_aware: None,
+                join_type: JoinType::Mark,
+                schema: join_schema,
+            }),
+            expressions: vec![
+                BoundExpr::column(1, DataType::Boolean, marker_name),
+                BoundExpr::column(0, DataType::Int64, "left_key"),
+            ],
+            schema: projection_schema.clone(),
+        }),
+        predicate: BoundExpr::column(0, DataType::Boolean, marker_name),
+        schema: projection_schema,
+    });
+
+    let LogicalPlan::Filter { input, .. } = plan else {
+        panic!("expected marker filter to remain above the projection")
+    };
+    let LogicalPlan::Projection { input, .. } = *input else {
+        panic!("expected the marker-reordering projection")
+    };
+    assert!(matches!(
+        *input,
+        LogicalPlan::Join {
+            join_type: JoinType::Mark,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn moves_preserved_side_predicates_below_outer_joins() {
+    let left_schema = one_column_schema("left_key");
+    let right_schema = one_column_schema("right_key");
+    for (join_type, predicate, expected_left) in [
+        (JoinType::Left, comparison(0, 7), true),
+        (JoinType::Right, comparison(1, 7), false),
+    ] {
+        let schema = if join_type == JoinType::Left {
+            PlanSchema::left_join(&left_schema, &right_schema)
+        } else {
+            PlanSchema::right_join(&left_schema, &right_schema)
+        };
+        let plan = apply(LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(empty(left_schema.clone())),
+                right: Box::new(empty(right_schema.clone())),
+                on: safe_keys(),
+                null_equal_keys: false,
+                residual: None,
+                null_aware: None,
+                join_type,
+                schema: schema.clone(),
+            }),
+            predicate,
+            schema,
+        });
+        let LogicalPlan::Join { left, right, .. } = plan else {
+            panic!("expected predicate below outer join")
+        };
+        if expected_left {
+            assert_filter_columns(*left, &[0]);
+        } else {
+            assert_filter_columns(*right, &[0]);
+        }
+    }
+}
+
+#[test]
+fn keeps_outer_join_predicate_above_a_fallible_join_condition() {
+    let division = binary(
+        column(0),
+        BinaryOp::Divide,
+        BoundExpr::literal(ScalarValue::Int64(0)),
+        DataType::Int64,
+    );
+    let left_schema = one_column_schema("left_key");
+    let right_schema = one_column_schema("right_key");
+    let schema = PlanSchema::left_join(&left_schema, &right_schema);
+    let plan = apply(LogicalPlan::Filter {
+        input: Box::new(LogicalPlan::Join {
+            left: Box::new(empty(left_schema)),
+            right: Box::new(empty(right_schema)),
+            on: vec![(division, column(0))],
+            null_equal_keys: false,
+            residual: None,
+            null_aware: None,
+            join_type: JoinType::Left,
+            schema: schema.clone(),
+        }),
+        predicate: comparison(0, 7),
+        schema,
+    });
+    assert_filter_above_join(plan);
 }
 
 #[test]

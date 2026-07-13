@@ -58,6 +58,12 @@ pub(super) fn remap_predicate(
                 .map(|predicate| remap_predicate(predicate, source, target))
                 .collect::<Option<Vec<_>>>()?,
         )),
+        ScanPredicate::Or(predicates) => Some(ScanPredicate::Or(
+            predicates
+                .iter()
+                .map(|predicate| remap_predicate(predicate, source, target))
+                .collect::<Option<Vec<_>>>()?,
+        )),
     }
 }
 

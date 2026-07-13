@@ -42,6 +42,13 @@ fn explain_reports_decorrelation_and_spill_strategies() {
     let explain = plan.explain();
     assert!(explain.contains("dedup:tagged_full_key"), "{explain}");
     assert!(explain.contains("Aggregate") && explain.contains("spill=recursive_hash"));
+    assert!(explain.contains("victim=largest_partition"), "{explain}");
+    assert!(explain.contains("fanout=adaptive(2..256)"), "{explain}");
+    assert!(
+        explain.contains("target=configured_or_auto(query_memory/(2*active_lanes),clamp=8..64MiB)"),
+        "{explain}"
+    );
+    assert!(explain.contains("repartition=bounded_seeded"), "{explain}");
     assert!(explain.contains("Sort") && explain.contains("spill=external_ipc_lz4"));
 
     let catalog = Catalog::default();
@@ -59,7 +66,22 @@ fn explain_reports_decorrelation_and_spill_strategies() {
     let explain = plan.explain();
     assert!(explain.contains("SemiJoin"), "{explain}");
     assert!(explain.contains("decorrelation=complete"), "{explain}");
+    assert!(explain.contains("runtime_filter=eligible"), "{explain}");
     assert!(explain.contains("spill=grace_hash"), "{explain}");
+
+    let StatementPlan::Query(plan) = plan_sql(
+        &catalog,
+        "SELECT l.id FROM left_ids l LEFT JOIN right_ids r ON r.id = l.id",
+    )
+    .unwrap() else {
+        panic!("expected query plan");
+    };
+    let explain = plan.explain();
+    assert!(explain.contains("LeftJoin"), "{explain}");
+    assert!(
+        explain.contains("runtime_filter=not_applicable"),
+        "{explain}"
+    );
 }
 
 #[test]
@@ -211,6 +233,27 @@ async fn explain_analyze_executes_and_reports_global_metrics() {
     assert!(output.contains("Projection"));
     assert!(output.contains("Global Metrics"));
     assert!(output.contains("returned_rows=1"));
+    assert!(output.contains("Operator Metrics"));
+    assert!(output.contains("name=Projection"));
+    assert!(output.contains("output_rows=1"));
+
+    let catalog = Catalog::default();
+    register_ids(&catalog, "profile_ids", vec![Some(0), Some(2)]);
+    let batches = run_with_catalog(
+        &catalog,
+        "EXPLAIN ANALYZE SELECT id + 1 FROM profile_ids WHERE id > 0",
+    )
+    .await;
+    let output = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+    for operator in ["Scan", "Filter", "Projection"] {
+        assert!(output.contains(&format!("name={operator}")), "{output}");
+    }
+    assert!(output.contains("name=Projection input_rows=1"), "{output}");
 }
 
 #[tokio::test]

@@ -16,6 +16,7 @@ use crate::{
 
 use super::{
     expr::evaluate,
+    runtime_filter::RuntimeFilterSlot,
     value::{CellValue, cell},
 };
 
@@ -41,14 +42,16 @@ use condition::JoinPredicates;
 use matched::BuildMatchTracker;
 use output::build_unmatched_right_envelope;
 use probe::{
-    GlobalMembershipState, ProbeCursor, try_build_hash_table, try_build_hash_table_with_nulls,
+    GlobalMembershipState, ProbeCursor, try_build_existence_hash_table_with_nulls,
+    try_build_hash_table, try_build_hash_table_with_nulls,
 };
-use spill::{BuildPartition, MAX_REPARTITION_DEPTH, Side};
+use spill::{BuildPartition, Side};
 
 // The physical join boundary carries both input schemas, output schema, keys,
 // execution state, and sizing. Keeping this explicit avoids a public options
 // abstraction for a single internal call site.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn join_with_null_keys<L, R>(
     left: L,
     right: R,
@@ -62,6 +65,43 @@ pub(crate) fn join_with_null_keys<L, R>(
     schema: SchemaRef,
     context: Arc<QueryContext>,
     batch_size: usize,
+) -> MemoryBatchStream
+where
+    L: IntoMemoryBatchStream,
+    R: IntoMemoryBatchStream,
+{
+    join_with_runtime_filter(
+        left,
+        right,
+        on,
+        null_equal_keys,
+        residual,
+        null_aware,
+        left_schema,
+        right_schema,
+        join_type,
+        schema,
+        context,
+        batch_size,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn join_with_runtime_filter<L, R>(
+    left: L,
+    right: R,
+    on: Vec<(BoundExpr, BoundExpr)>,
+    null_equal_keys: bool,
+    residual: Option<BoundExpr>,
+    null_aware: Option<(BoundExpr, BoundExpr)>,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+    join_type: JoinType,
+    schema: SchemaRef,
+    context: Arc<QueryContext>,
+    batch_size: usize,
+    runtime_filter: Option<Arc<RuntimeFilterSlot>>,
 ) -> MemoryBatchStream
 where
     L: IntoMemoryBatchStream,
@@ -116,7 +156,15 @@ where
                 || reservation.try_grow(bytes).is_err()
             {
                 reservation.shrink(right_bytes);
-                let mut spiller = spill::PartitionSpiller::new(&context, "join-right");
+                let partitions = spill::adaptive_partition_count(
+                    &context,
+                    right_bytes.saturating_add(bytes),
+                );
+                let mut spiller = spill::PartitionSpiller::with_partitions(
+                    &context,
+                    "join-right",
+                    partitions,
+                );
                 for buffered in right_batches.drain(..) {
                     let buffered_bytes = buffered.get_array_memory_size();
                     spill::spill_batch_with_null_keys(
@@ -154,7 +202,7 @@ where
                     )?;
                     drop(batch_memory);
                 }
-                right_partitions = Some(spiller.finish()?);
+                right_partitions = Some(spiller.finish_manifest()?);
                 break;
             }
             let (batch, batch_memory) = batch.into_parts();
@@ -199,13 +247,32 @@ where
                     &context,
                     "join build keys",
                 )?;
-                let hash_table = try_build_hash_table_with_nulls(
-                    &right_keys,
-                    rows,
-                    can_deduplicate_build(join_type, &predicates),
-                    null_equal_keys,
-                    &mut reservation,
+                let inequality_value = predicates
+                    .existence_inequality_right_value(join_type, left_schema.fields().len());
+                let inequality_values = evaluate_optional_values(
+                    inequality_value.as_ref(),
+                    &right_batch,
+                    &context,
+                    "join build existence inequality value",
                 )?;
+                let hash_table = if let Some(values) = optional_array(&inequality_values) {
+                    try_build_existence_hash_table_with_nulls(
+                        &right_keys,
+                        rows,
+                        null_equal_keys,
+                        values,
+                        &mut reservation,
+                    )?
+                } else {
+                    try_build_hash_table_with_nulls(
+                        &right_keys,
+                        rows,
+                        can_deduplicate_build(join_type, &predicates),
+                        null_equal_keys,
+                        &mut reservation,
+                    )?
+                };
+                drop(inequality_values);
                 drop(right_keys);
                 let right_values = evaluate_optional_values(
                     predicates.right_value(),
@@ -254,6 +321,14 @@ where
             }
         }
 
+        if let Some(runtime_filter) = &runtime_filter {
+            if let Some((_, hash_table, _, _, _)) = &in_memory_build {
+                runtime_filter.publish_hash(hash_table, &context);
+            } else {
+                runtime_filter.publish_none();
+            }
+        }
+
         if let Some(right_partitions) = right_partitions {
             let left_partitions = spill::spill_stream(
                 &mut left,
@@ -263,13 +338,14 @@ where
                 null_equal_keys,
                 &context,
                 "join-left",
+                right_partitions.len(),
             ).await?;
             let initial = spill::initial_tasks(left_partitions, right_partitions);
             context.metrics.record_spill(
                 0,
                 u64::try_from(initial.len()).unwrap_or(u64::MAX),
             );
-            if grace::is_supported(&context, initial.len()) {
+            if grace::is_supported(&context, &initial) {
                 let mut output = grace::join(
                     initial,
                     left_key_expressions.clone(),
@@ -288,14 +364,15 @@ where
                 }
                 return;
             }
-            let mut pending = initial.into_iter().rev().collect::<Vec<_>>();
-            while let Some(task) = pending.pop() {
+            let mut pending = initial;
+            while let Some(task) = spill::pop_largest_task(&mut pending) {
                 context.check_cancelled()?;
                 let build = match spill::load_build_partition(
                     &task.right,
                     &right_schema,
                     &context,
                     &mut reservation,
+                    task.build,
                 )? {
                     BuildPartition::Loaded(right_batch) => {
                         let right_keys = evaluate_keys_accounted(
@@ -305,13 +382,34 @@ where
                             "join spill build keys",
                         )?;
                         let rows = right_batch.num_rows();
-                        let hash_table = try_build_hash_table_with_nulls(
-                            &right_keys,
-                            rows,
-                            can_deduplicate_build(join_type, &predicates),
-                            null_equal_keys,
-                            &mut reservation,
+                        let inequality_value = predicates.existence_inequality_right_value(
+                            join_type,
+                            left_schema.fields().len(),
+                        );
+                        let inequality_values = evaluate_optional_values(
+                            inequality_value.as_ref(),
+                            &right_batch,
+                            &context,
+                            "join spill existence inequality value",
                         )?;
+                        let hash_table = if let Some(values) = optional_array(&inequality_values) {
+                            try_build_existence_hash_table_with_nulls(
+                                &right_keys,
+                                rows,
+                                null_equal_keys,
+                                values,
+                                &mut reservation,
+                            )?
+                        } else {
+                            try_build_hash_table_with_nulls(
+                                &right_keys,
+                                rows,
+                                can_deduplicate_build(join_type, &predicates),
+                                null_equal_keys,
+                                &mut reservation,
+                            )?
+                        };
+                        drop(inequality_values);
                         drop(right_keys);
                         let right_values = evaluate_optional_values(
                             predicates.right_value(),
@@ -428,7 +526,7 @@ where
                     }
                     PartitionHashBuild::TooLarge(rows) => {
                         reservation.try_resize(0)?;
-                        if task.depth < MAX_REPARTITION_DEPTH {
+                        if task.depth < context.execution.max_repartition_depth {
                             let next_depth = task.depth + 1;
                             let repartitioned = spill::repartition(
                                 &task,
@@ -447,7 +545,7 @@ where
                                 } else {
                                     task.stagnant_repartitions + 1
                                 };
-                                for mut child in repartitioned.tasks.into_iter().rev() {
+                                for mut child in repartitioned.tasks {
                                     child.stagnant_repartitions = stagnant;
                                     pending.push(child);
                                 }
@@ -708,9 +806,10 @@ fn spill_build_batch(
     null_equal_keys: bool,
     context: &QueryContext,
     reservation: &mut crate::runtime::MemoryReservation,
-) -> Result<Vec<Vec<crate::runtime::SpillFile>>> {
+) -> Result<spill::PartitionManifest> {
     reservation.try_resize(batch.get_array_memory_size())?;
-    let mut spiller = spill::PartitionSpiller::new(context, "join-right");
+    let partitions = spill::adaptive_partition_count(context, batch.get_array_memory_size());
+    let mut spiller = spill::PartitionSpiller::with_partitions(context, "join-right", partitions);
     spill::spill_batch_with_null_keys(
         batch,
         keys,
@@ -721,7 +820,7 @@ fn spill_build_batch(
         0,
     )?;
     reservation.try_resize(0)?;
-    spiller.finish()
+    spiller.finish_manifest()
 }
 
 pub(super) fn evaluate_keys_accounted(

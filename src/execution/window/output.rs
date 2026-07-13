@@ -289,6 +289,32 @@ pub(super) fn process(
                             WindowFunction::RowNumber => CellValue::Int64(row_number),
                             WindowFunction::Rank => CellValue::Int64(rank),
                             WindowFunction::DenseRank => CellValue::Int64(dense_rank),
+                            WindowFunction::Ntile(buckets) => CellValue::Int64(ntile(
+                                u64::try_from(row_number).map_err(|_| {
+                                    Error::Execution("NTILE row number is out of range".into())
+                                })?,
+                                partition.rows,
+                                *buckets,
+                            )?),
+                            WindowFunction::PercentRank => {
+                                let denominator = partition.rows.saturating_sub(1);
+                                CellValue::Float64(if denominator == 0 {
+                                    0.0
+                                } else {
+                                    (rank - 1) as f64 / denominator as f64
+                                })
+                            }
+                            WindowFunction::CumeDist => {
+                                let peer_end = u64::try_from(row_number)
+                                    .map_err(|_| Error::Execution(
+                                        "CUME_DIST row number is out of range".into(),
+                                    ))?
+                                    .checked_add(peer_remaining.saturating_sub(1))
+                                    .ok_or_else(|| Error::Execution(
+                                        "CUME_DIST peer position overflowed UINT64".into(),
+                                    ))?;
+                                CellValue::Float64(peer_end as f64 / partition.rows as f64)
+                            }
                             WindowFunction::Aggregate(_) if is_whole(expression) => partition
                                 .whole_values[index]
                                 .clone()
@@ -479,4 +505,20 @@ fn is_rows_prefix(expression: &WindowExpr) -> bool {
     expression.frame.units == WindowFrameUnits::Rows
         && expression.frame.end == WindowFrameBound::CurrentRow
         && matches!(expression.function, WindowFunction::Aggregate(_))
+}
+
+fn ntile(row: u64, rows: u64, buckets: u64) -> Result<i64> {
+    let quotient = rows / buckets;
+    let remainder = rows % buckets;
+    let position = row - 1;
+    let large_rows = quotient
+        .checked_add(1)
+        .and_then(|size| size.checked_mul(remainder))
+        .ok_or_else(|| Error::Execution("NTILE bucket calculation overflowed UINT64".into()))?;
+    let tile = if position < large_rows {
+        position / (quotient + 1) + 1
+    } else {
+        remainder + (position - large_rows) / quotient + 1
+    };
+    i64::try_from(tile).map_err(|_| Error::Execution("NTILE result overflowed INT64".into()))
 }

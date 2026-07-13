@@ -2,16 +2,17 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 use sqlparser::ast::{
-    Function, FunctionArguments, NamedWindowDefinition, NamedWindowExpr,
-    WindowFrameBound as AstBound, WindowFrameUnits as AstUnits, WindowSpec, WindowType,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, NamedWindowDefinition,
+    NamedWindowExpr, WindowFrameBound as AstBound, WindowFrameUnits as AstUnits, WindowSpec,
+    WindowType,
 };
 
 use crate::{Error, Result};
 
 use super::ast::WindowCall;
 use crate::sql::{
-    BoundExpr, SortExpr, WindowExpr, WindowFrame, WindowFrameBound, WindowFrameUnits,
-    WindowFunction, aggregate::bind_window_aggregate,
+    BoundExpr, ExprKind, ScalarValue, SortExpr, WindowExpr, WindowFrame, WindowFrameBound,
+    WindowFrameUnits, WindowFunction, aggregate::bind_window_aggregate,
 };
 
 pub(super) struct WindowBinding {
@@ -55,9 +56,11 @@ pub(super) fn bind_windows(
             let frame = bind_frame(spec.window_frame.as_ref(), !order_by.is_empty())?;
             let function = bind_function(&call.function, &mut bind)?;
             let data_type = match &function {
-                WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank => {
-                    DataType::Int64
-                }
+                WindowFunction::RowNumber
+                | WindowFunction::Rank
+                | WindowFunction::DenseRank
+                | WindowFunction::Ntile(_) => DataType::Int64,
+                WindowFunction::PercentRank | WindowFunction::CumeDist => DataType::Float64,
                 WindowFunction::Aggregate(aggregate) => aggregate.data_type.clone(),
             };
             Ok(WindowBinding {
@@ -133,7 +136,10 @@ fn bind_function(
         ));
     }
     let name = function.name.to_string().to_ascii_lowercase();
-    if matches!(name.as_str(), "row_number" | "rank" | "dense_rank") {
+    if matches!(
+        name.as_str(),
+        "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist"
+    ) {
         let FunctionArguments::List(arguments) = &function.args else {
             return Err(Error::InvalidArgument(format!(
                 "window function {} requires parentheses",
@@ -152,8 +158,39 @@ fn bind_function(
         return Ok(match name.as_str() {
             "row_number" => WindowFunction::RowNumber,
             "rank" => WindowFunction::Rank,
-            _ => WindowFunction::DenseRank,
+            "dense_rank" => WindowFunction::DenseRank,
+            "percent_rank" => WindowFunction::PercentRank,
+            _ => WindowFunction::CumeDist,
         });
+    }
+    if name == "ntile" {
+        let FunctionArguments::List(arguments) = &function.args else {
+            return Err(Error::InvalidArgument(
+                "window function ntile requires one argument".into(),
+            ));
+        };
+        if !arguments.clauses.is_empty() || arguments.duplicate_treatment.is_some() {
+            return Err(Error::InvalidArgument(
+                "window function ntile accepts one positive integer argument".into(),
+            ));
+        }
+        let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] = arguments.args.as_slice()
+        else {
+            return Err(Error::InvalidArgument(
+                "window function ntile accepts one positive integer argument".into(),
+            ));
+        };
+        let argument = bind(argument)?;
+        let buckets = match argument.kind {
+            ExprKind::Literal(ScalarValue::Int64(value)) if value > 0 => value as u64,
+            ExprKind::Literal(ScalarValue::UInt64(value)) if value > 0 => value,
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "window function ntile requires a positive integer constant".into(),
+                ));
+            }
+        };
+        return Ok(WindowFunction::Ntile(buckets));
     }
     Ok(WindowFunction::Aggregate(bind_window_aggregate(
         function, bind,

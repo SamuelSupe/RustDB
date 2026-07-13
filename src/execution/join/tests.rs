@@ -123,9 +123,16 @@ fn partition_spiller_coalesces_many_input_batches_into_bounded_files() {
         .unwrap();
     }
 
-    let right = spiller.finish().unwrap();
+    let right = spiller.finish_manifest().unwrap();
     let left = (0..spill::PARTITIONS).map(|_| Vec::new()).collect();
     let tasks = spill::initial_tasks(left, right);
+    assert!(
+        tasks
+            .iter()
+            .filter(|task| !task.right.is_empty())
+            .all(|task| task.build.estimated_bytes > 0),
+        "initial partition manifest did not retain build-byte estimates"
+    );
     let physical_files = tasks.iter().map(|task| task.right.len()).sum::<usize>();
     assert!(
         physical_files <= spill::PARTITIONS,
@@ -169,10 +176,9 @@ fn partition_spiller_coalesces_many_input_batches_into_bounded_files() {
 }
 
 #[test]
-fn partition_spiller_chunks_one_batch_larger_than_file_target() {
+fn partition_spiller_chunks_large_batch_without_rotating_small_files() {
     const ROWS: usize = 8_192;
     const MEMORY_LIMIT: usize = 64 << 10;
-    const TARGET_BYTES: usize = MEMORY_LIMIT / 8;
 
     let temp = tempfile::tempdir().unwrap();
     let context = QueryContext::shared(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
@@ -185,7 +191,7 @@ fn partition_spiller_chunks_one_batch_larger_than_file_target() {
         ],
     )
     .unwrap();
-    assert!(batch.get_array_memory_size() > TARGET_BYTES);
+    assert!(batch.get_array_memory_size() > MEMORY_LIMIT);
 
     let mut spiller = spill::PartitionSpiller::new(&context, "join-right-large-batch");
     spill::spill_batch(
@@ -203,22 +209,18 @@ fn partition_spiller_chunks_one_batch_larger_than_file_target() {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    assert!(files.len() > 1, "large partition did not rotate files");
+    assert_eq!(files.len(), 1, "one partition generation reuses one writer");
 
     let mut spilled_rows = 0;
     let mut record_batches = 0;
     for file in &files {
         let batches = context.spill.read_batches(file).unwrap();
-        let uncompressed_bytes = batches
-            .iter()
-            .map(RecordBatch::get_array_memory_size)
-            .sum::<usize>();
         let largest_batch = batches
             .iter()
             .map(RecordBatch::get_array_memory_size)
             .max()
             .unwrap_or(0);
-        assert!(uncompressed_bytes <= TARGET_BYTES.saturating_add(largest_batch));
+        assert!(largest_batch <= MEMORY_LIMIT);
         spilled_rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         record_batches += batches.len();
     }
@@ -369,8 +371,9 @@ fn fragmented_build_batches_use_buffer_footprint_after_compaction() {
     let temp = tempfile::tempdir().unwrap();
     let context = QueryContext::shared(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
     let (_, right_schema) = schemas();
-    let (file, fragmented_array_bytes) = fragmented_build_file(&context, &right_schema, ROWS);
-    let old_estimate = fragmented_array_bytes
+    let fragmented = fragmented_build_file(&context, &right_schema, ROWS);
+    let old_estimate = fragmented
+        .array_bytes
         .saturating_mul(2)
         .saturating_add(ROWS as usize * 128);
     assert!(
@@ -379,11 +382,13 @@ fn fragmented_build_batches_use_buffer_footprint_after_compaction() {
     );
 
     let mut reservation = context.memory.reservation();
+    let read_before = context.metrics.snapshot().spill_read_bytes;
     let loaded = spill::load_build_partition(
-        std::slice::from_ref(&file),
+        std::slice::from_ref(&fragmented.file),
         &right_schema,
         &context,
         &mut reservation,
+        fragmented.stats(ROWS as usize),
     )
     .unwrap();
     match loaded {
@@ -392,9 +397,25 @@ fn fragmented_build_batches_use_buffer_footprint_after_compaction() {
             panic!("fragmented buffers caused a false repartition")
         }
     }
+    let first_read = context
+        .metrics
+        .snapshot()
+        .spill_read_bytes
+        .saturating_sub(read_before);
     assert!(context.memory.used() <= MEMORY_LIMIT);
     reservation.try_resize(0).unwrap();
-    context.spill.remove_file(&file).unwrap();
+    let second_read_before = context.metrics.snapshot().spill_read_bytes;
+    drop(context.spill.read_batches(&fragmented.file).unwrap());
+    let second_read = context
+        .metrics
+        .snapshot()
+        .spill_read_bytes
+        .saturating_sub(second_read_before);
+    assert_eq!(
+        first_read, second_read,
+        "build partition was read more than once"
+    );
+    context.spill.remove_file(&fragmented.file).unwrap();
 }
 
 #[test]
@@ -405,13 +426,14 @@ fn actual_hash_footprint_rejects_an_oversized_partition() {
     let temp = tempfile::tempdir().unwrap();
     let context = QueryContext::shared(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
     let (_, right_schema) = schemas();
-    let (file, _) = fragmented_build_file(&context, &right_schema, ROWS);
+    let fragmented = fragmented_build_file(&context, &right_schema, ROWS);
     let mut reservation = context.memory.reservation();
     let loaded = spill::load_build_partition(
-        std::slice::from_ref(&file),
+        std::slice::from_ref(&fragmented.file),
         &right_schema,
         &context,
         &mut reservation,
+        fragmented.stats(ROWS as usize),
     )
     .unwrap();
     let spill::BuildPartition::Loaded(batch) = loaded else {
@@ -430,14 +452,14 @@ fn actual_hash_footprint_rejects_an_oversized_partition() {
     assert!(context.memory.used() > 0);
     drop(batch);
     reservation.try_resize(0).unwrap();
-    context.spill.remove_file(&file).unwrap();
+    context.spill.remove_file(&fragmented.file).unwrap();
     assert_eq!(context.memory.used(), 0);
 }
 
 #[tokio::test]
 async fn seeded_repartition_splits_an_initially_colliding_partition() {
     const ROWS: usize = 12_000;
-    let keys = (0_i64..1_000_000)
+    let keys = (0_i64..4_000_000)
         .filter(|key| spill::partition_for_key(&[super::CellValue::Int64(*key)], 0) == 0)
         .take(ROWS)
         .collect::<Vec<_>>();
@@ -707,6 +729,7 @@ async fn skew_fallback_rejects_a_decoded_spill_batch_over_budget() {
     let task = spill::PartitionTask {
         left: vec![left_file.clone()],
         right: vec![right_file.clone()],
+        build: spill::BuildPartitionStats::rows_only(RIGHT_ROWS),
         depth: spill::MAX_REPARTITION_DEPTH,
         stagnant_repartitions: 0,
     };
@@ -964,6 +987,7 @@ async fn float_key_sort_merge_matches_hash_join_for_zero_and_nan() {
     let task = spill::PartitionTask {
         left: vec![left_file],
         right: vec![right_file],
+        build: spill::BuildPartitionStats::rows_only(4),
         depth: spill::MAX_REPARTITION_DEPTH,
         stagnant_repartitions: 0,
     };
@@ -1137,7 +1161,7 @@ async fn run_skew_join(join_type: JoinType) -> (Vec<RecordBatch>, QueryMetricsSn
         right_schema,
         left_batch,
         right_batch,
-        320 << 10,
+        384 << 10,
     )
     .await
 }
@@ -1181,7 +1205,12 @@ async fn run_parallel_grace_join(join_type: JoinType) -> (usize, QueryMetricsSna
     let right = boxed_record_batch_stream(futures::stream::once(async move { Ok(right_batch) }));
     let schema = output_schema(join_type, &left_schema, &right_schema);
     let temp = tempfile::tempdir().unwrap();
-    let context = QueryContext::shared(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
+    let mut query = QueryContext::new(MemoryPool::new(MEMORY_LIMIT), temp.path()).unwrap();
+    // This case verifies concurrent Grace workers. Use enough partitions for
+    // two conservative build-footprint permits to coexist under the shared
+    // half-query build-admission budget.
+    query.execution.spill_partition_target_bytes = Some(64 << 10);
+    let context = Arc::new(query);
     context.configure_compute_lanes_unbounded_for_test(4);
     let batches = join(
         left,
@@ -1384,16 +1413,43 @@ fn join_pairs(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
     pairs
 }
 
+struct FragmentedBuildFile {
+    file: crate::runtime::SpillFile,
+    array_bytes: usize,
+    data_bytes: usize,
+    batches: usize,
+    max_batch_bytes: usize,
+}
+
+impl FragmentedBuildFile {
+    fn stats(&self, rows: usize) -> spill::BuildPartitionStats {
+        spill::BuildPartitionStats {
+            estimated_bytes: usize::try_from(spill::estimated_build_footprint(
+                u64::try_from(self.data_bytes).unwrap(),
+                u64::try_from(rows).unwrap(),
+            ))
+            .unwrap(),
+            data_bytes: self.data_bytes,
+            batches: self.batches,
+            max_batch_bytes: self.max_batch_bytes,
+            rows,
+        }
+    }
+}
+
 fn fragmented_build_file(
     context: &QueryContext,
     schema: &SchemaRef,
     rows: i64,
-) -> (crate::runtime::SpillFile, usize) {
+) -> FragmentedBuildFile {
     let mut writer = context
         .spill
         .writer("fragmented-build", Arc::clone(schema))
         .unwrap();
     let mut array_bytes = 0usize;
+    let mut data_bytes = 0usize;
+    let mut batches = 0usize;
+    let mut max_batch_bytes = 0usize;
     for row in 0..rows {
         let batch = RecordBatch::try_new(
             Arc::clone(schema),
@@ -1403,8 +1459,18 @@ fn fragmented_build_file(
             ],
         )
         .unwrap();
-        array_bytes = array_bytes.saturating_add(batch.get_array_memory_size());
+        let batch_bytes = batch.get_array_memory_size();
+        array_bytes = array_bytes.saturating_add(batch_bytes);
+        data_bytes = data_bytes.saturating_add(spill::batch_logical_buffer_bytes(&batch));
+        batches = batches.saturating_add(1);
+        max_batch_bytes = max_batch_bytes.max(batch_bytes);
         writer.write_batch(&batch).unwrap();
     }
-    (writer.finish(0).unwrap(), array_bytes)
+    FragmentedBuildFile {
+        file: writer.finish(0).unwrap(),
+        array_bytes,
+        data_bytes,
+        batches,
+        max_batch_bytes,
+    }
 }

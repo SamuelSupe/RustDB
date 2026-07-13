@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     pin::Pin,
     sync::{
-        Arc, Barrier,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
@@ -17,6 +17,7 @@ use arrow::{
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use parking_lot::Mutex;
+use tokio::sync::Barrier;
 
 use crate::{
     Error, Result,
@@ -77,7 +78,7 @@ impl TableProvider for PartitionedTable {
                 let threads = Arc::clone(&self.threads);
                 let task_context = Arc::clone(&context);
                 let stream = boxed_record_batch_stream(stream::once(async move {
-                    barrier.wait();
+                    barrier.wait().await;
                     threads.lock().push(
                         std::thread::current()
                             .name()
@@ -366,8 +367,9 @@ async fn scan_tasks_run_on_multiple_named_compute_lanes() {
     assert_eq!(requested_tasks.load(Ordering::Acquire), LANES);
     assert_eq!(context.metrics.snapshot().peak_active_lanes, LANES as u64);
 
-    let names = threads.lock().iter().cloned().collect::<HashSet<_>>();
-    assert_eq!(names.len(), LANES);
+    let observed = threads.lock().clone();
+    assert_eq!(observed.len(), LANES);
+    let names = observed.into_iter().collect::<HashSet<_>>();
     assert!(names.iter().all(|name| name.starts_with("rustdb-compute-")));
 }
 

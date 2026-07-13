@@ -168,6 +168,33 @@ async fn applies_projection_limit_and_row_group_pruning() {
         .unwrap();
     assert!(batches.is_empty());
     assert_eq!(pruning_context.metrics.snapshot().row_groups_pruned, 2);
+
+    let or_context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    let mut request = ScanRequest::new(2);
+    request.predicate = Some(ScanPredicate::Or(vec![
+        ScanPredicate::Comparison {
+            column: 0,
+            op: ComparisonOp::Eq,
+            value: PredicateValue::Int64(2),
+        },
+        ScanPredicate::Comparison {
+            column: 0,
+            op: ComparisonOp::Eq,
+            value: PredicateValue::Int64(10),
+        },
+    ]));
+    table.prepare(Arc::clone(&or_context)).await.unwrap();
+    or_context.seal_object_snapshots();
+    let batches = table
+        .scan(request, Arc::clone(&or_context))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    assert_eq!(or_context.metrics.snapshot().row_groups_pruned, 1);
 }
 
 #[tokio::test]
