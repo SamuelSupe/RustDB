@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::super::CellValue;
-use super::{BuildPartitionStats, PARTITIONS};
+use super::{BuildPartitionStats, PARTITIONS, build::compaction_reservation_bytes};
 
 const MAX_SPILL_FILE_BYTES: usize = 256 * 1024 * 1024;
 
@@ -30,6 +30,7 @@ pub(in crate::execution::join) struct PartitionSpiller<'a> {
     partition_batches: Vec<u64>,
     max_partition_batch_bytes: Vec<u64>,
     partition_rows: Vec<u64>,
+    key_columns: usize,
     partitions: Vec<PartitionSink>,
 }
 
@@ -48,6 +49,7 @@ struct PartitionSink {
     files: Vec<SpillFile>,
     writer: Option<SpillWriter>,
     uncompressed_bytes: usize,
+    schema_columns: usize,
 }
 
 impl<'a> PartitionSpiller<'a> {
@@ -96,14 +98,20 @@ impl<'a> PartitionSpiller<'a> {
             partition_batches: vec![0; partitions],
             max_partition_batch_bytes: vec![0; partitions],
             partition_rows: vec![0; partitions],
+            key_columns: 1,
             partitions: (0..partitions)
                 .map(|_| PartitionSink {
                     files: Vec::new(),
                     writer: None,
                     uncompressed_bytes: 0,
+                    schema_columns: 0,
                 })
                 .collect(),
         }
+    }
+
+    fn observe_key_columns(&mut self, columns: usize) {
+        self.key_columns = self.key_columns.max(columns.max(1));
     }
 
     fn write(&mut self, partition: usize, batch: RecordBatch) -> Result<()> {
@@ -133,6 +141,7 @@ impl<'a> PartitionSpiller<'a> {
             self.open_writer(partition, batch.schema())?;
         }
         let sink = &mut self.partitions[partition];
+        sink.schema_columns = sink.schema_columns.max(batch.num_columns());
         sink.writer
             .as_mut()
             .expect("partition writer was created above")
@@ -231,6 +240,17 @@ impl<'a> PartitionSpiller<'a> {
             self.depth,
             self.partition_bytes.iter().copied().max().unwrap_or(0),
         )?;
+        let key_columns = self.key_columns;
+        let file_counts = self
+            .partitions
+            .iter()
+            .map(|partition| partition.files.len())
+            .collect::<Vec<_>>();
+        let schema_columns = self
+            .partitions
+            .iter()
+            .map(|partition| partition.schema_columns)
+            .collect::<Vec<_>>();
         let files = self
             .partitions
             .into_iter()
@@ -242,14 +262,26 @@ impl<'a> PartitionSpiller<'a> {
             .zip(self.partition_batches)
             .zip(self.max_partition_batch_bytes)
             .zip(self.partition_rows)
+            .zip(file_counts)
+            .zip(schema_columns)
             .map(
-                |(((data_bytes, batches), max_batch_bytes), rows)| BuildPartitionStats {
-                    estimated_bytes: usize::try_from(estimated_build_footprint(data_bytes, rows))
-                        .unwrap_or(usize::MAX),
-                    data_bytes: usize::try_from(data_bytes).unwrap_or(usize::MAX),
-                    batches: usize::try_from(batches).unwrap_or(usize::MAX),
-                    max_batch_bytes: usize::try_from(max_batch_bytes).unwrap_or(usize::MAX),
-                    rows: usize::try_from(rows).unwrap_or(usize::MAX),
+                |(((((data_bytes, batches), max_batch_bytes), rows), files), columns)| {
+                    let data = usize::try_from(data_bytes).unwrap_or(usize::MAX);
+                    let batches = usize::try_from(batches).unwrap_or(usize::MAX);
+                    let max_batch = usize::try_from(max_batch_bytes).unwrap_or(usize::MAX);
+                    let rows_usize = usize::try_from(rows).unwrap_or(usize::MAX);
+                    let hash = estimated_build_footprint(data_bytes, rows, key_columns);
+                    let compaction =
+                        compaction_reservation_bytes(data, batches, max_batch, files, columns);
+                    BuildPartitionStats {
+                        estimated_bytes: usize::try_from(hash)
+                            .unwrap_or(usize::MAX)
+                            .max(compaction),
+                        data_bytes: data,
+                        batches,
+                        max_batch_bytes: max_batch,
+                        rows: rows_usize,
+                    }
                 },
             )
             .collect();
@@ -257,11 +289,24 @@ impl<'a> PartitionSpiller<'a> {
     }
 }
 
-pub(in crate::execution::join) fn estimated_build_footprint(data_bytes: u64, rows: u64) -> u64 {
-    let hash_and_key_bytes = size_of::<Vec<CellValue>>()
+pub(in crate::execution::join) fn estimated_build_footprint(
+    data_bytes: u64,
+    rows: u64,
+    key_columns: usize,
+) -> u64 {
+    // HashMap capacity can approach twice the row count. Rust also rounds the
+    // heap allocations of small key/value vectors up to at least four values.
+    let bucket_bytes = size_of::<Vec<CellValue>>()
         .saturating_add(size_of::<Vec<u32>>())
-        .saturating_add(size_of::<CellValue>())
         .saturating_add(size_of::<u64>().saturating_mul(2));
+    let key_capacity = key_columns
+        .max(4)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX);
+    let hash_and_key_bytes = bucket_bytes
+        .saturating_mul(2)
+        .saturating_add(size_of::<CellValue>().saturating_mul(key_capacity))
+        .saturating_add(size_of::<u32>().saturating_mul(4));
     data_bytes
         .saturating_mul(2)
         .saturating_add(rows.saturating_mul(u64::try_from(hash_and_key_bytes).unwrap_or(u64::MAX)))

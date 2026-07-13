@@ -224,10 +224,12 @@ MiB / four compute lanes / batch 8192 / I/O concurrency 32. It measures Q17 and
 candidate Q21, runs each through `tools/tpch/compare_query.sh` and saves the
 DuckDB-matched checksum, creates a temporary detached `v0.4.0-alpha.1`
 worktree for the comparable Q21 baseline, emits enclosing dataset manifests,
-and calls the strict checker. The output path must not already exist. The
-runner cleans only its uniquely-created temporary worktree and never pushes or
-tags; a failed evidence directory is retained for diagnosis and cannot be
-silently reused.
+and calls the strict checker. Because the v0.4 benchmark schema predates dataset
+provenance, this runner explicitly enables the baseline-only compatibility
+exception; candidate and low-memory provenance remain strict. The output path
+must not already exist. The runner cleans only its uniquely-created temporary
+worktree and never pushes or tags; a failed evidence directory is retained for
+diagnosis and cannot be silently reused.
 
 The candidate Q17 and Q21 reports must live below a run directory whose
 `manifest.json` contains the same complete `dataset` object as the clean
@@ -253,6 +255,7 @@ python3 -B benchmarks/check_v05_resource_gate.py \
   --q21-checksum "$V05/q21.checksum.txt" \
   --q21-baseline "$V05/baseline/q21.json" \
   --low-memory-manifest "$LOW_RUN/manifest.json" \
+  --allow-legacy-v04-missing-dataset \
   --join "$LOW/inner-join-134217728.json" \
   --join "$LOW/left-join-134217728.json" \
   --join "$LOW/right-join-134217728.json" \

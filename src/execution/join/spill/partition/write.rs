@@ -68,6 +68,7 @@ pub(in crate::execution::join) fn spill_batch_with_null_keys(
     spiller: &mut PartitionSpiller<'_>,
     seed: u64,
 ) -> Result<Vec<usize>> {
+    spiller.observe_key_columns(expressions.len());
     spiller.record_logical_input(batch.get_array_memory_size().max(1));
     let mut totals = vec![0usize; spiller.partitions.len()];
     let mut offset = 0usize;

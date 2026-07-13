@@ -54,15 +54,16 @@ impl QueryScheduler {
         self.inner.configured_lanes.load(Ordering::Acquire).max(1)
     }
 
+    #[cfg(test)]
     pub(crate) fn active_lanes(&self) -> usize {
         self.inner.active_lanes.load(Ordering::Acquire)
     }
 
     pub(crate) fn partitioning_lanes(&self) -> usize {
-        // Partitioning runs synchronously in the current coordinator/worker.
-        // When no lane guard is active, count that caller as one lane instead
-        // of assuming every configured worker will retain a partition at once.
-        self.active_lanes().max(1)
+        // Fanout must not depend on whether sibling workers happen to overlap
+        // at this instant. Use the query's stable, memory-bounded lane plan so
+        // identical inputs produce identical partition sizes.
+        self.configured_lanes()
     }
 
     pub(crate) fn lanes_for(&self, task_count: usize) -> usize {
@@ -113,17 +114,17 @@ mod tests {
         let scheduler = QueryScheduler::new(metrics.clone());
         scheduler.configure(4, 128 << 20);
         assert_eq!(scheduler.lanes_for(2), 2);
-        assert_eq!(scheduler.partitioning_lanes(), 1);
+        assert_eq!(scheduler.partitioning_lanes(), 4);
 
         let first = scheduler.enter_lane();
-        assert_eq!(scheduler.partitioning_lanes(), 1);
+        assert_eq!(scheduler.partitioning_lanes(), 4);
         let second = scheduler.enter_lane();
         assert_eq!(scheduler.active_lanes(), 2);
-        assert_eq!(scheduler.partitioning_lanes(), 2);
+        assert_eq!(scheduler.partitioning_lanes(), 4);
         assert_eq!(metrics.snapshot().peak_active_lanes, 2);
         drop((first, second));
         assert_eq!(scheduler.active_lanes(), 0);
-        assert_eq!(scheduler.partitioning_lanes(), 1);
+        assert_eq!(scheduler.partitioning_lanes(), 4);
     }
 
     #[test]

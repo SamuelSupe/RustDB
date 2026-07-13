@@ -1427,6 +1427,7 @@ impl FragmentedBuildFile {
             estimated_bytes: usize::try_from(spill::estimated_build_footprint(
                 u64::try_from(self.data_bytes).unwrap(),
                 u64::try_from(rows).unwrap(),
+                1,
             ))
             .unwrap(),
             data_bytes: self.data_bytes,

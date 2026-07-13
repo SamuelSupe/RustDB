@@ -47,6 +47,11 @@ use probe::{
 };
 use spill::{BuildPartition, Side};
 
+// A streaming build starts spilling after only a bounded prefix is buffered.
+// Reserve growth for the unseen suffix so common large scans do not begin
+// with a tiny fanout and immediately rewrite the complete build side.
+const STREAMING_BUILD_GROWTH_RESERVE: u64 = 4;
+
 // The physical join boundary carries both input schemas, output schema, keys,
 // execution state, and sizing. Keeping this explicit avoids a public options
 // abstraction for a single internal call site.
@@ -139,6 +144,7 @@ where
         let mut reservation = context.memory.reservation();
         let mut right_batches: Vec<RecordBatch> = Vec::new();
         let mut right_bytes = 0usize;
+        let mut right_rows = 0usize;
         let mut right_partitions = None;
         let mut in_memory_build = None;
         // Retaining both source batches and the future concat buffer can use
@@ -150,15 +156,23 @@ where
             context.check_cancelled()?;
             let batch = batch?;
             let bytes = batch.memory_size();
+            let projected_bytes = right_bytes.saturating_add(bytes);
+            let projected_rows = right_rows.saturating_add(batch.batch().num_rows());
             // Reserve the future concat buffer while the source envelope still
             // accounts for the retained input batch.
-            if right_bytes.saturating_add(bytes) > build_buffer_limit
+            if projected_bytes > build_buffer_limit
                 || reservation.try_grow(bytes).is_err()
             {
                 reservation.shrink(right_bytes);
+                let footprint = spill::estimated_build_footprint(
+                    u64::try_from(projected_bytes).unwrap_or(u64::MAX),
+                    u64::try_from(projected_rows).unwrap_or(u64::MAX),
+                    right_key_expressions.len(),
+                )
+                .saturating_mul(STREAMING_BUILD_GROWTH_RESERVE);
                 let partitions = spill::adaptive_partition_count(
                     &context,
-                    right_bytes.saturating_add(bytes),
+                    usize::try_from(footprint).unwrap_or(usize::MAX),
                 );
                 let mut spiller = spill::PartitionSpiller::with_partitions(
                     &context,
@@ -208,6 +222,7 @@ where
             let (batch, batch_memory) = batch.into_parts();
             reservation.absorb(batch_memory)?;
             right_bytes = right_bytes.saturating_add(bytes);
+            right_rows = projected_rows;
             right_batches.push(batch);
         }
 
@@ -808,7 +823,13 @@ fn spill_build_batch(
     reservation: &mut crate::runtime::MemoryReservation,
 ) -> Result<spill::PartitionManifest> {
     reservation.try_resize(batch.get_array_memory_size())?;
-    let partitions = spill::adaptive_partition_count(context, batch.get_array_memory_size());
+    let footprint = spill::estimated_build_footprint(
+        u64::try_from(spill::batch_logical_buffer_bytes(&batch)).unwrap_or(u64::MAX),
+        u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
+        keys.len(),
+    );
+    let partitions =
+        spill::adaptive_partition_count(context, usize::try_from(footprint).unwrap_or(usize::MAX));
     let mut spiller = spill::PartitionSpiller::with_partitions(context, "join-right", partitions);
     spill::spill_batch_with_null_keys(
         batch,

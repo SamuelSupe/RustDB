@@ -9,12 +9,11 @@ mod partition;
 
 pub(super) use build::{BuildPartition, load_build_partition};
 pub(super) use partition::{
-    PartitionManifest, PartitionSpiller, Side, spill_batch_with_null_keys, spill_stream,
+    PartitionManifest, PartitionSpiller, Side, batch_logical_buffer_bytes,
+    estimated_build_footprint, spill_batch_with_null_keys, spill_stream,
 };
 #[cfg(test)]
-pub(super) use partition::{
-    batch_logical_buffer_bytes, estimated_build_footprint, partition_for_key, spill_batch,
-};
+pub(super) use partition::{partition_for_key, spill_batch};
 
 pub(super) const PARTITIONS: usize = 256;
 #[cfg(test)]
@@ -105,7 +104,10 @@ pub(super) fn repartition(
     context: &QueryContext,
 ) -> Result<Repartitioned> {
     let seed = seed_for_depth(next_depth);
-    let partitions = adaptive_partition_count(context, task.build.estimated_bytes);
+    // This task already failed an exclusive build attempt. Splitting it only
+    // in two leaves too little margin for estimator error and allocator
+    // rounding, so a failed generation always fans out at least four ways.
+    let partitions = adaptive_partition_count(context, task.build.estimated_bytes).max(4);
     let mut left_spiller = PartitionSpiller::for_repartition(
         context,
         format!("join-left-r{next_depth}"),
@@ -260,18 +262,17 @@ mod adaptive_tests {
     }
 
     #[test]
-    fn default_target_uses_current_active_lanes() {
+    fn default_target_uses_stable_configured_lanes() {
         let directory = tempfile::tempdir().unwrap();
         let context = QueryContext::new(MemoryPool::new(128 << 20), directory.path()).unwrap();
-        context.scheduler.configure_unbounded(4);
-        assert_eq!(adaptive_partition_count(&context, 160 << 20), 4);
+        context.scheduler.configure_unbounded(2);
+        let expected = adaptive_partition_count(&context, 160 << 20);
+        assert_eq!(expected, 8);
+
         let _first = context.scheduler.enter_lane();
-        assert_eq!(adaptive_partition_count(&context, 160 << 20), 4);
+        assert_eq!(adaptive_partition_count(&context, 160 << 20), expected);
         let _second = context.scheduler.enter_lane();
-        assert_eq!(adaptive_partition_count(&context, 160 << 20), 8);
-        let _third = context.scheduler.enter_lane();
-        let _fourth = context.scheduler.enter_lane();
-        assert_eq!(adaptive_partition_count(&context, 160 << 20), 16);
+        assert_eq!(adaptive_partition_count(&context, 160 << 20), expected);
     }
 
     #[test]

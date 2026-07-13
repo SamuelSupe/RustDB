@@ -276,7 +276,8 @@ set -- python3 -B "$SCRIPT_DIR/check_v05_resource_gate.py" \
   --q21-baseline "$output_host/baseline/q21.json" \
   --low-memory-manifest "$low_memory_host/manifest.json" \
   --baseline-tag "$baseline_tag" \
-  --dataset-manifest "$dataset_host/manifest.sha256"
+  --dataset-manifest "$dataset_host/manifest.sha256" \
+  --allow-legacy-v04-missing-dataset
 for query in inner-join left-join right-join full-join semi-join anti-join; do
   set -- "$@" --join "$low_memory_host/reports/$query-$memory_limit.json"
 done

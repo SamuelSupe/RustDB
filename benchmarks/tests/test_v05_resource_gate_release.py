@@ -309,6 +309,7 @@ class V05ResourceGateReleaseTests(unittest.TestCase):
         self.assertIn("--q17-checksum", source)
         self.assertIn("--q21-checksum", source)
         self.assertIn("--low-memory-manifest", source)
+        self.assertIn("--allow-legacy-v04-missing-dataset", source)
         self.assertIn("requires an Apple M5 Max", source)
         self.assertIn("requires SF10", source)
         self.assertLess(

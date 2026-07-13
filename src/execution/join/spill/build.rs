@@ -57,7 +57,7 @@ pub(in crate::execution::join) fn load_build_partition(
     Ok(BuildPartition::Loaded(batch))
 }
 
-fn compaction_reservation_bytes(
+pub(super) fn compaction_reservation_bytes(
     data_bytes: usize,
     batches: usize,
     max_batch_bytes: usize,
