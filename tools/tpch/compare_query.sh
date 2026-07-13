@@ -111,8 +111,11 @@ fi
 if [ "$require_spill" = 1 ]; then
   set -- "$@" --metadata-cache 0 --metrics --spill-directory "/workspace/$work_relative/spill"
 fi
-set -- "$@" -f "/workspace/$work_relative/rustdb.sql"
-if ! "$@" > "$rustdb_csv" 2> "$rustdb_stderr"; then
+set -- "$@" -f /dev/stdin
+# Pipe the rendered query into the same container that executes it. On macOS,
+# a freshly-created bind-mounted file can briefly appear empty to a new
+# OrbStack container even though the host has already closed it.
+if ! "$@" < "$rustdb_query" > "$rustdb_csv" 2> "$rustdb_stderr"; then
   sed -n '1,200p' "$rustdb_stderr" >&2
   tpch_die "RustDB query execution failed"
 fi

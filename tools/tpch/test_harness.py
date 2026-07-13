@@ -130,6 +130,12 @@ class TpchHarnessTests(unittest.TestCase):
         self.assertIn("--rustdb-root must not be empty", result.stderr)
         self.assertNotIn("required command not found", result.stderr)
 
+    def test_compare_pipes_rendered_sql_into_the_execution_container(self) -> None:
+        source = (ROOT / "tools/tpch/compare_query.sh").read_text(encoding="utf-8")
+        self.assertIn('set -- "$@" -f /dev/stdin', source)
+        self.assertIn('if ! "$@" < "$rustdb_query"', source)
+        self.assertNotIn('-f "/workspace/$work_relative/rustdb.sql"', source)
+
     def test_provenance_hashes_the_query_list_and_every_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
