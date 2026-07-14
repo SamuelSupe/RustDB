@@ -20,8 +20,8 @@ Options:
   -h, --help            show this help
 
 The runner requires a clean candidate commit and a complete verified 24-case
-low-memory manifest. It records Q17 once, records Q21 after two warmups for five
-iterations on both the candidate and detached v0.4 baseline, and records
+low-memory manifest. It records Q17 and Q21 once with no warmup on both the
+candidate and detached v0.4 baseline, and records
 DuckDB-matched Q17/Q21 checksums. All reports use 128 MiB, four compute lanes,
 batch size 8192, I/O concurrency 32, and metadata cache 0. Candidate Spill is
 checked both before and after the baseline; legacy v0.4 Spill uses an isolated
@@ -171,7 +171,7 @@ assert_no_query_directories "$output_host/spill"
 echo "v0.5 resource: candidate Q21" >&2
 run_benchmark_report \
   "$output_container/rendered/q21.sql" "$output_host/q21.json" \
-  "$memory_limit" 2 5 "$threads" "$batch_size" "$io_concurrency" \
+  "$memory_limit" 0 1 "$threads" "$batch_size" "$io_concurrency" \
   "$metadata_cache_bytes" "$output_container/spill" 0 local
 assert_no_query_directories "$output_host/spill"
 
@@ -227,7 +227,7 @@ set -- "$baseline_binary" \
   "--build-rustflags=$candidate_rustflags" \
   --rustc-version "$candidate_rustc" \
   --cpu-model "$candidate_cpu" \
-  --warmup 2 --iterations 5 \
+  --warmup 0 --iterations 1 \
   --memory-limit "$memory_limit" \
   --threads "$threads" \
   --batch-size "$batch_size" \

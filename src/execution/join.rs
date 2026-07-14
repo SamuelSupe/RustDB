@@ -552,21 +552,23 @@ where
                                 next_depth,
                                 &context,
                             )?;
-                            let shrank = repartitioned.largest_build_rows < rows;
-                            if shrank || task.stagnant_repartitions == 0 {
-                                spill::remove_task(&context, &task)?;
-                                let stagnant = if shrank {
-                                    0
-                                } else {
-                                    task.stagnant_repartitions + 1
-                                };
-                                for mut child in repartitioned.tasks {
-                                    child.stagnant_repartitions = stagnant;
-                                    pending.push(child);
+                            if let Some(repartitioned) = repartitioned {
+                                let shrank = repartitioned.largest_build_rows < rows;
+                                if shrank || task.stagnant_repartitions == 0 {
+                                    spill::remove_task(&context, &task)?;
+                                    let stagnant = if shrank {
+                                        0
+                                    } else {
+                                        task.stagnant_repartitions + 1
+                                    };
+                                    for mut child in repartitioned.tasks {
+                                        child.stagnant_repartitions = stagnant;
+                                        pending.push(child);
+                                    }
+                                    continue;
                                 }
-                                continue;
+                                spill::remove_tasks(&context, &repartitioned.tasks)?;
                             }
-                            spill::remove_tasks(&context, &repartitioned.tasks)?;
                         }
 
                         let mut fallback = sort_merge::fallback_with_null_keys(

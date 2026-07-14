@@ -41,6 +41,7 @@ use io::{SpillReader, copy_memory_bytes};
 pub(crate) use io_pool::SpillIoPool;
 use io_tracker::IoTracker;
 use metadata::ActiveFiles;
+pub(crate) use metadata::MAX_ACTIVE_SPILL_FILES;
 #[allow(unused_imports)]
 pub(crate) use quota::{
     DiskSpace, DiskSpaceProbe, QuerySpillQuota, SpillCharge, SpillQuotaPool, SpillReservation,
@@ -302,6 +303,10 @@ impl SpillManager {
         &self.state.directory
     }
 
+    pub(crate) fn active_file_count(&self) -> usize {
+        self.state.files.len()
+    }
+
     pub fn write_batches<I>(&self, label: &str, schema: SchemaRef, batches: I) -> Result<SpillFile>
     where
         I: IntoIterator<Item = Result<RecordBatch>>,
@@ -492,13 +497,17 @@ impl State {
         }
         self.cleaned.store(true, Ordering::Release);
         self.io_tracker.close_and_wait();
+        let had_files = self.next_file.load(Ordering::Relaxed) != 0;
         // Persist earlier per-file removals before removing the query
         // directory. Shared mounts can otherwise replay those directory-entry
-        // updates after the terminal removal and expose an empty ghost.
-        if self.next_file.load(Ordering::Relaxed) != 0 {
+        // updates after the terminal removal. Linux FUSE/virtiofs also needs a
+        // filesystem barrier to drain dirty data writes before unlink.
+        if had_files && self.directory.exists() {
             let query_directory = self.directory.clone();
-            self.io_pool
-                .run_cleanup(move || io::sync_directory(&query_directory))?;
+            self.io_pool.run_cleanup(move || {
+                io::sync_shared_filesystem(&query_directory)?;
+                io::sync_directory(&query_directory)
+            })?;
         }
         // Do not unlink a directory while its advisory-lock file is still
         // open. That is legal on local Unix filesystems, but shared macOS/Linux
@@ -526,21 +535,19 @@ impl State {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(Error::io(Some(verify), error)),
             }
-            match std::fs::symlink_metadata(&verify) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(Error::io(Some(verify), error)),
-                Ok(_) => Err(Error::Execution(format!(
-                    "spill directory '{}' remained after cleanup",
-                    verify.display()
-                ))),
+            Ok(())
+        })?;
+        self.io_pool.run_cleanup(move || {
+            io::sync_parent_directory(&sync_path)?;
+            if had_files {
+                io::sync_parent_shared_filesystem(&sync_path)?;
             }
+            io::ensure_path_absent(&sync_path)
         })?;
         self.files.clear();
         if let Some(metrics) = &self.metrics {
             metrics.clear_active_spill();
         }
-        self.io_pool
-            .run_cleanup(move || io::sync_parent_directory(&sync_path))?;
         self.cleanup_completed.store(true, Ordering::Release);
         Ok(())
     }

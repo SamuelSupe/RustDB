@@ -1,10 +1,11 @@
-use std::{io, pin::Pin};
+use std::{io, io::SeekFrom, pin::Pin};
 
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio_util::io::StreamReader;
+use object_store::GetResultPayload;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::{
     CsvCompression, Error, Result,
@@ -13,6 +14,8 @@ use crate::{
 };
 
 pub(super) type CsvInput = Pin<Box<dyn AsyncRead + Send>>;
+
+const LOCAL_READ_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct QueryIo {
@@ -52,21 +55,41 @@ pub(super) async fn open_csv_input(
     snapshot.validate_get_response(file.uri(), &get.meta)?;
 
     let uri = file.uri().to_owned();
-    let stream_uri = uri.clone();
+    let source_stream: Pin<Box<dyn Stream<Item = Result<bytes::Bytes>> + Send>> = match get.payload
+    {
+        GetResultPayload::File(file, _) => {
+            let mut file = tokio::fs::File::from_std(file);
+            if get.range.start != 0 {
+                file.seek(SeekFrom::Start(get.range.start))
+                    .await
+                    .map_err(|error| input_error(&uri, error))?;
+            }
+            let remaining = get.range.end.saturating_sub(get.range.start);
+            let stream_uri = uri.clone();
+            let stream = ReaderStream::with_capacity(file.take(remaining), LOCAL_READ_CHUNK_BYTES)
+                .map(move |result| result.map_err(|error| input_error(&stream_uri, error)));
+            Box::pin(stream)
+        }
+        GetResultPayload::Stream(stream) => {
+            let stream_uri = uri.clone();
+            Box::pin(
+                stream.map(move |result| result.map_err(|error| object_error(&stream_uri, error))),
+            )
+        }
+    };
     let s3 = file.is_s3();
-    let stream = get.into_stream();
     let stream = try_stream! {
-        futures::pin_mut!(stream);
+        let mut source_stream = source_stream;
         loop {
             let next = match &query {
                 Some(query) => tokio::select! {
                     _ = query.control.cancelled() => Err(Error::Cancelled),
-                    next = stream.next() => Ok(next),
+                    next = source_stream.next() => Ok(next),
                 }?,
-                None => stream.next().await,
+                None => source_stream.next().await,
             };
             let Some(bytes) = next else { break };
-            let bytes = bytes.map_err(|error| object_error(&stream_uri, error))?;
+            let bytes = bytes?;
             if let Some(query) = &query {
                 let bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 query.metrics.add_csv_source_bytes(bytes);

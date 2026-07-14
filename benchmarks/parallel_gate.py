@@ -16,6 +16,8 @@ from typing import Any
 CASES = ("scan-filter", "aggregate")
 THREADS = (1, 4)
 MEMORY_LIMIT = 1_073_741_824
+RELEASE_WARMUP = 0
+RELEASE_ITERATIONS = 1
 DEFAULT_BASELINE_ENGINE_VERSION = "0.4.0-alpha.1"
 DEFAULT_CANDIDATE_ENGINE_VERSION = "0.5.0-alpha.1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -174,8 +176,8 @@ def validate_report(
         expect(report, "binary_sha256", binary_sha256, label)
     if report.get("build") != build:
         fail(f"{label}.build does not match its manifest")
-    expect(report, "warmup", 2, label)
-    expect(report, "iterations", 5, label)
+    expect(report, "warmup", RELEASE_WARMUP, label)
+    expect(report, "iterations", RELEASE_ITERATIONS, label)
 
     config = report.get("config")
     if not isinstance(config, dict):
@@ -203,11 +205,14 @@ def validate_report(
         )
 
     p50 = report.get("p50_ms")
+    p95 = report.get("p95_ms")
     runs = report.get("runs")
     if type(p50) not in (int, float) or not math.isfinite(p50) or p50 <= 0:
         fail(f"{label}.p50_ms must be a positive finite number")
-    if not isinstance(runs, list) or len(runs) != 5:
-        fail(f"{label}.runs must contain exactly five measured runs")
+    if type(p95) not in (int, float) or not math.isfinite(p95) or p95 <= 0:
+        fail(f"{label}.p95_ms must be a positive finite number")
+    if not isinstance(runs, list) or len(runs) != RELEASE_ITERATIONS:
+        fail(f"{label}.runs must contain exactly one measured run")
     elapsed = []
     for index, run in enumerate(runs):
         value = run.get("elapsed_ms") if isinstance(run, dict) else None
@@ -216,6 +221,8 @@ def validate_report(
         elapsed.append(float(value))
     if not math.isclose(float(p50), statistics.median(elapsed), rel_tol=1e-9, abs_tol=1e-6):
         fail(f"{label}.p50_ms does not equal the median measured elapsed_ms")
+    if not math.isclose(float(p95), elapsed[0], rel_tol=1e-9, abs_tol=1e-6):
+        fail(f"{label}.p95_ms does not equal the measured elapsed_ms")
     return float(p50)
 
 
@@ -297,8 +304,8 @@ def inspect_manifest(
             entry = selected.get(key)
             if entry is None:
                 fail(f"{label} is missing local/metadata-warm/{case}/t{threads}/b8192")
-            expect(entry, "warmup", 2, f"{label}.{case}.t{threads}")
-            expect(entry, "iterations", 5, f"{label}.{case}.t{threads}")
+            expect(entry, "warmup", RELEASE_WARMUP, f"{label}.{case}.t{threads}")
+            expect(entry, "iterations", RELEASE_ITERATIONS, f"{label}.{case}.t{threads}")
             report_path = resolve_artifact(path, entry.get("report"), f"{label} report")
             measurements[key] = validate_report(
                 report_path,

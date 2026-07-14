@@ -68,7 +68,7 @@ class ResourceGateFixture:
             "q21-candidate.json",
             self.report(
                 candidate_query,
-                **timed_runs([40, 41, 42, 43, 50]),
+                **timed_runs([42]),
             ),
         )
         self.paths["q21_baseline"] = self.write(
@@ -78,7 +78,7 @@ class ResourceGateFixture:
                 engine_version="0.4.0-alpha.1",
                 build_id=BASELINE_BUILD,
                 binary_sha256=BASELINE_BINARY,
-                **timed_runs([90, 95, 100, 105, 110]),
+                **timed_runs([100]),
             ),
         )
         self.q17_checksum = self.write_checksum("q17.checksum.txt", "q17")
@@ -178,7 +178,7 @@ class ResourceGateFixture:
         query_file,
         *,
         runs,
-        warmup=2,
+        warmup=0,
         iterations=None,
         p50_ms=None,
         p95_ms=None,

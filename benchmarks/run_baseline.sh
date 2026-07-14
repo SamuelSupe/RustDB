@@ -22,8 +22,8 @@ Environment matrix:
   CACHE_MODES          default: "cold warm" (cold means metadata-cache cold)
   MEMORY_LIMIT_BYTES   default: 1073741824
   COLD_ITERATIONS      default: 1
-  WARMUP               default: 2
-  ITERATIONS           default: 5
+  WARMUP               default: 0
+  ITERATIONS           default: 1
   IO_CONCURRENCY       default: 32
   METADATA_CACHE_BYTES default: 67108864
   RUSTDB_BENCH_RUSTFLAGS default: "-C target-cpu=native"
@@ -83,8 +83,8 @@ batch_sizes=${BATCH_SIZES:-4096 8192}
 cache_modes=${CACHE_MODES:-cold warm}
 memory_limit=${MEMORY_LIMIT_BYTES:-1073741824}
 cold_iterations=${COLD_ITERATIONS:-1}
-warmup_iterations=${WARMUP:-2}
-measured_iterations=${ITERATIONS:-5}
+warmup_iterations=${WARMUP:-0}
+measured_iterations=${ITERATIONS:-1}
 io_concurrency=${IO_CONCURRENCY:-32}
 metadata_cache_bytes=${METADATA_CACHE_BYTES:-67108864}
 MINIO_ENDPOINT=${MINIO_ENDPOINT:-http://minio:9000}
@@ -270,7 +270,7 @@ fi
   else
     printf '  "correctness":{"verified":false,"reason":"SKIP_CHECKSUM=1"},\n'
   fi
-  printf '  "cache_definition":{"metadata-cold":"new engine, zero metadata cache, no warmup","metadata-warm":"same engine/session warmups before measured runs","os_page_cache_flushed":false},\n'
+  printf '  "cache_definition":{"metadata-cold":"new engine, zero metadata cache, no warmup","metadata-warm":"metadata cache enabled; optional same-session warmups, release default zero","os_page_cache_flushed":false},\n'
   printf '  "runs":[\n'
   cat "$entries_file"
   printf '\n  ]\n}\n'

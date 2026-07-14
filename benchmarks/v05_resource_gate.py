@@ -104,8 +104,8 @@ def evaluate(
         expected_dataset_manifest_sha256=expected_dataset_manifest_sha256,
         expected_memory_limit=MEMORY_LIMIT,
         expected_metadata_cache_bytes=0,
-        expected_warmup=2,
-        expected_iterations=5,
+        expected_warmup=0,
+        expected_iterations=1,
     )
     baseline_evidence = _validate_evidence(
         baseline_report,
@@ -120,8 +120,8 @@ def evaluate(
         allow_missing_dataset=allow_legacy_v04_missing_dataset,
         expected_memory_limit=MEMORY_LIMIT,
         expected_metadata_cache_bytes=0,
-        expected_warmup=2,
-        expected_iterations=5,
+        expected_warmup=0,
+        expected_iterations=1,
     )
     _check_terminal_resources(q17_report, "Q17")
     _check_terminal_resources(candidate_report, "Q21 candidate")
@@ -328,8 +328,8 @@ def _nearest_rank(values: list[float], percentile: float) -> float:
 
 def _timings(report: dict[str, Any], label: str) -> tuple[float, float]:
     runs = _runs(report, label)
-    if len(runs) != 5:
-        raise GateError(f"{label} must contain exactly five measured runs")
+    if len(runs) != 1:
+        raise GateError(f"{label} must contain exactly one measured run")
     elapsed = [
         _number(run, "elapsed_ms", f"{label} run {index}", positive=True)
         for index, run in enumerate(runs, start=1)

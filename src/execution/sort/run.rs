@@ -16,6 +16,7 @@ use super::merge::MergeIterator;
 use super::{MERGE_FAN_IN, empty_columns_batch, evaluate_keys};
 
 pub(super) const MAX_PENDING_RUNS: usize = MERGE_FAN_IN;
+const FILE_BUDGET_REPLACEMENT_SLOTS: usize = 1;
 
 pub(super) fn sort_batches(
     batches: &[RecordBatch],
@@ -174,7 +175,31 @@ pub(super) fn compact_pending_runs(
             cleanup.remove(old)?;
         }
     }
+    // Base-MERGE_FAN_IN levels normally minimize write amplification, but a
+    // very large input can retain several partly-filled levels at once. Before
+    // the query-wide 512-file budget loses its replacement slot, collapse all
+    // runs to one final fan-in. This keeps sort-merge fallback forward-moving
+    // without weakening the physical file cap.
+    if force_file_budget_compaction(context.spill.active_file_count(), cleanup.files.len()) {
+        let runs = compact_runs(
+            cleanup.files(),
+            cleanup,
+            expressions,
+            fetch,
+            schema,
+            context,
+            pool,
+            batch_size,
+        )?;
+        debug_assert!(runs.len() <= MERGE_FAN_IN);
+    }
     Ok(())
+}
+
+fn force_file_budget_compaction(active_files: usize, pending_runs: usize) -> bool {
+    pending_runs > MERGE_FAN_IN
+        && active_files
+            >= crate::runtime::MAX_ACTIVE_SPILL_FILES.saturating_sub(FILE_BUDGET_REPLACEMENT_SLOTS)
 }
 
 pub(super) struct RunCleanup {
@@ -244,5 +269,27 @@ impl Drop for RunCleanup {
                 tracing::error!(%error, path = %run.file.path().display(), "failed to remove spill run");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod file_budget_tests {
+    use super::{MERGE_FAN_IN, force_file_budget_compaction};
+    use crate::runtime::MAX_ACTIVE_SPILL_FILES;
+
+    #[test]
+    fn forces_final_fan_in_before_the_last_file_slot() {
+        assert!(!force_file_budget_compaction(
+            MAX_ACTIVE_SPILL_FILES - 2,
+            MERGE_FAN_IN + 1
+        ));
+        assert!(!force_file_budget_compaction(
+            MAX_ACTIVE_SPILL_FILES - 1,
+            MERGE_FAN_IN
+        ));
+        assert!(force_file_budget_compaction(
+            MAX_ACTIVE_SPILL_FILES - 1,
+            MERGE_FAN_IN + 1
+        ));
     }
 }

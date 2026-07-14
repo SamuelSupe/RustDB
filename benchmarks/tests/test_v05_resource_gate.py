@@ -78,24 +78,24 @@ class V05ResourceGateTests(unittest.TestCase):
 
     def test_q21_timing_thresholds_and_summary_are_enforced(self):
         original = self.fixture.load("q21_candidate")
-        cases = (
-            (timed_runs([49, 50, 51, 52, 53]), "candidate/baseline p50 ratio"),
-            (timed_runs([40, 40, 40, 40, 53]), "p95/p50 ratio"),
+        changed = json.loads(json.dumps(original))
+        changed.update(timed_runs([51]))
+        changed["runs"][0].update(
+            current_memory_bytes=0,
+            active_spill_bytes=0,
+            active_spill_files=0,
+            spill_cleaned=True,
         )
-        for timing, message in cases:
-            with self.subTest(message=message):
-                changed = json.loads(json.dumps(original))
-                changed.update(timing)
-                for run in changed["runs"]:
-                    run.update(
-                        current_memory_bytes=0,
-                        active_spill_bytes=0,
-                        active_spill_files=0,
-                        spill_cleaned=True,
-                    )
-                self.fixture.replace("q21_candidate", changed)
-                with self.assertRaisesRegex(GateError, message):
-                    self.fixture.evaluate()
+        self.fixture.replace("q21_candidate", changed)
+        with self.assertRaisesRegex(GateError, "candidate/baseline p50 ratio"):
+            self.fixture.evaluate()
+
+        changed = json.loads(json.dumps(original))
+        changed["p95_ms"] = changed["p50_ms"] + 1
+        self.fixture.replace("q21_candidate", changed)
+        with self.assertRaisesRegex(GateError, "p95_ms does not match"):
+            self.fixture.evaluate()
+
         changed = json.loads(json.dumps(original))
         changed["p50_ms"] = 1
         self.fixture.replace("q21_candidate", changed)

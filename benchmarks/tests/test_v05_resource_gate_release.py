@@ -312,6 +312,9 @@ class V05ResourceGateReleaseTests(unittest.TestCase):
         self.assertIn("--allow-legacy-v04-missing-dataset", source)
         self.assertIn("baseline_spill_container", source)
         self.assertIn("legacy_baseline_spill_directories", source)
+        self.assertGreaterEqual(source.count('"$memory_limit" 0 1'), 2)
+        self.assertIn("--warmup 0 --iterations 1", source)
+        self.assertNotIn("--warmup 2 --iterations 5", source)
         self.assertGreaterEqual(
             source.count('assert_no_query_directories "$output_host/spill"'), 3
         )

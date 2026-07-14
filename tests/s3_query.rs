@@ -69,11 +69,16 @@ async fn reads_magic_detected_multi_member_csv_from_minio() -> Result<()> {
     for path in [&gzip_path, &zstd_path] {
         let mut result = session
             .execute(&format!(
-                "SELECT count(*) FROM read_csv('s3://{BUCKET}/{path}', header = true, compression = 'auto')"
+                "SELECT count(*), sum(id), min(payload), max(payload) \
+                 FROM read_csv('s3://{BUCKET}/{path}', header = true, compression = 'auto')"
             ))
             .await?;
         let metrics = result.metrics();
-        assert_eq!(int64_value(&result.stream().next().await.unwrap()?), 2);
+        let batch = result.stream().next().await.unwrap()?;
+        assert_eq!(int64_value_at(&batch, 0), 2);
+        assert_eq!(int64_value_at(&batch, 1), 3);
+        assert_eq!(string_value_at(&batch, 2), "a".repeat(2_048));
+        assert_eq!(string_value_at(&batch, 3), "b".repeat(2_048));
         drop(result);
         let metrics = metrics.snapshot();
         assert!(metrics.csv_source_bytes > 0);
@@ -638,6 +643,15 @@ fn int64_value_at(batch: &RecordBatch, column: usize) -> i64 {
         .column(column)
         .as_any()
         .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0)
+}
+
+fn string_value_at(batch: &RecordBatch, column: usize) -> &str {
+    batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<StringArray>()
         .unwrap()
         .value(0)
 }

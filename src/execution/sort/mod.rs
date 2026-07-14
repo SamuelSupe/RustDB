@@ -28,7 +28,7 @@ use super::value::canonicalize_sort_key;
 use merge::{MemoryRun, MergeIterator, MergeRun};
 use run::{RunCleanup, compact_pending_runs, compact_runs, sort_batches, spill_run};
 
-const MERGE_FAN_IN: usize = 8;
+pub(in crate::execution) const MERGE_FAN_IN: usize = 8;
 
 pub(crate) fn sort<I>(
     input: I,

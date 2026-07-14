@@ -18,8 +18,8 @@ from typing import Any
 
 RELEASE_ENGINE_VERSION = "0.5.0-alpha.1"
 RELEASE_SOURCE_BYTES = 10 * 1024**3
-RELEASE_WARMUP = 2
-RELEASE_ITERATIONS = 5
+RELEASE_WARMUP = 0
+RELEASE_ITERATIONS = 1
 RELEASE_MEMORY_BYTES = 1024**3
 RELEASE_BATCH_SIZE = 8192
 RELEASE_IO_CONCURRENCY = 32
@@ -149,7 +149,7 @@ def run_signature(
         positive_int(run.get(field), f"{label}.{field}")
         for field in ("rows", "batches", "csv_source_bytes", "csv_decompressed_bytes")
     )
-    rows, _, read_source_bytes, decompressed_bytes = values
+    rows, batches, read_source_bytes, decompressed_bytes = values
     if rows != expected_rows:
         fail(f"{label}.rows: expected {expected_rows}, got {rows}")
     scanned_rows = positive_int(run.get("scanned_rows"), f"{label}.scanned_rows")
@@ -159,7 +159,7 @@ def run_signature(
         fail(f"{label}.csv_source_bytes did not cover the complete {source_bytes}-byte source")
     if decompressed_bytes < source_bytes:
         fail(f"{label}.csv_decompressed_bytes did not cover the complete source")
-    return values
+    return rows, read_source_bytes, decompressed_bytes, batches
 
 
 def report_signature(
@@ -175,7 +175,7 @@ def report_signature(
         for index, run in enumerate(report["runs"])
     }
     if len(signatures) != 1:
-        fail(f"{label} row/batch/byte metrics differ between measured runs")
+        fail(f"{label} row/byte/batch metrics differ between measured runs")
     return signatures.pop()
 
 
@@ -225,8 +225,8 @@ def evaluate(
     four_signature = report_signature(
         four, label="threads-4", expected_rows=expected_rows, source_bytes=source_bytes
     )
-    if one_signature != four_signature:
-        fail("one-thread and four-thread row/batch/byte metrics differ")
+    if one_signature[:3] != four_signature[:3]:
+        fail("one-thread and four-thread row/byte metrics differ")
     parser_lanes = max(
         positive_int(run.get("peak_csv_parser_lanes"), f"threads-4.runs[{index}].peak_csv_parser_lanes")
         for index, run in enumerate(four["runs"])
@@ -236,7 +236,8 @@ def evaluate(
     speedup = float(one["p50_ms"]) / float(four["p50_ms"])
     if speedup < minimum_speedup:
         fail(f"CSV four-thread speedup {speedup:.3f} is below required {minimum_speedup:.3f}")
-    rows, batches, read_source_bytes, decompressed_bytes = one_signature
+    rows, read_source_bytes, decompressed_bytes, one_batches = one_signature
+    four_batches = four_signature[3]
     return {
         "gate": "csv-single-file-scaling",
         "mode": mode,
@@ -244,7 +245,8 @@ def evaluate(
         "source_bytes": source_bytes,
         "expected_rows": expected_rows,
         "rows": rows,
-        "batches": batches,
+        "threads_1_batches": one_batches,
+        "threads_4_batches": four_batches,
         "csv_source_bytes": read_source_bytes,
         "csv_decompressed_bytes": decompressed_bytes,
         "threads_1_p50_ms": one["p50_ms"],

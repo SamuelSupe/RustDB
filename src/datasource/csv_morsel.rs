@@ -67,6 +67,13 @@ impl RecordMorselizer {
                 let next = memchr(self.quote, &self.buffer[self.scan..end]);
                 if next.is_none() {
                     self.scan = end;
+                    if end != 0
+                        && end == self.target_bytes
+                        && self.buffer.get(end - 1) == Some(&b'\n')
+                    {
+                        output.push(self.buffer.split_to(end).freeze());
+                        self.scan = 0;
+                    }
                     continue;
                 }
                 next
@@ -190,5 +197,20 @@ mod tests {
                 "split at byte {split}"
             );
         }
+    }
+
+    #[test]
+    fn emits_when_target_ends_at_a_record_boundary() {
+        let mut morselizer = RecordMorselizer::new(4, b'"', None, false);
+        let mut output = morselizer.push(b"a,b\nc,d\n");
+        output.extend(morselizer.finish());
+
+        assert_eq!(
+            output
+                .iter()
+                .map(|bytes| bytes.as_ref())
+                .collect::<Vec<_>>(),
+            [b"a,b\n".as_slice(), b"c,d\n".as_slice()]
+        );
     }
 }

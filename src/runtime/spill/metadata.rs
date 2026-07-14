@@ -18,6 +18,7 @@ use super::SpillCharge;
 /// concurrent owned copies: the registry, returned `SpillFile`, partition file
 /// vector, and a pending/repartition task clone.
 pub(super) const ACTIVE_FILE_METADATA_BASE_BYTES: usize = 1_024;
+pub(crate) const MAX_ACTIVE_SPILL_FILES: usize = 512;
 const ACTIVE_FILE_PATH_COPIES: usize = 4;
 
 #[derive(Debug)]
@@ -43,7 +44,17 @@ impl ActiveFiles {
     }
 
     pub(super) fn insert(&self, path: PathBuf, cleaned: &AtomicBool) -> Result<()> {
-        let active = self.entries.lock().len();
+        let mut entries = self.entries.lock();
+        if cleaned.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        let active = entries.len();
+        if active >= MAX_ACTIVE_SPILL_FILES {
+            return Err(Error::ResourceExhausted(format!(
+                "spill active-file limit of {MAX_ACTIVE_SPILL_FILES} reached while allocating '{}'",
+                path.display()
+            )));
+        }
         let required = active_file_metadata_bytes(&path);
         let reservation = self.memory.try_reserve(required).map_err(|error| {
             Error::ResourceExhausted(format!(
@@ -55,10 +66,6 @@ impl ActiveFiles {
             ))
         })?;
 
-        let mut entries = self.entries.lock();
-        if cleaned.load(Ordering::Acquire) {
-            return Err(Error::Cancelled);
-        }
         match entries.entry(path) {
             Entry::Vacant(entry) => {
                 entry.insert(ActiveFile {
@@ -83,6 +90,10 @@ impl ActiveFiles {
 
     pub(super) fn contains(&self, path: &Path) -> bool {
         self.entries.lock().contains_key(path)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.entries.lock().len()
     }
 
     pub(super) fn add_charge(&self, path: &Path, charge: SpillCharge) -> Result<()> {
@@ -149,9 +160,11 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ACTIVE_FILE_METADATA_BASE_BYTES, ACTIVE_FILE_PATH_COPIES, active_file_metadata_bytes,
-        path_storage_bytes,
+        ACTIVE_FILE_METADATA_BASE_BYTES, ACTIVE_FILE_PATH_COPIES, ActiveFiles,
+        MAX_ACTIVE_SPILL_FILES, active_file_metadata_bytes, path_storage_bytes,
     };
+    use crate::{Error, runtime::MemoryPool};
+    use std::{path::PathBuf, sync::atomic::AtomicBool};
 
     #[test]
     fn active_file_charge_grows_with_the_full_path() {
@@ -165,5 +178,25 @@ mod tests {
             long_charge - short_charge,
             (path_storage_bytes(long) - path_storage_bytes(short)) * ACTIVE_FILE_PATH_COPIES
         );
+    }
+
+    #[test]
+    fn rejects_more_than_the_query_file_limit_atomically() {
+        let files = ActiveFiles::new(MemoryPool::new(16 << 20));
+        let cleaned = AtomicBool::new(false);
+        for index in 0..MAX_ACTIVE_SPILL_FILES {
+            files
+                .insert(PathBuf::from(format!("/spill/{index}.arrow")), &cleaned)
+                .unwrap();
+        }
+
+        let error = files
+            .insert(PathBuf::from("/spill/overflow.arrow"), &cleaned)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ResourceExhausted(message) if message.contains("active-file limit of 512")
+        ));
+        assert_eq!(files.len(), MAX_ACTIVE_SPILL_FILES);
     }
 }

@@ -21,7 +21,8 @@ pub(crate) use metrics::OperatorHandle;
 pub use metrics::{OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot};
 pub(crate) use scheduler::QueryScheduler;
 pub(crate) use spill::{
-    QuerySpillQuota, SpillIoPool, SpillQuotaPool, SpillWriter, scavenge_orphans,
+    MAX_ACTIVE_SPILL_FILES, QuerySpillQuota, SpillIoPool, SpillQuotaPool, SpillWriter,
+    scavenge_orphans,
 };
 pub use spill::{SpillFile, SpillManager};
 pub use stream::{RecordBatchStream, boxed_record_batch_stream};

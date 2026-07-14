@@ -148,6 +148,12 @@ pub(super) fn scan_tasks(
                         let mut offset = 0;
                         let mut bytes_scanned = u64::try_from(morsel_bytes).unwrap_or(u64::MAX);
                         loop {
+                            // A ready decoder can otherwise refill the shared
+                            // bounded pipeline queue before sibling CSV lanes
+                            // are scheduled. Yield once per output batch so
+                            // independently framed morsels decode concurrently.
+                            tokio::task::yield_now().await;
+                            stream_context.check_cancelled()?;
                             if remaining.as_ref().is_some_and(|remaining| {
                                 remaining.load(Ordering::Acquire) == 0
                             }) {

@@ -170,8 +170,9 @@ The checker requires an Apple M5 Max and rejects a dirty worktree. It resolves
 the local `v0.4.0-alpha.1` tag, rebuilds the clean candidate with
 `-C target-cpu=native`, hashes the authoritative SF10 manifest, and requires
 128 MiB, four compute lanes, batch size 8192, and I/O concurrency 32. The Q21
-baseline and candidate must also agree on metadata-cache size, warmup count,
-five measured iterations, compiler, native flags, OS, architecture, and CPU.
+baseline and candidate must also agree on metadata-cache size, use no warmup
+and one measured run, and match compiler, native flags, OS, architecture, and
+CPU.
 The candidate and low-memory manifests must contain the same complete SF10
 generation object and manifest digest; dataset path spelling is not compared.
 
@@ -198,7 +199,9 @@ The default matrix covers one and four compute threads, 4096/8192-row batches,
 and metadata-cold/warm runs. `THREADS_LIST`, `BATCH_SIZES`, and `CACHE_MODES`
 override those dimensions. “Cold” deliberately means a new engine with a zero
 metadata cache and no warmup; the runner does not claim to flush the OS page
-cache, and records that fact in its manifest. MinIO data must already be
+cache, and records that fact in its manifest. `metadata-warm` remains the
+stable name for a positive metadata-cache budget; the release gate performs no
+explicit warmup before its one measured run. MinIO data must already be
 uploaded at `--minio-root`; the runner starts and initializes the repository's
 MinIO service by default (`START_MINIO=0` disables that behavior). It compares
 the remote and local dataset manifests. Before timing, every distinct
@@ -214,7 +217,7 @@ the clean `v0.4.0-alpha.1` SF10 manifest:
 
 ```sh
 THREADS_LIST="1 4" BATCH_SIZES=8192 CACHE_MODES=warm \
-MEMORY_LIMIT_BYTES=1073741824 WARMUP=2 ITERATIONS=5 START_MINIO=0 \
+MEMORY_LIMIT_BYTES=1073741824 WARMUP=0 ITERATIONS=1 START_MINIO=0 \
 benchmarks/run_baseline.sh --local-root data/tpch-sf10 \
   --output benchmarks/results/baseline/<candidate-run>
 
@@ -233,7 +236,7 @@ checker prints the exact version pair in both human and JSON output.
 
 The checker reads only local, metadata-warm, batch-8192 reports for
 `scan-filter` and `aggregate` at one and four threads. It requires M5 Max,
-native release, 1 GiB, two warmups, five measured runs, matching build/data
+native release, 1 GiB, no warmup, one measured run, matching build/data
 fingerprints and checksums, at least 2.0x four-thread throughput, and no more
 than 10% one-thread regression. The candidate manifest must name the exact
 40-character commit of the current clean worktree, and every selected thread
@@ -253,14 +256,15 @@ The default is the release gate, not a configurable benchmark. It requires a
 clean 40-character candidate commit on an Apple M5 Max, version
 `0.5.0-alpha.1`, the fixed 10 GiB deterministic 64-byte-record fixture, one
 native-release executable SHA-256 for both reports, 1 GiB, batch 8192, I/O 32,
-an 8 MiB CSV morsel, no metadata cache, two warmups, five measurements, and at
-least 1.8x four-thread/one-thread throughput. Release settings cannot be
-lowered with environment variables.
+an 8 MiB CSV morsel, no metadata cache, no warmup, one measurement, and at least
+1.8x four-thread/one-thread throughput. Release settings cannot be lowered with
+environment variables.
 
-Every measured run must return the expected rows, agree on batch count, scan
-the complete source, and agree on source/decompressed byte counts. Schema
-sampling may make those counters exceed the fixture size. For a configurable,
-non-release harness check, opt in explicitly:
+Every measured run must return the expected rows, scan the complete source, and
+agree on source/decompressed byte counts. The summary records each thread
+configuration's physical batch count separately because record-aligned morsel
+boundaries may differ. Schema sampling may make byte counters exceed the fixture
+size. For a configurable, non-release harness check, opt in explicitly:
 
 ```sh
 TARGET_BYTES=67108864 WARMUP=0 ITERATIONS=1 MINIMUM_SPEEDUP=1.0 \

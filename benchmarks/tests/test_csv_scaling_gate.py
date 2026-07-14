@@ -33,7 +33,7 @@ class CsvScalingGateTests(unittest.TestCase):
 
     def write_report(self, name, threads, elapsed, parser_lanes, *, release=True):
         path = self.root / name
-        iterations = 5 if release else 2
+        iterations = 1 if release else 2
         run = {
             "elapsed_ms": elapsed,
             "rows": 10,
@@ -69,7 +69,7 @@ class CsvScalingGateTests(unittest.TestCase):
                         "rustc_version": "rustc 1.90.0 (fake)",
                     },
                     "environment": {"cpu_model": CPU},
-                    "warmup": 2,
+                    "warmup": 0,
                 }
             )
         path.write_text(json.dumps(report), encoding="utf-8")
@@ -171,19 +171,33 @@ class CsvScalingGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(GateError, message):
                     self.evaluate_release()
 
-    def test_rejects_cross_thread_or_iteration_metric_drift(self):
-        for run in range(5):
-            self.mutate_run(self.four, "batches", 3, run)
-        with self.assertRaisesRegex(GateError, "one-thread and four-thread"):
-            self.evaluate_release()
+    def test_records_cross_thread_batch_boundaries_but_rejects_byte_drift(self):
+        self.mutate_run(self.four, "batches", 3)
+        result = self.evaluate_release()
+        self.assertEqual(result["threads_1_batches"], 2)
+        self.assertEqual(result["threads_4_batches"], 3)
+
         self.four = self.write_report("four.json", 4, 40.0, 2)
-        self.mutate_run(self.one, "batches", 3, 1)
-        with self.assertRaisesRegex(GateError, "differ between measured runs"):
+        self.mutate_run(self.four, "csv_source_bytes", 701)
+        with self.assertRaisesRegex(GateError, "one-thread and four-thread row/byte"):
             self.evaluate_release()
 
+    def test_rejects_metric_drift_between_iterations(self):
+        one = self.write_report("smoke-one.json", 1, 100.0, 1, release=False)
+        four = self.write_report("smoke-four.json", 4, 80.0, 1, release=False)
+        self.mutate_run(one, "batches", 3, 1)
+        with self.assertRaisesRegex(GateError, "differ between measured runs"):
+            evaluate(
+                one,
+                four,
+                mode="smoke",
+                minimum_speedup=1.1,
+                source_bytes=651,
+                expected_rows=10,
+            )
+
     def test_rejects_serial_or_slow_four_thread_run(self):
-        for run in range(5):
-            self.mutate_run(self.four, "peak_csv_parser_lanes", 1, run)
+        self.mutate_run(self.four, "peak_csv_parser_lanes", 1)
         with self.assertRaisesRegex(GateError, "never observed two"):
             self.evaluate_release()
         self.four = self.write_report("four.json", 4, 60.0, 2)

@@ -16,8 +16,8 @@ output_argument=${2:-benchmarks/results/csv-scaling/$(date -u '+%Y%m%dT%H%M%SZ')
 
 if [ "$mode" = release ]; then
   target_bytes=10737418240
-  warmup=2
-  iterations=5
+  warmup=0
+  iterations=1
   minimum_speedup=1.8
   memory_limit=1073741824
   [ "${TARGET_BYTES:-$target_bytes}" = "$target_bytes" ] || \

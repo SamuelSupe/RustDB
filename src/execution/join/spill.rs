@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    runtime::{BatchEnvelope, QueryContext, SpillFile},
+    runtime::{BatchEnvelope, MAX_ACTIVE_SPILL_FILES, QueryContext, SpillFile},
     sql::{BoundExpr, JoinType},
 };
 
@@ -16,6 +16,12 @@ pub(super) use partition::{
 pub(super) use partition::{partition_for_key, spill_batch};
 
 pub(super) const PARTITIONS: usize = 256;
+const MIN_PARTITIONS: usize = 2;
+// A sort-merge fallback retains at most one final fan-in per side. Two group
+// files plus one publish-before-delete replacement slot make the remaining
+// three slots explicit.
+pub(super) const FALLBACK_FILE_HEADROOM: usize = crate::execution::sort::MERGE_FAN_IN * 2 + 3;
+const MAX_PARTITIONS_WITH_REPARTITION: usize = 128;
 #[cfg(test)]
 pub(super) const MAX_REPARTITION_DEPTH: usize = 4;
 const SEED_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -102,12 +108,14 @@ pub(super) fn repartition(
     null_equal_keys: bool,
     next_depth: usize,
     context: &QueryContext,
-) -> Result<Repartitioned> {
+) -> Result<Option<Repartitioned>> {
     let seed = seed_for_depth(next_depth);
-    // This task already failed an exclusive build attempt. Splitting it only
-    // in two leaves too little margin for estimator error and allocator
-    // rounding, so a failed generation always fans out at least four ways.
-    let partitions = adaptive_partition_count(context, task.build.estimated_bytes).max(4);
+    // Refuse to start a generation that cannot retain at least two files per
+    // side plus rotation headroom. The caller falls back to sort-merge while
+    // the original partition is still intact.
+    let Some(partitions) = repartition_partition_count(context, task.build.estimated_bytes) else {
+        return Ok(None);
+    };
     let mut left_spiller = PartitionSpiller::for_repartition(
         context,
         format!("join-left-r{next_depth}"),
@@ -190,14 +198,13 @@ pub(super) fn repartition(
     context
         .metrics
         .record_spill(0, u64::try_from(tasks.len()).unwrap_or(u64::MAX));
-    Ok(Repartitioned {
+    Ok(Some(Repartitioned {
         tasks,
         largest_build_rows,
-    })
+    }))
 }
 
 pub(super) fn adaptive_partition_count(context: &QueryContext, estimated_bytes: usize) -> usize {
-    const MIN_PARTITIONS: usize = 2;
     const MIN_TARGET_BYTES: usize = 8 << 20;
 
     let lanes = context.scheduler.partitioning_lanes();
@@ -212,12 +219,72 @@ pub(super) fn adaptive_partition_count(context: &QueryContext, estimated_bytes: 
         .spill_partition_target_bytes
         .unwrap_or(default_target)
         .max(1);
+    desired_partition_count(estimated_bytes, target)
+        .min(file_budget_partition_cap(context).unwrap_or(MIN_PARTITIONS))
+}
+
+fn repartition_partition_count(context: &QueryContext, estimated_bytes: usize) -> Option<usize> {
+    const MIN_TARGET_BYTES: usize = 8 << 20;
+
+    let lanes = context.scheduler.partitioning_lanes();
+    let lane_target = context
+        .memory
+        .limit()
+        .checked_div(lanes.saturating_mul(2))
+        .unwrap_or(0);
+    let default_target = lane_target.clamp(MIN_TARGET_BYTES, 64 << 20);
+    let target = context
+        .execution
+        .spill_partition_target_bytes
+        .unwrap_or(default_target)
+        .max(1);
+    let cap = file_budget_partition_cap(context)?;
+    Some(desired_partition_count(estimated_bytes, target).min(cap))
+}
+
+fn desired_partition_count(estimated_bytes: usize, target: usize) -> usize {
     estimated_bytes
         .max(1)
         .div_ceil(target)
         .checked_next_power_of_two()
         .unwrap_or(PARTITIONS)
         .clamp(MIN_PARTITIONS, PARTITIONS)
+}
+
+fn file_budget_partition_cap(context: &QueryContext) -> Option<usize> {
+    partition_cap_for_active_files(
+        context.spill.active_file_count(),
+        context.execution.max_repartition_depth,
+    )
+}
+
+fn partition_cap_for_active_files(active: usize, max_repartition_depth: usize) -> Option<usize> {
+    const SIDES: usize = 2;
+
+    let headroom = if max_repartition_depth == 0 {
+        0
+    } else {
+        FALLBACK_FILE_HEADROOM
+    };
+    let available = MAX_ACTIVE_SPILL_FILES
+        .saturating_sub(active)
+        .saturating_sub(headroom);
+    if available < SIDES * MIN_PARTITIONS {
+        return None;
+    }
+    let generation_cap = available / SIDES;
+    let generation_cap = previous_power_of_two(generation_cap.min(PARTITIONS));
+    let depth_cap = if max_repartition_depth == 0 {
+        PARTITIONS
+    } else {
+        MAX_PARTITIONS_WITH_REPARTITION
+    };
+    Some(generation_cap.min(depth_cap).max(MIN_PARTITIONS))
+}
+
+fn previous_power_of_two(value: usize) -> usize {
+    let next = value.checked_next_power_of_two().unwrap_or(PARTITIONS);
+    if next == value { value } else { next / 2 }
 }
 
 pub(super) fn remove_task(context: &QueryContext, task: &PartitionTask) -> Result<()> {
@@ -245,7 +312,10 @@ fn seed_for_depth(depth: usize) -> u64 {
 
 #[cfg(test)]
 mod adaptive_tests {
-    use super::{PartitionTask, adaptive_partition_count, pop_largest_task};
+    use super::{
+        MAX_PARTITIONS_WITH_REPARTITION, PARTITIONS, PartitionTask, adaptive_partition_count,
+        partition_cap_for_active_files, pop_largest_task,
+    };
     use crate::runtime::{MemoryPool, QueryContext};
 
     #[test]
@@ -257,8 +327,20 @@ mod adaptive_tests {
         assert_eq!(adaptive_partition_count(&context, 80 << 20), 16);
         assert_eq!(
             adaptive_partition_count(&context, usize::MAX),
-            super::PARTITIONS
+            MAX_PARTITIONS_WITH_REPARTITION
         );
+
+        context.execution.max_repartition_depth = 0;
+        assert_eq!(adaptive_partition_count(&context, usize::MAX), PARTITIONS);
+    }
+
+    #[test]
+    fn repartition_file_budget_never_invents_missing_slots() {
+        assert_eq!(partition_cap_for_active_files(0, 2), Some(128));
+        assert_eq!(partition_cap_for_active_files(489, 2), Some(2));
+        assert_eq!(partition_cap_for_active_files(490, 2), None);
+        assert_eq!(partition_cap_for_active_files(508, 0), Some(2));
+        assert_eq!(partition_cap_for_active_files(509, 0), None);
     }
 
     #[test]

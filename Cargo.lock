@@ -2033,6 +2033,7 @@ dependencies = [
  "parquet",
  "pretty_assertions",
  "rand 0.9.4",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

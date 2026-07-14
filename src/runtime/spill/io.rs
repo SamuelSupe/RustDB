@@ -684,11 +684,56 @@ pub(super) fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn sync_shared_filesystem(path: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+
+        let directory =
+            File::open(path).map_err(|error| Error::io(Some(path.to_path_buf()), error))?;
+        let filesystem = rustix::fs::fstatfs(&directory).map_err(|error| {
+            Error::io(
+                Some(path.to_path_buf()),
+                io::Error::from_raw_os_error(error.raw_os_error()),
+            )
+        })?;
+        if filesystem.f_type as u64 == FUSE_SUPER_MAGIC {
+            rustix::fs::syncfs(&directory).map_err(|error| {
+                Error::io(
+                    Some(path.to_path_buf()),
+                    io::Error::from_raw_os_error(error.raw_os_error()),
+                )
+            })?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
+    Ok(())
+}
+
 pub(super) fn sync_parent_directory(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         sync_directory(parent)?;
     }
     Ok(())
+}
+
+pub(super) fn sync_parent_shared_filesystem(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        sync_shared_filesystem(parent)?;
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_path_absent(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::io(Some(path.to_path_buf()), error)),
+        Ok(_) => Err(Error::Execution(format!(
+            "spill directory '{}' remained after cleanup",
+            path.display()
+        ))),
+    }
 }
 
 pub(super) fn set_directory_permissions(path: &Path) -> Result<()> {

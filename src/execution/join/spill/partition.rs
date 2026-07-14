@@ -8,7 +8,9 @@ use crate::{
 };
 
 use super::super::CellValue;
-use super::{BuildPartitionStats, PARTITIONS, build::compaction_reservation_bytes};
+use super::{
+    BuildPartitionStats, FALLBACK_FILE_HEADROOM, PARTITIONS, build::compaction_reservation_bytes,
+};
 
 const MAX_SPILL_FILE_BYTES: usize = 256 * 1024 * 1024;
 
@@ -127,11 +129,14 @@ impl<'a> PartitionSpiller<'a> {
             .max()
             .unwrap_or(0)
             .max(projected_partition);
+        let rotation_preserves_fallback = self.spill.active_file_count()
+            < crate::runtime::MAX_ACTIVE_SPILL_FILES.saturating_sub(FALLBACK_FILE_HEADROOM);
         let should_rotate = {
             let sink = &self.partitions[partition];
             sink.writer.is_some()
                 && sink.uncompressed_bytes > 0
                 && sink.uncompressed_bytes.saturating_add(bytes) > self.target_bytes
+                && rotation_preserves_fallback
         };
         if should_rotate {
             self.finish_partition(partition)?;

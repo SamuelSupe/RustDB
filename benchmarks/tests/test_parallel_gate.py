@@ -80,8 +80,8 @@ class GateFixture:
                 "engine_version": engine_version,
                 "build_id": build_id,
                 "build": build,
-                "warmup": 2,
-                "iterations": 5,
+                "warmup": 0,
+                "iterations": 1,
                 "config": {
                     "memory_limit_bytes": 1_073_741_824,
                     "compute_threads": threads,
@@ -91,7 +91,8 @@ class GateFixture:
                 },
                 "environment": {"cpu_model": "Apple M5 Max"},
                 "p50_ms": p50,
-                "runs": [{"elapsed_ms": p50} for _ in range(5)],
+                "p95_ms": p50,
+                "runs": [{"elapsed_ms": p50}],
                 "binary_sha256": binary_sha256,
             }
             report_path.write_text(json.dumps(report), encoding="utf-8")
@@ -102,8 +103,8 @@ class GateFixture:
                 "case": case,
                 "threads": threads,
                 "batch_size": 8192,
-                "warmup": 2,
-                "iterations": 5,
+                "warmup": 0,
+                "iterations": 1,
                 "report": f"reports/{report_path.name}",
                 "checksum_report": f"reports/{checksum_path.name}",
             }
@@ -438,9 +439,18 @@ class ParallelGateTests(unittest.TestCase):
         path = self.fixture.reports[("candidate", "scan-filter", 4)]
         report = json.loads(path.read_text(encoding="utf-8"))
         report["p50_ms"] = 60
-        report["runs"] = [{"elapsed_ms": 60} for _ in range(5)]
+        report["p95_ms"] = 60
+        report["runs"] = [{"elapsed_ms": 60}]
         path.write_text(json.dumps(report), encoding="utf-8")
         with self.assertRaisesRegex(GateError, "only 1.750x"):
+            self.evaluate()
+
+    def test_single_run_p95_must_match_the_measurement(self):
+        path = self.fixture.reports[("candidate", "scan-filter", 1)]
+        report = json.loads(path.read_text(encoding="utf-8"))
+        report["p95_ms"] += 1
+        path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaisesRegex(GateError, "p95_ms does not equal"):
             self.evaluate()
 
 

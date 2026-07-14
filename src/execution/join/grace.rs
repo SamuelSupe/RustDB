@@ -50,6 +50,7 @@ pub(super) fn join(
         let lanes = lane_count(&context, &tasks);
         let admission = BuildAdmission::new(context.memory.limit());
         let pending = Arc::new(Mutex::new(tasks));
+        let spill_generation = Arc::new(Mutex::new(()));
         let workers_ready = Arc::new(Barrier::new(lanes));
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = CancelOnDrop(cancellation.clone());
@@ -72,6 +73,7 @@ pub(super) fn join(
                 batch_size.max(1),
                 admission.clone(),
                 Arc::clone(&workers_ready),
+                Arc::clone(&spill_generation),
             );
             if let Err(error) = context.tasks.spawn("grace-join-worker", worker) {
                 cancellation.cancel();
@@ -129,6 +131,7 @@ async fn run_worker(
     batch_size: usize,
     admission: BuildAdmission,
     workers_ready: Arc<Barrier>,
+    spill_generation: Arc<Mutex<()>>,
 ) -> Result<()> {
     tokio::select! {
         _ = workers_ready.wait() => {}
@@ -150,6 +153,7 @@ async fn run_worker(
         &context,
         batch_size,
         &admission,
+        &spill_generation,
     )
     .await?;
     sender
@@ -174,6 +178,7 @@ async fn run_worker_inner(
     context: &Arc<QueryContext>,
     batch_size: usize,
     admission: &BuildAdmission,
+    spill_generation: &Mutex<()>,
 ) -> Result<()> {
     loop {
         let task = {
@@ -280,6 +285,15 @@ async fn run_worker_inner(
                     reservation.try_resize(0)?;
                     drop(reservation);
                     drop(build_permit);
+                    // Repartition and sort-merge both create Spill files while
+                    // their parent partition remains live. Serialize those
+                    // generations so every worker observes a stable query-wide
+                    // file budget instead of racing to the 512-file ceiling.
+                    let _spill_generation = tokio::select! {
+                        _ = cancellation.cancelled() => return Err(Error::Cancelled),
+                        _ = context.control.cancelled() => return Err(Error::Cancelled),
+                        guard = spill_generation.lock() => guard,
+                    };
                     if task.depth < context.execution.max_repartition_depth {
                         let next_depth = task.depth + 1;
                         let repartitioned = {
@@ -294,21 +308,23 @@ async fn run_worker_inner(
                                 context,
                             )?
                         };
-                        let shrank = repartitioned.largest_build_rows < rows;
-                        if shrank || task.stagnant_repartitions == 0 {
-                            spill::remove_task(context, &task)?;
-                            let stagnant = if shrank {
-                                0
-                            } else {
-                                task.stagnant_repartitions + 1
-                            };
-                            local.extend(repartitioned.tasks.into_iter().map(|mut child| {
-                                child.stagnant_repartitions = stagnant;
-                                child
-                            }));
-                            continue;
+                        if let Some(repartitioned) = repartitioned {
+                            let shrank = repartitioned.largest_build_rows < rows;
+                            if shrank || task.stagnant_repartitions == 0 {
+                                spill::remove_task(context, &task)?;
+                                let stagnant = if shrank {
+                                    0
+                                } else {
+                                    task.stagnant_repartitions + 1
+                                };
+                                local.extend(repartitioned.tasks.into_iter().map(|mut child| {
+                                    child.stagnant_repartitions = stagnant;
+                                    child
+                                }));
+                                continue;
+                            }
+                            spill::remove_tasks(context, &repartitioned.tasks)?;
                         }
-                        spill::remove_tasks(context, &repartitioned.tasks)?;
                     }
 
                     let mut fallback = sort_merge::fallback_with_null_keys(

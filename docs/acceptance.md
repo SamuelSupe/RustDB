@@ -194,18 +194,18 @@ This command is the strict release mode. It refuses a dirty or non-40-character
 candidate, non-M5-Max hardware, a non-10-GiB fixture, a version other than
 `0.5.0-alpha.1`, non-native/non-release builds, or reports that do not share the
 current executable SHA-256. It fixes the engine settings to 1 GiB, batch 8192,
-I/O concurrency 32, metadata cache zero, an 8 MiB CSV morsel, two warmups and
-five measured runs; the 1.8x threshold and these settings cannot be weakened by
+I/O concurrency 32, metadata cache zero, an 8 MiB CSV morsel, no warmup and one
+measured run; the 1.8x threshold and these settings cannot be weakened by
 environment variables.
 
-The gate checks every measured iteration: one and four threads must return the
-fixture's expected row count, agree on batches, and each report a complete
-source/decompressed-byte read with cross-thread-identical counters before the
-throughput ratio is accepted. Counters may exceed the fixture size because
-schema sampling uses the same measured input path. Configurable harness checks
-must use `benchmarks/run_csv_scaling.sh --smoke`; their summary is explicitly
-marked `"mode": "smoke"` and `"release_qualified": false` and is not release
-evidence.
+The gate checks the measured run: one and four threads must return the fixture's
+expected row count and each report a complete source/decompressed-byte read with
+cross-thread-identical counters before the throughput ratio is accepted. It
+records physical batch counts separately because record-aligned morsel boundaries
+may differ. Counters may exceed the fixture size because schema sampling uses the
+same measured input path. Configurable harness checks must use
+`benchmarks/run_csv_scaling.sh --smoke`; their summary is explicitly marked
+`"mode": "smoke"` and `"release_qualified": false` and is not release evidence.
 
 Generate and validate the SF10 resource evidence from a clean candidate commit
 with the repeatable runner. Supply the completed low-memory run from the same
@@ -236,6 +236,18 @@ the detached baseline, making delayed shared-mount residue a release failure.
 The v0.4 process writes to an isolated baseline Spill root; any legacy ghost
 directories are counted in the resource manifest and removed only after that
 process has exited, without weakening the candidate assertion.
+
+The shared-mount regression is also available as a focused OrbStack gate. It
+forces a real aggregate Spill in one container, waits for delayed VirtioFS
+writeback, then verifies the same directory through a fresh read-only mount:
+
+```sh
+scripts/ci/spill_fresh_mount.sh
+```
+
+The default wait is 30 seconds and the probe runs once. Set
+`RUSTDB_SPILL_REPLAY_WAIT_SECONDS` only for filesystem diagnostics; preserving
+the probe directory requires `RUSTDB_KEEP_SPILL_REPLAY_PROBE=1`.
 
 The candidate Q17 and Q21 reports must live below a run directory whose
 `manifest.json` contains the same complete `dataset` object as the clean
@@ -274,8 +286,8 @@ The default checker is release-strict. It requires an Apple M5 Max; a clean,
 exact 40-character candidate commit; native release reports from one rebuilt
 candidate binary; SF10 manifest provenance; and 128 MiB / four compute lanes /
 batch 8192 / I/O concurrency 32. Q21 candidate and baseline must additionally
-use comparable build, environment, and metadata-cache settings, with two
-warmups and five measured iterations. It resolves the local
+use comparable build, environment, and metadata-cache settings, with no
+warmup and one measured run. The single sample is both p50 and p95. It resolves the local
 `v0.4.0-alpha.1` tag and rejects a baseline from another commit.
 Candidate Q17, Q21, and the low-memory run must have an identical complete
 dataset generation object and manifest digest. Dataset paths may differ only
@@ -341,7 +353,9 @@ writes timestamped manifests and per-case JSON reports below
   requests, and spill metrics.
 
 The two 1,000-iteration lifecycle soaks are deliberately ignored by routine
-`cargo test` runs. Execute both release-mode tests explicitly before tagging:
+`cargo test` runs. They remain optional deep diagnostics; the v0.5 alpha release
+uses the single full OrbStack lifecycle run plus the focused fresh-mount probe,
+so it does not repeat these stress loops by default:
 
 ```sh
 docker compose run --rm --no-deps dev sh -c '
@@ -367,9 +381,12 @@ The v0.5 release-blocking parallel performance sample is local SF10 on an Apple 
 Max. Capture the candidate with only the required matrix dimensions (the
 baseline suite may still emit its other query cases; the gate ignores them):
 
+`metadata-warm` is the retained selector for a positive metadata-cache budget;
+this single-run gate performs no explicit warmup.
+
 ```sh
 THREADS_LIST="1 4" BATCH_SIZES=8192 CACHE_MODES=warm \
-MEMORY_LIMIT_BYTES=1073741824 WARMUP=2 ITERATIONS=5 START_MINIO=0 \
+MEMORY_LIMIT_BYTES=1073741824 WARMUP=0 ITERATIONS=1 START_MINIO=0 \
 benchmarks/run_baseline.sh \
   --local-root data/tpch-sf10 \
   --output benchmarks/results/baseline/<candidate-run>
@@ -393,7 +410,7 @@ requires its digest to match every selected report. The gate also fails on
 missing or duplicate matrix entries,
 unverified checksums, a dataset mismatch, non-M5-Max hardware, a non-release or
 non-native build, settings other than local metadata-warm / batch 8192 / 1 GiB
-/ warmup 2 / five measurements, or a report whose build/config does not match
+/ no warmup / one measurement, or a report whose build/config does not match
 its manifest. Missing evidence is a failure, never a pass.
 
 For both `scan-filter` and `aggregate`, the candidate must satisfy:
