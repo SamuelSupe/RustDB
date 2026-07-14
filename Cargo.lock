@@ -2027,6 +2027,7 @@ dependencies = [
  "glob",
  "hashbrown 0.16.1",
  "lru",
+ "memchr",
  "object_store",
  "parking_lot",
  "parquet",

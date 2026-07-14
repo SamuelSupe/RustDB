@@ -235,7 +235,8 @@ async fn produce_morsels(
         Some((&context.control, &context.metrics)),
     )
     .await?;
-    let read_bytes = target_bytes.clamp(1, 64 * 1024);
+    let max_read_bytes = context.memory.limit().saturating_div(8).clamp(1, 1 << 20);
+    let read_bytes = target_bytes.clamp(1, max_read_bytes);
     let _read_memory = context
         .reserve_memory(read_bytes, "CSV input buffer")
         .await
