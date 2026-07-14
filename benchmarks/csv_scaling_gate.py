@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -278,14 +277,42 @@ def release_context(root: Path) -> ReleaseContext:
     ).stdout.strip()
     if "M5 Max" not in cpu_model:
         fail(f"release gate requires an Apple M5 Max, detected {cpu_model!r}")
-    binary = root / "target/release/rustdb-bench"
-    try:
-        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    except OSError as error:
-        fail(f"cannot hash candidate benchmark executable: {error}")
-    if not SHA256.fullmatch(digest):
-        fail("candidate benchmark executable SHA-256 is invalid")
+    digest = rebuild_candidate_binary_sha256(root)
     return ReleaseContext(build_id, digest, cpu_model)
+
+
+def rebuild_candidate_binary_sha256(root: Path) -> str:
+    command = [
+        "docker",
+        "compose",
+        "run",
+        "--rm",
+        "--no-deps",
+        "--no-TTY",
+        "--env",
+        f"RUSTFLAGS={RELEASE_RUSTFLAGS}",
+        "dev",
+        "sh",
+        "-c",
+        "cargo build --locked --quiet --release --bin rustdb-bench && "
+        "sha256sum target/release/rustdb-bench",
+    ]
+    try:
+        lines = subprocess.run(
+            command,
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError) as error:
+        detail = getattr(error, "stderr", "") or str(error)
+        fail(f"cannot rebuild the candidate benchmark executable: {detail}")
+    digests = [line.split()[0] for line in lines if line.split()]
+    digests = [digest for digest in digests if SHA256.fullmatch(digest)]
+    if len(digests) != 1:
+        fail("candidate rebuild did not emit exactly one benchmark executable SHA-256")
+    return digests[0]
 
 
 def main() -> int:

@@ -1,8 +1,10 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -11,6 +13,7 @@ from csv_scaling_gate import (  # noqa: E402
     RELEASE_SOURCE_BYTES,
     ReleaseContext,
     evaluate,
+    rebuild_candidate_binary_sha256,
     source_facts,
 )
 
@@ -155,6 +158,20 @@ class CsvScalingGateTests(unittest.TestCase):
                 self.context = context
                 with self.assertRaisesRegex(GateError, message):
                     self.evaluate_release()
+
+    @patch("csv_scaling_gate.subprocess.run")
+    def test_candidate_digest_is_rebuilt_inside_the_compose_target_volume(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"{DIGEST}  target/release/rustdb-bench\n"
+        )
+        self.assertEqual(rebuild_candidate_binary_sha256(self.root), DIGEST)
+        command = run.call_args.args[0]
+        self.assertIn("RUSTFLAGS=-C target-cpu=native", command)
+        self.assertIn("sha256sum target/release/rustdb-bench", command[-1])
+
+        run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="bad\n")
+        with self.assertRaisesRegex(GateError, "exactly one"):
+            rebuild_candidate_binary_sha256(self.root)
 
     def test_rejects_incomplete_or_inconsistent_results(self):
         cases = (
