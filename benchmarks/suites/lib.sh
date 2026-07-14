@@ -92,8 +92,7 @@ require_tpch_parquet_root() {
 }
 
 validate_template_root() {
-  dataset_root=$1
-  case "$dataset_root" in
+  case "$1" in
     *'|'*|*'&'*|*'\'*|*"'"*)
       die "dataset root contains a character unsupported by SQL template rendering"
       ;;

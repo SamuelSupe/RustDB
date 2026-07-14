@@ -327,5 +327,21 @@ class V05ResourceGateReleaseTests(unittest.TestCase):
         self.assertNotIn("git push", source)
         self.assertNotIn("git tag", source)
 
+    def test_template_validation_preserves_the_render_dataset_root(self):
+        library = ROOT / "benchmarks/suites/lib.sh"
+        result = subprocess.run(
+            [
+                "sh",
+                "-c",
+                f'. "{library}"; dataset_root=/workspace/data/tpch-sf10; '
+                'validate_template_root data/tpch-sf10; printf "%s" "$dataset_root"',
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "/workspace/data/tpch-sf10")
+
 if __name__ == "__main__":
     unittest.main()

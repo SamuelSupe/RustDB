@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -257,7 +257,18 @@ def _validate_query(
     roots = set(match.groups())
     if len(roots) != 1:
         raise GateError(f"{label}.query_file mixes multiple dataset roots")
-    return roots.pop()
+    return _canonical_query_root(roots.pop(), label)
+
+
+def _canonical_query_root(root: str, label: str) -> str:
+    if "://" in root:
+        return root
+    path = PurePosixPath(root)
+    if any(part in (".", "..") for part in path.parts):
+        raise GateError(f"{label}.query_file contains an unsafe dataset root")
+    if not path.is_absolute():
+        path = PurePosixPath("/workspace") / path
+    return str(path)
 
 
 def _resolve_artifact(report_path: Path, value: str, label: str) -> Path:

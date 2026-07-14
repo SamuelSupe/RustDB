@@ -193,6 +193,16 @@ class V05ResourceGateTests(unittest.TestCase):
         with self.assertRaisesRegex(GateError, "query root"):
             self.fixture.evaluate()
 
+    def test_relative_and_workspace_query_roots_are_equivalent(self):
+        candidate = self.fixture.load("q21_candidate")
+        candidate["query_file"] = str(self.fixture.render(
+            ROOT / "benchmarks/tpch/q21.sql",
+            "relative-root/q21.sql",
+            "data/tpch-sf10",
+        ))
+        self.fixture.replace("q21_candidate", candidate)
+        self.assertEqual(self.fixture.evaluate()["status"], "pass")
+
     def test_baseline_and_candidate_binary_digests_must_differ(self):
         baseline = self.fixture.load("q21_baseline")
         baseline["binary_sha256"] = CANDIDATE_BINARY
