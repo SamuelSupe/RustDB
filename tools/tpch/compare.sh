@@ -100,7 +100,7 @@ if ! binary_digest_output=$(docker compose --project-directory "$TPCH_ROOT" run 
   tpch_die "cannot hash the RustDB release binary; build it before using TPCH_SKIP_BUILD=1"
 fi
 binary_sha256=$(printf '%s\n' "$binary_digest_output" | \
-  awk '/^[0-9a-f]{64}[[:space:]]/ {print $1; exit}')
+  awk 'length($1) == 64 && $1 !~ /[^0-9a-f]/ {print $1; exit}')
 printf '%s\n' "$binary_sha256" | grep -Eq '^[0-9a-f]{64}$' || \
   tpch_die "cannot determine the RustDB release binary SHA-256"
 rustdb_manifest=

@@ -215,7 +215,8 @@ docker compose run --rm --no-deps --no-TTY \
   --manifest-path "$baseline_container/Cargo.toml" \
   --target-dir "$baseline_container/target"
 baseline_binary_sha256=$(docker compose run --rm --no-deps --no-TTY dev \
-  sha256sum "$baseline_binary" | awk '/^[0-9a-f]{64}[[:space:]]/ {print $1; exit}')
+  sha256sum "$baseline_binary" | \
+  awk 'length($1) == 64 && $1 !~ /[^0-9a-f]/ {print $1; exit}')
 printf '%s\n' "$baseline_binary_sha256" | grep -Eq '^[0-9a-f]{64}$' || \
   die "cannot determine the baseline benchmark executable SHA-256"
 

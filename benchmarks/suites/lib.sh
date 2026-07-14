@@ -162,7 +162,8 @@ build_benchmark_binary() {
     --env "RUSTFLAGS=$BENCHMARK_RUSTFLAGS" dev \
     cargo build --quiet --release --bin rustdb-bench
   BENCHMARK_BINARY_SHA256=$(docker compose run --rm --no-deps --no-TTY dev \
-    sha256sum target/release/rustdb-bench | awk '/^[0-9a-f]{64}[[:space:]]/ {print $1; exit}')
+    sha256sum target/release/rustdb-bench | \
+    awk 'length($1) == 64 && $1 !~ /[^0-9a-f]/ {print $1; exit}')
   printf '%s\n' "$BENCHMARK_BINARY_SHA256" | grep -Eq '^[0-9a-f]{64}$' || \
     die "cannot determine the benchmark executable SHA-256"
 }
