@@ -58,11 +58,18 @@ impl RecordMorselizer {
     fn scan_unescaped(&mut self, eof: bool) -> Vec<Bytes> {
         let mut output = Vec::new();
         while self.scan < self.buffer.len() {
-            let remaining = &self.buffer[self.scan..];
             let next = if self.in_quotes {
-                memchr(self.quote, remaining)
+                memchr(self.quote, &self.buffer[self.scan..])
+            } else if self.skip_header || self.scan >= self.target_bytes {
+                memchr2(self.quote, b'\n', &self.buffer[self.scan..])
             } else {
-                memchr2(self.quote, b'\n', remaining)
+                let end = self.target_bytes.min(self.buffer.len());
+                let next = memchr(self.quote, &self.buffer[self.scan..end]);
+                if next.is_none() {
+                    self.scan = end;
+                    continue;
+                }
+                next
             };
             let Some(next) = next else {
                 self.scan = self.buffer.len();
