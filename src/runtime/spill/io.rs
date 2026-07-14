@@ -670,17 +670,24 @@ pub(super) fn create_query_directory(path: &Path) -> Result<()> {
         .map_err(|error| Error::io(Some(path.to_path_buf()), error))
 }
 
-pub(super) fn sync_parent_directory(path: &Path) -> Result<()> {
+pub(super) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
-    if let Some(parent) = path.parent() {
+    {
         let directory =
-            File::open(parent).map_err(|error| Error::io(Some(parent.to_path_buf()), error))?;
+            File::open(path).map_err(|error| Error::io(Some(path.to_path_buf()), error))?;
         directory
             .sync_all()
-            .map_err(|error| Error::io(Some(parent.to_path_buf()), error))?;
+            .map_err(|error| Error::io(Some(path.to_path_buf()), error))?;
     }
     #[cfg(not(unix))]
     let _ = path;
+    Ok(())
+}
+
+pub(super) fn sync_parent_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
     Ok(())
 }
 

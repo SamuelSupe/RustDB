@@ -492,6 +492,14 @@ impl State {
         }
         self.cleaned.store(true, Ordering::Release);
         self.io_tracker.close_and_wait();
+        // Persist earlier per-file removals before removing the query
+        // directory. Shared mounts can otherwise replay those directory-entry
+        // updates after the terminal removal and expose an empty ghost.
+        if self.next_file.load(Ordering::Relaxed) != 0 {
+            let query_directory = self.directory.clone();
+            self.io_pool
+                .run_cleanup(move || io::sync_directory(&query_directory))?;
+        }
         // Do not unlink a directory while its advisory-lock file is still
         // open. That is legal on local Unix filesystems, but shared macOS/Linux
         // mounts can expose an empty ghost directory when the handle closes
