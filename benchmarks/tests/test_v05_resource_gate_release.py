@@ -310,6 +310,11 @@ class V05ResourceGateReleaseTests(unittest.TestCase):
         self.assertIn("--q21-checksum", source)
         self.assertIn("--low-memory-manifest", source)
         self.assertIn("--allow-legacy-v04-missing-dataset", source)
+        self.assertIn("baseline_spill_container", source)
+        self.assertIn("legacy_baseline_spill_directories", source)
+        self.assertGreaterEqual(
+            source.count('assert_no_query_directories "$output_host/spill"'), 3
+        )
         self.assertIn("requires an Apple M5 Max", source)
         self.assertIn("requires SF10", source)
         self.assertLess(

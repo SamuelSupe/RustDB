@@ -23,7 +23,9 @@ The runner requires a clean candidate commit and a complete verified 24-case
 low-memory manifest. It records Q17 once, records Q21 after two warmups for five
 iterations on both the candidate and detached v0.4 baseline, and records
 DuckDB-matched Q17/Q21 checksums. All reports use 128 MiB, four compute lanes,
-batch size 8192, I/O concurrency 32, and metadata cache 0.
+batch size 8192, I/O concurrency 32, and metadata cache 0. Candidate Spill is
+checked both before and after the baseline; legacy v0.4 Spill uses an isolated
+directory that is removed only after the detached process exits.
 EOF
   exit 2
 }
@@ -112,7 +114,9 @@ output_host=$WORKSPACE/$output_relative
 output_container=/workspace/$output_relative
 [ ! -e "$output_host" ] || \
   die "output directory already exists; choose a new path: $output_relative"
-mkdir -p "$output_host/rendered" "$output_host/baseline" "$output_host/spill"
+mkdir -p "$output_host/rendered" "$output_host/baseline/spill" "$output_host/spill"
+baseline_spill_host=$output_host/baseline/spill
+baseline_spill_container=$output_container/baseline/spill
 
 temporary_root=
 baseline_worktree=
@@ -229,7 +233,7 @@ set -- "$baseline_binary" \
   --batch-size "$batch_size" \
   --io-concurrency "$io_concurrency" \
   --metadata-cache-bytes "$metadata_cache_bytes" \
-  --spill-directory "$output_container/spill"
+  --spill-directory "$baseline_spill_container"
 if ! docker compose run --rm --no-deps --no-TTY dev "$@" \
     < /dev/null > "$output_host/baseline/q21.json.tmp"; then
   exit 1
@@ -238,7 +242,22 @@ assert_benchmark_report_config \
   "$output_host/baseline/q21.json.tmp" "$memory_limit" "$threads" \
   "$batch_size" "$io_concurrency" "$metadata_cache_bytes" "$baseline_binary_sha256"
 mv "$output_host/baseline/q21.json.tmp" "$output_host/baseline/q21.json"
+# Recheck the candidate root after the long baseline run. This catches a query
+# directory that reappears late on a shared macOS/Linux mount instead of hiding
+# it among legacy baseline files.
 assert_no_query_directories "$output_host/spill"
+
+# v0.4 can leave mount-level ghost directories after its process has exited.
+# Keep them isolated from candidate evidence, then remove only the new output
+# tree owned by this invocation. Candidate cleanup is never excused here.
+legacy_baseline_spill_directories=$(find "$baseline_spill_host" \
+  -mindepth 1 -maxdepth 1 -type d -name 'query-*' -print | wc -l | tr -d '[:space:]')
+if [ "$legacy_baseline_spill_directories" -gt 0 ]; then
+  echo "warning: removing $legacy_baseline_spill_directories legacy v0.4 Spill directories" >&2
+  find "$baseline_spill_host" -mindepth 1 -maxdepth 1 -type d -name 'query-*' \
+    -exec rm -rf -- {} +
+fi
+assert_no_query_directories "$baseline_spill_host"
 
 generation_json=$(tr -d '\r\n' < "$dataset_host/manifest.json")
 manifest_digest=$(sha256_file "$dataset_host/manifest.sha256")
@@ -251,8 +270,9 @@ dataset_json=$(printf '{"generation":%s,"manifest":"%s","manifest_sha256":"%s"}'
   printf '  "dataset":%s,\n' "$dataset_json"
   printf '  "candidate":{"build_id":"%s","binary_sha256":"%s"},\n' \
     "$candidate_commit" "$candidate_binary_sha256"
-  printf '  "baseline":{"tag":"%s","build_id":"%s","binary_sha256":"%s"},\n' \
+  printf '  "baseline":{"tag":"%s","build_id":"%s","binary_sha256":"%s",' \
     "$(json_escape "$baseline_tag")" "$baseline_commit" "$baseline_binary_sha256"
+  printf '"legacy_spill_directories_removed":%s},\n' "$legacy_baseline_spill_directories"
   printf '  "config":{"memory_limit_bytes":%s,"compute_threads":%s,' \
     "$memory_limit" "$threads"
   printf '"batch_size":%s,"io_concurrency":%s,"metadata_cache_bytes":%s},\n' \

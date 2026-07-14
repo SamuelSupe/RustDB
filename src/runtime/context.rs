@@ -583,6 +583,10 @@ fn replay_cleanup_outcome(outcome: &std::result::Result<(), String>) -> Result<(
 type SpillCleanupHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 #[cfg(test)]
+#[path = "context_cleanup_tests.rs"]
+mod cleanup_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::{
         Arc,

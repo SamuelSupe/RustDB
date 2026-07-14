@@ -79,6 +79,7 @@ struct State {
     cleaned: AtomicBool,
     cleanup_completed: AtomicBool,
     cleanup_on_drop: bool,
+    defer_unfinished_files: bool,
     cleanup_lock: Mutex<()>,
     metrics: Option<QueryMetrics>,
 }
@@ -122,6 +123,7 @@ impl SpillManager {
             quota,
             io_pool,
             true,
+            false,
         )
     }
 
@@ -157,6 +159,7 @@ impl SpillManager {
             quota,
             io_pool,
             false,
+            true,
         )
     }
 
@@ -180,6 +183,7 @@ impl SpillManager {
             metrics,
             quota,
             io_pool,
+            false,
             false,
         )?;
         let state = Arc::downgrade(&manager.state);
@@ -209,6 +213,7 @@ impl SpillManager {
             quota,
             io_pool,
             false,
+            true,
         )
     }
 
@@ -222,6 +227,7 @@ impl SpillManager {
         quota: QuerySpillQuota,
         io_pool: SpillIoPool,
         cleanup_on_drop: bool,
+        defer_unfinished_files: bool,
     ) -> Result<Self> {
         Self::protect_query_io_headroom(&memory)?;
         let root = spill_root.as_ref().to_path_buf();
@@ -285,6 +291,7 @@ impl SpillManager {
                 cleaned: AtomicBool::new(false),
                 cleanup_completed: AtomicBool::new(false),
                 cleanup_on_drop,
+                defer_unfinished_files,
                 cleanup_lock: Mutex::new(()),
                 metrics,
             }),

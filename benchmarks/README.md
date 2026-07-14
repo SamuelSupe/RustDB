@@ -111,6 +111,10 @@ enclosing dataset provenance, and invokes the strict checker. It fixes batch
 8192, I/O concurrency 32, and metadata cache 0. The output path must not exist.
 Its temporary worktree has an isolated target directory and is removed on
 success, failure, or interruption; it never creates a tag or pushes.
+Candidate Spill cleanup is checked immediately after Q17/Q21 and again after
+the long baseline run, so delayed shared-mount residue remains a hard failure.
+The detached v0.4 process uses a separate Spill root; legacy ghost directories
+are counted in the manifest and removed only after that process exits.
 Store the candidate reports and rendered SQL below the generated run directory:
 
 ```text

@@ -231,6 +231,12 @@ must not already exist. The runner cleans only its uniquely-created temporary
 worktree and never pushes or tags; a failed evidence directory is retained for
 diagnosis and cannot be silently reused.
 
+Candidate Spill cleanup is checked after each measured query and rechecked after
+the detached baseline, making delayed shared-mount residue a release failure.
+The v0.4 process writes to an isolated baseline Spill root; any legacy ghost
+directories are counted in the resource manifest and removed only after that
+process has exited, without weakening the candidate assertion.
+
 The candidate Q17 and Q21 reports must live below a run directory whose
 `manifest.json` contains the same complete `dataset` object as the clean
 candidate low-memory manifest. Keep the rendered canonical `q17.sql` and

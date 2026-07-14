@@ -308,6 +308,14 @@ impl Drop for SpillWriter {
         take_copy_memory(&self.copy_memory);
         self.memory.take();
         if let Some(spill_file) = self.spill_file.take() {
+            // Task-group queries remove unfinished streams only at the
+            // terminal directory barrier. Unlinking a just-closed file here
+            // can be replayed after the later directory removal by shared
+            // virtiofs mounts, resurrecting stale Spill files after a query
+            // has reported successful cleanup.
+            if self.state.defer_unfinished_files {
+                return;
+            }
             // Query-level cleanup owns the directory after cancellation. A
             // per-writer unlink would only return Cancelled and can emit tens
             // of thousands of duplicate errors for a partitioned spill.
