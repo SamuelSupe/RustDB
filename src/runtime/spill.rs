@@ -13,7 +13,7 @@ use arrow::{
     datatypes::{Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, ReentrantMutex};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -81,6 +81,7 @@ struct State {
     cleanup_completed: AtomicBool,
     cleanup_on_drop: bool,
     defer_unfinished_files: bool,
+    file_budget_lock: ReentrantMutex<()>,
     cleanup_lock: Mutex<()>,
     metrics: Option<QueryMetrics>,
 }
@@ -293,6 +294,7 @@ impl SpillManager {
                 cleanup_completed: AtomicBool::new(false),
                 cleanup_on_drop,
                 defer_unfinished_files,
+                file_budget_lock: ReentrantMutex::new(()),
                 cleanup_lock: Mutex::new(()),
                 metrics,
             }),
@@ -332,6 +334,7 @@ impl SpillManager {
     }
 
     pub(crate) fn writer(&self, label: &str, schema: SchemaRef) -> Result<SpillWriter> {
+        let _file_budget = self.state.file_budget_lock.lock();
         self.ensure_active()?;
         let writer_memory = io::reserve_writer_memory(&self.state.memory, schema.as_ref())?;
         if let Some(metrics) = &self.state.metrics {
@@ -339,6 +342,16 @@ impl SpillManager {
         }
         let spill_file = self.allocate_file(label)?;
         SpillWriter::create(Arc::clone(&self.state), spill_file, schema, writer_memory)
+    }
+
+    /// Runs one file-replacement generation while preventing other lanes from
+    /// allocating Spill files against the generation's computed headroom.
+    /// `writer` takes the same reentrant lock, so callers can keep using the
+    /// normal writer API inside the operation.
+    pub(crate) fn with_file_budget<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _file_budget = self.state.file_budget_lock.lock();
+        self.ensure_active()?;
+        operation()
     }
 
     pub(crate) fn writer_headroom_bytes(&self, label: &str, schema: &Schema) -> usize {

@@ -9,8 +9,8 @@ use crate::{
 };
 
 use super::{
-    SPILL_PARTITIONS, SpillPartition, adaptive_spill_partitions, estimate_index_key_bytes,
-    group_key, partition_for_key,
+    SPILL_PARTITIONS, SpillPartition, adaptive_spill_partitions, cap_repartition_partitions,
+    estimate_index_key_bytes, group_key, partition_for_key,
 };
 use crate::execution::aggregate::{GroupState, estimate_group_bytes};
 
@@ -84,6 +84,7 @@ impl RepartitionSpiller {
         if sink.writer.is_some()
             && sink.uncompressed_bytes > 0
             && sink.uncompressed_bytes.saturating_add(bytes) > self.target_bytes
+            && self.rotation_preserves_partition_slots()
         {
             self.finish_partition(partition)?;
         }
@@ -117,6 +118,18 @@ impl RepartitionSpiller {
         }
         sink.uncompressed_bytes = 0;
         Ok(())
+    }
+
+    fn rotation_preserves_partition_slots(&self) -> bool {
+        let unmaterialized = self
+            .partitions
+            .iter()
+            .filter(|sink| sink.writer.is_none() && sink.files.is_empty())
+            .count();
+        self.spill
+            .active_file_count()
+            .saturating_add(unmaterialized)
+            < crate::runtime::MAX_ACTIVE_SPILL_FILES
     }
 
     fn pending_write_bytes(&self) -> u64 {
@@ -165,7 +178,22 @@ pub(in crate::execution::aggregate) fn repartition_partition(
     depth: usize,
     context: &QueryContext,
 ) -> Result<Vec<SpillPartition>> {
-    let partitions = recursive_spill_partitions(context, source_bytes);
+    context.spill.with_file_budget(|| {
+        repartition_partition_locked(files, source_bytes, groups, aggregates, depth, context)
+    })
+}
+
+fn repartition_partition_locked(
+    files: &[SpillFile],
+    source_bytes: usize,
+    groups: &[BoundExpr],
+    aggregates: &[AggregateExpr],
+    depth: usize,
+    context: &QueryContext,
+) -> Result<Vec<SpillPartition>> {
+    let desired = recursive_spill_partitions(context, source_bytes);
+    let partitions =
+        cap_repartition_partitions(context, desired, "HashAggregate", depth, source_bytes)?;
     let mut spiller = RepartitionSpiller::new(context, depth, partitions, groups.len(), aggregates);
     let seed = SEED_STEP.wrapping_mul(depth as u64);
     let workspace = context.memory.child(

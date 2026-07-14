@@ -8,7 +8,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::{
     Error, Result,
-    runtime::{MemoryReservation, QueryContext, SpillFile},
+    runtime::{MAX_ACTIVE_SPILL_FILES, MemoryReservation, QueryContext, SpillFile},
     sql::{AggregateExpr, BoundExpr},
 };
 
@@ -225,6 +225,43 @@ pub(super) fn adaptive_spill_partitions(context: &QueryContext, estimated_bytes:
         .clamp(2, MAX_SPILL_PARTITIONS)
 }
 
+/// Caps one replacement generation by the query's remaining active-file
+/// budget. Source files stay readable until the new generation is complete,
+/// so counting only the desired fanout can exceed the hard file limit even
+/// when both generations are individually bounded.
+pub(super) fn cap_repartition_partitions(
+    context: &QueryContext,
+    desired: usize,
+    operator: &str,
+    depth: usize,
+    source_bytes: usize,
+) -> Result<usize> {
+    let active = context.spill.active_file_count();
+    let Some(cap) = repartition_partition_cap(active) else {
+        return Err(Error::ResourceExhausted(format!(
+            "{operator} cannot repartition at depth {depth}: spill file budget has fewer than \
+             two free slots ({active} active, limit {MAX_ACTIVE_SPILL_FILES}, maximum partition \
+             {source_bytes} bytes)"
+        )));
+    };
+    Ok(desired.clamp(2, cap))
+}
+
+fn repartition_partition_cap(active: usize) -> Option<usize> {
+    let available = MAX_ACTIVE_SPILL_FILES.saturating_sub(active);
+    if available < 2 {
+        return None;
+    }
+    Some(previous_power_of_two(available.min(MAX_SPILL_PARTITIONS)))
+}
+
+fn previous_power_of_two(value: usize) -> usize {
+    let next = value
+        .checked_next_power_of_two()
+        .unwrap_or(MAX_SPILL_PARTITIONS);
+    if next == value { value } else { next / 2 }
+}
+
 #[cfg(test)]
 mod task_tests {
     use super::*;
@@ -250,5 +287,14 @@ mod task_tests {
             pop_largest_partition(&mut tasks).unwrap().estimated_bytes,
             4
         );
+    }
+
+    #[test]
+    fn recursive_generation_respects_active_file_budget() {
+        assert_eq!(repartition_partition_cap(0), Some(256));
+        assert_eq!(repartition_partition_cap(256), Some(256));
+        assert_eq!(repartition_partition_cap(257), Some(128));
+        assert_eq!(repartition_partition_cap(510), Some(2));
+        assert_eq!(repartition_partition_cap(511), None);
     }
 }

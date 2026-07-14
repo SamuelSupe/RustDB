@@ -12,7 +12,9 @@ use crate::{
     runtime::{MemoryPool, MemoryReservation, QueryContext, SpillFile, SpillWriter},
 };
 
-use crate::execution::aggregate::spill::{SpillPartition, adaptive_spill_partitions};
+use crate::execution::aggregate::spill::{
+    SpillPartition, adaptive_spill_partitions, cap_repartition_partitions,
+};
 use crate::execution::value::CellValue;
 
 mod codec;
@@ -579,7 +581,25 @@ pub(super) fn repartition(
     _partitions: usize,
     context: &QueryContext,
 ) -> Result<Vec<SpillPartition>> {
-    let partitions = recursive_spill_partitions(context, estimated_bytes);
+    context
+        .spill
+        .with_file_budget(|| repartition_locked(files, estimated_bytes, depth, context))
+}
+
+fn repartition_locked(
+    files: &[SpillFile],
+    estimated_bytes: usize,
+    depth: usize,
+    context: &QueryContext,
+) -> Result<Vec<SpillPartition>> {
+    let desired = recursive_spill_partitions(context, estimated_bytes);
+    let partitions = cap_repartition_partitions(
+        context,
+        desired,
+        "DistinctAggregate",
+        depth,
+        estimated_bytes,
+    )?;
     partition_files(
         files,
         partitions,
