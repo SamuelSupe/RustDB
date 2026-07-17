@@ -67,6 +67,11 @@ release_build() {
   run cargo build --locked --release --all-targets --jobs "$release_jobs"
 }
 
+release_cli_build() {
+  release_jobs=${RUSTDB_RELEASE_BUILD_JOBS:-1}
+  run cargo build --locked --release --bin rustdb --jobs "$release_jobs"
+}
+
 dist_build() {
   release_jobs=${RUSTDB_RELEASE_BUILD_JOBS:-1}
   run cargo build --locked --release --bin rustdb --jobs "$release_jobs"
@@ -75,7 +80,7 @@ dist_build() {
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|check|release|dist|all
+usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|check|release|release-cli|dist|all
 
   lint         formatting and strict Clippy
   test         all-target tests; requires a live configured MinIO
@@ -84,6 +89,7 @@ usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|check|relea
   portable     all-target tests without requiring MinIO (S3 tests may skip)
   check        compile every target without running tests
   release      portable release build of every target
+  release-cli  release build of the distributed rustdb CLI
   dist         build and validate the native CLI distribution archive
   all          lint, live-MinIO tests, and release build
 EOF
@@ -110,6 +116,9 @@ case "${1:-}" in
     ;;
   release)
     release_build
+    ;;
+  release-cli)
+    release_cli_build
     ;;
   dist)
     dist_build

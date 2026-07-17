@@ -58,7 +58,7 @@ The hosted workflow uses explicit image labels rather than `*-latest`:
 
 | Gate | Runner label | Architecture | Scope |
 | --- | --- | --- | --- |
-| Quality, representative tests with live MinIO, release | `ubuntu-24.04` | Linux x64 | Required |
+| Quality, representative tests with live MinIO, CLI release | `ubuntu-24.04` | Linux x64 | Required |
 | Native compile portability | `ubuntu-24.04-arm` | Linux arm64 | Required |
 | Native compile portability | `macos-15` | macOS M1 arm64 | Required |
 

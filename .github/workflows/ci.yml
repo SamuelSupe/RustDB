@@ -38,8 +38,8 @@ jobs:
         run: scripts/ci/check.sh lint
       - name: Representative tests with live MinIO
         run: scripts/ci/with_minio.sh scripts/ci/check.sh hosted-test
-      - name: Release build
-        run: scripts/ci/check.sh release
+      - name: Release CLI build
+        run: scripts/ci/check.sh release-cli
 
   native-portability:
     name: Native portability (${{ matrix.name }})
