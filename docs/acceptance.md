@@ -58,9 +58,9 @@ The hosted workflow uses explicit image labels rather than `*-latest`:
 
 | Gate | Runner label | Architecture | Scope |
 | --- | --- | --- | --- |
-| Quality, live MinIO, release | `ubuntu-24.04` | Linux x64 | Required |
-| Native portability | `ubuntu-24.04-arm` | Linux arm64 | Required |
-| Native portability | `macos-15` | macOS M1 arm64 | Required |
+| Quality, representative tests with live MinIO, release | `ubuntu-24.04` | Linux x64 | Required |
+| Native compile portability | `ubuntu-24.04-arm` | Linux arm64 | Required |
+| Native compile portability | `macos-15` | macOS M1 arm64 | Required |
 
 GitHub's current standard-runner table lists these labels for public and
 private repositories. It also lists 14 GB of runner storage; public Linux jobs
@@ -72,13 +72,16 @@ Linux arm64 became available to private repositories in January 2026; GitHub's
 also confirms the `ubuntu-24.04-arm` label.
 
 GitHub documents that arm64 macOS hosted runners do not support nested
-virtualization. Consequently, the Linux x64 job is the single authoritative
-live-MinIO integration gate. Linux arm64 and macOS arm64 run all targets
-natively, allowing the S3-only test to skip, and then build every release
-target. This split exercises the supported architectures without pretending a
-containerized service ran on macOS. GitHub-provided Actions are documented as
-arm64 compatible; the workflows therefore use only `actions/checkout` and
-`actions/cache`, not community setup Actions.
+virtualization. Consequently, the Linux x64 job is the single hosted
+live-MinIO integration gate. It runs the representative suite once and skips
+the long, extreme low-memory Spill case; the complete suite remains available
+through the OrbStack release-candidate gate above. Linux arm64 and macOS arm64
+compile every target natively, while the Distribution workflow builds and
+validates their release packages. This split exercises the supported
+architectures without repeating the same resource-heavy suite on every runner
+or pretending a containerized service ran on macOS. GitHub-provided Actions
+are documented as arm64 compatible; the workflows therefore use only
+`actions/checkout` and `actions/cache`, not community setup Actions.
 
 Cargo caches contain registry and Git dependency sources only, are separated
 by operating system and architecture, and do not cache `target/`. GitHub notes

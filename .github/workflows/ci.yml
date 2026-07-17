@@ -36,8 +36,8 @@ jobs:
             cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Formatting and strict Clippy
         run: scripts/ci/check.sh lint
-      - name: All-target tests with live MinIO
-        run: scripts/ci/with_minio.sh scripts/ci/check.sh test
+      - name: Representative tests with live MinIO
+        run: scripts/ci/with_minio.sh scripts/ci/check.sh hosted-test
       - name: Release build
         run: scripts/ci/check.sh release
 
@@ -52,7 +52,7 @@ jobs:
           - name: macOS arm64
             runner: macos-15
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - name: Install pinned Rust toolchain
@@ -66,7 +66,5 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-
-      - name: Native all-target tests
-        run: scripts/ci/check.sh portable
-      - name: Native release build
-        run: scripts/ci/check.sh release
+      - name: Native portability check
+        run: scripts/ci/check.sh check

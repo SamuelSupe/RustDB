@@ -31,10 +31,21 @@ test_with_minio() {
   run cargo test --locked --all-targets --jobs "$test_jobs"
 }
 
+hosted_test_with_minio() {
+  require_minio
+  test_jobs=${RUSTDB_TEST_JOBS:-1}
+  run cargo test --locked --all-targets --jobs "$test_jobs" -- \
+    --skip execution::tests::aggregate_spills_and_join_completes_under_small_memory_limit
+}
+
 test_portable() {
   tool_tests
   test_jobs=${RUSTDB_TEST_JOBS:-1}
   run cargo test --locked --all-targets --jobs "$test_jobs"
+}
+
+check_portable() {
+  run cargo check --locked --all-targets
 }
 
 tool_tests() {
@@ -56,12 +67,14 @@ dist_build() {
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/ci/check.sh lint|test|minio-test|portable|release|dist|all
+usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|check|release|dist|all
 
   lint         formatting and strict Clippy
   test         all-target tests; requires a live configured MinIO
   minio-test   alias for test
+  hosted-test  live-MinIO tests without the long low-memory Spill case
   portable     all-target tests without requiring MinIO (S3 tests may skip)
+  check        compile every target without running tests
   release      portable release build of every target
   dist         build and validate the native CLI distribution archive
   all          lint, live-MinIO tests, and release build
@@ -77,8 +90,15 @@ case "${1:-}" in
     tool_tests
     test_with_minio
     ;;
+  hosted-test)
+    tool_tests
+    hosted_test_with_minio
+    ;;
   portable)
     test_portable
+    ;;
+  check)
+    check_portable
     ;;
   release)
     release_build
