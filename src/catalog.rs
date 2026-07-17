@@ -1,8 +1,12 @@
+mod persistent;
+
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 
 use crate::{Result, datasource::TableProvider};
+
+pub(crate) use persistent::{PersistentCatalog, PersistentCatalogSnapshot};
 
 #[derive(Clone)]
 pub struct TableEntry {
@@ -31,9 +35,40 @@ impl TableEntry {
 pub struct Catalog {
     tables: Arc<RwLock<HashMap<String, TableEntry>>>,
     views: Arc<RwLock<HashMap<String, String>>>,
+    persistent: Option<PersistentCatalog>,
+    pinned: Option<PersistentCatalogSnapshot>,
 }
 
 impl Catalog {
+    pub(crate) fn with_persistent(persistent: PersistentCatalog) -> Self {
+        Self {
+            persistent: Some(persistent),
+            ..Self::default()
+        }
+    }
+
+    /// Fixes persistent table lookup to one immutable generation.
+    ///
+    /// Session-local tables and views are copied as well, so one query block
+    /// cannot observe a concurrent registration or view replacement.
+    #[must_use]
+    pub(crate) fn pin(&self) -> Self {
+        if self.pinned.is_some() {
+            return self.clone();
+        }
+        Self {
+            tables: Arc::new(RwLock::new(self.tables.read().clone())),
+            views: Arc::new(RwLock::new(self.views.read().clone())),
+            persistent: self.persistent.clone(),
+            pinned: self.persistent.as_ref().map(PersistentCatalog::snapshot),
+        }
+    }
+
+    pub(crate) fn persistent_generation(&self) -> Option<u64> {
+        self.persistent_snapshot()
+            .map(|snapshot| snapshot.generation())
+    }
+
     pub fn register(&self, entry: TableEntry) -> Result<()> {
         let key = normalize(entry.name());
         let mut tables = self.tables.write();
@@ -53,7 +88,20 @@ impl Catalog {
     }
 
     pub fn table(&self, name: &str) -> Option<TableEntry> {
+        let key = normalize(name);
+        self.tables.read().get(&key).cloned().or_else(|| {
+            self.persistent_snapshot()
+                .and_then(|snapshot| snapshot.table(&key))
+        })
+    }
+
+    pub(crate) fn local_table(&self, name: &str) -> Option<TableEntry> {
         self.tables.read().get(&normalize(name)).cloned()
+    }
+
+    pub(crate) fn persistent_table(&self, name: &str) -> Option<TableEntry> {
+        self.persistent_snapshot()
+            .and_then(|snapshot| snapshot.table(&normalize(name)))
     }
 
     pub(crate) fn replace_provider(
@@ -77,12 +125,21 @@ impl Catalog {
     }
 
     pub fn table_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self
-            .tables
-            .read()
-            .values()
-            .map(|entry| entry.name().to_owned())
-            .collect();
+        let mut visible = HashMap::new();
+        if let Some(snapshot) = self.persistent_snapshot() {
+            visible.extend(
+                snapshot
+                    .entries()
+                    .map(|entry| (normalize(entry.name()), entry.name().to_owned())),
+            );
+        }
+        visible.extend(
+            self.tables
+                .read()
+                .values()
+                .map(|entry| (normalize(entry.name()), entry.name().to_owned())),
+        );
+        let mut names = visible.into_values().collect::<Vec<_>>();
         names.sort_unstable();
         names
     }
@@ -130,6 +187,12 @@ impl Catalog {
     pub fn is_view(&self, name: &str) -> bool {
         self.views.read().contains_key(&normalize(name))
     }
+
+    fn persistent_snapshot(&self) -> Option<PersistentCatalogSnapshot> {
+        self.pinned
+            .clone()
+            .or_else(|| self.persistent.as_ref().map(PersistentCatalog::snapshot))
+    }
 }
 
 fn normalize(name: &str) -> String {
@@ -137,18 +200,4 @@ fn normalize(name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Catalog, normalize};
-
-    #[test]
-    fn catalog_keys_are_ascii_case_insensitive() {
-        assert_eq!(normalize("Orders"), "orders");
-    }
-
-    #[test]
-    fn dropping_unknown_view_does_not_remove_tables() {
-        let catalog = Catalog::default();
-        assert!(!catalog.drop_view("external"));
-        assert!(!catalog.is_view("external"));
-    }
-}
+mod tests;

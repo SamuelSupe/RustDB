@@ -64,6 +64,12 @@ fn dynamic_bytes(object: &ObjectSource) -> usize {
         .saturating_add(object.location.as_ref().len())
         .saturating_add(object.snapshot.e_tag.as_ref().map_or(0, String::capacity))
         .saturating_add(object.snapshot.version.as_ref().map_or(0, String::capacity))
+        .saturating_add(
+            object
+                .local_path
+                .as_ref()
+                .map_or(0, |path| path.as_os_str().len()),
+        )
         .saturating_add(SOURCE_RUNTIME_SLACK_BYTES)
 }
 

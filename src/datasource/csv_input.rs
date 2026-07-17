@@ -1,11 +1,11 @@
-use std::{io, io::SeekFrom, pin::Pin};
+use std::{io, pin::Pin, time::Instant};
 
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
 use object_store::GetResultPayload;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader};
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio_util::io::StreamReader;
 
 use crate::{
     CsvCompression, Error, Result,
@@ -15,7 +15,7 @@ use crate::{
 
 pub(super) type CsvInput = Pin<Box<dyn AsyncRead + Send>>;
 
-const LOCAL_READ_CHUNK_BYTES: usize = 1024 * 1024;
+mod local;
 
 #[derive(Clone)]
 struct QueryIo {
@@ -55,39 +55,78 @@ pub(super) async fn open_csv_input(
     snapshot.validate_get_response(file.uri(), &get.meta)?;
 
     let uri = file.uri().to_owned();
-    let source_stream: Pin<Box<dyn Stream<Item = Result<bytes::Bytes>> + Send>> = match get.payload
-    {
+    let source = match get.payload {
         GetResultPayload::File(file, _) => {
-            let mut file = tokio::fs::File::from_std(file);
-            if get.range.start != 0 {
-                file.seek(SeekFrom::Start(get.range.start))
-                    .await
-                    .map_err(|error| input_error(&uri, error))?;
-            }
-            let remaining = get.range.end.saturating_sub(get.range.start);
-            let stream_uri = uri.clone();
-            let stream = ReaderStream::with_capacity(file.take(remaining), LOCAL_READ_CHUNK_BYTES)
-                .map(move |result| result.map_err(|error| input_error(&stream_uri, error)));
-            Box::pin(stream)
+            local::open(
+                file,
+                get.range.start,
+                get.range.end,
+                &uri,
+                snapshot,
+                query.clone(),
+            )
+            .await?
         }
         GetResultPayload::Stream(stream) => {
             let stream_uri = uri.clone();
-            Box::pin(
+            let source_stream = Box::pin(
                 stream.map(move |result| result.map_err(|error| object_error(&stream_uri, error))),
-            )
+            );
+            stream_input(source_stream, query.clone(), file.is_s3())
         }
     };
-    let s3 = file.is_s3();
+    let mut reader = BufReader::new(source);
+    let detected = if compression == CsvCompression::Auto {
+        let prefix = match &query {
+            Some(query) => tokio::select! {
+                _ = query.control.cancelled() => Err(Error::Cancelled),
+                result = reader.fill_buf() => result.map_err(|error| input_error(&uri, error)),
+            },
+            None => reader
+                .fill_buf()
+                .await
+                .map_err(|error| input_error(&uri, error)),
+        }?;
+        detect(prefix)
+    } else {
+        compression
+    };
+
+    match detected {
+        CsvCompression::Auto | CsvCompression::None => Ok(Box::pin(reader)),
+        CsvCompression::Gzip => {
+            let mut decoder = GzipDecoder::new(reader);
+            decoder.multiple_members(true);
+            Ok(Box::pin(decoder))
+        }
+        CsvCompression::Zstd => {
+            let mut decoder = ZstdDecoder::new(reader);
+            decoder.multiple_members(true);
+            Ok(Box::pin(decoder))
+        }
+    }
+}
+
+fn stream_input(
+    source_stream: Pin<Box<dyn Stream<Item = Result<bytes::Bytes>> + Send>>,
+    query: Option<QueryIo>,
+    s3: bool,
+) -> CsvInput {
     let stream = try_stream! {
         let mut source_stream = source_stream;
         loop {
+            let started = query.as_ref().map(|_| Instant::now());
             let next = match &query {
                 Some(query) => tokio::select! {
                     _ = query.control.cancelled() => Err(Error::Cancelled),
                     next = source_stream.next() => Ok(next),
-                }?,
-                None => source_stream.next().await,
+                },
+                None => Ok(source_stream.next().await),
             };
+            if let (Some(query), Some(started)) = (&query, started) {
+                query.metrics.record_csv_source_io_time(started.elapsed());
+            }
+            let next = next?;
             let Some(bytes) = next else { break };
             let bytes = bytes?;
             if let Some(query) = &query {
@@ -107,31 +146,7 @@ pub(super) async fn open_csv_input(
         })
     });
     let stream: Pin<Box<dyn Stream<Item = io::Result<bytes::Bytes>> + Send>> = Box::pin(stream);
-    let mut reader = BufReader::new(StreamReader::new(stream));
-    let detected = if compression == CsvCompression::Auto {
-        detect(
-            reader
-                .fill_buf()
-                .await
-                .map_err(|error| input_error(&uri, error))?,
-        )
-    } else {
-        compression
-    };
-
-    match detected {
-        CsvCompression::Auto | CsvCompression::None => Ok(Box::pin(reader)),
-        CsvCompression::Gzip => {
-            let mut decoder = GzipDecoder::new(reader);
-            decoder.multiple_members(true);
-            Ok(Box::pin(decoder))
-        }
-        CsvCompression::Zstd => {
-            let mut decoder = ZstdDecoder::new(reader);
-            decoder.multiple_members(true);
-            Ok(Box::pin(decoder))
-        }
-    }
+    Box::pin(StreamReader::new(stream))
 }
 
 fn detect(prefix: &[u8]) -> CsvCompression {
@@ -194,6 +209,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_input_does_not_prefetch_a_megabyte_for_a_small_consumer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded.csv");
+        std::fs::write(&path, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        let files = LocationResolver::new(S3Config::default())
+            .resolve(&[path.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        let file = &files[0];
+        let context =
+            QueryContext::new(MemoryPool::new(4 * 1024 * 1024), directory.path()).unwrap();
+        let mut reader = open_csv_input(
+            file,
+            file.snapshot(),
+            CsvCompression::None,
+            Some((&context.control, &context.metrics)),
+        )
+        .await
+        .unwrap();
+        let mut byte = [0_u8; 1];
+        reader.read_exact(&mut byte).await.unwrap();
+
+        let source_bytes = context.metrics.snapshot().csv_source_bytes;
+        assert!(source_bytes >= 1);
+        assert!(source_bytes <= 16 * 1024, "read ahead was {source_bytes}");
+    }
+
+    #[tokio::test]
     async fn cancellation_survives_the_compressed_io_adapter() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cancel.csv.gz");
@@ -242,3 +285,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod local_tests;

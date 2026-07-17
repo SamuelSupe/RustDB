@@ -6,7 +6,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
-use crate::datasource::{ComparisonOp, PredicateValue, ScanPredicate, ScanRequest, TableProvider};
+use crate::datasource::{
+    ComparisonOp, PredicateGuarantee, PredicateValue, ScanPredicate, ScanRequest, TableProvider,
+};
 use crate::runtime::{
     BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream,
     estimate_schema_batch_bytes,
@@ -14,10 +16,16 @@ use crate::runtime::{
 use crate::sql::{BinaryOp, BoundExpr, ExprKind, ScalarValue};
 use crate::{Error, Result};
 
+pub(crate) enum ScanFilter<'a> {
+    None,
+    BestEffort(&'a BoundExpr),
+    Exact(ScanPredicate),
+}
+
 pub(crate) async fn scan(
     provider: Arc<dyn TableProvider>,
     projection: Option<Vec<usize>>,
-    predicate: Option<&BoundExpr>,
+    filter: ScanFilter<'_>,
     limit: Option<usize>,
     schema: SchemaRef,
     context: Arc<QueryContext>,
@@ -25,7 +33,16 @@ pub(crate) async fn scan(
 ) -> Result<MemoryBatchStream> {
     let mut request = ScanRequest::new(batch_size);
     request.projection = projection.clone();
-    request.predicate = predicate.and_then(to_scan_predicate);
+    match filter {
+        ScanFilter::None => {}
+        ScanFilter::BestEffort(predicate) => {
+            request.predicate = to_scan_predicate(predicate);
+        }
+        ScanFilter::Exact(predicate) => {
+            request.predicate = Some(predicate);
+            request.predicate_guarantee = PredicateGuarantee::Exact;
+        }
+    }
     request.limit = limit;
     let decoded_schema = request.projected_schema(&provider.schema())?;
     let preclaim = estimate_schema_batch_bytes(decoded_schema.as_ref(), batch_size).max(1);

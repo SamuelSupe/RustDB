@@ -57,6 +57,10 @@ impl JoinPredicates {
         self.null_aware.is_some()
     }
 
+    pub(super) fn is_simple_equality(&self) -> bool {
+        self.residual.is_none() && self.null_aware.is_none()
+    }
+
     /// Returns the RHS value for the Q21-style existence predicate
     /// `left.value <> right.value`. Two distinct non-NULL RHS values per
     /// equality key are sufficient to answer that predicate for every LHS
@@ -194,6 +198,14 @@ fn candidate_batch(
     right_indices: &[u32],
     schema: SchemaRef,
 ) -> Result<RecordBatch> {
+    if left_indices.is_empty() || right_indices.is_empty() {
+        if left_indices.len() != right_indices.len() {
+            return Err(Error::Internal(
+                "Join candidate index arrays have different lengths".to_owned(),
+            ));
+        }
+        return Ok(RecordBatch::new_empty(schema));
+    }
     let left_indices = UInt32Array::from(left_indices.to_vec());
     let right_indices = UInt32Array::from(right_indices.to_vec());
     let mut columns = Vec::with_capacity(left.num_columns() + right.num_columns());
@@ -216,7 +228,7 @@ mod tests {
         record_batch::RecordBatch,
     };
 
-    use super::{JoinPredicates, SqlTruth};
+    use super::{JoinPredicates, SqlTruth, candidate_batch};
     use crate::sql::{BinaryOp, BoundExpr, ExprKind};
 
     #[test]
@@ -306,5 +318,22 @@ mod tests {
                 .is_none(),
             "Mark must retain NULL candidates so it can return UNKNOWN"
         );
+    }
+
+    #[test]
+    fn empty_candidate_batch_does_not_materialize_columns() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        let output = candidate_batch(&input, &input, &[], &[], schema).unwrap();
+        assert_eq!(output.num_rows(), 0);
+        assert_eq!(output.num_columns(), 1);
     }
 }

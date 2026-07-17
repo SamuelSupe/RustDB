@@ -1,4 +1,4 @@
-use std::{mem::size_of, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
     array::{ArrayRef, BooleanArray, UInt32Array, new_null_array},
@@ -9,34 +9,19 @@ use arrow::{
 
 use crate::{
     Error, Result,
-    runtime::{BatchEnvelope, MemoryReservation, QueryContext},
-    sql::JoinType,
+    runtime::{BatchEnvelope, QueryContext},
+    sql::{JoinType, field_is_materialized},
 };
 
-pub(super) fn candidate_workspace_bytes(
-    left: &RecordBatch,
-    right: &RecordBatch,
-    left_indices: &[u32],
-    right_indices: &[u32],
-) -> Result<usize> {
-    let left_bytes = selected_rows_bytes(left, left_indices.iter().copied().map(Some))?;
-    let right_bytes = selected_rows_bytes(right, right_indices.iter().copied().map(Some))?;
-    Ok(left_bytes
-        .saturating_add(right_bytes)
-        .saturating_mul(3)
-        .saturating_add(
-            left_indices
-                .len()
-                .saturating_mul(size_of::<u32>().saturating_mul(4)),
-        )
-        .saturating_add(
-            left.num_columns()
-                .saturating_add(right.num_columns())
-                .saturating_mul(512),
-        )
-        .saturating_add(1_024)
-        .max(1))
-}
+mod memory;
+mod target;
+
+#[cfg(test)]
+use memory::selected_rows_bytes;
+pub(super) use memory::{candidate_workspace_bytes, grow_workspace, output_workspace_bytes};
+use memory::{outputs_left_only, unmatched_right_workspace_bytes};
+pub(super) use target::BatchOutputTarget;
+pub(in crate::execution) use target::{JoinEmission, JoinOutputTarget, JoinSelection};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_output_envelope(
@@ -51,10 +36,13 @@ pub(super) async fn build_output_envelope(
     held_bytes: usize,
     owner: &'static str,
 ) -> Result<BatchEnvelope> {
-    let estimate = output_workspace_bytes(left, right, left_indices, right_indices, join_type)?;
+    let estimate =
+        output_workspace_bytes(left, right, left_indices, right_indices, join_type, &schema)?;
     let workspace = context
         .reserve_memory_while_holding(estimate, held_bytes, owner)
         .await?;
+    let _permit = context.acquire_compute().await?;
+    let _active = context.scheduler.enter_lane();
     let output = build_output(
         left,
         right,
@@ -75,102 +63,29 @@ pub(super) async fn build_unmatched_right_envelope(
     context: &QueryContext,
     held_bytes: usize,
 ) -> Result<BatchEnvelope> {
-    let right_bytes = selected_rows_bytes(right, right_indices.iter().copied().map(Some))?;
-    let estimate = right_bytes
-        .saturating_mul(2)
-        .saturating_add(right_indices.len().saturating_mul(size_of::<u32>()))
-        .saturating_add(
-            left_schema
-                .fields()
-                .len()
-                .saturating_add(right.num_columns())
-                .saturating_mul(512),
-        )
-        .saturating_add(1_024)
-        .max(1);
+    let estimate = unmatched_right_workspace_bytes(left_schema, right, right_indices, &schema)?;
     let workspace = context
         .reserve_memory_while_holding(estimate, held_bytes, "join unmatched build output")
         .await?;
+    let _permit = context.acquire_compute().await?;
+    let _active = context.scheduler.enter_lane();
     let rows = right_indices.len();
     let indices = UInt32Array::from(right_indices.to_vec());
     let mut columns = Vec::with_capacity(left_schema.fields().len() + right.num_columns());
-    for field in left_schema.fields() {
-        columns.push(new_null_array(field.data_type(), rows));
+    for index in 0..left_schema.fields().len() {
+        columns.push(new_null_array(schema.field(index).data_type(), rows));
     }
-    for column in right.columns() {
-        columns.push(take(column.as_ref(), &indices, None)?);
+    for (index, column) in right.columns().iter().enumerate() {
+        let output_index = left_schema.fields().len() + index;
+        let field = schema.field(output_index);
+        if field_is_materialized(field) {
+            columns.push(take(column.as_ref(), &indices, None)?);
+        } else {
+            columns.push(new_null_array(field.data_type(), rows));
+        }
     }
     let output = build_record_batch(schema, columns, rows)?;
     BatchEnvelope::from_reservation(output, workspace, "join unmatched build output")
-}
-
-pub(super) async fn grow_workspace(
-    workspace: &mut MemoryReservation,
-    required: usize,
-    context: &QueryContext,
-    held_bytes: usize,
-) -> Result<()> {
-    let additional = required.saturating_sub(workspace.size());
-    if additional != 0 {
-        let more = context
-            .reserve_memory_while_holding(
-                additional,
-                held_bytes.saturating_add(workspace.size()),
-                "join output workspace",
-            )
-            .await?;
-        workspace.absorb(more)?;
-    }
-    Ok(())
-}
-
-pub(super) fn output_workspace_bytes(
-    left: &RecordBatch,
-    right: &RecordBatch,
-    left_indices: &[u32],
-    right_indices: &[Option<u32>],
-    join_type: JoinType,
-) -> Result<usize> {
-    let left_bytes = selected_rows_bytes(left, left_indices.iter().copied().map(Some))?;
-    let right_bytes = if outputs_left_only(join_type) || join_type == JoinType::Mark {
-        0
-    } else {
-        selected_rows_bytes(right, right_indices.iter().copied())?
-    };
-    let rows = left_indices.len();
-    let columns = left.num_columns().saturating_add(
-        if outputs_left_only(join_type) || join_type == JoinType::Mark {
-            0
-        } else {
-            right.num_columns()
-        },
-    );
-    let indices = rows.saturating_mul(size_of::<u32>().saturating_add(size_of::<Option<u32>>()));
-    Ok(left_bytes
-        .saturating_add(right_bytes)
-        .saturating_mul(2)
-        .saturating_add(indices.saturating_mul(2))
-        .saturating_add(columns.saturating_mul(512))
-        .saturating_add(1_024)
-        .max(1))
-}
-
-fn selected_rows_bytes<I>(batch: &RecordBatch, rows: I) -> Result<usize>
-where
-    I: IntoIterator<Item = Option<u32>>,
-{
-    rows.into_iter().try_fold(0usize, |total, row| {
-        let row_bytes = match row {
-            Some(row) => batch.columns().iter().try_fold(0usize, |bytes, column| {
-                let data = column.to_data().slice(row as usize, 1);
-                Ok::<_, arrow::error::ArrowError>(
-                    bytes.saturating_add(data.get_slice_memory_size()?),
-                )
-            })?,
-            None => batch.num_columns().saturating_mul(64),
-        };
-        Ok(total.saturating_add(row_bytes))
-    })
 }
 
 pub(super) fn build_output(
@@ -182,10 +97,24 @@ pub(super) fn build_output(
     join_type: JoinType,
     schema: SchemaRef,
 ) -> Result<RecordBatch> {
-    let left_indices = UInt32Array::from(left_indices.to_vec());
+    let identity_left = is_identity_selection(left_indices, left.num_rows());
+    let left_take_indices = (!identity_left).then(|| UInt32Array::from(left_indices.to_vec()));
     let mut columns = Vec::with_capacity(left.num_columns() + right.num_columns());
-    for column in left.columns() {
-        columns.push(take(column.as_ref(), &left_indices, None)?);
+    for (index, column) in left.columns().iter().enumerate() {
+        let field = schema.field(index);
+        if field_is_materialized(field) {
+            if identity_left {
+                columns.push(Arc::clone(column));
+            } else {
+                columns.push(take(
+                    column.as_ref(),
+                    left_take_indices.as_ref().expect("non-identity indices"),
+                    None,
+                )?);
+            }
+        } else {
+            columns.push(new_null_array(field.data_type(), left_indices.len()));
+        }
     }
     if outputs_left_only(join_type) {
         return build_record_batch(schema, columns, left_indices.len());
@@ -204,23 +133,25 @@ pub(super) fn build_output(
     }
     let right_indices = UInt32Array::from(right_indices.to_vec());
     for (index, column) in right.columns().iter().enumerate() {
+        let output_index = left.num_columns() + index;
+        let field = schema.field(output_index);
         if right.num_rows() == 0 {
-            columns.push(new_null_array(
-                schema.field(left.num_columns() + index).data_type(),
-                left_indices.len(),
-            ));
-        } else {
+            columns.push(new_null_array(field.data_type(), left_indices.len()));
+        } else if field_is_materialized(field) {
             columns.push(take(column.as_ref(), &right_indices, None)?);
+        } else {
+            columns.push(new_null_array(field.data_type(), left_indices.len()));
         }
     }
     build_record_batch(schema, columns, left_indices.len())
 }
 
-fn outputs_left_only(join_type: JoinType) -> bool {
-    matches!(
-        join_type,
-        JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti
-    )
+fn is_identity_selection(indices: &[u32], rows: usize) -> bool {
+    indices.len() == rows
+        && indices
+            .iter()
+            .enumerate()
+            .all(|(position, index)| usize::try_from(*index) == Ok(position))
 }
 
 fn build_record_batch(
@@ -237,3 +168,7 @@ fn build_record_batch(
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 }
+
+#[cfg(test)]
+#[path = "output/tests.rs"]
+mod tests;

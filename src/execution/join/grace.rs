@@ -21,7 +21,7 @@ use super::{
     ProbeCursor,
     condition::JoinPredicates,
     evaluate_keys_accounted, evaluate_optional_values, optional_array, optional_memory,
-    output::build_unmatched_right_envelope,
+    output::{BatchOutputTarget, JoinEmission, build_unmatched_right_envelope},
     sort_merge,
     spill::{self, PartitionTask},
 };
@@ -207,27 +207,30 @@ async fn run_worker_inner(
                     for file in &task.left {
                         for left_batch in context.spill.read_file(file)? {
                             check_running(cancellation, context)?;
-                            let (left_batch, left_keys) = {
+                            let left_batch = BatchEnvelope::try_new(
+                                left_batch?,
+                                &context.memory,
+                                "join spill probe",
+                            )?;
+                            let (left_keys, left_values) = {
+                                let _permit = context
+                                    .acquire_compute_until_cancelled(cancellation)
+                                    .await?;
                                 let _active = context.scheduler.enter_lane();
-                                let left_batch = BatchEnvelope::try_new(
-                                    left_batch?,
-                                    &context.memory,
-                                    "join spill probe",
-                                )?;
                                 let left_keys = evaluate_keys_accounted(
                                     left_key_expressions,
                                     left_batch.batch(),
                                     context,
                                     "Grace join probe keys",
                                 )?;
-                                (left_batch, left_keys)
+                                let left_values = evaluate_optional_values(
+                                    predicates.left_value(),
+                                    left_batch.batch(),
+                                    context,
+                                    "Grace join probe membership value",
+                                )?;
+                                (left_keys, left_values)
                             };
-                            let left_values = evaluate_optional_values(
-                                predicates.left_value(),
-                                left_batch.batch(),
-                                context,
-                                "Grace join probe membership value",
-                            )?;
                             let mut probe = ProbeCursor::new(
                                 left_batch.batch(),
                                 &right_batch,
@@ -249,10 +252,15 @@ async fn run_worker_inner(
                                     .saturating_add(optional_memory(&left_values))
                                     .saturating_add(optional_memory(&right_values)),
                             );
+                            let mut target = BatchOutputTarget;
                             loop {
-                                let output = probe.next_batch(context).await?;
-                                let Some(output) = output else { break };
-                                send(sender, output, cancellation, context).await?;
+                                match probe.next_output(&mut target, context).await? {
+                                    JoinEmission::Batch(output) => {
+                                        send(sender, output, cancellation, context).await?
+                                    }
+                                    JoinEmission::Consumed { .. } => {}
+                                    JoinEmission::Exhausted => break,
+                                }
                             }
                         }
                     }
@@ -296,18 +304,17 @@ async fn run_worker_inner(
                     };
                     if task.depth < context.execution.max_repartition_depth {
                         let next_depth = task.depth + 1;
-                        let repartitioned = {
-                            let _active = context.scheduler.enter_lane();
-                            spill::repartition(
-                                &task,
-                                left_key_expressions,
-                                right_key_expressions,
-                                join_type,
-                                null_equal_keys,
-                                next_depth,
-                                context,
-                            )?
-                        };
+                        let repartitioned = spill::repartition_scheduled(
+                            &task,
+                            left_key_expressions,
+                            right_key_expressions,
+                            join_type,
+                            null_equal_keys,
+                            next_depth,
+                            context,
+                            cancellation,
+                        )
+                        .await?;
                         if let Some(repartitioned) = repartitioned {
                             let shrank = repartitioned.largest_build_rows < rows;
                             if shrank || task.stagnant_repartitions == 0 {

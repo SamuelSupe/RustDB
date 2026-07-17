@@ -279,8 +279,14 @@ impl Planner<'_> {
                 keys: on,
                 residual,
                 using_columns,
+                unhashable_equality_reason,
             } = bind_join_constraint(constraint, left.schema(), right.schema())?;
             if on.is_empty() {
+                if let Some(reason) = unhashable_equality_reason {
+                    return Err(Error::InvalidArgument(format!(
+                        "{reason}; use an explicit CAST so both sides have the same type, or add another same-type equality key"
+                    )));
+                }
                 return Err(Error::Unsupported(
                     "joins require at least one equality key".into(),
                 ));
@@ -369,6 +375,7 @@ impl Planner<'_> {
                     statistics,
                     projection: None,
                     pushed_filter: None,
+                    exact_filter: None,
                     limit: None,
                     schema: plan_schema,
                 };

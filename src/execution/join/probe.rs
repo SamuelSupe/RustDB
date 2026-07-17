@@ -1,20 +1,33 @@
-use std::{collections::HashMap, mem::size_of, sync::Arc};
+use std::{collections::HashMap, mem::size_of};
 
-use arrow::{array::ArrayRef, datatypes::SchemaRef, record_batch::RecordBatch};
+use arrow::{
+    array::ArrayRef,
+    datatypes::{DataType, SchemaRef},
+    record_batch::RecordBatch,
+};
 
 use crate::{
     Error, Result,
-    runtime::{BatchEnvelope, MemoryReservation, QueryContext},
+    runtime::{MemoryReservation, QueryContext},
     sql::JoinType,
 };
 
 use super::{
     CellValue, cell,
     condition::{JoinPredicates, SqlTruth},
+    hash_table::{
+        CompositeProbeRows, JoinHashTable, composite_eligible, try_build_binary,
+        try_build_composite, try_build_fixed, try_build_utf8,
+    },
     matched::BuildMatchTracker,
-    output::{build_output, candidate_workspace_bytes, grow_workspace, output_workspace_bytes},
+    output::{
+        JoinEmission, JoinOutputTarget, JoinSelection, candidate_workspace_bytes, grow_workspace,
+    },
     row_key,
 };
+
+mod composite;
+mod simple;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GlobalMembershipState {
@@ -36,7 +49,7 @@ pub(super) fn try_build_hash_table(
     rows: usize,
     deduplicate: bool,
     reservation: &mut MemoryReservation,
-) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
+) -> Result<Option<JoinHashTable>> {
     try_build_hash_table_with_nulls(key_arrays, rows, deduplicate, false, reservation)
 }
 
@@ -46,13 +59,32 @@ pub(super) fn try_build_hash_table_with_nulls(
     deduplicate: bool,
     null_equal_keys: bool,
     reservation: &mut MemoryReservation,
-) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
+) -> Result<Option<JoinHashTable>> {
     try_build_summarized_hash_table_with_nulls(
         key_arrays,
         rows,
         deduplicate,
         null_equal_keys,
         None,
+        false,
+        reservation,
+    )
+}
+
+pub(super) fn try_build_primary_hash_table_with_nulls(
+    key_arrays: &[ArrayRef],
+    rows: usize,
+    deduplicate: bool,
+    null_equal_keys: bool,
+    reservation: &mut MemoryReservation,
+) -> Result<Option<JoinHashTable>> {
+    try_build_summarized_hash_table_with_nulls(
+        key_arrays,
+        rows,
+        deduplicate,
+        null_equal_keys,
+        None,
+        true,
         reservation,
     )
 }
@@ -63,13 +95,26 @@ pub(super) fn try_build_existence_hash_table_with_nulls(
     null_equal_keys: bool,
     summary_values: &ArrayRef,
     reservation: &mut MemoryReservation,
-) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
+) -> Result<Option<JoinHashTable>> {
+    if matches!(
+        summary_values.data_type(),
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) {
+        return try_build_hash_table_with_nulls(
+            key_arrays,
+            rows,
+            false,
+            null_equal_keys,
+            reservation,
+        );
+    }
     try_build_summarized_hash_table_with_nulls(
         key_arrays,
         rows,
         false,
         null_equal_keys,
         Some(summary_values),
+        false,
         reservation,
     )
 }
@@ -80,8 +125,44 @@ fn try_build_summarized_hash_table_with_nulls(
     deduplicate: bool,
     null_equal_keys: bool,
     summary_values: Option<&ArrayRef>,
+    allow_composite: bool,
     reservation: &mut MemoryReservation,
-) -> Result<Option<HashMap<Vec<CellValue>, Vec<u32>>>> {
+) -> Result<Option<JoinHashTable>> {
+    if summary_values.is_none() && key_arrays.len() == 1 {
+        match key_arrays[0].data_type() {
+            DataType::Int64 | DataType::UInt64 => {
+                return try_build_fixed(
+                    &key_arrays[0],
+                    rows,
+                    deduplicate,
+                    null_equal_keys,
+                    reservation,
+                );
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                return try_build_utf8(
+                    &key_arrays[0],
+                    rows,
+                    deduplicate,
+                    null_equal_keys,
+                    reservation,
+                );
+            }
+            DataType::Binary | DataType::LargeBinary => {
+                return try_build_binary(
+                    &key_arrays[0],
+                    rows,
+                    deduplicate,
+                    null_equal_keys,
+                    reservation,
+                );
+            }
+            _ => {}
+        }
+    }
+    if allow_composite && summary_values.is_none() && composite_eligible(key_arrays, rows) {
+        return try_build_composite(key_arrays, rows, deduplicate, null_equal_keys, reservation);
+    }
     let initial_reservation = reservation.size();
     let mut hash_table: HashMap<Vec<CellValue>, Vec<u32>> = HashMap::new();
     for row in 0..rows {
@@ -194,7 +275,7 @@ fn try_build_summarized_hash_table_with_nulls(
             }
         }
     }
-    Ok(Some(hash_table))
+    Ok(Some(JoinHashTable::generic(hash_table)))
 }
 
 fn predicted_vec_growth(length: usize, capacity: usize) -> usize {
@@ -255,7 +336,7 @@ pub(super) struct ProbeCursor<'a> {
     left: &'a RecordBatch,
     right: &'a RecordBatch,
     left_keys: &'a [ArrayRef],
-    hash_table: &'a HashMap<Vec<CellValue>, Vec<u32>>,
+    hash_table: &'a JoinHashTable,
     predicates: &'a JoinPredicates,
     left_values: Option<&'a ArrayRef>,
     right_values: Option<&'a ArrayRef>,
@@ -269,6 +350,7 @@ pub(super) struct ProbeCursor<'a> {
     row: usize,
     match_index: usize,
     current_state: RowState,
+    composite_probe: Option<CompositeProbeRows>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -292,7 +374,7 @@ impl<'a> ProbeCursor<'a> {
         left: &'a RecordBatch,
         right: &'a RecordBatch,
         left_keys: &'a [ArrayRef],
-        hash_table: &'a HashMap<Vec<CellValue>, Vec<u32>>,
+        hash_table: &'a JoinHashTable,
         predicates: &'a JoinPredicates,
         left_values: Option<&'a ArrayRef>,
         right_values: Option<&'a ArrayRef>,
@@ -322,245 +404,255 @@ impl<'a> ProbeCursor<'a> {
             row: 0,
             match_index: 0,
             current_state: RowState::default(),
+            composite_probe: None,
         }
     }
 
-    pub(super) async fn next_batch(
+    pub(super) async fn next_output(
         &mut self,
+        target: &mut impl JoinOutputTarget,
         context: &QueryContext,
-    ) -> Result<Option<BatchEnvelope>> {
+    ) -> Result<JoinEmission> {
         context.check_cancelled()?;
+        self.prepare_composite(context).await?;
+        let held_bytes = self
+            .held_bytes
+            .saturating_add(self.composite_probe_memory_size());
+        let output_index_bytes = size_of::<u32>()
+            .saturating_add(size_of::<Option<u32>>())
+            .saturating_add(if self.join_type == JoinType::Mark {
+                size_of::<Option<bool>>()
+            } else {
+                0
+            });
+        let candidate_bytes = if self.predicates.is_simple_equality() {
+            0
+        } else {
+            size_of::<u32>()
+                .saturating_mul(2)
+                .saturating_add(size_of::<CandidateGroup>())
+        };
         let index_bytes = self
             .batch_size
-            .saturating_mul(
-                size_of::<u32>()
-                    .saturating_mul(3)
-                    .saturating_add(size_of::<Option<u32>>())
-                    .saturating_add(size_of::<CandidateGroup>()),
-            )
+            .saturating_mul(output_index_bytes.saturating_add(candidate_bytes))
             .saturating_add(size_of::<RowState>())
             .saturating_add(1_024)
             .max(1);
         let mut workspace = context
-            .reserve_memory_while_holding(
-                index_bytes,
-                self.held_bytes,
-                "join output index workspace",
-            )
+            .reserve_memory_while_holding(index_bytes, held_bytes, "join output index workspace")
             .await?;
         let mut left_indices = Vec::with_capacity(self.batch_size);
         let mut right_indices = Vec::with_capacity(self.batch_size);
-        let mut markers = Vec::with_capacity(self.batch_size);
+        let mut markers = if self.join_type == JoinType::Mark {
+            Vec::with_capacity(self.batch_size)
+        } else {
+            Vec::new()
+        };
 
-        while self.row < self.left.num_rows() && left_indices.len() < self.batch_size {
-            let mut candidate_left = Vec::with_capacity(self.batch_size);
-            let mut candidate_right = Vec::with_capacity(self.batch_size);
-            let mut candidate_groups = Vec::new();
-            {
-                let _active = context.scheduler.enter_lane();
-                while self.row < self.left.num_rows()
-                    && left_indices.len().saturating_add(candidate_left.len()) < self.batch_size
+        if self.predicates.is_simple_equality() {
+            let _permit = context.acquire_compute().await?;
+            let _active = context.scheduler.enter_lane();
+            self.fill_simple_indices(&mut left_indices, &mut right_indices, &mut markers, context)?;
+        } else {
+            while self.row < self.left.num_rows() && left_indices.len() < self.batch_size {
+                let mut candidate_left = Vec::with_capacity(self.batch_size);
+                let mut candidate_right = Vec::with_capacity(self.batch_size);
+                let mut candidate_groups = Vec::new();
                 {
-                    let left_row = self.row;
-                    let key = row_key(self.left_keys, left_row)?;
-                    let matches = if !self.null_equal_keys && key.iter().any(CellValue::is_null) {
-                        None
-                    } else {
-                        self.hash_table.get(&key)
-                    };
-                    let Some(matches) = matches.filter(|matches| !matches.is_empty()) else {
-                        let state = self.initial_state(left_row)?;
-                        finish_row(
-                            left_row,
-                            self.join_type,
-                            &state,
-                            &mut left_indices,
-                            &mut right_indices,
-                            &mut markers,
-                        )?;
-                        self.row += 1;
-                        self.match_index = 0;
-                        self.current_state = RowState::default();
-                        continue;
-                    };
-
-                    let available = self
-                        .batch_size
-                        .saturating_sub(left_indices.len())
-                        .saturating_sub(candidate_left.len());
-                    let take = available.min(matches.len().saturating_sub(self.match_index));
-                    let start = candidate_left.len();
-                    let state = if self.match_index == 0 {
-                        self.initial_state(left_row)?
-                    } else {
-                        self.current_state
-                    };
-                    let end = self.match_index + take;
-                    for right_row in &matches[self.match_index..end] {
-                        candidate_left.push(u32::try_from(left_row).map_err(|_| {
-                            Error::ResourceExhausted(
-                                "join probe batch exceeds UINT32_MAX rows".into(),
-                            )
-                        })?);
-                        candidate_right.push(*right_row);
-                    }
-                    let complete = end == matches.len();
-                    candidate_groups.push(CandidateGroup {
-                        left_row,
-                        start,
-                        end: candidate_left.len(),
-                        complete,
-                        state,
-                    });
-                    self.match_index = end;
-                    if complete {
-                        self.row += 1;
-                        self.match_index = 0;
-                        self.current_state = RowState::default();
-                    }
-                }
-            }
-
-            let had_candidates = !candidate_left.is_empty();
-            if had_candidates {
-                grow_workspace(
-                    &mut workspace,
-                    index_bytes.saturating_add(candidate_workspace_bytes(
-                        self.left,
-                        self.right,
-                        &candidate_left,
-                        &candidate_right,
-                    )?),
-                    context,
-                    self.held_bytes,
-                )
-                .await?;
-                let outcomes = {
+                    let _permit = context.acquire_compute().await?;
                     let _active = context.scheduler.enter_lane();
-                    self.predicates.evaluate_candidates(
-                        self.left,
-                        self.right,
-                        &candidate_left,
-                        &candidate_right,
-                        self.left_values,
-                        self.right_values,
-                    )?
-                };
-                context
-                    .metrics
-                    .add_join_candidates(u64::try_from(outcomes.len()).unwrap_or(u64::MAX));
-                for group in &candidate_groups {
-                    let mut state = group.state;
-                    for candidate in group.start..group.end {
-                        let right_row = candidate_right[candidate];
-                        let outcome = outcomes[candidate];
-                        if outcome.qualifies {
-                            if self.predicates.is_null_aware() {
-                                match outcome.membership.expect("null-aware outcome") {
-                                    SqlTruth::True => {
-                                        state.matches = 1;
-                                        state.first_right.get_or_insert(right_row);
-                                    }
-                                    SqlTruth::False => {}
-                                    SqlTruth::Unknown => state.unknown = true,
-                                }
-                            } else {
-                                state.matches = state.matches.saturating_add(1);
-                                state.first_right.get_or_insert(right_row);
-                                if let Some(matched) = &self.matched_build {
-                                    matched.mark(right_row);
-                                }
-                                if self.join_type == JoinType::LeftSingle && state.matches > 1 {
-                                    return Err(Error::Execution(
-                                        "scalar subquery returned more than one row".into(),
-                                    ));
-                                }
-                                if matches!(
-                                    self.join_type,
-                                    JoinType::Inner
-                                        | JoinType::Left
-                                        | JoinType::Right
-                                        | JoinType::Full
-                                ) {
-                                    left_indices.push(group.left_row as u32);
-                                    right_indices.push(Some(right_row));
-                                }
-                            }
+                    while self.row < self.left.num_rows()
+                        && left_indices.len().saturating_add(candidate_left.len()) < self.batch_size
+                    {
+                        let left_row = self.row;
+                        let matches = self.matches(left_row)?;
+                        let Some(matches) = matches.filter(|matches| !matches.is_empty()) else {
+                            let state = self.initial_state(left_row)?;
+                            finish_row(
+                                left_row,
+                                self.join_type,
+                                &state,
+                                &mut left_indices,
+                                &mut right_indices,
+                                &mut markers,
+                            )?;
+                            self.row += 1;
+                            self.match_index = 0;
+                            self.current_state = RowState::default();
+                            continue;
+                        };
+
+                        let available = self
+                            .batch_size
+                            .saturating_sub(left_indices.len())
+                            .saturating_sub(candidate_left.len());
+                        let take = available.min(matches.len().saturating_sub(self.match_index));
+                        let start = candidate_left.len();
+                        let state = if self.match_index == 0 {
+                            self.initial_state(left_row)?
+                        } else {
+                            self.current_state
+                        };
+                        let end = self.match_index + take;
+                        for right_row in &matches[self.match_index..end] {
+                            candidate_left.push(u32::try_from(left_row).map_err(|_| {
+                                Error::ResourceExhausted(
+                                    "join probe batch exceeds UINT32_MAX rows".into(),
+                                )
+                            })?);
+                            candidate_right.push(*right_row);
                         }
-                    }
-                    if group.complete || result_is_decided(self.join_type, &state) {
-                        // Semi/Anti/Mark joins need only an existence answer. Once a
-                        // qualifying candidate is observed, do not rescan a large
-                        // duplicate-key group in subsequent batches. Q21's supplier
-                        // inequality predicates benefit directly while general residual
-                        // semantics stay intact.
-                        if !group.complete {
-                            context.metrics.add_join_short_circuits(1);
-                            self.row = self.row.saturating_add(1);
+                        let complete = end == matches.len();
+                        candidate_groups.push(CandidateGroup {
+                            left_row,
+                            start,
+                            end: candidate_left.len(),
+                            complete,
+                            state,
+                        });
+                        self.match_index = end;
+                        if complete {
+                            self.row += 1;
                             self.match_index = 0;
                             self.current_state = RowState::default();
                         }
-                        finish_row(
-                            group.left_row,
-                            self.join_type,
-                            &state,
-                            &mut left_indices,
-                            &mut right_indices,
-                            &mut markers,
-                        )?;
-                    } else {
-                        self.current_state = state;
                     }
                 }
-                drop(outcomes);
-                drop(candidate_groups);
-                drop(candidate_left);
-                drop(candidate_right);
-                workspace.try_resize(index_bytes)?;
-            }
 
-            if left_indices.len() >= self.batch_size {
-                break;
+                let had_candidates = !candidate_left.is_empty();
+                if had_candidates {
+                    grow_workspace(
+                        &mut workspace,
+                        index_bytes.saturating_add(candidate_workspace_bytes(
+                            self.left,
+                            self.right,
+                            &candidate_left,
+                            &candidate_right,
+                        )?),
+                        context,
+                        held_bytes,
+                    )
+                    .await?;
+                    let outcomes = {
+                        let _permit = context.acquire_compute().await?;
+                        let _active = context.scheduler.enter_lane();
+                        self.predicates.evaluate_candidates(
+                            self.left,
+                            self.right,
+                            &candidate_left,
+                            &candidate_right,
+                            self.left_values,
+                            self.right_values,
+                        )?
+                    };
+                    context
+                        .metrics
+                        .add_join_candidates(u64::try_from(outcomes.len()).unwrap_or(u64::MAX));
+                    for group in &candidate_groups {
+                        let mut state = group.state;
+                        for candidate in group.start..group.end {
+                            let right_row = candidate_right[candidate];
+                            let outcome = outcomes[candidate];
+                            if outcome.qualifies {
+                                if self.predicates.is_null_aware() {
+                                    match outcome.membership.expect("null-aware outcome") {
+                                        SqlTruth::True => {
+                                            state.matches = 1;
+                                            state.first_right.get_or_insert(right_row);
+                                        }
+                                        SqlTruth::False => {}
+                                        SqlTruth::Unknown => state.unknown = true,
+                                    }
+                                } else {
+                                    state.matches = state.matches.saturating_add(1);
+                                    state.first_right.get_or_insert(right_row);
+                                    if let Some(matched) = &self.matched_build {
+                                        matched.mark(right_row);
+                                    }
+                                    if self.join_type == JoinType::LeftSingle && state.matches > 1 {
+                                        return Err(Error::Execution(
+                                            "scalar subquery returned more than one row".into(),
+                                        ));
+                                    }
+                                    if matches!(
+                                        self.join_type,
+                                        JoinType::Inner
+                                            | JoinType::Left
+                                            | JoinType::Right
+                                            | JoinType::Full
+                                    ) {
+                                        left_indices.push(group.left_row as u32);
+                                        right_indices.push(Some(right_row));
+                                    }
+                                }
+                            }
+                        }
+                        if group.complete || result_is_decided(self.join_type, &state) {
+                            // Semi/Anti/Mark joins need only an existence answer. Once a
+                            // qualifying candidate is observed, do not rescan a large
+                            // duplicate-key group in subsequent batches. Q21's supplier
+                            // inequality predicates benefit directly while general residual
+                            // semantics stay intact.
+                            if !group.complete {
+                                context.metrics.add_join_short_circuits(1);
+                                self.row = self.row.saturating_add(1);
+                                self.match_index = 0;
+                                self.current_state = RowState::default();
+                            }
+                            finish_row(
+                                group.left_row,
+                                self.join_type,
+                                &state,
+                                &mut left_indices,
+                                &mut right_indices,
+                                &mut markers,
+                            )?;
+                        } else {
+                            self.current_state = state;
+                        }
+                    }
+                    drop(outcomes);
+                    drop(candidate_groups);
+                    drop(candidate_left);
+                    drop(candidate_right);
+                    workspace.try_resize(index_bytes)?;
+                }
+
+                if left_indices.len() >= self.batch_size {
+                    break;
+                }
+                if !had_candidates && self.row >= self.left.num_rows() {
+                    break;
+                }
+                context.check_cancelled()?;
             }
-            if !had_candidates && self.row >= self.left.num_rows() {
-                break;
-            }
-            context.check_cancelled()?;
         }
 
         if left_indices.is_empty() {
-            Ok(None)
+            Ok(JoinEmission::Exhausted)
         } else {
+            let selection = JoinSelection {
+                left: self.left,
+                right: self.right,
+                left_indices: &left_indices,
+                right_indices: &right_indices,
+                markers: marker_slice(self.join_type, &markers),
+                join_type: self.join_type,
+                schema: &self.schema,
+            };
             grow_workspace(
                 &mut workspace,
-                index_bytes.saturating_add(output_workspace_bytes(
-                    self.left,
-                    self.right,
-                    &left_indices,
-                    &right_indices,
-                    self.join_type,
-                )?),
+                index_bytes.saturating_add(target.workspace_bytes(&selection)?),
                 context,
-                self.held_bytes,
+                held_bytes,
             )
             .await?;
-            let output = {
+            let emission = {
+                let _permit = context.acquire_compute().await?;
                 let _active = context.scheduler.enter_lane();
-                build_output(
-                    self.left,
-                    self.right,
-                    &left_indices,
-                    &right_indices,
-                    marker_slice(self.join_type, &markers),
-                    self.join_type,
-                    Arc::clone(&self.schema),
-                )?
+                target.consume(selection, workspace)?
             };
-            Ok(Some(BatchEnvelope::from_reservation(
-                output,
-                workspace,
-                "join output",
-            )?))
+            Ok(emission)
         }
     }
 
@@ -647,7 +739,7 @@ fn marker_slice(join_type: JoinType, markers: &[Option<bool>]) -> Option<&[Optio
 mod summary_tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::array::{ArrayRef, Float64Array, Int64Array};
 
     use super::{RowState, result_is_decided, try_build_existence_hash_table_with_nulls};
     use crate::runtime::MemoryPool;
@@ -669,8 +761,27 @@ mod summary_tests {
             try_build_existence_hash_table_with_nulls(&keys, 5, false, &values, &mut reservation)
                 .unwrap()
                 .unwrap();
-        let representatives = hash.values().next().unwrap();
-        assert_eq!(representatives.as_slice(), &[0, 2]);
+        let representatives = hash.matches(&keys, 0, false).unwrap().unwrap();
+        assert_eq!(representatives, &[0, 2]);
+    }
+
+    #[test]
+    fn float_existence_hash_keeps_all_rows_for_arrow_comparison_semantics() {
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1; 5]))];
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![nan_a, nan_b, -0.0, 0.0, 1.0]));
+        let pool = MemoryPool::new(1 << 20);
+        let mut reservation = pool.reservation();
+        let hash =
+            try_build_existence_hash_table_with_nulls(&keys, 5, false, &values, &mut reservation)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            hash.matches(&keys, 0, false).unwrap().unwrap(),
+            &[0, 1, 2, 3, 4]
+        );
     }
 
     #[test]

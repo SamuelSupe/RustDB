@@ -1,53 +1,148 @@
+<div align="center">
+
 # RustDB
 
-RustDB is a read-only, single-node OLAP engine written in Rust. It queries CSV
-and Parquet files from local storage or S3-compatible object stores and returns
-Apache Arrow record batches. The SQL planner, optimizer, execution operators,
-memory accounting, and spill behavior live in this repository; DataFusion is
-not a runtime dependency.
+**An embedded, single-node OLAP engine for CSV, Parquet, S3, and persistent local analytics.**
 
-## Development
+[简体中文](README.zh-CN.md) · [Architecture](docs/architecture.md) · [SQL compatibility](docs/compatibility.md) · [CLI guide](packaging/dist/CLI.md)
 
-RustDB's repeatable development environment runs through OrbStack's Docker
-engine:
+[![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
+[![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
+[![Version](https://img.shields.io/badge/version-0.7.0--alpha.1-orange)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+</div>
+
+> [!WARNING]
+> RustDB is experimental alpha software. It is suitable for evaluation,
+> development, and reproducible engine research, but its storage format and
+> public API are not yet production-stable.
+
+RustDB queries CSV and Parquet directly from local disks or S3-compatible
+object stores. Data can optionally be imported into an immutable, persistent
+Native database for repeated local analytics. Results are streamed as Apache
+Arrow `RecordBatch` values, both through the Rust API and the `rustdb` CLI.
+
+The SQL binder, optimizer, vectorized operators, scheduler, memory accounting,
+Native storage, and Spill implementation live in this repository. DataFusion
+is not a runtime dependency, and project code forbids `unsafe`.
+
+## Why RustDB?
+
+- **Query data where it lives** — local paths, globs, `file://`, AWS S3, and
+  MinIO/S3-compatible endpoints.
+- **Fast columnar paths** — projection and predicate pushdown, Parquet
+  row-group/page-index/Bloom pruning, runtime filters, and metadata
+  singleflight.
+- **High-throughput CSV** — raw, gzip, and zstd input with quote-aware framing
+  and bounded parallel decoding of a single large file.
+- **Persistent Native analytics** — atomic bulk import, append, replacement,
+  snapshot reads, restart recovery, and validated local backup/restore.
+- **Resource-aware execution** — multi-lane pipelines, global/query memory
+  budgets, cancellation, bounded queues, and governed Spill for blocking
+  operators.
+- **Embedded by default** — a small stable outer Rust API plus a streaming CLI;
+  no server process is required.
+
+## At a glance
+
+| Area | Current v0.7 alpha scope |
+| --- | --- |
+| Sources | CSV, gzip CSV, zstd CSV, Parquet |
+| Storage | Local filesystem, S3/MinIO, persistent local Native database |
+| Interfaces | Embedded Rust API and `rustdb` CLI/REPL |
+| Output | Streaming Apache Arrow `RecordBatch` |
+| Execution | Vectorized, multi-lane, memory-accounted, Spill-capable |
+| SQL | TPC-H-oriented analytics, joins, aggregates, windows, set operations, prepared parameters |
+| Safety | Project code uses `#![forbid(unsafe_code)]` |
+
+See the [compatibility matrix](docs/compatibility.md) for the authoritative SQL,
+type, and format boundary.
+
+## Quick start
+
+### Build a distribution with OrbStack
+
+The default development and packaging path uses OrbStack's Docker engine:
 
 ```sh
-docker compose build dev
-docker compose run --rm dev cargo fmt --check
-docker compose run --rm dev cargo clippy --all-targets -- -D warnings
-docker compose run --rm dev cargo test
+git clone https://github.com/SamuelSupe/RustDB.git
+cd RustDB
+scripts/dist/build.sh
 ```
 
-`compose.yaml` also starts MinIO for S3 integration tests. The credentials in
-that file are test-only values.
+The command writes a versioned archive and SHA-256 file to `dist/`, then
+validates English/Chinese help, installation, execution, and uninstallation.
+Use `scripts/dist/build.sh --native` on a host with the pinned Rust toolchain to
+build for the current native platform.
 
-## CLI
-
-Run one query:
+### Query files directly
 
 ```sh
-docker compose run --rm dev cargo run --release -- \
+cargo run --locked --release --bin rustdb -- \
+  --threads 4 \
+  --memory-limit 2GiB \
   -c "SELECT count(*) FROM read_parquet('/data/events/*.parquet')"
 ```
 
-Start the interactive shell by omitting `-c` and `-f`. Results can be written
-as a table, CSV, or JSON Lines. `--csv-null TOKEN` supplies an unambiguous SQL
-NULL marker for machine comparisons; the default remains an empty CSV field.
+```sql
+SELECT country, count(*) AS events
+FROM read_csv('/data/events/*.csv.gz', compression = 'auto')
+WHERE event_date >= DATE '2026-01-01'
+GROUP BY country
+ORDER BY events DESC
+LIMIT 20;
+```
 
-## Library
+Omit `-c` and `-f` to open the REPL. Output formats are `table`, `csv`, and
+`jsonl`. Run `rustdb --help`, `rustdb --help-zh`, or `.help zh` in the REPL for
+bilingual help.
+
+### Query S3 or MinIO
+
+AWS credentials come only from the default credential chain or an embedding
+application's credential provider. RustDB does not expose plaintext secret
+flags.
+
+```sh
+AWS_PROFILE=analytics rustdb --s3-region us-east-1 -c \
+  "SELECT count(*) FROM read_parquet('s3://analytics/events/*.parquet')"
+```
+
+```sh
+rustdb \
+  --s3-endpoint http://127.0.0.1:9000 \
+  --s3-region us-east-1 \
+  --s3-path-style \
+  --s3-allow-http \
+  -c "SELECT * FROM read_parquet('s3://demo/events/*.parquet') LIMIT 10"
+```
+
+See [S3 configuration](docs/s3.md) for AWS, anonymous access, and MinIO.
+
+## Embed RustDB
 
 ```rust,no_run
 use futures::StreamExt;
 use rustdb::{Engine, EngineConfig, ParquetOptions};
 
-# async fn example() -> rustdb::Result<()> {
+# async fn run() -> rustdb::Result<()> {
 let engine = Engine::new(EngineConfig::default())?;
 let session = engine.session();
+
 session
-    .register_parquet("events", ["/data/events/*.parquet"], ParquetOptions::default())
+    .register_parquet(
+        "events",
+        ["/data/events/*.parquet"],
+        ParquetOptions::default(),
+    )
     .await?;
 
-let mut result = session.execute("SELECT count(*) FROM events").await?;
+let mut result = session
+    .execute("SELECT country, count(*) FROM events GROUP BY country")
+    .await?;
+
 while let Some(batch) = result.stream().next().await {
     println!("{:?}", batch?);
 }
@@ -55,51 +150,118 @@ while let Some(batch) = result.stream().next().await {
 # }
 ```
 
-## Supported scope
+The public result remains streaming: callers decide whether and when to
+collect it. Dropping or cancelling a query converges its task group before
+query Spill is cleaned up.
 
-- Read-only external CSV and Parquet data.
-- Local paths, globs, `file://`, AWS S3, and custom S3 endpoints.
-- Raw, gzip, and zstd CSV selected by content magic, including concatenated
-  gzip members and multi-frame zstd streams.
-- Record-aligned single-file CSV morsels decoded across bounded compute lanes;
-  quoted newlines are never split between decoders, and oversized-record
-  errors identify the URI and decompressed offset.
-- Vectorized projection, filter, aggregation, sort, limit, and equi-joins.
-- Typed string, NULL, numeric, and temporal scalar functions; aggregate
-  `DISTINCT`; and set-at-a-time, one-level correlated subqueries.
-- Ranking, distribution, and aggregate window functions with named windows and
-  `QUALIFY`; DISTINCT and multiset set operations; and equi
-  `RIGHT`/`FULL`/Left Semi/Anti joins with `USING` where applicable.
-- Parsed-only prepared statements with typed Rust parameters; every execution
-  rebinds the live catalog and fixes a fresh external-object snapshot.
-- Query-time file discovery, atomic schema refresh with stable CSV column order,
-  and safe Parquet widening.
-- Budgeted Parquet page-index/Bloom pruning, bounded same-column `IN`/`OR`,
-  query runtime filters, and singleflight metadata loads, with residual
-  predicates retained for correctness.
-- Multi-lane pipelines, cancellation-aware memory backpressure, query-scoped
-  optimizer statistics, workspace-aware accounting, and
-  quota/free-space-governed Spill.
+## Persistent Native database
 
-RustDB does not currently provide managed tables, transactions, DML, a server
-protocol, distributed execution, or DuckDB compatibility. During data scan,
-each CSV object is read once in source order, optionally decompressed, and
-framed only at complete record boundaries before parsing in parallel; RustDB
-does not issue speculative S3 ranges across quoted records. `compute_threads`
-is an execution upper bound:
-actual lanes also depend on available Scan tasks, operator eligibility, and
-memory budget. Result order is unspecified without `ORDER BY`.
+`Engine::new` is ephemeral. `Engine::open` enables a persistent local database
+whose immutable segments can be populated directly from CSV or Parquet:
 
-See [architecture.md](docs/architecture.md) for the execution model and
-[compatibility.md](docs/compatibility.md) for the SQL and format contract.
-[s3.md](docs/s3.md) covers AWS and MinIO configuration, and
-[troubleshooting.md](docs/troubleshooting.md) covers resource, spill, and input
-errors. [parquet-pruning.md](docs/parquet-pruning.md) documents page-index and
-Bloom-filter policy. [migration-v0.5.md](docs/migration-v0.5.md) covers the
-`CsvOptions` builder migration, compressed/parallel CSV behavior, prepared
-statements, and new metrics. [migration-v0.4.md](docs/migration-v0.4.md),
-[migration-v0.3.md](docs/migration-v0.3.md), and
-[migration-v0.2.md](docs/migration-v0.2.md) cover earlier releases.
-The repeatable benchmark workflow is documented in
-[benchmarks/README.md](benchmarks/README.md), and the release gates are listed
-in [acceptance.md](docs/acceptance.md).
+```rust,no_run
+use futures::StreamExt;
+use rustdb::{Engine, EngineConfig};
+
+# async fn import() -> rustdb::Result<()> {
+let engine = Engine::open("./warehouse", EngineConfig::default())?;
+let session = engine.session();
+
+let mut write = session
+    .execute(
+        "CREATE TABLE events AS \
+         SELECT * FROM read_parquet('/data/events/*.parquet')",
+    )
+    .await?;
+
+while let Some(batch) = write.stream().next().await {
+    batch?;
+}
+# Ok(())
+# }
+```
+
+Bulk `INSERT INTO ... SELECT` and `CREATE OR REPLACE TABLE ... AS SELECT` are
+also supported. Publication is atomic: running queries keep their pinned
+snapshot while later queries see the new catalog generation. Native storage is
+not a row-oriented transactional database; row-level DML, MVCC, and general
+transactions are outside the current scope.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    SQL["SQL / prepared parameters"] --> Binder["Binder + session catalog"]
+    Binder --> Optimizer["Rule optimizer + statistics"]
+    Optimizer --> Pipelines["Vectorized physical pipelines"]
+    Local["Local files"] --> Scan["CSV / Parquet / Native scan"]
+    S3["S3 / MinIO"] --> Scan
+    Native["Native snapshots"] --> Scan
+    Scan --> Pipelines
+    Pipelines --> Memory["Memory reservations + governed Spill"]
+    Memory --> Arrow["Streaming Arrow RecordBatch"]
+```
+
+Arrow `RecordBatch` is the exchange format. Scan, Filter, and Projection are
+fused where safe; Aggregate, Join, Sort, and Window form controlled pipeline
+breakers. Internal batches carry memory leases through bounded queues. Query
+workers belong to one cancellation-aware task group, and blocking operators
+switch to partitioned Spill when reservations cannot be satisfied.
+
+The full execution model is documented in [architecture.md](docs/architecture.md).
+
+## Functional status
+
+- TPC-H Q1-Q22 query coverage is retained in [`benchmarks/tpch`](benchmarks/tpch).
+- The v0.7 functional ClickBench gate runs all 43 official queries once in a
+  four-CPU/16-GiB container profile.
+- The retained one-million-row run completed **43/43 queries**; its manifest is
+  [`20260717-functional-1m-4c16g.json`](benchmarks/clickbench/evidence/20260717-functional-1m-4c16g.json).
+
+That ClickBench run is a compatibility and reliability check, not a published
+cross-engine performance claim. The opt-in 100M profile and reproduction steps
+are in the [ClickBench guide](benchmarks/clickbench/README.md).
+
+## Current boundaries
+
+RustDB currently does not provide row-level update/delete, schema alteration,
+general transactions, MVCC, a server protocol, distributed execution, or
+DuckDB database-file/SQL compatibility. JSON, ORC, Iceberg, and Parquet writing
+are also outside v0.7. Result order is unspecified without an outer `ORDER BY`.
+
+## Documentation
+
+| Document | Purpose |
+| --- | --- |
+| [Architecture](docs/architecture.md) | Pipelines, scheduling, memory, pruning, Native storage, and Spill |
+| [Compatibility](docs/compatibility.md) | Supported SQL, types, formats, and explicit limitations |
+| [CLI guide](packaging/dist/CLI.md) / [中文](packaging/dist/CLI.zh-CN.md) | Commands, output, resources, and S3 flags |
+| [Installation](packaging/dist/INSTALL.md) / [中文](packaging/dist/INSTALL.zh-CN.md) | Binary package installation and removal |
+| [S3 and MinIO](docs/s3.md) | Credentials, endpoints, and object-store behavior |
+| [Troubleshooting](docs/troubleshooting.md) | Resource, Spill, corruption, and input errors |
+| [Acceptance](docs/acceptance.md) | Correctness and release checks |
+| [v0.7 migration](docs/migration-v0.7.md) | Current execution-core and benchmark changes |
+
+## Development
+
+The complete default verification path runs through OrbStack:
+
+```sh
+scripts/ci/orbstack.sh all
+```
+
+Focused commands are also available:
+
+```sh
+docker compose run --rm dev cargo fmt --check
+docker compose run --rm dev cargo clippy --all-targets -- -D warnings
+docker compose run --rm dev cargo test --all-targets
+```
+
+Please keep operators and data sources small and single-purpose, preserve
+streaming result semantics, and do not introduce project-owned `unsafe` or a
+DataFusion runtime dependency.
+
+## License
+
+RustDB is licensed under the [Apache License 2.0](LICENSE).

@@ -39,6 +39,7 @@ pub(super) fn pull(plan: LogicalPlan) -> Result<Pulled> {
             statistics,
             projection,
             pushed_filter,
+            exact_filter,
             limit,
             schema,
         } => {
@@ -58,6 +59,7 @@ pub(super) fn pull(plan: LogicalPlan) -> Result<Pulled> {
                     statistics,
                     projection,
                     pushed_filter,
+                    exact_filter,
                     limit,
                     schema,
                 },

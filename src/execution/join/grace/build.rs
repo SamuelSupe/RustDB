@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use tokio_util::sync::CancellationToken;
 
@@ -10,20 +8,27 @@ use crate::{
 };
 
 use super::super::{
-    CellValue, EvaluatedKeys,
+    EvaluatedKeys,
     condition::JoinPredicates,
     evaluate_keys_accounted, evaluate_optional_values,
+    hash_table::JoinHashTable,
     matched::BuildMatchTracker,
     optional_array,
     probe::{try_build_existence_hash_table_with_nulls, try_build_hash_table_with_nulls},
-    spill::{self, BuildPartition, PartitionTask},
+    spill::{
+        BuildPartition, BuildPartitionRead, PartitionTask, compact_build_partition,
+        read_build_partition,
+    },
 };
 use super::admission::{BuildAdmission, BuildPermit};
 
+// This short-lived hot-path result keeps a ready hash table inline; boxing it
+// would add an allocation to every successfully loaded partition.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum TaskHashBuild {
     Ready(
         RecordBatch,
-        HashMap<Vec<CellValue>, Vec<u32>>,
+        JoinHashTable,
         Option<EvaluatedKeys>,
         Option<BuildMatchTracker>,
     ),
@@ -49,6 +54,7 @@ pub(super) async fn load_with_admission(
     let mut reservation = build_reservation(context, "build", permit.limit_bytes());
     let mut build = try_load_hash_build(
         task,
+        cancellation,
         right_key_expressions,
         right_schema,
         predicates,
@@ -57,7 +63,8 @@ pub(super) async fn load_with_admission(
         left_columns,
         context,
         &mut reservation,
-    )?;
+    )
+    .await?;
 
     if matches!(build, TaskHashBuild::TooLarge(_)) && !permit.is_exclusive() {
         reservation.try_resize(0)?;
@@ -67,6 +74,7 @@ pub(super) async fn load_with_admission(
         reservation = build_reservation(context, "straggler", permit.limit_bytes());
         build = try_load_hash_build(
             task,
+            cancellation,
             right_key_expressions,
             right_schema,
             predicates,
@@ -75,7 +83,8 @@ pub(super) async fn load_with_admission(
             left_columns,
             context,
             &mut reservation,
-        )?;
+        )
+        .await?;
     }
     Ok((build, reservation, permit))
 }
@@ -88,8 +97,9 @@ fn build_reservation(context: &QueryContext, label: &str, limit: usize) -> Memor
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_load_hash_build(
+async fn try_load_hash_build(
     task: &PartitionTask,
+    cancellation: &CancellationToken,
     right_key_expressions: &[BoundExpr],
     right_schema: &SchemaRef,
     predicates: &JoinPredicates,
@@ -99,17 +109,20 @@ fn try_load_hash_build(
     context: &QueryContext,
     reservation: &mut MemoryReservation,
 ) -> Result<TaskHashBuild> {
+    let batches =
+        match read_build_partition(&task.right, right_schema, context, reservation, task.build)? {
+            BuildPartitionRead::Batches(batches) => batches,
+            BuildPartitionRead::TooLarge { rows } => return Ok(TaskHashBuild::TooLarge(rows)),
+        };
+    let _permit = context
+        .acquire_compute_until_cancelled(cancellation)
+        .await?;
     let _active = context.scheduler.enter_lane();
-    let right_batch = match spill::load_build_partition(
-        &task.right,
-        right_schema,
-        context,
-        reservation,
-        task.build,
-    )? {
-        BuildPartition::Loaded(batch) => batch,
-        BuildPartition::TooLarge { rows } => return Ok(TaskHashBuild::TooLarge(rows)),
-    };
+    let right_batch =
+        match compact_build_partition(batches, right_schema, reservation, task.build.rows)? {
+            BuildPartition::Loaded(batch) => batch,
+            BuildPartition::TooLarge { rows } => return Ok(TaskHashBuild::TooLarge(rows)),
+        };
     let right_keys = evaluate_keys_accounted(
         right_key_expressions,
         &right_batch,

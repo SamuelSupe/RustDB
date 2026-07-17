@@ -21,6 +21,7 @@ pub use expr::{
 };
 pub(crate) use parser::{parse_statements, split_statement_text};
 pub use plan::{DependentJoinKind, JoinType, LogicalPlan, PlanSchema, StatementPlan};
+pub(crate) use plan::{UNMATERIALIZED_FIELD_KEY, field_is_materialized};
 #[cfg(test)]
 pub use planner::plan_sql;
 pub(crate) use planner::{bind_statement, optimize_statement};

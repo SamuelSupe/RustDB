@@ -1,0 +1,67 @@
+RustDB - 查询本地磁盘和 S3/MinIO 上的 CSV、Parquet 与 Native 数据
+
+使用方法：rustdb [选项]
+
+不指定 -c 或 -f 时启动交互终端。SQL 语句必须以分号结束。
+
+查询输入：
+  -c, --command <SQL>                 执行 SQL 后退出
+  -f, --file <路径>                   执行文件中的 SQL 后退出
+      --format <table|csv|jsonl>      输出格式，默认 table
+      --csv-null <文本>               CSV 输出中的 NULL 文本，默认空字段
+      --metrics                       查询结束后输出执行指标
+
+执行资源：
+      --memory-limit <大小>           查询内存上限，例如 512MiB、2GiB
+      --threads <数量>                计算工作线程数
+      --batch-size <行数>             Arrow 执行批次的目标行数
+      --io-concurrency <数量>         Scan 的最大文件/对象并发数
+      --metadata-cache <大小>         Parquet 元数据缓存上限，0 表示禁用
+      --max-concurrent-queries <数量> 最大并发查询数
+
+CSV：
+      --csv-target-morsel-bytes <大小>       每个解析 morsel 的目标解压字节数
+      --no-csv-parallel-single-file          禁用单个 CSV 文件的并行解析
+
+Parquet：
+      --parquet-page-index <auto|disabled>   Page Index 裁剪策略
+      --parquet-bloom-filter <auto|disabled> Bloom Filter 裁剪策略
+      --parquet-pruning-metadata <大小>       单查询裁剪元数据上限
+
+Spill：
+      --spill-directory <路径>               Spill 文件目录
+      --spill-engine-limit <大小>             全引擎 Spill 字节上限
+      --spill-query-limit <大小>              单查询 Spill 字节上限
+      --spill-min-free-bytes <大小>           Spill 文件系统必须保留的空间
+      --spill-io-threads <数量>               专用 Spill I/O 线程数
+      --spill-partition-target-bytes <大小>   自适应 Hash 分区目标大小
+      --max-repartition-depth <深度>          最大递归重分区深度
+      --max-spill-write-amplification <倍数>  最大累计 Spill 写放大
+      --runtime-filter-bytes <大小>           Join Runtime Filter 内存预算
+
+S3/MinIO：
+      --s3-region <区域>               AWS Region
+      --s3-endpoint <URL>              S3-compatible endpoint
+      --s3-path-style                  强制使用 path-style 请求
+      --s3-allow-http                  允许明文 HTTP，仅用于可信开发环境
+      --s3-anonymous                   匿名访问，不签名请求
+
+通用：
+      --help-zh                        显示本帮助
+  -h, --help                           显示英文帮助
+  -V, --version                        显示版本
+
+大小单位支持 B、KB、MB、GB、KiB、MiB、GiB。
+凭证通过 AWS 默认凭证链提供；命令行不接受明文 Access Key 或 Secret Key。
+
+示例：
+  rustdb -c "SELECT count(*) FROM read_parquet('/data/*.parquet')"
+  rustdb -f query.sql --format csv --memory-limit 2GiB --threads 4
+  rustdb --s3-region us-east-1 -c \
+    "SELECT * FROM read_parquet('s3://bucket/events/*.parquet') LIMIT 10"
+
+交互终端命令：
+  .tables    列出已注册的外部表
+  .help      显示英文帮助
+  .help zh   显示中文帮助
+  .quit      退出

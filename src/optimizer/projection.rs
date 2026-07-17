@@ -2,7 +2,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 
-use crate::sql::{BoundExpr, ExprKind, JoinType, LogicalPlan, PlanSchema};
+use crate::sql::{
+    BoundExpr, ExprKind, JoinType, LogicalPlan, PlanSchema, UNMATERIALIZED_FIELD_KEY,
+};
+
+mod aggregate_input;
 
 pub(super) fn push_required_columns(plan: &mut LogicalPlan) {
     let required = (0..plan.schema().arrow().fields().len()).collect::<Vec<_>>();
@@ -15,11 +19,14 @@ fn push(plan: &mut LogicalPlan, required: &[usize]) {
         LogicalPlan::Scan {
             projection,
             pushed_filter,
+            exact_filter,
             schema,
             ..
         } => {
             let mut columns = required.to_vec();
-            if let Some(predicate) = pushed_filter {
+            if exact_filter.is_none()
+                && let Some(predicate) = pushed_filter
+            {
                 predicate.referenced_columns(&mut columns);
             }
             set_projection(projection, columns);
@@ -101,6 +108,7 @@ fn push(plan: &mut LogicalPlan, required: &[usize]) {
             // The current aggregate executor materializes every configured
             // state. Keep every state input until aggregate-output pruning is
             // implemented, while still pushing the complete requirement down.
+            aggregate_input::compact(input, group_exprs, aggregate_exprs);
             let mut columns = referenced_columns(group_exprs);
             for aggregate in aggregate_exprs {
                 if let Some(expr) = &aggregate.expr {
@@ -254,11 +262,20 @@ fn nullable_unrequired(schema: &PlanSchema, required: &[usize]) -> PlanSchema {
         .iter()
         .enumerate()
         .map(|(index, field)| {
-            if required.contains(&index) || field.is_nullable() {
-                Arc::clone(field)
+            let materialized = required.contains(&index);
+            let mut metadata = field.metadata().clone();
+            if materialized {
+                metadata.remove(UNMATERIALIZED_FIELD_KEY);
             } else {
-                Arc::new(field.as_ref().clone().with_nullable(true))
+                metadata.insert(UNMATERIALIZED_FIELD_KEY.to_owned(), "true".to_owned());
             }
+            Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_nullable(field.is_nullable() || !materialized)
+                    .with_metadata(metadata),
+            )
         })
         .collect::<Vec<_>>();
     let qualifiers = (0..fields.len())
@@ -289,7 +306,12 @@ fn set_projection(target: &mut Option<Vec<usize>>, mut columns: Vec<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::set_projection;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::{nullable_unrequired, set_projection};
+    use crate::sql::{PlanSchema, field_is_materialized};
 
     #[test]
     fn projections_are_sorted_and_deduplicated() {
@@ -303,5 +325,19 @@ mod tests {
         let mut target = None;
         set_projection(&mut target, Vec::new());
         assert_eq!(target, Some(Vec::new()));
+    }
+
+    #[test]
+    fn records_internal_materialization_without_changing_schema_width() {
+        let schema = PlanSchema::unqualified(Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("payload", DataType::Int64, false),
+        ])));
+
+        let projected = nullable_unrequired(&schema, &[1]);
+
+        assert_eq!(projected.arrow().fields().len(), 2);
+        assert!(!field_is_materialized(projected.arrow().field(0)));
+        assert!(field_is_materialized(projected.arrow().field(1)));
     }
 }

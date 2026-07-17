@@ -3,8 +3,8 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 
 use crate::{
-    datasource::TableProvider,
-    sql::{BinaryOp, BoundExpr, ExprKind, LogicalPlan},
+    datasource::{ScanPredicate, TableProvider},
+    sql::{BoundExpr, LogicalPlan},
 };
 
 pub(super) struct FusedPipeline {
@@ -16,6 +16,7 @@ pub(super) struct ScanStage {
     pub(super) provider: Arc<dyn TableProvider>,
     pub(super) projection: Option<Vec<usize>>,
     pub(super) pushed_filter: Option<BoundExpr>,
+    pub(super) exact_filter: Option<ScanPredicate>,
     pub(super) limit: Option<usize>,
     pub(super) schema: SchemaRef,
 }
@@ -52,6 +53,7 @@ fn build(plan: LogicalPlan) -> FusedPipeline {
             provider,
             projection,
             pushed_filter,
+            exact_filter,
             limit,
             schema,
             ..
@@ -60,6 +62,7 @@ fn build(plan: LogicalPlan) -> FusedPipeline {
                 provider,
                 projection,
                 pushed_filter,
+                exact_filter,
                 limit,
                 schema: Arc::clone(schema.arrow()),
             },
@@ -88,23 +91,11 @@ fn build(plan: LogicalPlan) -> FusedPipeline {
     }
 }
 
-/// Breaks an infallible conjunction into sequential filters so selective
-/// terms shrink the batch before later kernels run. The logical predicate is
-/// left intact for scan pruning and EXPLAIN, and fallible expressions retain
-/// SQL short-circuit evaluation in one operator.
+/// Keeps one logical predicate in one physical filter. Infallible conjunctions
+/// are evaluated as Arrow masks and gather the batch once; fallible expressions
+/// retain the expression executor's SQL short-circuit semantics.
 fn push_filter_operators(operators: &mut Vec<PipelineOperator>, predicate: BoundExpr) {
-    if predicate.is_structurally_infallible()
-        && let ExprKind::Binary {
-            left,
-            op: BinaryOp::And,
-            right,
-        } = predicate.kind
-    {
-        push_filter_operators(operators, *left);
-        push_filter_operators(operators, *right);
-    } else {
-        operators.push(PipelineOperator::Filter(predicate));
-    }
+    operators.push(PipelineOperator::Filter(predicate));
 }
 
 #[cfg(test)]
@@ -115,22 +106,18 @@ mod tests {
     use crate::sql::{BinaryOp, BoundExpr, ExprKind, ScalarValue};
 
     #[test]
-    fn splits_infallible_conjunctions_left_to_right() {
+    fn keeps_infallible_conjunction_as_one_filter() {
         let mut operators = Vec::new();
         push_filter_operators(
             &mut operators,
             binary(comparison(1), BinaryOp::And, comparison(2)),
         );
 
-        assert_eq!(operators.len(), 2);
-        let PipelineOperator::Filter(left) = &operators[0] else {
-            panic!("expected left filter")
+        assert_eq!(operators.len(), 1);
+        let PipelineOperator::Filter(predicate) = &operators[0] else {
+            panic!("expected filter")
         };
-        let PipelineOperator::Filter(right) = &operators[1] else {
-            panic!("expected right filter")
-        };
-        assert_eq!(left.display_name, "value = 1");
-        assert_eq!(right.display_name, "value = 2");
+        assert_eq!(predicate.display_name, "value = 1 AND value = 2");
     }
 
     #[test]

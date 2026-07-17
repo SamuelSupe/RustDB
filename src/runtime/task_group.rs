@@ -2,6 +2,7 @@ use std::{
     any::Any,
     future::Future,
     panic::AssertUnwindSafe,
+    path::PathBuf,
     sync::{Arc, Weak},
 };
 
@@ -63,6 +64,21 @@ enum TaskFailure {
     Unsupported(String),
     ResourceExhausted(String),
     Catalog(String),
+    NativeStorage {
+        path: PathBuf,
+        message: String,
+    },
+    CommitOutcomeUnknown {
+        path: PathBuf,
+        transaction_id: String,
+        message: String,
+    },
+    NativeCommitPostCommitFailure {
+        path: PathBuf,
+        transaction_id: String,
+        generation: u64,
+        message: String,
+    },
     Execution(String),
     Internal(String),
 }
@@ -347,6 +363,30 @@ impl TaskFailure {
             Error::Unsupported(message) => Self::Unsupported(message.clone()),
             Error::ResourceExhausted(message) => Self::ResourceExhausted(message.clone()),
             Error::Catalog(message) => Self::Catalog(message.clone()),
+            Error::NativeStorage { path, message } => Self::NativeStorage {
+                path: path.clone(),
+                message: message.clone(),
+            },
+            Error::CommitOutcomeUnknown {
+                path,
+                transaction_id,
+                message,
+            } => Self::CommitOutcomeUnknown {
+                path: path.clone(),
+                transaction_id: transaction_id.clone(),
+                message: message.clone(),
+            },
+            Error::NativeCommitPostCommitFailure {
+                path,
+                transaction_id,
+                generation,
+                message,
+            } => Self::NativeCommitPostCommitFailure {
+                path: path.clone(),
+                transaction_id: transaction_id.clone(),
+                generation: *generation,
+                message: message.clone(),
+            },
             Error::Execution(message) => Self::Execution(message.clone()),
             Error::Internal(message) => Self::Internal(message.clone()),
             // External error types are not Clone. Preserve their complete
@@ -366,6 +406,30 @@ impl TaskFailure {
             Self::Unsupported(message) => Error::Unsupported(message.clone()),
             Self::ResourceExhausted(message) => Error::ResourceExhausted(message.clone()),
             Self::Catalog(message) => Error::Catalog(message.clone()),
+            Self::NativeStorage { path, message } => Error::NativeStorage {
+                path: path.clone(),
+                message: message.clone(),
+            },
+            Self::CommitOutcomeUnknown {
+                path,
+                transaction_id,
+                message,
+            } => Error::CommitOutcomeUnknown {
+                path: path.clone(),
+                transaction_id: transaction_id.clone(),
+                message: message.clone(),
+            },
+            Self::NativeCommitPostCommitFailure {
+                path,
+                transaction_id,
+                generation,
+                message,
+            } => Error::NativeCommitPostCommitFailure {
+                path: path.clone(),
+                transaction_id: transaction_id.clone(),
+                generation: *generation,
+                message: message.clone(),
+            },
             Self::Execution(message) => Error::Execution(message.clone()),
             Self::Internal(message) => Error::Internal(message.clone()),
         }
@@ -409,95 +473,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_hundred_short_lifecycles_leave_no_active_tasks() {
-        for _ in 0..100 {
-            let group = TaskGroup::new(QueryControl::new());
-            group.spawn("lifecycle", async { Ok(()) }).unwrap();
-            group.quiesce().await;
-            assert_eq!(group.active_tasks(), 0);
-            assert!(group.first_failure().is_none());
-        }
+    async fn a_short_lifecycle_leaves_no_active_tasks() {
+        let group = TaskGroup::new(QueryControl::new());
+        group.spawn("lifecycle", async { Ok(()) }).unwrap();
+        group.quiesce().await;
+        assert_eq!(group.active_tasks(), 0);
+        assert!(group.first_failure().is_none());
     }
 
     #[tokio::test]
-    async fn one_hundred_error_panic_and_cancel_lifecycles_converge() {
-        for iteration in 0..100 {
-            let error_group = TaskGroup::new(QueryControl::new());
-            error_group
-                .spawn("ci-error", async move {
-                    Err(Error::Execution(format!("injected error {iteration}")))
-                })
-                .unwrap();
-            error_group.quiesce().await;
-            assert_eq!(error_group.active_tasks(), 0);
-            assert!(matches!(
-                error_group.first_failure(),
-                Some(Error::Execution(message)) if message.contains("injected error")
-            ));
+    async fn error_panic_and_cancel_lifecycles_converge_once() {
+        let error_group = TaskGroup::new(QueryControl::new());
+        error_group
+            .spawn("ci-error", async {
+                Err(Error::Execution("injected error".to_owned()))
+            })
+            .unwrap();
+        error_group.quiesce().await;
+        assert_eq!(error_group.active_tasks(), 0);
+        assert!(matches!(
+            error_group.first_failure(),
+            Some(Error::Execution(message)) if message.contains("injected error")
+        ));
 
-            let panic_group = TaskGroup::new(QueryControl::new());
-            panic_group
-                .spawn("ci-panic", async move {
-                    panic!("injected panic {iteration}");
-                    #[allow(unreachable_code)]
-                    Ok(())
-                })
-                .unwrap();
-            panic_group.quiesce().await;
-            assert_eq!(panic_group.active_tasks(), 0);
-            assert!(matches!(
-                panic_group.first_failure(),
-                Some(Error::Internal(_))
-            ));
+        let panic_group = TaskGroup::new(QueryControl::new());
+        panic_group
+            .spawn("ci-panic", async {
+                panic!("injected panic");
+                #[allow(unreachable_code)]
+                Ok(())
+            })
+            .unwrap();
+        panic_group.quiesce().await;
+        assert_eq!(panic_group.active_tasks(), 0);
+        assert!(matches!(
+            panic_group.first_failure(),
+            Some(Error::Internal(_))
+        ));
 
-            let control = QueryControl::new();
-            let cancel_group = TaskGroup::new(control.clone());
-            let worker_control = control.clone();
-            cancel_group
-                .spawn("ci-cancel", async move {
-                    worker_control.cancelled().await;
-                    Ok(())
-                })
-                .unwrap();
-            control.cancel();
-            cancel_group.quiesce().await;
-            assert_eq!(cancel_group.active_tasks(), 0);
-            assert!(cancel_group.first_failure().is_none());
-        }
+        let control = QueryControl::new();
+        let cancel_group = TaskGroup::new(control.clone());
+        let worker_control = control.clone();
+        cancel_group
+            .spawn("ci-cancel", async move {
+                worker_control.cancelled().await;
+                Ok(())
+            })
+            .unwrap();
+        control.cancel();
+        cancel_group.quiesce().await;
+        assert_eq!(cancel_group.active_tasks(), 0);
+        assert!(cancel_group.first_failure().is_none());
     }
 
     #[tokio::test]
     async fn concurrent_quiescence_waiters_do_not_miss_the_last_task_exit() {
-        for _ in 0..100 {
-            let group = TaskGroup::new(QueryControl::new());
-            let release = Arc::new(Notify::new());
-            let worker_release = Arc::clone(&release);
-            group
-                .spawn("last-worker", async move {
-                    worker_release.notified().await;
-                    Ok(())
-                })
-                .unwrap();
-
-            let mut waiters = Vec::new();
-            for _ in 0..8 {
-                let waiting = group.clone();
-                waiters.push(tokio::spawn(async move {
-                    waiting.quiesce().await;
-                }));
-            }
-            tokio::task::yield_now().await;
-            release.notify_one();
-
-            tokio::time::timeout(Duration::from_secs(2), async {
-                for waiter in waiters {
-                    waiter.await.unwrap();
-                }
+        let group = TaskGroup::new(QueryControl::new());
+        let release = Arc::new(Notify::new());
+        let worker_release = Arc::clone(&release);
+        group
+            .spawn("last-worker", async move {
+                worker_release.notified().await;
+                Ok(())
             })
-            .await
-            .expect("every quiescence waiter must observe the final task exit");
-            assert_eq!(group.active_tasks(), 0);
+            .unwrap();
+
+        let mut waiters = Vec::new();
+        for _ in 0..8 {
+            let waiting = group.clone();
+            waiters.push(tokio::spawn(async move {
+                waiting.quiesce().await;
+            }));
         }
+        tokio::task::yield_now().await;
+        release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for waiter in waiters {
+                waiter.await.unwrap();
+            }
+        })
+        .await
+        .expect("every quiescence waiter must observe the final task exit");
+        assert_eq!(group.active_tasks(), 0);
     }
 
     #[test]

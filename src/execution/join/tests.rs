@@ -419,7 +419,7 @@ fn fragmented_build_batches_use_buffer_footprint_after_compaction() {
 }
 
 #[test]
-fn actual_hash_footprint_rejects_an_oversized_partition() {
+fn actual_generic_hash_footprint_rejects_an_oversized_partition() {
     const ROWS: i64 = 2_048;
     const MEMORY_LIMIT: usize = 256 << 10;
 
@@ -440,7 +440,10 @@ fn actual_hash_footprint_rejects_an_oversized_partition() {
         panic!("the compacted batch itself should fit before hash-key accounting")
     };
     let keys = super::evaluate_keys(
-        &[BoundExpr::column(0, DataType::Int64, "right.key")],
+        &[
+            BoundExpr::column(0, DataType::Int64, "right.key"),
+            BoundExpr::column(1, DataType::Int64, "right.value"),
+        ],
         &batch,
     )
     .unwrap();
@@ -472,7 +475,12 @@ async fn seeded_repartition_splits_an_initially_colliding_partition() {
     }
     assert!(next_seed_counts.into_iter().max().unwrap() < keys.len());
 
-    let (left_schema, right_schema) = schemas();
+    let (left_schema, _) = schemas();
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("right_id", DataType::Int64, false),
+        Field::new("padding", DataType::Int64, false),
+    ]));
     let left_batch = RecordBatch::try_new(
         Arc::clone(&left_schema),
         vec![
@@ -486,20 +494,23 @@ async fn seeded_repartition_splits_an_initially_colliding_partition() {
         vec![
             Arc::new(Int64Array::from(keys)),
             Arc::new(Int64Array::from_iter_values(0..ROWS as i64)),
+            Arc::new(Int64Array::from_iter_values(0..ROWS as i64)),
         ],
     )
     .unwrap();
 
-    let (batches, metrics) = run_join(
+    let (batches, metrics) = run_join_with_limit(
         JoinType::Inner,
         left_schema,
         right_schema,
         left_batch,
         right_batch,
+        512 << 10,
     )
     .await;
     assert_eq!(rows(&batches), ROWS);
     assert!(metrics.spill_partitions > 0);
+    assert!(metrics.spill_repartition_bytes > 0);
 }
 
 #[tokio::test]
@@ -627,7 +638,7 @@ async fn null_equal_semi_join_preserves_null_through_grace_spill() {
         .map(Some)
         .chain(std::iter::once(None))
         .collect::<Vec<_>>();
-    let batch = || {
+    let left_batch = || {
         RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -637,12 +648,28 @@ async fn null_equal_semi_join_preserves_null_through_grace_spill() {
         )
         .unwrap()
     };
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, true),
+        Field::new("value", DataType::Int64, false),
+        Field::new("padding", DataType::Int64, false),
+    ]));
+    let right_batch = || {
+        RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int64Array::from(keys.clone())),
+                Arc::new(Int64Array::from_iter_values(0..=ROWS)),
+                Arc::new(Int64Array::from_iter_values(0..=ROWS)),
+            ],
+        )
+        .unwrap()
+    };
     let left = boxed_record_batch_stream(futures::stream::once({
-        let batch = batch();
+        let batch = left_batch();
         async move { Ok(batch) }
     }));
     let right = boxed_record_batch_stream(futures::stream::once({
-        let batch = batch();
+        let batch = right_batch();
         async move { Ok(batch) }
     }));
     let temp = tempfile::tempdir().unwrap();
@@ -658,7 +685,7 @@ async fn null_equal_semi_join_preserves_null_through_grace_spill() {
         None,
         None,
         Arc::clone(&schema),
-        Arc::clone(&schema),
+        right_schema,
         JoinType::Semi,
         schema,
         Arc::clone(&context),
@@ -1215,10 +1242,16 @@ async fn run_parallel_grace_join(join_type: JoinType) -> (usize, QueryMetricsSna
     let batches = join(
         left,
         right,
-        vec![(
-            BoundExpr::column(0, DataType::Int64, "left.key"),
-            BoundExpr::column(0, DataType::Int64, "right.key"),
-        )],
+        vec![
+            (
+                BoundExpr::column(0, DataType::Int64, "left.key"),
+                BoundExpr::column(0, DataType::Int64, "right.key"),
+            ),
+            (
+                BoundExpr::column(1, DataType::Int64, "left.id"),
+                BoundExpr::column(1, DataType::Int64, "right.id"),
+            ),
+        ],
         None,
         None,
         left_schema,

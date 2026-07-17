@@ -24,6 +24,13 @@ pub(super) fn spawn_run(
 ) -> Result<()> {
     let tasks = context.tasks.clone();
     tasks.spawn("sort-run-lane", async move {
+        let _permit = tokio::select! {
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            permit = context.acquire_compute() => permit?,
+        };
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let generated = {
             let _active = context.scheduler.enter_lane();
             context.check_cancelled()?;
@@ -37,6 +44,7 @@ pub(super) fn spawn_run(
             context.metrics.observe_memory(context.memory.used());
             MemoryRun::new(sorted, workspace)
         };
+        drop(_permit);
         let started = Instant::now();
         let result = tokio::select! {
             _ = cancellation.cancelled() => Err(Error::Cancelled),

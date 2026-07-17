@@ -31,6 +31,12 @@ const SIGNATURES: &[Signature] = &[
     Signature::new(&["rtrim"], ScalarFunction::RTrim, 1, 2),
     Signature::new(&["concat"], ScalarFunction::Concat, 1, VARIADIC),
     Signature::new(&["replace"], ScalarFunction::Replace, 3, 3),
+    Signature::new(
+        &["regexp_replace", "regex_replace"],
+        ScalarFunction::RegexpReplace,
+        3,
+        3,
+    ),
     Signature::new(&["starts_with"], ScalarFunction::StartsWith, 2, 2),
     Signature::new(&["ends_with"], ScalarFunction::EndsWith, 2, 2),
     Signature::new(&["contains"], ScalarFunction::Contains, 2, 2),
@@ -40,6 +46,12 @@ const SIGNATURES: &[Signature] = &[
     Signature::new(&["ceil", "ceiling"], ScalarFunction::Ceil, 1, 1),
     Signature::new(&["floor"], ScalarFunction::Floor, 1, 1),
     Signature::new(&["round"], ScalarFunction::Round, 1, 2),
+    Signature::new(
+        &["to_timestamp_seconds"],
+        ScalarFunction::ToTimestampSeconds,
+        1,
+        1,
+    ),
 ];
 
 impl Signature {
@@ -187,7 +199,8 @@ fn make_function(
         | ScalarFunction::LTrim
         | ScalarFunction::RTrim
         | ScalarFunction::Concat
-        | ScalarFunction::Replace => {
+        | ScalarFunction::Replace
+        | ScalarFunction::RegexpReplace => {
             coerce_strings(&mut args, function)?;
             DataType::Utf8
         }
@@ -243,6 +256,16 @@ fn make_function(
             }
             args[0] = cast_if_needed(args[0].clone(), &target);
             decimal_numeric_output(function, &target, args.get(1))?
+        }
+        ScalarFunction::ToTimestampSeconds => {
+            if !is_integer(&args[0].data_type) {
+                return Err(Error::InvalidArgument(format!(
+                    "{function} requires an integer argument, got {}",
+                    args[0].data_type
+                )));
+            }
+            args[0] = cast_if_needed(args[0].clone(), &DataType::Int64);
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         }
         ScalarFunction::DatePart(_) | ScalarFunction::DateTrunc(_) => {
             return Err(Error::Internal(

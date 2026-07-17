@@ -1,4 +1,4 @@
-use arrow::array::{Array, Int64Array};
+use arrow::array::{Array, Decimal128Array, Int64Array};
 use futures::TryStreamExt;
 
 use crate::execution::execute;
@@ -593,12 +593,12 @@ async fn direct_scalar_aggregate_preserves_count_sum_and_multiple_aggregate_sema
     let sum = batches[0]
         .column(1)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Decimal128Array>()
         .unwrap();
     let combined = batches[0]
         .column(2)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Decimal128Array>()
         .unwrap();
     assert_eq!(count.value(0), 0);
     assert!(sum.is_null(0));

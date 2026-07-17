@@ -212,6 +212,7 @@ impl TableProvider for CsvTable {
         request: ScanRequest,
         context: Arc<QueryContext>,
     ) -> Result<RecordBatchStream> {
+        request.reject_unsupported_exact("CSV provider")?;
         if request.batch_size == 0 {
             return Err(Error::InvalidArgument(
                 "scan batch_size must be greater than zero".to_owned(),
@@ -271,6 +272,7 @@ impl TableProvider for CsvTable {
         context: Arc<QueryContext>,
         target_tasks: usize,
     ) -> Result<Vec<ScanTask>> {
+        request.reject_unsupported_exact("CSV provider")?;
         if request.batch_size == 0 {
             return Err(Error::InvalidArgument(
                 "scan batch_size must be greater than zero".to_owned(),
@@ -293,6 +295,7 @@ impl TableProvider for CsvTable {
         }
         let output_schema = request.projected_schema(&self.schema)?;
         let preclaim = estimate_schema_batch_bytes(output_schema.as_ref(), request.batch_size);
+        let task_count = task_count.min(self.files.len());
         let file_scan = CsvFileScan {
             schema: Arc::clone(&self.schema),
             options: self.options.clone(),
@@ -302,7 +305,6 @@ impl TableProvider for CsvTable {
         };
         let remaining = request.limit.map(|limit| Arc::new(AtomicUsize::new(limit)));
         let next_file = Arc::new(AtomicUsize::new(0));
-        let task_count = task_count.min(self.files.len());
         Ok((0..task_count)
             .map(|task| {
                 let files = Arc::clone(&self.files);
@@ -447,9 +449,14 @@ fn csv_file_stream(
 
                 let decoded = {
                     let _parser_lane = context.metrics.enter_csv_parser_lane();
-                    decoder
+                    let started = std::time::Instant::now();
+                    let decoded = decoder
                         .decode(&buffered[buffered_offset..buffered_len])
-                        .map_err(|error| csv_decode_error(file.uri(), error))?
+                        .map_err(|error| csv_decode_error(file.uri(), error));
+                    context
+                        .metrics
+                        .record_csv_decode_compute_time(started.elapsed());
+                    decoded?
                 };
                 if decoded == 0 {
                     break;
@@ -459,9 +466,14 @@ fn csv_file_stream(
 
             let batch = {
                 let _parser_lane = context.metrics.enter_csv_parser_lane();
-                decoder
+                let started = std::time::Instant::now();
+                let batch = decoder
                     .flush()
-                    .map_err(|error| csv_decode_error(file.uri(), error))?
+                    .map_err(|error| csv_decode_error(file.uri(), error));
+                context
+                    .metrics
+                    .record_csv_decode_compute_time(started.elapsed());
+                batch?
             };
             if let Some(batch) = batch {
                 context.metrics.record_scan(

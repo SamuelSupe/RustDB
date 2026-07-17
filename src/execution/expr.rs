@@ -11,13 +11,15 @@ use arrow::{
         filter_record_batch,
         kernels::{boolean, cmp, numeric},
     },
-    record_batch::RecordBatch,
+    record_batch::{RecordBatch, RecordBatchOptions},
 };
 
 use crate::runtime::estimate_array_bytes;
 use crate::sql::{BinaryOp, BoundExpr, ExprKind, ScalarValue, UnaryOp};
 use crate::{Error, Result};
 
+mod like;
+mod scalar_compare;
 mod short_circuit;
 
 pub(crate) fn evaluate(expr: &BoundExpr, batch: &RecordBatch) -> Result<ArrayRef> {
@@ -59,6 +61,9 @@ pub(crate) fn evaluate(expr: &BoundExpr, batch: &RecordBatch) -> Result<ArrayRef
             short_circuit::boolean(*op, left, right, batch)
         }
         ExprKind::Binary { left, op, right } => {
+            if let Some(result) = scalar_compare::try_evaluate(left, *op, right, batch) {
+                return result;
+            }
             let left = evaluate(left, batch)?;
             let right = evaluate(right, batch)?;
             evaluate_binary(*op, left, right)
@@ -86,8 +91,16 @@ pub(crate) fn evaluate(expr: &BoundExpr, batch: &RecordBatch) -> Result<ArrayRef
             escape,
         } => {
             let expr = evaluate(expr, batch)?;
-            let pattern = evaluate(pattern, batch)?;
-            Ok(Arc::new(evaluate_like(&expr, &pattern, *negated, *escape)?))
+            let result = match &pattern.kind {
+                ExprKind::Literal(ScalarValue::Utf8(pattern)) => {
+                    like::evaluate_literal(&expr, pattern, *negated, *escape)?
+                }
+                _ => {
+                    let pattern = evaluate(pattern, batch)?;
+                    like::evaluate(&expr, &pattern, *negated, *escape)?
+                }
+            };
+            Ok(Arc::new(result))
         }
         ExprKind::Case {
             when_then,
@@ -105,7 +118,76 @@ pub(crate) fn project(
         .iter()
         .map(|expr| evaluate(expr, batch))
         .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(schema, columns)?)
+    projected_batch(schema, columns, batch.num_rows())
+}
+
+/// Builds an internal Aggregate-input batch while retaining dictionary arrays
+/// explicitly requested by the grouped scan fast path. The logical field name,
+/// nullability and metadata are preserved; Aggregate materializes its public
+/// output back to the logical value type.
+pub(crate) fn project_preserving_dictionaries(
+    expressions: &[BoundExpr],
+    logical_schema: arrow::datatypes::SchemaRef,
+    batch: &RecordBatch,
+    dictionary_columns: &[usize],
+) -> Result<RecordBatch> {
+    let mut columns = expressions
+        .iter()
+        .map(|expression| evaluate(expression, batch))
+        .collect::<Result<Vec<_>>>()?;
+    if columns.len() != logical_schema.fields().len() {
+        return Err(Error::Internal(format!(
+            "projection produced {} columns for a {}-field schema",
+            columns.len(),
+            logical_schema.fields().len()
+        )));
+    }
+    let fields = logical_schema
+        .fields()
+        .iter()
+        .zip(&columns)
+        .enumerate()
+        .map(|(index, (field, column))| match column.data_type() {
+            arrow::datatypes::DataType::Dictionary(_, value)
+                if dictionary_columns.contains(&index) && value.as_ref() == field.data_type() =>
+            {
+                Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(column.data_type().clone()),
+                )
+            }
+            _ => Arc::clone(field),
+        })
+        .collect::<Vec<_>>();
+    for (index, column) in columns.iter_mut().enumerate() {
+        if dictionary_columns.contains(&index) {
+            continue;
+        }
+        if matches!(column.data_type(), arrow::datatypes::DataType::Dictionary(_, value)
+            if value.as_ref() == logical_schema.field(index).data_type())
+        {
+            *column =
+                arrow::compute::cast(column.as_ref(), logical_schema.field(index).data_type())?;
+        }
+    }
+    let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        logical_schema.metadata().clone(),
+    ));
+    projected_batch(schema, columns, batch.num_rows())
+}
+
+fn projected_batch(
+    schema: arrow::datatypes::SchemaRef,
+    columns: Vec<ArrayRef>,
+    rows: usize,
+) -> Result<RecordBatch> {
+    let options = RecordBatchOptions::new().with_row_count(Some(rows));
+    Ok(RecordBatch::try_new_with_options(
+        schema, columns, &options,
+    )?)
 }
 
 pub(crate) fn filter(predicate: &BoundExpr, batch: &RecordBatch) -> Result<RecordBatch> {
@@ -142,11 +224,14 @@ struct ExpressionMemory {
 fn expression_memory(expression: &BoundExpr, batch: &RecordBatch) -> ExpressionMemory {
     let output = expression_output_bytes(expression, batch);
     match &expression.kind {
+        // A projected column is an Arc clone of an input array. The input
+        // envelope already owns its buffers, so only the RecordBatch/ArrayRef
+        // container overhead below is new projection workspace.
         ExprKind::Column(_)
         | ExprKind::OuterRef { .. }
         | ExprKind::DeferredGroup(_)
-        | ExprKind::DeferredAggregate(_)
-        | ExprKind::Literal(_) => ExpressionMemory {
+        | ExprKind::DeferredAggregate(_) => ExpressionMemory { output: 0, peak: 0 },
+        ExprKind::Literal(_) => ExpressionMemory {
             output,
             peak: output,
         },
@@ -178,6 +263,13 @@ fn expression_memory(expression: &BoundExpr, batch: &RecordBatch) -> ExpressionM
             estimate
         }
         ExprKind::Binary { left, op, right } => {
+            if let Some(input) = scalar_compare::array_operand(left, *op, right) {
+                let input = expression_memory(input, batch);
+                return ExpressionMemory {
+                    output,
+                    peak: input.peak.max(input.output.saturating_add(output)),
+                };
+            }
             let mut estimate = binary_expression_memory(left, right, output, batch);
             if matches!(op, BinaryOp::And | BinaryOp::Or) && !right.is_structurally_infallible() {
                 estimate.peak = estimate.peak.saturating_add(masked_input_bytes(batch));
@@ -188,7 +280,20 @@ fn expression_memory(expression: &BoundExpr, batch: &RecordBatch) -> ExpressionM
             expr: left,
             pattern: right,
             ..
-        } => binary_expression_memory(left, right, output, batch),
+        } => {
+            if let ExprKind::Literal(ScalarValue::Utf8(pattern)) = &right.kind {
+                let left = expression_memory(left, batch);
+                let workspace = like::literal_workspace_bytes(pattern);
+                ExpressionMemory {
+                    output,
+                    peak: left
+                        .peak
+                        .max(left.output.saturating_add(output).saturating_add(workspace)),
+                }
+            } else {
+                binary_expression_memory(left, right, output, batch)
+            }
+        }
         ExprKind::Case {
             when_then,
             else_expr,
@@ -508,85 +613,6 @@ fn literal_array(value: &ScalarValue, len: usize) -> Result<ArrayRef> {
     Ok(array)
 }
 
-fn evaluate_like(
-    values: &ArrayRef,
-    patterns: &ArrayRef,
-    negated: bool,
-    escape: Option<char>,
-) -> Result<BooleanArray> {
-    let values = values
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::Internal(format!("LIKE input has type {}", values.data_type())))?;
-    let patterns = patterns
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            Error::Internal(format!("LIKE pattern has type {}", patterns.data_type()))
-        })?;
-    let output = (0..values.len())
-        .map(|row| {
-            if values.is_null(row) || patterns.is_null(row) {
-                Ok(None)
-            } else {
-                Ok(Some(
-                    like_matches(values.value(row), patterns.value(row), escape)? ^ negated,
-                ))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(BooleanArray::from(output))
-}
-
-fn like_matches(value: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
-    let tokens = like_tokens(pattern, escape)?;
-    let value = value.chars().collect::<Vec<_>>();
-    let mut previous = vec![false; value.len() + 1];
-    previous[0] = true;
-    for token in tokens {
-        let mut current = vec![false; value.len() + 1];
-        if token == LikeToken::Any {
-            current[0] = previous[0];
-        }
-        for index in 1..=value.len() {
-            current[index] = match token {
-                LikeToken::Any => previous[index] || current[index - 1],
-                LikeToken::One => previous[index - 1],
-                LikeToken::Literal(expected) => previous[index - 1] && value[index - 1] == expected,
-            };
-        }
-        previous = current;
-    }
-    Ok(previous[value.len()])
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum LikeToken {
-    Any,
-    One,
-    Literal(char),
-}
-
-fn like_tokens(pattern: &str, escape: Option<char>) -> Result<Vec<LikeToken>> {
-    let mut characters = pattern.chars();
-    let mut tokens = Vec::with_capacity(pattern.len());
-    while let Some(character) = characters.next() {
-        if escape == Some(character) {
-            let literal = characters.next().ok_or_else(|| {
-                Error::InvalidArgument("LIKE pattern ends with its ESCAPE character".into())
-            })?;
-            tokens.push(LikeToken::Literal(literal));
-        } else {
-            tokens.push(match character {
-                '%' => LikeToken::Any,
-                '_' => LikeToken::One,
-                literal => LikeToken::Literal(literal),
-            });
-        }
-    }
-    Ok(tokens)
-}
-
 fn as_boolean(array: &ArrayRef) -> Result<&BooleanArray> {
     array
         .as_any()
@@ -595,6 +621,9 @@ fn as_boolean(array: &ArrayRef) -> Result<&BooleanArray> {
             Error::Execution(format!("expected BOOLEAN array, got {}", array.data_type()))
         })
 }
+
+#[cfg(test)]
+mod projection_memory_tests;
 
 #[cfg(test)]
 mod tests;

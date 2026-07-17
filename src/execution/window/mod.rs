@@ -111,14 +111,19 @@ where
                     "window input expression workspace",
                 )
                 .await?;
-            let partition_keys = keys::evaluate_keys(&partition_exprs, batch.batch())?;
-            let aggregate_inputs = spool::aggregate_inputs(&expressions, batch.batch())?;
-            let key_payload = (0..batch.num_rows()).try_fold(
-                0usize,
-                |bytes, row| -> Result<usize> {
-                    Ok(bytes.max(memory::row_payload_bytes(&partition_keys, row)?))
-                },
-            )?;
+            let (partition_keys, aggregate_inputs, key_payload) = {
+                let _compute = context.acquire_compute().await?;
+                let _active = context.scheduler.enter_lane();
+                let partition_keys = keys::evaluate_keys(&partition_exprs, batch.batch())?;
+                let aggregate_inputs = spool::aggregate_inputs(&expressions, batch.batch())?;
+                let key_payload = (0..batch.num_rows()).try_fold(
+                    0usize,
+                    |bytes, row| -> Result<usize> {
+                        Ok(bytes.max(memory::row_payload_bytes(&partition_keys, row)?))
+                    },
+                )?;
+                (partition_keys, aggregate_inputs, key_payload)
+            };
             let key_workspace_bytes = key_payload.saturating_add(
                 partition_exprs
                     .len()
@@ -144,17 +149,35 @@ where
                 .await?;
             let mut start = 0usize;
             while start < batch.num_rows() {
-                let key = keys::row_key(&partition_keys, start)?;
-                let mut end = start + 1;
-                while end < batch.num_rows()
-                    && keys::row_key(&partition_keys, end)? == key
-                {
-                    end += 1;
-                }
-                if pending
-                    .as_ref()
-                    .is_some_and(|partition| !partition.matches(&key))
-                {
+                let (key, end, partition_changed, state_updated) = {
+                    let _compute = context.acquire_compute().await?;
+                    let _active = context.scheduler.enter_lane();
+                    let key = keys::row_key(&partition_keys, start)?;
+                    let mut end = start + 1;
+                    while end < batch.num_rows()
+                        && keys::row_key(&partition_keys, end)? == key
+                    {
+                        end += 1;
+                    }
+                    let partition_changed = pending
+                        .as_ref()
+                        .is_some_and(|partition| !partition.matches(&key));
+                    let state_updated = if !partition_changed
+                        && let Some(partition) = pending.as_mut()
+                    {
+                        partition.update(
+                            start,
+                            end - start,
+                            &expressions,
+                            &aggregate_inputs,
+                        )?;
+                        true
+                    } else {
+                        false
+                    };
+                    (key, end, partition_changed, state_updated)
+                };
+                if partition_changed {
                     spawn_partition(
                         pending.take().expect("pending checked above").finish()?,
                         expressions.clone(),
@@ -179,12 +202,24 @@ where
                         &expressions,
                     )?);
                 }
-                pending.as_mut().expect("partition initialized").write(
+                if !state_updated {
+                    let _compute = context.acquire_compute().await?;
+                    let _active = context.scheduler.enter_lane();
+                    pending.as_mut().expect("partition initialized").update(
+                        start,
+                        end - start,
+                        &expressions,
+                        &aggregate_inputs,
+                    )?;
+                }
+                // Spill I/O is deliberately outside the global compute slot.
+                pending
+                    .as_mut()
+                    .expect("partition initialized")
+                    .write_slice(
                     batch.batch(),
                     start,
                     end - start,
-                    &expressions,
-                    &aggregate_inputs,
                 )?;
                 start = end;
             }
@@ -226,9 +261,6 @@ fn spawn_partition(
 ) -> Result<()> {
     let tasks = context.tasks.clone();
     tasks.spawn("window-partition-lane", async move {
-        let _active = context.scheduler.enter_lane();
-        #[cfg(test)]
-        fault_injection::panic_if_armed(context.query_id);
         let mut output = output::process(
             partition,
             expressions,

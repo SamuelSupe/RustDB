@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, BooleanArray, Int64Array},
+    array::{Array, BooleanArray, Decimal128Array, Int64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -137,7 +137,13 @@ async fn having_uses_the_last_duplicate_alias() {
          GROUP BY a HAVING z > 5 ORDER BY 2",
     )
     .await;
-    assert_eq!(int64_pairs(&batches), vec![(1, 10), (2, 30)]);
+    assert_eq!(
+        int64_column(&batches, 0)
+            .into_iter()
+            .zip(decimal_column(&batches, 1))
+            .collect::<Vec<_>>(),
+        vec![(1, 10), (2, 30)]
+    );
 }
 
 #[tokio::test]
@@ -319,6 +325,22 @@ fn optional_int64_column(batches: &[RecordBatch], column: usize) -> Vec<Option<i
                 .unwrap();
             (0..array.len())
                 .map(|row| (!array.is_null(row)).then(|| array.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn decimal_column(batches: &[RecordBatch], column: usize) -> Vec<i128> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| array.value(row))
                 .collect::<Vec<_>>()
         })
         .collect()

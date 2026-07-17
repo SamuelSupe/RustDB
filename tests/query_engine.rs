@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
 use arrow::{
-    array::{Array, Int64Array, StringArray},
+    array::{Array, Decimal128Array, Int64Array, StringArray},
     datatypes::DataType,
 };
 use futures::StreamExt;
@@ -102,7 +102,7 @@ async fn groups_and_aggregates_csv() -> Result<()> {
         let payroll = batch
             .column(2)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Decimal128Array>()
             .unwrap();
         for row in 0..batch.num_rows() {
             values.insert(

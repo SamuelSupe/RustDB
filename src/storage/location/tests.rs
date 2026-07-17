@@ -1,5 +1,8 @@
 use std::{fs, sync::Arc};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::{fs::FileTimes, time::Duration};
+
 use object_store::ObjectStoreExt;
 use tempfile::tempdir;
 
@@ -51,6 +54,38 @@ async fn query_resolution_registers_the_initial_object_identity() {
     assert!(error.to_string().contains("identity changed"));
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn local_snapshot_detects_same_size_mutation_with_restored_mtime() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("identity.bin");
+    fs::write(&path, b"before").unwrap();
+    let object = LocationResolver::new(S3Config::default())
+        .resolve(&[path.display().to_string()])
+        .await
+        .unwrap()
+        .remove(0);
+    let before = object.snapshot().clone();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+    std::thread::sleep(Duration::from_millis(2));
+    fs::write(&path, b"after!").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(modified))
+        .unwrap();
+
+    let after = object.head_snapshot().await.unwrap();
+    assert_eq!(before.size, after.size);
+    assert_eq!(
+        before.e_tag, after.e_tag,
+        "weak local ETag unexpectedly changed"
+    );
+    assert_ne!(before.local_identity, after.local_identity);
+}
+
 #[tokio::test]
 async fn get_response_must_preserve_every_snapshotted_identity_token() {
     let directory = tempdir().unwrap();
@@ -68,6 +103,7 @@ async fn get_response_must_preserve_every_snapshotted_identity_token() {
         size: response.size,
         e_tag: Some("expected-etag".to_owned()),
         version: Some("expected-version".to_owned()),
+        local_identity: None,
     };
 
     let error = expected
@@ -77,6 +113,25 @@ async fn get_response_must_preserve_every_snapshotted_identity_token() {
 
     assert!(error.contains("object changed during query"), "{error}");
     assert!(error.contains("identity.csv"), "{error}");
+}
+
+#[tokio::test]
+async fn local_get_response_accepts_its_wire_identity_without_an_fd_identity() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("identity.csv");
+    fs::write(&path, b"value\n1\n").unwrap();
+    let object = LocationResolver::new(S3Config::default())
+        .resolve(&[path.display().to_string()])
+        .await
+        .unwrap()
+        .remove(0);
+    let expected = object.head_snapshot().await.unwrap();
+    assert!(expected.local_identity.is_some());
+
+    let response = object.store().get(object.location()).await.unwrap();
+    expected
+        .validate_get_response(object.uri(), &response.meta)
+        .unwrap();
 }
 
 #[tokio::test]

@@ -1,7 +1,10 @@
 use std::{fs::File, sync::Arc};
 
 use arrow::{
-    array::{ArrayRef, Float64Array, Int64Array, StringArray, StringDictionaryBuilder},
+    array::{
+        Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+        StringDictionaryBuilder,
+    },
     datatypes::{DataType, Field, Int8Type, Schema},
     record_batch::RecordBatch,
 };
@@ -37,6 +40,105 @@ fn write_fixture(path: &std::path::Path) -> Result<()> {
     )?;
     writer.write(&batch)?;
     writer.close()?;
+    Ok(())
+}
+
+fn write_q6_fixture(path: &std::path::Path) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_shipdate", DataType::Date32, false),
+        Field::new("l_discount", DataType::Decimal128(15, 2), false),
+        Field::new("l_quantity", DataType::Int64, false),
+        Field::new("l_extendedprice", DataType::Decimal128(15, 2), false),
+    ]));
+    let discount = Decimal128Array::from(vec![5_i128, 5, 5]).with_precision_and_scale(15, 2)?;
+    let price =
+        Decimal128Array::from(vec![10_000_i128, 28_000, 30_000]).with_precision_and_scale(15, 2)?;
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Date32Array::from(vec![8_766, 8_766, 9_131])),
+            Arc::new(discount),
+            Arc::new(Int64Array::from(vec![10, 10, 10])),
+            Arc::new(price),
+        ],
+    )?;
+    let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn q6_exact_filter_drops_filter_only_scan_columns() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("q6-exact.parquet");
+    write_q6_fixture(&path)?;
+    let session = Engine::new(EngineConfig::default())?.session();
+    session
+        .register_parquet(
+            "lineitem_q6_exact",
+            [path.to_string_lossy().into_owned()],
+            ParquetOptions::default(),
+        )
+        .await?;
+    let query = "SELECT sum(l_extendedprice * l_discount) AS revenue \
+                 FROM lineitem_q6_exact \
+                 WHERE l_shipdate >= DATE '1994-01-01' \
+                   AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR \
+                   AND l_discount BETWEEN 0.04 AND 0.06 \
+                   AND l_quantity < 24";
+    let mut explain = session.execute(&format!("EXPLAIN {query}")).await?;
+    let batch = explain.stream().next().await.unwrap()?;
+    let text = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_owned();
+    drop(explain);
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.trim_start().starts_with("Filter ")),
+        "{text}"
+    );
+    assert!(
+        text.contains("projection=Some([1, 3]) filter=exact"),
+        "{text}"
+    );
+
+    let mut result = session.execute(query).await?;
+    let batch = result.stream().next().await.unwrap()?;
+    let revenue = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(revenue.data_type(), &DataType::Decimal128(38, 4));
+    assert_eq!(revenue.value(0), 190_000);
+    drop(result);
+
+    let count = "SELECT count(*) FROM lineitem_q6_exact WHERE l_quantity < 24";
+    let mut explain = session.execute(&format!("EXPLAIN {count}")).await?;
+    let batch = explain.stream().next().await.unwrap()?;
+    let text = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_owned();
+    drop(explain);
+    assert!(text.contains("projection=Some([]) filter=exact"), "{text}");
+    let mut result = session.execute(count).await?;
+    let batch = result.stream().next().await.unwrap()?;
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 3);
     Ok(())
 }
 

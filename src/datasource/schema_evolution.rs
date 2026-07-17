@@ -36,6 +36,15 @@ pub(crate) fn align_batch_to_schema(
     alignment::align_batch_to_schema(batch, target, uri)
 }
 
+pub(crate) fn align_batch_to_schema_preserving_dictionaries(
+    batch: RecordBatch,
+    target: SchemaRef,
+    uri: &str,
+    dictionary_columns: &[usize],
+) -> Result<RecordBatch> {
+    alignment::align_batch_to_schema_preserving_dictionaries(batch, target, uri, dictionary_columns)
+}
+
 pub(crate) fn canonicalize_schema(schema: SchemaRef) -> SchemaRef {
     if schema
         .fields()

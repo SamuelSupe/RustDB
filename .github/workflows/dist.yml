@@ -1,0 +1,58 @@
+name: Distribution
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - target: macos-aarch64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned Rust toolchain
+        run: scripts/ci/install-rust.sh
+      - name: Cache Cargo sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: dist-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            dist-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build release CLI
+        run: cargo build --locked --release --bin rustdb
+      - name: Package and validate
+        run: >-
+          scripts/dist/package.sh
+          --binary target/release/rustdb
+          --output dist
+          --target ${{ matrix.target }}
+          --check
+      - name: Upload distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustdb-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

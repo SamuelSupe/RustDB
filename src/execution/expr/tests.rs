@@ -9,11 +9,25 @@ use arrow::{
 };
 use futures::TryStreamExt;
 
-use super::evaluate;
+use super::{evaluate, project};
 use crate::Catalog;
 use crate::execution::execute;
 use crate::runtime::{MemoryPool, QueryContext};
 use crate::sql::{BinaryOp, BoundExpr, ExprKind, ScalarValue};
+
+#[test]
+fn empty_projection_preserves_input_row_count() {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+
+    let projected = project(&[], Arc::new(Schema::empty()), &batch).unwrap();
+
+    assert_eq!(projected.num_columns(), 0);
+    assert_eq!(projected.num_rows(), 3);
+}
 
 #[test]
 fn evaluates_vectorized_arithmetic() {
@@ -374,7 +388,7 @@ async fn executes_decimal_sum_and_average_semantics() {
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .unwrap();
-    assert_eq!(sum.data_type(), &DataType::Decimal128(5, 2));
+    assert_eq!(sum.data_type(), &DataType::Decimal128(38, 2));
     assert_eq!(sum.value(0), 125);
 
     let average = batches[0]
@@ -386,6 +400,6 @@ async fn executes_decimal_sum_and_average_semantics() {
     assert!(batches[0].column(2).is_null(0));
     assert_eq!(
         batches[0].column(2).data_type(),
-        &DataType::Decimal128(5, 2)
+        &DataType::Decimal128(38, 2)
     );
 }

@@ -67,6 +67,36 @@ pub(super) fn remap_predicate(
     }
 }
 
+pub(super) fn remap_exact_predicate(
+    predicate: &ScanPredicate,
+    source: &Schema,
+    target: &Schema,
+) -> Result<ScanPredicate> {
+    remap_predicate(predicate, source, target).ok_or_else(|| {
+        let column = missing_column(predicate, source, target)
+            .and_then(|index| source.fields().get(index))
+            .map_or_else(|| "<unknown>".to_owned(), |field| field.name().clone());
+        Error::Execution(format!(
+            "exact Parquet predicate column '{column}' is absent from the query snapshot"
+        ))
+    })
+}
+
+fn missing_column(predicate: &ScanPredicate, source: &Schema, target: &Schema) -> Option<usize> {
+    match predicate {
+        ScanPredicate::Comparison { column, .. }
+        | ScanPredicate::IsNull { column }
+        | ScanPredicate::IsNotNull { column } => source
+            .fields()
+            .get(*column)
+            .filter(|field| target.index_of(field.name()).is_err())
+            .map(|_| *column),
+        ScanPredicate::And(predicates) | ScanPredicate::Or(predicates) => predicates
+            .iter()
+            .find_map(|predicate| missing_column(predicate, source, target)),
+    }
+}
+
 pub(super) fn reorder_schema(current: &SchemaRef, previous: Option<&Schema>) -> SchemaRef {
     let Some(previous) = previous else {
         return Arc::clone(current);
@@ -108,7 +138,8 @@ pub(super) fn nullable_schema(schema: &Schema) -> SchemaRef {
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use super::reorder_schema;
+    use super::{remap_exact_predicate, reorder_schema};
+    use crate::{Error, datasource::ScanPredicate};
 
     fn schema(names: &[&str]) -> std::sync::Arc<Schema> {
         std::sync::Arc::new(Schema::new(
@@ -141,5 +172,15 @@ mod tests {
             names(&reorder_schema(&current, Some(&previous))),
             ["b", "a", "d"]
         );
+    }
+
+    #[test]
+    fn exact_remap_reports_a_missing_snapshot_column() {
+        let registered = schema(&["id", "payload"]);
+        let snapshot = schema(&["id"]);
+        let error =
+            remap_exact_predicate(&ScanPredicate::IsNull { column: 1 }, &registered, &snapshot)
+                .unwrap_err();
+        assert!(matches!(error, Error::Execution(message) if message.contains("payload")));
     }
 }

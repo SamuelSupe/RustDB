@@ -6,12 +6,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Result,
-    datasource::{ScanRequest, ScanTask},
+    datasource::{PredicateGuarantee, ScanRequest, ScanTask},
     runtime::{BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream},
-    sql::BoundExpr,
 };
 
-use super::{FusedPipeline, PipelineOperator, compact, profile::PipelineProfile};
+use super::{
+    FusedPipeline, PipelineOperator, compact, dictionary::GroupDictionaryPlan,
+    profile::PipelineProfile,
+};
 use crate::execution::{expr, scan};
 
 enum LaneMessage {
@@ -21,27 +23,56 @@ enum LaneMessage {
 
 struct LanePlan {
     operators: Vec<PipelineOperator>,
-    compact_filters: Option<Vec<BoundExpr>>,
+    compact: Option<compact::CompactPlan>,
     projection: Option<Vec<usize>>,
     scan_schema: arrow::datatypes::SchemaRef,
+    dictionary_outputs: Vec<usize>,
     profile: Arc<PipelineProfile>,
 }
 
 pub(super) fn execute(
     pipeline: FusedPipeline,
+    dictionaries: GroupDictionaryPlan,
+    decode_batch_size: Option<usize>,
     context: Arc<QueryContext>,
     parent_id: Option<u64>,
 ) -> MemoryBatchStream {
     boxed_memory_batch_stream(async_stream::try_stream! {
+        let preserve_dictionaries = dictionaries.enabled();
         let profile = Arc::new(PipelineProfile::new(&context, &pipeline, parent_id));
         let mut request = ScanRequest::new(context.batch_size);
         request.projection = pipeline.scan.projection.clone();
-        request.predicate = pipeline
-            .scan
-            .pushed_filter
-            .as_ref()
-            .and_then(scan::to_scan_predicate);
+        request.predicate = pipeline.scan.exact_filter.clone().or_else(|| {
+            pipeline
+                .scan
+                .pushed_filter
+                .as_ref()
+                .and_then(scan::to_scan_predicate)
+        });
+        if pipeline.scan.exact_filter.is_some() {
+            request.predicate_guarantee = PredicateGuarantee::Exact;
+        }
         request.limit = pipeline.scan.limit;
+        request.dictionary_columns = dictionaries.scan_columns;
+
+        // Validate the fused remap before a provider allocates scan tasks or
+        // starts source work.
+        let compact = compact::plan(&pipeline.operators, pipeline.scan.projection.as_deref())?;
+        if preserve_dictionaries && compact.is_none() {
+            Err(crate::Error::Internal(
+                "dictionary scan hint requires a compact terminal projection".into(),
+            ))?;
+        }
+        if decode_batch_size.is_some()
+            && pipeline.scan.exact_filter.is_none()
+            && pipeline.scan.pushed_filter.is_none()
+            && !pipeline
+                .operators
+                .iter()
+                .any(|operator| matches!(operator, PipelineOperator::Filter(_)))
+        {
+            request.decode_batch_size = decode_batch_size;
+        }
 
         let target = context.scheduler.configured_lanes();
         let tasks = pipeline
@@ -54,12 +85,12 @@ pub(super) fn execute(
         }
 
         let lanes = context.scheduler.lanes_for(tasks.len());
-        let compact_filters = compact_filters(&pipeline.operators, pipeline.scan.projection.as_deref())?;
         let lane_plan = Arc::new(LanePlan {
             operators: pipeline.operators,
-            compact_filters,
+            compact,
             projection: pipeline.scan.projection,
             scan_schema: pipeline.scan.schema,
+            dictionary_outputs: dictionaries.output_columns,
             profile,
         });
         let pending = Arc::new(Mutex::new(VecDeque::from(tasks)));
@@ -138,22 +169,20 @@ async fn run_lane_inner(
         tracing::trace!(scan_task = task.id(), "starting scan task");
         let mut input = task.into_stream();
         loop {
-            // A lane waiting for downstream channel capacity is not active
-            // compute work.  Hold the metric guard while polling/decoding and
-            // running fused kernels, then release it before the bounded send.
-            let active = context.scheduler.enter_lane();
+            // Source polling may wait for object I/O. Fused kernels acquire an
+            // engine-wide compute slot only after their memory workspace is ready.
             let scan_started = Instant::now();
             let next = input.next().await;
             let scan_wait = scan_started.elapsed();
             let Some(batch) = next else {
-                drop(active);
                 break;
             };
             check_running(cancellation, context)?;
             let mut batch = batch?;
             plan.profile.record_scan(batch.batch(), scan_wait);
             let mut emit = true;
-            if let Some(filters) = plan.compact_filters.as_deref() {
+            if let Some(compact) = plan.compact.as_ref() {
+                let filters = &compact.filters;
                 for (operator, predicate) in filters.iter().enumerate() {
                     plan.profile.record_input(operator, batch.batch());
                     let started = Instant::now();
@@ -164,7 +193,10 @@ async fn run_lane_inner(
                             "compact pipeline filter workspace",
                         )
                         .await?;
-                    let filtered = expr::filter(predicate, batch.batch())?;
+                    let filtered = run_compute(context, cancellation, || {
+                        expr::filter(predicate, batch.batch())
+                    })
+                    .await?;
                     if filtered.num_rows() == 0 {
                         plan.profile
                             .record_output(operator, None, started.elapsed());
@@ -179,15 +211,57 @@ async fn run_lane_inner(
                     plan.profile
                         .record_output(operator, Some(batch.batch()), started.elapsed());
                 }
+                if emit && let Some(projection) = compact.projection.as_ref() {
+                    let operator = filters.len();
+                    plan.profile.record_input(operator, batch.batch());
+                    let started = Instant::now();
+                    let workspace = context
+                        .reserve_memory_while_holding(
+                            expr::projection_workspace_bytes(
+                                &projection.expressions,
+                                batch.batch(),
+                            ),
+                            batch.memory_size(),
+                            "compact pipeline projection workspace",
+                        )
+                        .await?;
+                    let projected = run_compute(context, cancellation, || {
+                        if !plan.dictionary_outputs.is_empty() {
+                            expr::project_preserving_dictionaries(
+                                &projection.expressions,
+                                Arc::clone(&projection.schema),
+                                batch.batch(),
+                                &plan.dictionary_outputs,
+                            )
+                        } else {
+                            expr::project(
+                                &projection.expressions,
+                                Arc::clone(&projection.schema),
+                                batch.batch(),
+                            )
+                        }
+                    })
+                    .await?;
+                    batch = batch.replace_with_reservation(
+                        projected,
+                        workspace,
+                        "compact pipeline projection",
+                    )?;
+                    plan.profile
+                        .record_output(operator, Some(batch.batch()), started.elapsed());
+                }
             }
             if !emit {
-                drop(active);
                 continue;
             }
-            if let Some(projection) = plan
-                .projection
-                .as_deref()
-                .filter(|projection| !projection.is_empty())
+            if plan
+                .compact
+                .as_ref()
+                .is_none_or(|compact| compact.projection.is_none())
+                && let Some(projection) = plan
+                    .projection
+                    .as_deref()
+                    .filter(|projection| !projection.is_empty())
             {
                 let workspace = context
                     .reserve_memory_while_holding(
@@ -199,8 +273,10 @@ async fn run_lane_inner(
                         "scan projection expansion workspace",
                     )
                     .await?;
-                let expanded =
-                    scan::expand_projection(batch.batch().clone(), &plan.scan_schema, projection)?;
+                let expanded = run_compute(context, cancellation, || {
+                    scan::expand_projection(batch.batch().clone(), &plan.scan_schema, projection)
+                })
+                .await?;
                 batch = batch.replace_with_reservation(
                     expanded,
                     workspace,
@@ -210,7 +286,7 @@ async fn run_lane_inner(
             for (operator_index, operator) in plan
                 .operators
                 .iter()
-                .filter(|_| plan.compact_filters.is_none())
+                .filter(|_| plan.compact.is_none())
                 .enumerate()
             {
                 plan.profile.record_input(operator_index, batch.batch());
@@ -224,7 +300,10 @@ async fn run_lane_inner(
                                 "pipeline filter workspace",
                             )
                             .await?;
-                        let filtered = expr::filter(predicate, batch.batch())?;
+                        let filtered = run_compute(context, cancellation, || {
+                            expr::filter(predicate, batch.batch())
+                        })
+                        .await?;
                         if filtered.num_rows() == 0 {
                             plan.profile
                                 .record_output(operator_index, None, started.elapsed());
@@ -253,8 +332,10 @@ async fn run_lane_inner(
                                 "pipeline projection workspace",
                             )
                             .await?;
-                        let projected =
-                            expr::project(expressions, Arc::clone(schema), batch.batch())?;
+                        let projected = run_compute(context, cancellation, || {
+                            expr::project(expressions, Arc::clone(schema), batch.batch())
+                        })
+                        .await?;
                         batch = batch.replace_with_reservation(
                             projected,
                             workspace,
@@ -268,7 +349,6 @@ async fn run_lane_inner(
                     }
                 }
             }
-            drop(active);
             if emit {
                 send_batch(sender, batch, cancellation, context).await?;
             }
@@ -276,29 +356,18 @@ async fn run_lane_inner(
     }
 }
 
-fn compact_filters(
-    operators: &[PipelineOperator],
-    projection: Option<&[usize]>,
-) -> Result<Option<Vec<BoundExpr>>> {
-    let Some(projection) = projection.filter(|projection| !projection.is_empty()) else {
-        return Ok(None);
+async fn run_compute<T>(
+    context: &QueryContext,
+    cancellation: &CancellationToken,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _permit = tokio::select! {
+        _ = cancellation.cancelled() => return Err(crate::Error::Cancelled),
+        permit = context.acquire_compute() => permit?,
     };
-    if !operators
-        .iter()
-        .all(|operator| matches!(operator, PipelineOperator::Filter(_)))
-    {
-        return Ok(None);
-    }
-    operators
-        .iter()
-        .map(|operator| {
-            let PipelineOperator::Filter(predicate) = operator else {
-                unreachable!("all operators were checked as filters")
-            };
-            compact::remap_filter(predicate, projection)
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
+    check_running(cancellation, context)?;
+    let _active = context.scheduler.enter_lane();
+    operation()
 }
 
 async fn send_batch(
@@ -307,14 +376,29 @@ async fn send_batch(
     cancellation: &CancellationToken,
     context: &QueryContext,
 ) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Ok(());
+    }
+    context.check_cancelled()?;
     let started = Instant::now();
-    let result = tokio::select! {
-        _ = cancellation.cancelled() => return Ok(()),
-        _ = context.control.cancelled() => return Err(crate::Error::Cancelled),
-        result = sender.send(LaneMessage::Batch(batch)) => result,
+    let result = match sender.try_send(LaneMessage::Batch(batch)) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(message)) => {
+            let backpressure_started = Instant::now();
+            let result = tokio::select! {
+                _ = cancellation.cancelled() => Ok(()),
+                _ = context.control.cancelled() => Err(crate::Error::Cancelled),
+                result = sender.send(message) => result.map_err(|_| crate::Error::Cancelled),
+            };
+            context
+                .metrics
+                .record_scan_pipeline_output_queue_wait(backpressure_started.elapsed());
+            result
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(crate::Error::Cancelled),
     };
     context.scheduler.record_wait(started.elapsed());
-    result.map_err(|_| crate::Error::Cancelled)
+    result
 }
 
 fn check_running(cancellation: &CancellationToken, context: &QueryContext) -> Result<()> {

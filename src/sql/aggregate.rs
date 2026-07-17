@@ -18,8 +18,9 @@ use super::{
     AggregateExpr, AggregateFunction, BinaryOp, BoundExpr, ExprKind, LogicalPlan, PlanSchema,
     ScalarValue, UnaryOp,
     binder::{
-        TruthValue, bind_expr, bind_expr_scoped, ensure_boolean, make_binary, make_case,
-        make_is_null, make_is_truth, make_like, make_unary, map_binary, parse_escape,
+        TruthValue, bind_expr, bind_expr_scoped, combine_binary_balanced, ensure_boolean,
+        make_binary, make_case, make_is_null, make_is_truth, make_like, make_unary, map_binary,
+        parse_escape,
     },
     coercion::{cast, is_numeric},
 };
@@ -300,7 +301,7 @@ pub(super) fn bind_after_aggregate(
             } else {
                 BinaryOp::Or
             };
-            let mut output: Option<BoundExpr> = None;
+            let mut comparisons = Vec::with_capacity(list.len());
             for candidate in list {
                 let comparison = make_binary(
                     needle.clone(),
@@ -313,12 +314,9 @@ pub(super) fn bind_after_aggregate(
                         aggregates,
                     )?,
                 )?;
-                output = Some(match output {
-                    Some(output) => make_binary(output, connective, comparison)?,
-                    None => comparison,
-                });
+                comparisons.push(comparison);
             }
-            Ok(output.expect("non-empty IN list established above"))
+            combine_binary_balanced(comparisons, connective)
         }
         Expr::Between {
             expr,
@@ -510,13 +508,18 @@ fn aggregate_type(
         AggregateFunction::Count => DataType::Int64,
         AggregateFunction::Avg => DataType::Float64,
         AggregateFunction::Sum => match input {
-            Some(DataType::Decimal128(precision, scale)) => {
-                DataType::Decimal128(*precision, *scale)
-            }
+            Some(DataType::Decimal128(_, scale)) => DataType::Decimal128(38, *scale),
             Some(DataType::Float16 | DataType::Float32 | DataType::Float64) => DataType::Float64,
-            Some(DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64) => {
-                DataType::UInt64
-            }
+            Some(
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64,
+            ) => DataType::Decimal128(38, 0),
             _ => DataType::Int64,
         },
         AggregateFunction::Min | AggregateFunction::Max => input.cloned().ok_or_else(|| {

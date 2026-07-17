@@ -3,17 +3,25 @@ mod csv_infer;
 mod csv_input;
 mod csv_morsel;
 mod csv_parallel;
+mod exact_filter;
 mod hive;
 mod metadata_cache;
+mod native;
 mod parquet;
 mod parquet_bloom;
+mod parquet_decimal;
+mod parquet_decode_batch;
+mod parquet_decode_schedule;
+mod parquet_dictionary;
 mod parquet_index_metadata;
 mod parquet_metadata;
 mod parquet_page_pruning;
 mod parquet_page_values;
+mod parquet_predicate_cache;
 mod parquet_pruning;
 mod parquet_pruning_budget;
 mod parquet_reader;
+mod parquet_row_filter;
 mod parquet_scan;
 mod provider;
 mod registered;
@@ -21,7 +29,9 @@ mod schema_evolution;
 
 pub use csv::CsvTable;
 pub(crate) use metadata_cache::MetadataCache;
+pub(crate) use native::NativeSegmentTable;
 pub use parquet::ParquetTable;
+pub(crate) use provider::PredicateGuarantee;
 pub use provider::{
     ComparisonOp, PredicateValue, ScanPredicate, ScanRequest, TableProvider, TableStatistics,
 };

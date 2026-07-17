@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, ArrayRef, Int64Array},
+    array::{Array, ArrayRef, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -18,10 +18,12 @@ use super::{
 #[tokio::test]
 async fn full_join_spills_when_only_the_match_tracker_exceeds_the_budget() {
     const ROWS: usize = 20_000;
-    let side_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+    let side_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
     let right_batch = RecordBatch::try_new(
         Arc::clone(&side_schema),
-        vec![Arc::new(Int64Array::from_iter_values(0..ROWS as i64))],
+        vec![Arc::new(StringArray::from_iter_values(
+            (0..ROWS).map(|row| row.to_string()),
+        ))],
     )
     .unwrap();
     let limit = tracker_failure_boundary(&right_batch);
@@ -29,12 +31,12 @@ async fn full_join_spills_when_only_the_match_tracker_exceeds_the_budget() {
 
     let left_batch = RecordBatch::try_new(
         Arc::clone(&side_schema),
-        vec![Arc::new(Int64Array::from(vec![0]))],
+        vec![Arc::new(StringArray::from(vec!["0"]))],
     )
     .unwrap();
     let output_schema = Arc::new(Schema::new(vec![
-        Field::new("left_key", DataType::Int64, true),
-        Field::new("right_key", DataType::Int64, true),
+        Field::new("left_key", DataType::Utf8, true),
+        Field::new("right_key", DataType::Utf8, true),
     ]));
     let temp = tempfile::tempdir().unwrap();
     let context = QueryContext::shared(MemoryPool::new(limit), temp.path()).unwrap();
@@ -42,8 +44,8 @@ async fn full_join_spills_when_only_the_match_tracker_exceeds_the_budget() {
         boxed_record_batch_stream(stream::once(async move { Ok(left_batch) })),
         boxed_record_batch_stream(stream::once(async move { Ok(right_batch) })),
         vec![(
-            BoundExpr::column(0, DataType::Int64, "left.key"),
-            BoundExpr::column(0, DataType::Int64, "right.key"),
+            BoundExpr::column(0, DataType::Utf8, "left.key"),
+            BoundExpr::column(0, DataType::Utf8, "right.key"),
         )],
         None,
         None,

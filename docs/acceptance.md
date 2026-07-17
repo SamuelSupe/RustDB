@@ -5,6 +5,27 @@ resource-heavy performance work as separate gates. This prevents every
 platform job from downloading or generating the same analytical dataset while
 still requiring one real S3-compatible integration run.
 
+## Active v0.7 release gate
+
+The v0.7 release decision is functionality-first and supersedes comparative
+performance gates elsewhere in this historical document. Run the 43 official
+ClickBench queries once on the official 1M Parquet partition:
+
+```sh
+benchmarks/clickbench/run.sh
+```
+
+The runner uses an OrbStack container capped at four CPUs and 16 GiB, with four
+RustDB compute threads and a 12-GiB engine budget. Acceptance requires 43/43
+successful, fully consumed results, retained typed checksums and provenance,
+and clean terminal query resources. There is no cross-engine score, repeated
+timing requirement, or 100M download requirement. The optional full dataset
+profile is `CLICKBENCH_PROFILE=full`.
+
+The TPC-H differential, old fixed-hardware measurements, and low-memory suites
+below remain useful regression tools, but they are not blocking v0.7 unless a
+focused correctness issue explicitly calls for them.
+
 ## Local quality gate
 
 The supported local entrypoint uses the pinned development image and live

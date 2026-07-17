@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array},
+    array::{Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -84,7 +84,7 @@ async fn subqueries_inside_aggregate_arguments_run_before_aggregation() {
          FROM (SELECT 1 AS key) AS rows",
     )
     .await;
-    assert_eq!(int64(&batches[0], 0).value(0), 2);
+    assert_eq!(decimal(&batches[0], 0).value(0), 2);
     assert_eq!(int64(&batches[0], 1).value(0), 1);
 }
 
@@ -189,7 +189,7 @@ async fn aggregate_subquery_arguments_execute_over_multiple_input_rows() {
         "an attachment with no data dependency needs only one schema anchor:\n{explain}"
     );
     let batches = run(&catalog, sql).await;
-    assert_eq!(int64(&batches[0], 0).value(0), 12);
+    assert_eq!(decimal(&batches[0], 0).value(0), 12);
     assert_eq!(int64(&batches[0], 1).value(0), 6);
 }
 
@@ -609,7 +609,7 @@ async fn rebuilds_empty_global_aggregate_expressions() {
     )
     .await;
     let count = int64(&batches[0], 0);
-    let sum = int64(&batches[0], 1);
+    let sum = decimal(&batches[0], 1);
     assert_eq!((count.value(0), sum.value(0)), (1, 42));
 }
 
@@ -627,8 +627,8 @@ async fn synthetic_left_row_never_contributes_to_aggregate_arguments() {
     )
     .await;
     assert_eq!(int64(&batches[0], 0).value(0), 0);
-    assert!(int64(&batches[0], 1).is_null(0));
-    assert!(int64(&batches[0], 2).is_null(0));
+    assert!(decimal(&batches[0], 1).is_null(0));
+    assert!(decimal(&batches[0], 2).is_null(0));
 }
 
 #[tokio::test]
@@ -654,7 +654,7 @@ async fn correlated_aggregate_expression_arguments_preserve_empty_groups() {
     )
     .await;
     let keys = int64(&batches[0], 0);
-    let sums = int64(&batches[0], 1);
+    let sums = decimal(&batches[0], 1);
     let averages = batches[0]
         .column(2)
         .as_any()
@@ -687,7 +687,7 @@ async fn unmatched_inner_key_does_not_evaluate_fallible_aggregate_argument() {
     );
 
     let batches = run(&catalog, sql).await;
-    assert!(int64(&batches[0], 0).is_null(0));
+    assert!(decimal(&batches[0], 0).is_null(0));
 }
 
 #[tokio::test]
@@ -824,6 +824,14 @@ fn int64(batch: &RecordBatch, column: usize) -> &Int64Array {
         .column(column)
         .as_any()
         .downcast_ref::<Int64Array>()
+        .unwrap()
+}
+
+fn decimal(batch: &RecordBatch, column: usize) -> &Decimal128Array {
+    batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
         .unwrap()
 }
 

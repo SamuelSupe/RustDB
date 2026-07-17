@@ -1,25 +1,28 @@
 use std::{
     collections::{HashMap, HashSet},
     mem::size_of,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
 };
 
 use parking_lot::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    Error, ExecutionConfig, Result, datasource::TableProvider, sql::LogicalPlan,
-    storage::ObjectSnapshot,
+    Catalog, Error, ExecutionConfig, Result,
+    datasource::TableProvider,
+    sql::LogicalPlan,
+    storage::{NativeDatabase, ObjectSnapshot},
 };
 
 use super::{
-    MemoryPool, MemoryReservation, QueryControl, QueryMetrics, QueryScheduler, QuerySpillQuota,
-    SpillIoPool, SpillManager, TaskGroup,
+    GlobalComputePermit, GlobalComputeScheduler, MemoryPool, MemoryReservation, QueryControl,
+    QueryMetrics, QueryScheduler, QuerySpillQuota, SpillIoPool, SpillManager, TaskGroup,
 };
 
 pub struct QueryContext {
@@ -31,19 +34,26 @@ pub struct QueryContext {
     pub spill: SpillManager,
     pub(crate) execution: ExecutionConfig,
     pub(crate) scheduler: QueryScheduler,
+    configured_query_concurrency: usize,
+    compute_scheduler: GlobalComputeScheduler,
     pub(crate) tasks: TaskGroup,
     cleanup: Arc<QueryCleanup>,
     view_depth: Arc<AtomicUsize>,
     preparing_views: Arc<Mutex<HashSet<String>>>,
+    catalog_snapshot: RwLock<Option<Catalog>>,
     object_snapshots: RwLock<ObjectSnapshots>,
     object_snapshots_sealed: AtomicBool,
     view_plans: RwLock<HashMap<String, LogicalPlan>>,
     prepared_providers: RwLock<HashMap<u64, Arc<dyn TableProvider>>>,
+    durable_native_commit: Mutex<Option<DurableNativeCommit>>,
+    native_cleanup: NativeCleanup,
 }
 
 impl QueryContext {
     #[cfg(test)]
     const DEFAULT_BATCH_SIZE: usize = 8_192;
+    #[cfg(test)]
+    const DEFAULT_COMPUTE_SLOTS: usize = 64;
 
     /// Creates a context over a query-level memory pool and a shared spill root.
     #[cfg(test)]
@@ -69,6 +79,7 @@ impl QueryContext {
     ) -> Result<Self> {
         let control = QueryControl::new();
         let metrics = QueryMetrics::with_memory_pool(memory.clone());
+        let compute_scheduler = GlobalComputeScheduler::new(Self::DEFAULT_COMPUTE_SLOTS)?;
         let spill = SpillManager::for_task_group_query(
             spill_root,
             query_id,
@@ -84,11 +95,16 @@ impl QueryContext {
             metrics,
             spill,
             ExecutionConfig::default(),
+            1,
+            compute_scheduler,
         ))
     }
 
     /// Creates a query over engine-shared spill quota and blocking-I/O
     /// resources. Engine should use this constructor for production queries.
+    // These arguments are already cohesive runtime resources owned by Engine;
+    // another wrapper would only duplicate their construction boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_spill_resources(
         query_id: Uuid,
         memory: MemoryPool,
@@ -96,7 +112,9 @@ impl QueryContext {
         batch_size: usize,
         spill_quota: QuerySpillQuota,
         spill_io: SpillIoPool,
+        compute_scheduler: GlobalComputeScheduler,
         execution: ExecutionConfig,
+        configured_query_concurrency: usize,
     ) -> Result<Self> {
         let control = QueryControl::new();
         let metrics = QueryMetrics::with_memory_pool(memory.clone());
@@ -110,10 +128,21 @@ impl QueryContext {
             spill_io,
         )?;
         Ok(Self::from_runtime_parts(
-            query_id, memory, batch_size, control, metrics, spill, execution,
+            query_id,
+            memory,
+            batch_size,
+            control,
+            metrics,
+            spill,
+            execution,
+            configured_query_concurrency,
+            compute_scheduler,
         ))
     }
 
+    // Centralizing context assembly keeps cleanup and cancellation registration
+    // atomic without introducing a second, partially initialized context type.
+    #[allow(clippy::too_many_arguments)]
     fn from_runtime_parts(
         query_id: Uuid,
         memory: MemoryPool,
@@ -122,6 +151,8 @@ impl QueryContext {
         metrics: QueryMetrics,
         spill: SpillManager,
         execution: ExecutionConfig,
+        configured_query_concurrency: usize,
+        compute_scheduler: GlobalComputeScheduler,
     ) -> Self {
         let scheduler = QueryScheduler::new(metrics.clone());
         let tasks = TaskGroup::new(control.clone());
@@ -159,10 +190,13 @@ impl QueryContext {
             spill,
             execution,
             scheduler,
+            configured_query_concurrency: configured_query_concurrency.max(1),
+            compute_scheduler,
             tasks,
             cleanup,
             view_depth: Arc::new(AtomicUsize::new(0)),
             preparing_views: Arc::new(Mutex::new(HashSet::new())),
+            catalog_snapshot: RwLock::new(None),
             object_snapshots: RwLock::new(ObjectSnapshots {
                 entries: HashMap::new(),
                 memory: snapshot_memory,
@@ -170,6 +204,8 @@ impl QueryContext {
             object_snapshots_sealed: AtomicBool::new(false),
             view_plans: RwLock::new(HashMap::new()),
             prepared_providers: RwLock::new(HashMap::new()),
+            durable_native_commit: Mutex::new(None),
+            native_cleanup: NativeCleanup::default(),
         }
     }
 
@@ -183,6 +219,43 @@ impl QueryContext {
             Err(self.tasks.first_failure().unwrap_or(Error::Cancelled))
         } else {
             Ok(())
+        }
+    }
+
+    pub(crate) fn mark_native_commit(
+        &self,
+        path: PathBuf,
+        transaction_id: String,
+        generation: u64,
+    ) {
+        *self.durable_native_commit.lock() = Some(DurableNativeCommit {
+            path,
+            transaction_id,
+            generation,
+        });
+    }
+
+    pub(crate) fn set_native_database_cleanup(&self, database: Weak<NativeDatabase>) {
+        *self.native_cleanup.database.lock() = Some(database);
+    }
+
+    pub(crate) fn native_commit_is_durable(&self) -> bool {
+        self.durable_native_commit.lock().is_some()
+    }
+
+    pub(crate) fn error_after_native_commit(&self, error: Error) -> Error {
+        if matches!(error, Error::NativeCommitPostCommitFailure { .. }) {
+            return error;
+        }
+        let commit = self.durable_native_commit.lock();
+        match commit.as_ref() {
+            Some(commit) => Error::native_commit_post_commit_failure(
+                &commit.path,
+                &commit.transaction_id,
+                commit.generation,
+                format!("{error}; do not retry the write before reopening the engine"),
+            ),
+            None => error,
         }
     }
 
@@ -279,6 +352,7 @@ impl QueryContext {
     /// lifecycle. The first caller receives any deletion failure; later
     /// teardown paths are no-ops so they cannot mask or duplicate that error.
     pub(crate) fn cleanup_spill(&self) -> Result<()> {
+        self.control.clear_local_files();
         // Closing first makes the active-count check a cleanup barrier: no
         // worker can register between observing zero and deleting the query
         // directory.
@@ -292,10 +366,12 @@ impl QueryContext {
 
     pub(crate) async fn cleanup_spill_after_tasks(&self) -> Result<()> {
         self.tasks.quiesce().await;
+        self.control.clear_local_files();
         self.cleanup.run()
     }
 
     pub(crate) fn schedule_cleanup(&self) {
+        self.control.clear_local_files();
         if self.cleanup.was_attempted() {
             return;
         }
@@ -346,6 +422,44 @@ impl QueryContext {
         self.scheduler.configure(lanes, self.memory.limit());
     }
 
+    pub(crate) fn configured_query_concurrency(&self) -> usize {
+        self.configured_query_concurrency
+    }
+
+    pub(crate) async fn acquire_compute(&self) -> Result<GlobalComputePermit> {
+        let permit = self
+            .compute_scheduler
+            .acquire(self.query_id, &self.control)
+            .await?;
+        let wait = permit.wait_time();
+        self.scheduler.record_wait(wait);
+        self.metrics.record_compute_permit_wait(wait);
+        Ok(permit)
+    }
+
+    pub(crate) async fn acquire_compute_until_cancelled(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<GlobalComputePermit> {
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            _ = self.control.cancelled() => return Err(self
+                .check_cancelled()
+                .expect_err("cancelled query has a terminal error")),
+            permit = self.acquire_compute() => permit?,
+        };
+        if cancellation.is_cancelled() {
+            drop(permit);
+            return Err(Error::Cancelled);
+        }
+        if let Err(error) = self.check_cancelled() {
+            drop(permit);
+            return Err(error);
+        }
+        Ok(permit)
+    }
+
     /// Some operator unit tests deliberately exercise parallel spill paths
     /// with unrealistically tiny pools. Production query setup always uses
     /// `configure_compute_lanes`, which applies the forward-progress cap.
@@ -381,6 +495,26 @@ impl QueryContext {
             name,
             active: Arc::clone(&self.preparing_views),
         })
+    }
+
+    pub(crate) fn set_catalog_snapshot(&self, catalog: Catalog) -> Result<()> {
+        let mut snapshot = self.catalog_snapshot.write();
+        if snapshot.is_some() {
+            return Err(Error::Internal(
+                "query catalog snapshot was installed more than once".to_owned(),
+            ));
+        }
+        *snapshot = Some(catalog);
+        Ok(())
+    }
+
+    pub(crate) fn catalog_snapshot(&self) -> Option<Catalog> {
+        self.catalog_snapshot.read().clone()
+    }
+
+    pub(crate) fn release_catalog_snapshot(&self) {
+        self.catalog_snapshot.write().take();
+        self.view_plans.write().clear();
     }
 
     pub(crate) fn register_object_snapshot(
@@ -442,6 +576,23 @@ impl QueryContext {
             })
     }
 
+    pub(crate) fn object_snapshot_bytes(&self) -> Result<u64> {
+        if !self.object_snapshots_sealed() {
+            return Err(Error::Internal(
+                "object byte total requested before query snapshots were fixed".to_owned(),
+            ));
+        }
+        self.object_snapshots
+            .read()
+            .entries
+            .values()
+            .try_fold(0_u64, |total, snapshot| {
+                total.checked_add(snapshot.size).ok_or_else(|| {
+                    Error::ResourceExhausted("query object byte total overflow".to_owned())
+                })
+            })
+    }
+
     pub(crate) fn cache_view_plan(&self, name: &str, plan: LogicalPlan) -> Result<()> {
         if self.object_snapshots_sealed() {
             return Err(Error::Internal(format!(
@@ -487,6 +638,37 @@ impl QueryContext {
 struct ObjectSnapshots {
     entries: HashMap<String, ObjectSnapshot>,
     memory: MemoryReservation,
+}
+
+struct DurableNativeCommit {
+    path: PathBuf,
+    transaction_id: String,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct NativeCleanup {
+    database: Mutex<Option<Weak<NativeDatabase>>>,
+}
+
+impl Drop for NativeCleanup {
+    fn drop(&mut self) {
+        let Some(database) = self
+            .database
+            .get_mut()
+            .take()
+            .and_then(|database| database.upgrade())
+        else {
+            return;
+        };
+        if let Err(error) = database.drain_retired() {
+            tracing::error!(
+                %error,
+                path = %database.path().display(),
+                "failed to clean retired native snapshots after query abandonment"
+            );
+        }
+    }
 }
 
 fn snapshot_entry_bytes(uri: &str, snapshot: &ObjectSnapshot) -> usize {
@@ -739,6 +921,7 @@ mod tests {
             size: 10,
             e_tag: Some("v1".to_owned()),
             version: None,
+            local_identity: None,
         };
         context
             .register_object_snapshot("s3://bucket/data.csv", first.clone())
@@ -750,6 +933,7 @@ mod tests {
             size: 11,
             e_tag: Some("v2".to_owned()),
             version: None,
+            local_identity: None,
         };
         assert!(
             context
@@ -772,6 +956,7 @@ mod tests {
                         size: 1,
                         e_tag: None,
                         version: None,
+                        local_identity: None,
                     },
                 )
                 .unwrap_err()
@@ -789,6 +974,7 @@ mod tests {
             size: 10,
             e_tag: Some("etag-1".to_owned()),
             version: Some("version-1".to_owned()),
+            local_identity: None,
         };
         context
             .register_object_snapshot("s3://bucket/first.parquet", first.clone())
@@ -810,6 +996,7 @@ mod tests {
                     size: 20,
                     e_tag: Some("x".repeat(128)),
                     version: Some("y".repeat(128)),
+                    local_identity: None,
                 },
             )
             .unwrap_err();

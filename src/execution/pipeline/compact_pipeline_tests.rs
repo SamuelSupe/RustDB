@@ -96,6 +96,7 @@ async fn projected_filter_runs_before_full_schema_expansion() {
         statistics: TableStatistics::default(),
         projection: Some(vec![0, 2]),
         pushed_filter: None,
+        exact_filter: None,
         limit: None,
         schema: PlanSchema::unqualified(Arc::clone(&schema)),
     };
@@ -143,5 +144,107 @@ async fn projected_filter_runs_before_full_schema_expansion() {
         &[1, 1]
     );
     assert!(batch.column(3).is_null(1));
+    assert!(output.next().await.is_none());
+}
+
+#[tokio::test]
+async fn terminal_projection_stays_on_compact_scan_columns() {
+    const WIDTH: usize = 64;
+    const ROWS: usize = 8_192;
+    let schema = Arc::new(Schema::new(
+        (0..WIDTH)
+            .map(|index| Field::new(format!("c{index}"), DataType::Int64, false))
+            .collect::<Vec<_>>(),
+    ));
+    let columns = (0..WIDTH)
+        .map(|index| {
+            if index == 47 {
+                Arc::new(Int64Array::from_iter_values(
+                    (0..ROWS).map(|row| i64::from(row == 0 || row == 2)),
+                )) as _
+            } else {
+                Arc::new(Int64Array::from_iter_values(
+                    (0..ROWS).map(|row| index as i64 * 10 + row as i64),
+                )) as _
+            }
+        })
+        .collect();
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let scan = LogicalPlan::Scan {
+        table_name: "compact".into(),
+        provider: Arc::new(ProjectingTable {
+            schema: Arc::clone(&schema),
+            batch,
+        }),
+        statistics: TableStatistics::default(),
+        projection: Some(vec![1, 47, 62]),
+        pushed_filter: None,
+        exact_filter: None,
+        limit: None,
+        schema: PlanSchema::unqualified(Arc::clone(&schema)),
+    };
+    let predicate = BoundExpr {
+        kind: ExprKind::Binary {
+            left: Box::new(BoundExpr::column(47, DataType::Int64, "c47")),
+            op: BinaryOp::Eq,
+            right: Box::new(BoundExpr::literal(ScalarValue::Int64(1))),
+        },
+        data_type: DataType::Boolean,
+        display_name: "c47 = 1".into(),
+    };
+    let filter = LogicalPlan::Filter {
+        input: Box::new(scan),
+        predicate,
+        schema: PlanSchema::unqualified(schema),
+    };
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("selected", DataType::Int64, false),
+        Field::new("computed", DataType::Int64, false),
+    ]));
+    let computed = BoundExpr {
+        kind: ExprKind::Binary {
+            left: Box::new(BoundExpr::column(62, DataType::Int64, "c62")),
+            op: BinaryOp::Add,
+            right: Box::new(BoundExpr::literal(ScalarValue::Int64(1))),
+        },
+        data_type: DataType::Int64,
+        display_name: "c62 + 1".into(),
+    };
+    let plan = LogicalPlan::Projection {
+        input: Box::new(filter),
+        expressions: vec![BoundExpr::column(1, DataType::Int64, "c1"), computed],
+        schema: PlanSchema::unqualified(output_schema),
+    };
+
+    // Expanding 64 logical Int64 columns at the configured 8192-row batch size
+    // would require several MiB. The compact path stays below 768 KiB with only
+    // the three scanned columns and two final outputs.
+    let temp = tempfile::tempdir().unwrap();
+    let context = Arc::new(QueryContext::new(MemoryPool::new(768 << 10), temp.path()).unwrap());
+    let mut output = super::super::runner::execute(StatementPlan::Query(plan), context)
+        .await
+        .unwrap();
+    let batch = output.next().await.unwrap().unwrap();
+
+    assert_eq!(batch.num_columns(), 2);
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[10, 12]
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[621, 623]
+    );
     assert!(output.next().await.is_none());
 }

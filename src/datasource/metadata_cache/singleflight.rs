@@ -121,6 +121,21 @@ pub(super) enum SharedLoadError {
     ResourceExhausted(String),
     Cancelled,
     Catalog(String),
+    NativeStorage {
+        path: PathBuf,
+        message: String,
+    },
+    CommitOutcomeUnknown {
+        path: PathBuf,
+        transaction_id: String,
+        message: String,
+    },
+    NativeCommitPostCommitFailure {
+        path: PathBuf,
+        transaction_id: String,
+        generation: u64,
+        message: String,
+    },
     Execution(String),
     Internal(String),
 }
@@ -142,6 +157,30 @@ impl SharedLoadError {
             Error::ResourceExhausted(message) => Self::ResourceExhausted(message.clone()),
             Error::Cancelled => Self::Cancelled,
             Error::Catalog(message) => Self::Catalog(message.clone()),
+            Error::NativeStorage { path, message } => Self::NativeStorage {
+                path: path.clone(),
+                message: message.clone(),
+            },
+            Error::CommitOutcomeUnknown {
+                path,
+                transaction_id,
+                message,
+            } => Self::CommitOutcomeUnknown {
+                path: path.clone(),
+                transaction_id: transaction_id.clone(),
+                message: message.clone(),
+            },
+            Error::NativeCommitPostCommitFailure {
+                path,
+                transaction_id,
+                generation,
+                message,
+            } => Self::NativeCommitPostCommitFailure {
+                path: path.clone(),
+                transaction_id: transaction_id.clone(),
+                generation: *generation,
+                message: message.clone(),
+            },
             Error::Execution(message) => Self::Execution(message.clone()),
             Error::Internal(message) => Self::Internal(message.clone()),
         }
@@ -173,6 +212,27 @@ impl SharedLoadError {
             Self::ResourceExhausted(message) => Error::ResourceExhausted(message),
             Self::Cancelled => Error::Cancelled,
             Self::Catalog(message) => Error::Catalog(message),
+            Self::NativeStorage { path, message } => Error::NativeStorage { path, message },
+            Self::CommitOutcomeUnknown {
+                path,
+                transaction_id,
+                message,
+            } => Error::CommitOutcomeUnknown {
+                path,
+                transaction_id,
+                message,
+            },
+            Self::NativeCommitPostCommitFailure {
+                path,
+                transaction_id,
+                generation,
+                message,
+            } => Error::NativeCommitPostCommitFailure {
+                path,
+                transaction_id,
+                generation,
+                message,
+            },
             Self::Execution(message) => Error::Execution(message),
             Self::Internal(message) => Error::Internal(message),
         }

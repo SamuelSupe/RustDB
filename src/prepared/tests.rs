@@ -44,6 +44,29 @@ async fn executes_question_and_reused_numbered_parameters() {
 }
 
 #[tokio::test]
+async fn execution_of_cached_ast_reports_no_sql_parse_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = Engine::new(
+        EngineConfig::builder()
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )
+    .unwrap()
+    .session();
+
+    let result = session
+        .prepare("SELECT ? AS value")
+        .unwrap()
+        .execute(&[ParameterValue::Int64(7)])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.metrics().snapshot().sql_parse_time,
+        std::time::Duration::ZERO
+    );
+}
+
+#[tokio::test]
 async fn integer_parameters_work_in_limit_offset_and_fetch() {
     let directory = tempfile::tempdir().unwrap();
     let session = Engine::new(

@@ -6,14 +6,20 @@ use crate::{
 
 mod build;
 mod partition;
+mod scheduled_repartition;
 
-pub(super) use build::{BuildPartition, load_build_partition};
+pub(super) use build::{
+    BuildPartition, BuildPartitionRead, compact_build_partition, load_build_partition,
+    read_build_partition,
+};
 pub(super) use partition::{
     PartitionManifest, PartitionSpiller, Side, batch_logical_buffer_bytes,
-    estimated_build_footprint, spill_batch_with_null_keys, spill_stream,
+    estimated_build_footprint, spill_batch_with_null_keys, spill_batch_with_null_keys_scheduled,
+    spill_stream,
 };
 #[cfg(test)]
 pub(super) use partition::{partition_for_key, spill_batch};
+pub(super) use scheduled_repartition::repartition_scheduled;
 
 pub(super) const PARTITIONS: usize = 256;
 const MIN_PARTITIONS: usize = 2;
@@ -172,6 +178,16 @@ pub(super) fn repartition(
     }
     let right = right_spiller.finish_manifest()?;
 
+    finish_repartition(left, right, repartition_bytes, next_depth, context)
+}
+
+fn finish_repartition(
+    left: Vec<Vec<SpillFile>>,
+    right: PartitionManifest,
+    repartition_bytes: u64,
+    next_depth: usize,
+    context: &QueryContext,
+) -> Result<Option<Repartitioned>> {
     let largest_build_rows = right
         .build
         .iter()

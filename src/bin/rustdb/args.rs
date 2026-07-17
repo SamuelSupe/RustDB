@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
+pub const HELP_ZH: &str = include_str!("help.zh-CN.txt");
+
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum OutputFormat {
     #[default]
@@ -32,6 +34,10 @@ impl From<PruningModeArg> for rustdb::ParquetPruningMode {
     about = "Query local and S3 CSV/Parquet files"
 )]
 pub struct Args {
+    /// Print complete Simplified Chinese help and exit.
+    #[arg(long)]
+    pub help_zh: bool,
+
     /// Execute a SQL statement and exit.
     #[arg(short = 'c', long, conflicts_with = "file")]
     pub command: Option<String>,
@@ -181,12 +187,22 @@ fn parse_bytes(input: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bytes;
+    use clap::Parser;
+
+    use super::{Args, HELP_ZH, parse_bytes};
 
     #[test]
     fn parses_binary_and_decimal_sizes() {
         assert_eq!(parse_bytes("64MiB").unwrap(), 64 * 1024 * 1024);
         assert_eq!(parse_bytes("2GB").unwrap(), 2_000_000_000);
         assert!(parse_bytes("12watts").is_err());
+    }
+
+    #[test]
+    fn accepts_chinese_help_switch() {
+        let args = Args::try_parse_from(["rustdb", "--help-zh"]).unwrap();
+        assert!(args.help_zh);
+        assert!(HELP_ZH.contains("使用方法"));
+        assert!(HELP_ZH.contains("--s3-endpoint"));
     }
 }

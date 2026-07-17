@@ -20,8 +20,17 @@ use crate::runtime::{
 use crate::sql::{LogicalPlan, StatementPlan};
 use crate::{Catalog, EngineConfig, Error, Result};
 
+#[path = "command/native_write.rs"]
+mod native_write;
 #[path = "command/source.rs"]
 mod source;
+
+pub(crate) use native_write::{NativeWriteCommand, NativeWriteKind};
+
+pub(crate) enum ParsedStatement {
+    Command(SessionCommand),
+    Query(Box<Statement>),
+}
 
 pub(crate) enum SessionCommand {
     ShowTables,
@@ -40,11 +49,12 @@ pub(crate) enum SessionCommand {
         name: String,
         if_exists: bool,
     },
+    NativeWrite(NativeWriteCommand),
 }
 
-pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
+pub(crate) fn parse(sql: &str) -> Result<ParsedStatement> {
     if let Some(command) = parse_refresh_table(sql)? {
-        return Ok(Some(command));
+        return Ok(ParsedStatement::Command(command));
     }
     let mut statements = crate::sql::parse_statements(sql)?;
     if statements.len() != 1 {
@@ -52,7 +62,13 @@ pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
             "exactly one SQL statement is required".into(),
         ));
     }
-    let command = match statements.remove(0) {
+    let statement = statements.remove(0);
+    if let Some(command) = native_write::parse(&statement, sql)? {
+        return Ok(ParsedStatement::Command(SessionCommand::NativeWrite(
+            command,
+        )));
+    }
+    let command = match &statement {
         Statement::ShowTables {
             terse,
             history,
@@ -61,12 +77,12 @@ pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
             external,
             show_options,
         } => {
-            if terse
-                || history
-                || extended
-                || full
-                || external
-                || !plain_show_options(&show_options)
+            if *terse
+                || *history
+                || *extended
+                || *full
+                || *external
+                || !plain_show_options(show_options)
             {
                 return Err(Error::Unsupported(
                     "SHOW TABLES modifiers are not supported".into(),
@@ -86,7 +102,7 @@ pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
                 ));
             }
             Some(SessionCommand::Describe {
-                name: simple_name(&table_name, "table")?,
+                name: simple_name(table_name, "table")?,
             })
         }
         Statement::CreateView(view) => {
@@ -130,19 +146,23 @@ pub(crate) fn parse(sql: &str) -> Result<Option<SessionCommand>> {
             temporary,
             table,
         } => {
-            if cascade || restrict || purge || temporary || table.is_some() || names.len() != 1 {
+            if *cascade || *restrict || *purge || *temporary || table.is_some() || names.len() != 1
+            {
                 return Err(Error::Unsupported(
                     "DROP VIEW supports one name and optional IF EXISTS only".into(),
                 ));
             }
             Some(SessionCommand::DropView {
                 name: simple_name(&names[0], "view")?,
-                if_exists,
+                if_exists: *if_exists,
             })
         }
         _ => None,
     };
-    Ok(command)
+    Ok(match command {
+        Some(command) => ParsedStatement::Command(command),
+        None => ParsedStatement::Query(Box::new(statement)),
+    })
 }
 
 fn parse_refresh_table(sql: &str) -> Result<Option<SessionCommand>> {
@@ -300,8 +320,12 @@ impl ViewTable {
     }
 
     async fn current_plan(&self, context: Option<Arc<QueryContext>>) -> Result<LogicalPlan> {
+        let catalog = context
+            .as_ref()
+            .and_then(|context| context.catalog_snapshot())
+            .unwrap_or_else(|| self.catalog.pin());
         let prepared = crate::table_function::prepare_with_cache_for_query(
-            &self.catalog,
+            &catalog,
             &self.config,
             &self.metadata_cache,
             &self.query,
@@ -313,8 +337,8 @@ impl ViewTable {
             generated_tables,
         } = prepared;
         let _generated_tables =
-            crate::table_function::GeneratedTablesGuard::new(&self.catalog, generated_tables);
-        let planned = crate::sql::bind_statement(&self.catalog, statement);
+            crate::table_function::GeneratedTablesGuard::new(&catalog, generated_tables);
+        let planned = crate::sql::bind_statement(&catalog, statement);
         let StatementPlan::Query(plan) = planned? else {
             return Err(Error::Internal(
                 "temporary view query produced an EXPLAIN plan".into(),
@@ -334,6 +358,7 @@ impl ViewTable {
         request: ScanRequest,
         context: Arc<QueryContext>,
     ) -> Result<MemoryBatchStream> {
+        request.reject_unsupported_exact("view provider")?;
         let expansion = context.enter_view(&self.name)?;
         let plan = context.view_plan(&self.name).ok_or_else(|| {
             Error::Internal(format!(
@@ -451,13 +476,17 @@ fn project_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionCommand, parse};
+    use sqlparser::ast::Statement;
+
+    use super::{ParsedStatement, SessionCommand, parse};
 
     #[test]
     fn parses_view_lifecycle_commands() {
-        let command = parse("CREATE OR REPLACE TEMP VIEW v AS SELECT 1")
-            .unwrap()
-            .unwrap();
+        let ParsedStatement::Command(command) =
+            parse("CREATE OR REPLACE TEMP VIEW v AS SELECT 1").unwrap()
+        else {
+            panic!("CREATE TEMP VIEW was not dispatched as a command");
+        };
         assert!(matches!(
             command,
             SessionCommand::CreateTempView {
@@ -467,25 +496,41 @@ mod tests {
             } if name == "v"
         ));
         assert!(matches!(
-            parse("DROP VIEW IF EXISTS v").unwrap().unwrap(),
-            SessionCommand::DropView {
+            parse("DROP VIEW IF EXISTS v").unwrap(),
+            ParsedStatement::Command(SessionCommand::DropView {
                 name,
                 if_exists: true
-            } if name == "v"
+            }) if name == "v"
         ));
     }
 
     #[test]
     fn parses_refresh_table_and_rejects_qualified_names() {
         assert!(matches!(
-            parse("REFRESH TABLE dynamic_data;").unwrap().unwrap(),
-            SessionCommand::RefreshTable { name } if name == "dynamic_data"
+            parse("REFRESH TABLE dynamic_data;").unwrap(),
+            ParsedStatement::Command(SessionCommand::RefreshTable { name })
+                if name == "dynamic_data"
         ));
         assert!(parse("REFRESH TABLE catalog.dynamic_data").is_err());
     }
 
     #[test]
     fn leaves_select_for_the_query_planner() {
-        assert!(parse("SELECT 1").unwrap().is_none());
+        let ParsedStatement::Query(statement) = parse("SELECT 1").unwrap() else {
+            panic!("SELECT was not dispatched to the query planner");
+        };
+        assert!(matches!(statement.as_ref(), Statement::Query(_)));
+    }
+
+    #[test]
+    fn query_dispatch_still_requires_exactly_one_statement() {
+        let error = match parse("SELECT 1; SELECT 2") {
+            Ok(_) => panic!("multiple queries were accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid argument: exactly one SQL statement is required"
+        );
     }
 }

@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use parquet::{arrow::arrow_reader::ArrowReaderMetadata, bloom_filter::Sbbf};
 use tokio::sync::watch;
 
-use crate::storage::{ObjectSnapshot, ObjectSource};
+use crate::storage::{LocalFileIdentity, ObjectSnapshot, ObjectSource};
 use crate::{Result, runtime::QueryControl};
 
 mod singleflight;
@@ -42,6 +42,7 @@ struct MetadataKey {
     size: u64,
     e_tag: Option<String>,
     version: Option<String>,
+    local_identity: Option<LocalFileIdentity>,
     level: MetadataLevel,
 }
 
@@ -452,6 +453,7 @@ impl MetadataKey {
             size: snapshot.size,
             e_tag: snapshot.e_tag.clone(),
             version: snapshot.version.clone(),
+            local_identity: snapshot.local_identity,
             level,
         }
     }

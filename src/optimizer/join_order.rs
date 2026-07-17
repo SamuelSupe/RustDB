@@ -1,10 +1,13 @@
-use std::{cmp::Ordering, mem};
+use std::mem;
 
+use crate::Result;
 use crate::sql::{BoundExpr, JoinType, LogicalPlan, PlanSchema};
+
+use super::{decorrelate::remap_columns, estimate::estimate};
 
 /// Chooses the smaller build input for each independent inner-join node. This
 /// deliberately does not search alternative multi-table join trees.
-pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
+pub(super) fn choose_build_sides(plan: &mut LogicalPlan) -> Result<()> {
     match plan {
         LogicalPlan::Empty { .. } | LogicalPlan::Scan { .. } => {}
         LogicalPlan::Filter { input, .. }
@@ -14,11 +17,15 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         | LogicalPlan::Repeat { input, .. }
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Limit { input, .. } => choose_build_sides(input),
-        LogicalPlan::Append { inputs, .. } => inputs.iter_mut().for_each(choose_build_sides),
+        | LogicalPlan::Limit { input, .. } => choose_build_sides(input)?,
+        LogicalPlan::Append { inputs, .. } => {
+            for input in inputs {
+                choose_build_sides(input)?;
+            }
+        }
         LogicalPlan::Join { left, right, .. } | LogicalPlan::DependentJoin { left, right, .. } => {
-            choose_build_sides(left);
-            choose_build_sides(right);
+            choose_build_sides(left)?;
+            choose_build_sides(right)?;
         }
     }
 
@@ -27,14 +34,19 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
             left,
             right,
             join_type: JoinType::Inner,
-            residual: None,
+            residual,
             null_aware: None,
             ..
-        } => smaller(left, right),
+        } if residual
+            .as_ref()
+            .is_none_or(BoundExpr::is_structurally_infallible) =>
+        {
+            smaller(left, right)
+        }
         _ => false,
     };
     if !should_swap {
-        return;
+        return Ok(());
     }
 
     let placeholder = LogicalPlan::Empty {
@@ -46,7 +58,7 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         right,
         on,
         null_equal_keys,
-        residual: None,
+        mut residual,
         null_aware: None,
         join_type: JoinType::Inner,
         schema,
@@ -57,6 +69,13 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
 
     let left_width = left.schema().arrow().fields().len();
     let right_width = right.schema().arrow().fields().len();
+    if let Some(residual) = residual.as_mut() {
+        let mapping = (0..left_width)
+            .map(|index| right_width + index)
+            .chain(0..right_width)
+            .collect::<Vec<_>>();
+        remap_columns(residual, &mapping)?;
+    }
     let mut restore = Vec::with_capacity(left_width + right_width);
     restore.extend(
         left.schema()
@@ -86,7 +105,7 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         right: left,
         on: on.into_iter().map(|(left, right)| (right, left)).collect(),
         null_equal_keys,
-        residual: None,
+        residual,
         null_aware: None,
         join_type: JoinType::Inner,
         schema: join_schema,
@@ -96,84 +115,17 @@ pub(super) fn choose_build_sides(plan: &mut LogicalPlan) {
         expressions: restore,
         schema,
     };
+    Ok(())
 }
 
 fn smaller(left: &LogicalPlan, right: &LogicalPlan) -> bool {
     let left = estimate(left);
     let right = estimate(right);
-    if let (Some(left), Some(right)) = (left.bytes, right.bytes) {
+    if let (Some(left), Some(right)) = (left.output_bytes, right.output_bytes) {
         return left < right;
     }
-    matches!(
-        (left.rows, right.rows),
-        (Some(left), Some(right)) if left.cmp(&right) == Ordering::Less
-    )
+    matches!((left.rows, right.rows), (Some(left), Some(right)) if left < right)
 }
 
-#[derive(Clone, Copy, Default)]
-struct Estimate {
-    rows: Option<u64>,
-    bytes: Option<u64>,
-}
-
-fn estimate(plan: &LogicalPlan) -> Estimate {
-    match plan {
-        LogicalPlan::Empty {
-            produce_one_row, ..
-        } => Estimate {
-            rows: Some(u64::from(*produce_one_row)),
-            bytes: Some(0),
-        },
-        LogicalPlan::Scan { statistics, .. } => Estimate {
-            rows: statistics.row_count,
-            bytes: statistics.total_byte_size,
-        },
-        LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Projection { input, .. }
-        | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Repeat { input, .. }
-        | LogicalPlan::Window { input, .. }
-        | LogicalPlan::Sort { input, .. } => estimate(input),
-        LogicalPlan::Append { inputs, .. } => {
-            inputs.iter().fold(Estimate::default(), |total, input| {
-                let input = estimate(input);
-                Estimate {
-                    rows: match (total.rows, input.rows) {
-                        (None, rows) => rows,
-                        (rows, None) => rows,
-                        (Some(left), Some(right)) => Some(left.saturating_add(right)),
-                    },
-                    bytes: match (total.bytes, input.bytes) {
-                        (None, bytes) => bytes,
-                        (bytes, None) => bytes,
-                        (Some(left), Some(right)) => Some(left.saturating_add(right)),
-                    },
-                }
-            })
-        }
-        LogicalPlan::Limit {
-            input,
-            offset,
-            limit,
-            ..
-        } => {
-            let mut estimate = estimate(input);
-            estimate.rows = estimate.rows.map(|rows| {
-                rows.saturating_sub(u64::try_from(*offset).unwrap_or(u64::MAX))
-                    .min(
-                        limit
-                            .map(|limit| u64::try_from(limit).unwrap_or(u64::MAX))
-                            .unwrap_or(u64::MAX),
-                    )
-            });
-            estimate
-        }
-        LogicalPlan::Scalarize { .. } => Estimate {
-            rows: Some(1),
-            bytes: None,
-        },
-        // Avoid pretending a local estimate is a global multi-table cost
-        // model. Each child join has already made its own safe build choice.
-        LogicalPlan::Join { .. } | LogicalPlan::DependentJoin { .. } => Estimate::default(),
-    }
-}
+#[cfg(test)]
+mod tests;

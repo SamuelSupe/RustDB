@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "source_root": "/bench-data",
+  "tables": [
+    { "name": "customer", "path": "customer/*.parquet" },
+    { "name": "lineitem", "path": "lineitem/*.parquet" },
+    { "name": "nation", "path": "nation/*.parquet" },
+    { "name": "orders", "path": "orders/*.parquet" },
+    { "name": "part", "path": "part/*.parquet" },
+    { "name": "partsupp", "path": "partsupp/*.parquet" },
+    { "name": "region", "path": "region/*.parquet" },
+    { "name": "supplier", "path": "supplier/*.parquet" }
+  ]
+}

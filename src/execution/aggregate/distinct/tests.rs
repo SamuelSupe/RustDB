@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::Int64Array,
+    array::{Decimal128Array, Int64Array},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -35,11 +35,11 @@ async fn amplification_limit_allows_fifty_thousand_values_repeated_twice() {
         .collect::<Vec<_>>();
     let aggregates = vec![
         distinct(AggregateFunction::Count, DataType::Int64),
-        distinct(AggregateFunction::Sum, DataType::Int64),
+        distinct(AggregateFunction::Sum, DataType::Decimal128(38, 0)),
     ];
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("count", DataType::Int64, false),
-        Field::new("sum", DataType::Int64, true),
+        Field::new("sum", DataType::Decimal128(38, 0), true),
     ]));
     let temp = tempfile::tempdir().unwrap();
     let mut query_context = QueryContext::new(MemoryPool::new(4 << 20), temp.path()).unwrap();
@@ -67,10 +67,13 @@ async fn amplification_limit_allows_fifty_thousand_values_repeated_twice() {
     let sum = output[0]
         .column(1)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Decimal128Array>()
         .unwrap();
     assert_eq!(count.value(0), UNIQUE);
-    assert_eq!(sum.value(0), UNIQUE * (UNIQUE - 1) / 2);
+    assert_eq!(
+        sum.value(0),
+        i128::from(UNIQUE) * i128::from(UNIQUE - 1) / 2
+    );
     let metrics = context.metrics.snapshot();
     assert!(metrics.spill_write_bytes > 0, "metrics: {metrics:?}");
     assert_eq!(metrics.max_repartition_depth, 0, "metrics: {metrics:?}");

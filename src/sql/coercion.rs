@@ -83,6 +83,20 @@ pub(super) fn coerce_comparison(
             cast_if_needed(right, &DataType::Utf8),
         ));
     }
+    if left.data_type == DataType::Date32 && is_utf8_literal(&right) {
+        return Ok((left, cast_if_needed(right, &DataType::Date32)));
+    }
+    if right.data_type == DataType::Date32 && is_utf8_literal(&left) {
+        return Ok((cast_if_needed(left, &DataType::Date32), right));
+    }
+    if matches!(left.data_type, DataType::Timestamp(_, None)) && is_utf8_literal(&right) {
+        let target = left.data_type.clone();
+        return Ok((left, cast_if_needed(right, &target)));
+    }
+    if matches!(right.data_type, DataType::Timestamp(_, None)) && is_utf8_literal(&left) {
+        let target = right.data_type.clone();
+        return Ok((cast_if_needed(left, &target), right));
+    }
     if left.data_type == DataType::Date32
         && let DataType::Timestamp(unit, None) = &right.data_type
     {
@@ -549,6 +563,10 @@ pub(super) fn is_integer(data_type: &DataType) -> bool {
     )
 }
 
+fn is_utf8_literal(expr: &BoundExpr) -> bool {
+    matches!(&expr.kind, ExprKind::Literal(ScalarValue::Utf8(_)))
+}
+
 fn validate_temporal_cast(source: &DataType, target: &DataType) -> Result<()> {
     let source_temporal = matches!(source, DataType::Date32 | DataType::Timestamp(_, _));
     let target_temporal = matches!(target, DataType::Date32 | DataType::Timestamp(_, _));
@@ -556,6 +574,9 @@ fn validate_temporal_cast(source: &DataType, target: &DataType) -> Result<()> {
         return Ok(());
     }
     if source == &DataType::Null {
+        return Ok(());
+    }
+    if target == &DataType::Date32 && is_integer(source) {
         return Ok(());
     }
     let supported = matches!(

@@ -9,7 +9,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
-use super::align_batch_to_schema;
+use super::{align_batch_to_schema, align_batch_to_schema_preserving_dictionaries};
 
 fn schema(fields: Vec<(&str, DataType, bool)>) -> Schema {
     Schema::new(
@@ -56,6 +56,34 @@ fn decodes_dictionary_values() {
     let target = Arc::new(schema(vec![("name", DataType::Utf8, false)]));
     let aligned = align_batch_to_schema(batch, target, "s3://bucket/data.parquet").unwrap();
     assert_eq!(aligned.column(0).data_type(), &DataType::Utf8);
+}
+
+#[test]
+fn internal_alignment_preserves_only_requested_dictionary_columns() {
+    let mut builder = StringDictionaryBuilder::<Int8Type>::new();
+    builder.append("alpha").unwrap();
+    builder.append("beta").unwrap();
+    let dictionary = Arc::new(builder.finish()) as ArrayRef;
+    let batch = RecordBatch::try_from_iter([("name", dictionary)]).unwrap();
+    let target = Arc::new(schema(vec![("name", DataType::Utf8, false)]));
+
+    let aligned = align_batch_to_schema_preserving_dictionaries(
+        batch,
+        target,
+        "s3://bucket/data.parquet",
+        &[0],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        aligned.column(0).data_type(),
+        DataType::Dictionary(key, value)
+            if key.as_ref() == &DataType::Int8 && value.as_ref() == &DataType::Utf8
+    ));
+    assert_eq!(
+        aligned.schema().field(0).data_type(),
+        aligned.column(0).data_type()
+    );
 }
 
 #[test]

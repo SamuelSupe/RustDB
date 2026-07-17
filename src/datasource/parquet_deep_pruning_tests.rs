@@ -144,7 +144,9 @@ async fn page_index_builds_row_selection_before_decode() {
         })
         .await
         .unwrap();
-    assert_eq!(fallback_rows, 100);
+    // The metadata budget disables page-index pruning, but the reader-level
+    // RowFilter still evaluates this exact predicate before payload decode.
+    assert_eq!(fallback_rows, 10);
     assert_eq!(context.metrics.snapshot().parquet_page_index_bytes_read, 0);
     assert_eq!(context.metrics.snapshot().parquet_pruning_budget_skips, 1);
 
@@ -177,7 +179,8 @@ async fn page_index_builds_row_selection_before_decode() {
         })
         .await
         .unwrap();
-    assert_eq!(rows, 100);
+    // Disabling the page index does not disable the independent RowFilter.
+    assert_eq!(rows, 10);
     assert_eq!(context.metrics.snapshot().parquet_page_index_bytes_read, 0);
     assert_eq!(context.metrics.snapshot().parquet_pages_pruned, 0);
 }
@@ -256,7 +259,7 @@ async fn bloom_filter_proves_missing_equality_without_data_pages() {
         })
         .await
         .unwrap();
-    assert_eq!(positive_rows, 100);
+    assert_eq!(positive_rows, 1);
     let positive_metrics = positive_context.metrics.snapshot();
     assert_eq!(positive_metrics.parquet_bloom_filter_bytes_read, 0);
     assert!(positive_metrics.metadata_cache_hits > 0);
@@ -333,7 +336,8 @@ async fn bloom_filter_proves_missing_equality_without_data_pages() {
         })
         .await
         .unwrap();
-    assert_eq!(disabled_rows, 100);
+    // Bloom pruning is disabled, while the exact reader RowFilter remains.
+    assert_eq!(disabled_rows, 0);
     let disabled_metrics = disabled_context.metrics.snapshot();
     assert_eq!(disabled_metrics.parquet_bloom_filter_bytes_read, 0);
     assert_eq!(disabled_metrics.parquet_bloom_row_groups_pruned, 0);

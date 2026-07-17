@@ -157,12 +157,14 @@ pub(crate) fn estimate_array_bytes(data_type: &DataType, rows: usize) -> usize {
         DataType::Int32
         | DataType::UInt32
         | DataType::Float32
+        | DataType::Decimal32(_, _)
         | DataType::Date32
         | DataType::Time32(_)
         | DataType::Interval(IntervalUnit::YearMonth) => fixed(4),
         DataType::Int64
         | DataType::UInt64
         | DataType::Float64
+        | DataType::Decimal64(_, _)
         | DataType::Date64
         | DataType::Time64(_)
         | DataType::Timestamp(_, _)
@@ -210,6 +212,25 @@ pub(crate) fn estimate_schema_batch_bytes(schema: &Schema, rows: usize) -> usize
     schema.fields().iter().fold(512usize, |bytes, field| {
         bytes.saturating_add(estimate_array_bytes(field.data_type(), rows))
     })
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use arrow::datatypes::DataType;
+
+    use super::estimate_array_bytes;
+
+    #[test]
+    fn estimates_narrow_decimal_physical_widths() {
+        assert_eq!(
+            estimate_array_bytes(&DataType::Decimal32(9, 2), 8),
+            estimate_array_bytes(&DataType::Int32, 8)
+        );
+        assert_eq!(
+            estimate_array_bytes(&DataType::Decimal64(18, 2), 8),
+            estimate_array_bytes(&DataType::Int64, 8)
+        );
+    }
 }
 
 /// Converts a public batch stream at an execution boundary while leaving an

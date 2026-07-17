@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
+use regex::Regex;
 
 use crate::sql::ScalarFunction;
 use crate::{Error, Result};
@@ -19,6 +20,7 @@ pub(super) fn evaluate(function: ScalarFunction, args: &[ArrayRef]) -> Result<Ar
         }
         ScalarFunction::Concat => concat(args),
         ScalarFunction::Replace => ternary_string(args, |value, from, to| value.replace(from, to)),
+        ScalarFunction::RegexpReplace => regexp_replace(args),
         ScalarFunction::StartsWith => {
             binary_predicate(args, |value, pattern| value.starts_with(pattern))
         }
@@ -181,6 +183,60 @@ where
     Ok(string_array(output))
 }
 
+fn regexp_replace(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let values = strings(&args[0])?;
+    let patterns = strings(&args[1])?;
+    let replacements = strings(&args[2])?;
+    let mut cached: Option<(String, Regex)> = None;
+    let mut output = Vec::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) || patterns.is_null(row) || replacements.is_null(row) {
+            output.push(None);
+            continue;
+        }
+        let pattern = patterns.value(row);
+        if cached
+            .as_ref()
+            .is_none_or(|(current, _)| current != pattern)
+        {
+            let compiled = Regex::new(pattern).map_err(|error| {
+                Error::Execution(format!(
+                    "regexp_replace has invalid pattern at row {row}: {error}"
+                ))
+            })?;
+            cached = Some((pattern.to_owned(), compiled));
+        }
+        let replacement = regex_replacement(replacements.value(row));
+        let expression = &cached.as_ref().expect("regex cached above").1;
+        output.push(Some(
+            expression
+                .replace_all(values.value(row), replacement.as_str())
+                .into_owned(),
+        ));
+    }
+    Ok(string_array(output))
+}
+
+fn regex_replacement(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '$' => output.push_str("$$"),
+            '\\' if chars.peek().is_some_and(char::is_ascii_digit) => {
+                output.push_str("${");
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    output.push(chars.next().expect("peeked digit"));
+                }
+                output.push('}');
+            }
+            '\\' => output.push(chars.next().unwrap_or('\\')),
+            other => output.push(other),
+        }
+    }
+    output
+}
+
 fn binary_predicate<F>(args: &[ArrayRef], predicate: F) -> Result<ArrayRef>
 where
     F: Fn(&str, &str) -> bool,
@@ -229,5 +285,39 @@ mod tests {
         let output = evaluate(ScalarFunction::Trim, &[input]).unwrap();
         let output = output.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(output.value(0), "\tvalue\t");
+    }
+
+    #[test]
+    fn regexp_replace_supports_sql_capture_references_and_nulls() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("https://www.example.com/path"),
+            None,
+        ]));
+        let patterns: ArrayRef = Arc::new(StringArray::from(vec![
+            Some(r"^https?://(?:www\.)?([^/]+)/.*$"),
+            Some("unused"),
+        ]));
+        let replacements: ArrayRef = Arc::new(StringArray::from(vec![Some(r"\1"), Some("unused")]));
+
+        let output = evaluate(
+            ScalarFunction::RegexpReplace,
+            &[values, patterns, replacements],
+        )
+        .unwrap();
+        let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(output.value(0), "example.com");
+        assert!(output.is_null(1));
+    }
+
+    #[test]
+    fn regexp_replace_rejects_invalid_patterns_at_the_source_row() {
+        let args: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["value"])),
+            Arc::new(StringArray::from(vec!["["])),
+            Arc::new(StringArray::from(vec!["replacement"])),
+        ];
+
+        let error = evaluate(ScalarFunction::RegexpReplace, &args).unwrap_err();
+        assert!(error.to_string().contains("invalid pattern at row 0"));
     }
 }

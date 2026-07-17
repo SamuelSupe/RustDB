@@ -1,7 +1,8 @@
 use std::{fs::File, sync::Arc};
 
 use arrow::{
-    array::{Int64Array, StringArray},
+    array::{Array, ArrayRef, Int64Array, StringArray},
+    compute::cast,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -12,6 +13,7 @@ use tempfile::tempdir;
 use super::{ParquetTable, validate_file_schema};
 use crate::{
     EngineConfig, Error, ParquetOptions, ParquetSchemaMode,
+    datasource::parquet_metadata::ParquetMetadata,
     datasource::parquet_scan::align_batch,
     datasource::{
         ComparisonOp, MetadataCache, PredicateValue, ScanPredicate, ScanRequest, TableProvider,
@@ -89,6 +91,18 @@ fn alignment_fills_missing_union_columns_with_null() {
     assert_eq!(aligned.num_rows(), 2);
     assert_eq!(aligned.column(0).null_count(), 2);
     assert_eq!(aligned.schema(), target);
+}
+
+#[test]
+fn identity_alignment_reuses_existing_array_buffers() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let column: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column.clone()]).unwrap();
+
+    let aligned = align_batch(batch, &schema, None, 0, "memory://identity").unwrap();
+
+    assert!(Arc::ptr_eq(&column, aligned.column(0)));
+    assert_eq!(aligned.schema(), schema);
 }
 
 #[tokio::test]
@@ -195,6 +209,159 @@ async fn applies_projection_limit_and_row_group_pruning() {
         .unwrap();
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
     assert_eq!(or_context.metrics.snapshot().row_groups_pruned, 1);
+}
+
+#[tokio::test]
+async fn query_hint_preserves_proven_string_dictionaries() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("dictionary.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("key", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..8)),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                None,
+                Some("a"),
+                Some("b"),
+                Some("a"),
+                None,
+                Some("b"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(true)
+        .set_dictionary_page_size_limit(1024 * 1024)
+        .set_max_row_group_row_count(Some(4))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let config = EngineConfig::default();
+    let table = ParquetTable::try_new_with_cache(
+        vec![path.to_string_lossy().into_owned()],
+        ParquetOptions::default(),
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+    )
+    .await
+    .unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    table.prepare(Arc::clone(&context)).await.unwrap();
+    context.seal_object_snapshots();
+    let retained_before_scan = context.memory.used();
+
+    let mut request = ScanRequest::new(2);
+    request.projection = Some(vec![1]);
+    request.dictionary_columns = vec![1];
+    let batches = table
+        .scan(request, Arc::clone(&context))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    assert!(!batches.is_empty());
+    assert!(batches.iter().all(|batch| {
+        matches!(
+            batch.column(0).data_type(),
+            DataType::Dictionary(key, value)
+                if key.as_ref() == &DataType::UInt32 && value.as_ref() == &DataType::Utf8
+        )
+    }));
+    let mut values = batches
+        .iter()
+        .flat_map(|batch| {
+            let decoded = cast(batch.column(0).as_ref(), &DataType::Utf8).unwrap();
+            decoded
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut expected = vec![
+        Some("a".to_owned()),
+        Some("b".to_owned()),
+        None,
+        Some("a".to_owned()),
+        Some("b".to_owned()),
+        Some("a".to_owned()),
+        None,
+        Some("b".to_owned()),
+    ];
+    values.sort();
+    expected.sort();
+    assert_eq!(values, expected);
+    assert_eq!(context.memory.used(), retained_before_scan);
+
+    let mut canonical = ScanRequest::new(2);
+    canonical.projection = Some(vec![1]);
+    let canonical = table
+        .scan(canonical, context)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(
+        canonical
+            .iter()
+            .all(|batch| batch.column(0).data_type() == &DataType::Utf8)
+    );
+
+    let plain_path = directory.path().join("plain.parquet");
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(&plain_path).unwrap(),
+        batch.schema(),
+        Some(properties),
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let plain = ParquetTable::try_new_with_cache(
+        vec![plain_path.to_string_lossy().into_owned()],
+        ParquetOptions::default(),
+        &config,
+        MetadataCache::new(config.metadata_cache_bytes),
+    )
+    .await
+    .unwrap();
+    let context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    plain.prepare(Arc::clone(&context)).await.unwrap();
+    context.seal_object_snapshots();
+    let mut request = ScanRequest::new(2);
+    request.projection = Some(vec![1]);
+    request.dictionary_columns = vec![1];
+    let plain = plain
+        .scan(request, context)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(
+        plain
+            .iter()
+            .all(|batch| batch.column(0).data_type() == &DataType::Utf8)
+    );
 }
 
 #[tokio::test]
@@ -327,6 +494,60 @@ async fn refreshes_object_identity_between_queries() {
 }
 
 #[tokio::test]
+async fn query_footer_is_reused_without_cache_and_reloaded_after_change() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("query-footer.parquet");
+    write_ids(&path, &[1]);
+    let config = EngineConfig {
+        metadata_cache_bytes: 0,
+        ..EngineConfig::default()
+    };
+    let first_context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    let table = ParquetTable::try_new_with_cache_for_query(
+        vec![path.to_string_lossy().into_owned()],
+        ParquetOptions::default(),
+        &config,
+        MetadataCache::new(0),
+        Some(Arc::clone(&first_context)),
+    )
+    .await
+    .unwrap();
+    table.prepare(Arc::clone(&first_context)).await.unwrap();
+    first_context.seal_object_snapshots();
+    let batches = table
+        .scan(ScanRequest::new(2), Arc::clone(&first_context))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(first_context.metrics.snapshot().metadata_cache_misses, 1);
+
+    write_ids(&path, &[1, 2, 3]);
+    let changed_context =
+        Arc::new(QueryContext::new(MemoryPool::new(16 * 1024 * 1024), directory.path()).unwrap());
+    table.prepare(Arc::clone(&changed_context)).await.unwrap();
+    changed_context.seal_object_snapshots();
+    assert_ne!(
+        changed_context
+            .object_snapshot(table.files[0].uri())
+            .unwrap(),
+        *table.files[0].snapshot()
+    );
+    let batches = table
+        .scan(ScanRequest::new(2), Arc::clone(&changed_context))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    assert_eq!(changed_context.metrics.snapshot().metadata_cache_misses, 1);
+}
+
+#[tokio::test]
 async fn query_schema_reservation_lives_with_table() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("schema-lease.parquet");
@@ -344,13 +565,22 @@ async fn query_schema_reservation_lives_with_table() {
     .await
     .unwrap();
 
-    let held = table
+    let schema_held = table
         ._schema_reservation
         .as_ref()
         .expect("query schema reservation")
         .size();
+    let metadata_held = table
+        .query_metadata
+        .as_ref()
+        .expect("query metadata")
+        .iter()
+        .map(ParquetMetadata::reserved_bytes)
+        .sum::<usize>();
+    let held = schema_held.saturating_add(metadata_held);
     let before_drop = context.memory.used();
-    assert!(held > 0);
+    assert!(schema_held > 0);
+    assert!(metadata_held > 0);
     drop(table);
     assert_eq!(context.memory.used(), before_drop - held);
 }
@@ -395,13 +625,22 @@ async fn multi_file_schema_reservation_covers_every_retained_schema() {
         .saturating_add(super::schema_memory_size(&table.physical_schema))
         .saturating_add(super::schema_memory_size(&table.schema))
         .saturating_add(table.hive.as_deref().unwrap().memory_size());
-    let held = table
+    let schema_held = table
         ._schema_reservation
         .as_ref()
         .expect("query schema reservation")
         .size();
+    let metadata_held = table
+        .query_metadata
+        .as_ref()
+        .expect("query metadata")
+        .iter()
+        .map(ParquetMetadata::reserved_bytes)
+        .sum::<usize>();
+    let held = schema_held.saturating_add(metadata_held);
 
-    assert!(held >= retained_schema_floor);
+    assert!(schema_held >= retained_schema_floor);
+    assert!(metadata_held > 0);
     let before_drop = context.memory.used();
     drop(table);
     assert_eq!(context.memory.used(), before_drop - held);

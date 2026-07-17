@@ -1,4 +1,11 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_stream::stream;
@@ -9,14 +16,19 @@ use uuid::Uuid;
 use crate::{
     Catalog, CsvOptions, EngineConfig, Error, ParquetOptions, PreparedStatement, QueryMetrics,
     Result, TableEntry,
-    command::{SessionCommand, ViewTable},
-    datasource::{MetadataCache, RegisteredCsvTable, RegisteredParquetTable},
+    catalog::PersistentCatalog,
+    command::{ParsedStatement, SessionCommand, ViewTable},
+    datasource::{MetadataCache, NativeSegmentTable, RegisteredCsvTable, RegisteredParquetTable},
     runtime::{
-        ComputeRuntime, MemoryPool, QueryContext, QueryControl, RecordBatchStream, SpillIoPool,
-        SpillManager, SpillQuotaPool, boxed_record_batch_stream, scavenge_orphans,
+        ComputeRuntime, GlobalComputeScheduler, MemoryPool, QueryContext, QueryControl,
+        RecordBatchStream, SpillIoPool, SpillManager, SpillQuotaPool, boxed_record_batch_stream,
+        scavenge_orphans,
     },
     sql::{LogicalPlan, StatementPlan},
+    storage::NativeDatabase,
 };
+
+pub use memory_snapshot::EngineMemorySnapshot;
 
 #[derive(Clone)]
 pub struct Engine {
@@ -28,14 +40,46 @@ struct EngineInner {
     memory: MemoryPool,
     admission: Arc<Semaphore>,
     compute: ComputeRuntime,
+    compute_scheduler: GlobalComputeScheduler,
     metadata_cache: MetadataCache,
     spill_quota: SpillQuotaPool,
     spill_io: SpillIoPool,
+    database: Option<Arc<NativeDatabase>>,
+    persistent_catalog: PersistentCatalog,
+    native_commit: parking_lot::Mutex<()>,
+    native_write_admission: Arc<Semaphore>,
+    native_poisoned: AtomicBool,
 }
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Result<Self> {
         validate_config(&config)?;
+        Self::from_validated_config(config, None)
+    }
+
+    pub fn open(path: impl AsRef<Path>, config: EngineConfig) -> Result<Self> {
+        validate_config(&config)?;
+        let database = NativeDatabase::open(path)?;
+        Self::from_validated_config(config, Some(database))
+    }
+
+    pub fn restore_from(
+        backup: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        config: EngineConfig,
+    ) -> Result<Self> {
+        validate_config(&config)?;
+        let source = NativeDatabase::open(backup)?;
+        source.backup_to(destination.as_ref())?;
+        drop(source);
+        Self::open(destination, config)
+    }
+
+    fn from_validated_config(
+        config: EngineConfig,
+        database: Option<NativeDatabase>,
+    ) -> Result<Self> {
+        let database = database.map(Arc::new);
         std::fs::create_dir_all(&config.spill.directory)
             .map_err(|error| Error::io(Some(config.spill.directory.clone()), error))?;
         scavenge_orphans(&config.spill.directory, config.spill.orphan_ttl)?;
@@ -43,7 +87,27 @@ impl Engine {
         SpillManager::protect_io_headroom(&memory, config.spill.io_threads)?;
         let admission = Arc::new(Semaphore::new(config.max_concurrent_queries));
         let compute = ComputeRuntime::new(config.compute_threads)?;
+        let compute_scheduler = GlobalComputeScheduler::new(config.compute_threads)?;
         let metadata_cache = MetadataCache::new(config.metadata_cache_bytes);
+        let persistent_catalog = match database.as_ref() {
+            Some(database) => {
+                let entries = database
+                    .table_snapshots()
+                    .into_iter()
+                    .map(|(name, snapshot)| {
+                        let provider = NativeSegmentTable::new(
+                            database.path(),
+                            snapshot,
+                            &config,
+                            metadata_cache.clone(),
+                        );
+                        TableEntry::new(name, Arc::new(provider))
+                    })
+                    .collect::<Vec<_>>();
+                PersistentCatalog::new(database.catalog_generation(), entries)?
+            }
+            None => PersistentCatalog::default(),
+        };
         let spill_quota = SpillQuotaPool::new(config.spill.clone())?;
         let spill_io = SpillIoPool::new(config.spill.io_threads)?;
         Ok(Self {
@@ -52,9 +116,15 @@ impl Engine {
                 memory,
                 admission,
                 compute,
+                compute_scheduler,
                 metadata_cache,
                 spill_quota,
                 spill_io,
+                database,
+                persistent_catalog,
+                native_commit: parking_lot::Mutex::new(()),
+                native_write_admission: Arc::new(Semaphore::new(1)),
+                native_poisoned: AtomicBool::new(false),
             }),
         })
     }
@@ -63,11 +133,63 @@ impl Engine {
         &self.inner.config
     }
 
+    pub fn memory_snapshot(&self) -> EngineMemorySnapshot {
+        EngineMemorySnapshot::from_pool(&self.inner.memory)
+    }
+
+    pub fn database_path(&self) -> Option<&Path> {
+        self.inner.database.as_ref().map(|database| database.path())
+    }
+
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<()> {
+        let database = self.inner.database.as_ref().ok_or_else(|| {
+            Error::Unsupported("backup requires Engine::open(path, config)".to_owned())
+        })?;
+        self.ensure_native_healthy()?;
+        let _commit = self.inner.native_commit.lock();
+        self.ensure_native_healthy()?;
+        database.backup_to(destination.as_ref())
+    }
+
     pub fn session(&self) -> Session {
         Session {
             engine: self.clone(),
-            catalog: Catalog::default(),
+            catalog: Catalog::with_persistent(self.inner.persistent_catalog.clone()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_context_for_test(&self) -> Result<Arc<QueryContext>> {
+        self.session().query_context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compute_scheduler_counts_for_test(&self) -> (usize, usize, usize, usize) {
+        let snapshot = self.inner.compute_scheduler.snapshot();
+        (
+            snapshot.active_slots,
+            snapshot.peak_active_slots,
+            snapshot.queued_waiters,
+            snapshot.waiting_queries,
+        )
+    }
+
+    fn drain_native_retired(&self) -> Result<()> {
+        match self.inner.database.as_ref() {
+            Some(database) => database.drain_retired(),
+            None => Ok(()),
+        }
+    }
+
+    fn ensure_native_healthy(&self) -> Result<()> {
+        if !self.inner.native_poisoned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(Error::native_storage(
+            self.database_path()
+                .unwrap_or_else(|| Path::new("native database")),
+            "engine state requires reopen after a native commit failure",
+        ))
     }
 }
 
@@ -151,24 +273,39 @@ impl Session {
     }
 
     pub async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        let permit = Arc::clone(&self.engine.inner.admission)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Internal("query admission controller closed".to_owned()))?;
+        let admission_started = Instant::now();
+        let permit = self.acquire_query_permit().await?;
+        let admission_wait = admission_started.elapsed();
+        let parse_started = Instant::now();
+        let parsed = crate::command::parse(sql);
+        let parse_time = parse_started.elapsed();
 
-        if let Some(command) = crate::command::parse(sql)? {
-            return self.execute_command(command, permit).await;
+        match parsed? {
+            ParsedStatement::Command(command) => {
+                self.execute_command(command, permit, admission_wait, parse_time)
+                    .await
+            }
+            ParsedStatement::Query(statement) => {
+                self.execute_query(*statement, permit, admission_wait, parse_time)
+                    .await
+            }
         }
-
-        self.execute_query(sql, permit).await
     }
 
-    async fn execute_query(&self, sql: &str, permit: OwnedSemaphorePermit) -> Result<QueryResult> {
+    async fn execute_query(
+        &self,
+        statement: sqlparser::ast::Statement,
+        permit: OwnedSemaphorePermit,
+        admission_wait: Duration,
+        parse_time: Duration,
+    ) -> Result<QueryResult> {
         // Start query accounting before file-function schema discovery so the
         // reported elapsed time includes planning and metadata preparation.
         let context = self.query_context()?;
+        context.metrics.record_query_admission_wait(admission_wait);
+        context.metrics.record_sql_parse_time(parse_time);
         let plan = match self
-            .prepare_statement_for_query(sql, Some(Arc::clone(&context)))
+            .prepare_ast_for_query(statement, Some(Arc::clone(&context)))
             .await
         {
             Ok(plan) => plan,
@@ -193,11 +330,11 @@ impl Session {
         &self,
         statement: sqlparser::ast::Statement,
     ) -> Result<QueryResult> {
-        let permit = Arc::clone(&self.engine.inner.admission)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Internal("query admission controller closed".to_owned()))?;
+        let admission_started = Instant::now();
+        let permit = self.acquire_query_permit().await?;
+        let admission_wait = admission_started.elapsed();
         let context = self.query_context()?;
+        context.metrics.record_query_admission_wait(admission_wait);
         let plan = match self
             .prepare_ast_for_query(statement, Some(Arc::clone(&context)))
             .await
@@ -220,12 +357,31 @@ impl Session {
         ))
     }
 
+    async fn acquire_query_permit(&self) -> Result<OwnedSemaphorePermit> {
+        self.engine.ensure_native_healthy()?;
+        let permit = Arc::clone(&self.engine.inner.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Internal("query admission controller closed".to_owned()))?;
+        self.engine.ensure_native_healthy()?;
+        Ok(permit)
+    }
+
     async fn execute_command(
         &self,
         command: SessionCommand,
         permit: OwnedSemaphorePermit,
+        admission_wait: Duration,
+        parse_time: Duration,
     ) -> Result<QueryResult> {
+        if let SessionCommand::NativeWrite(command) = command {
+            return self
+                .execute_native_write(command, permit, admission_wait, parse_time)
+                .await;
+        }
         let context = self.query_context()?;
+        context.metrics.record_query_admission_wait(admission_wait);
+        context.metrics.record_sql_parse_time(parse_time);
         let batch = async {
             match command {
                 SessionCommand::ShowTables => crate::command::show_tables(&self.catalog),
@@ -260,6 +416,7 @@ impl Session {
                     }
                     crate::command::status("DROP VIEW")
                 }
+                SessionCommand::NativeWrite(_) => unreachable!("handled before command dispatch"),
             }
         }
         .await;
@@ -293,27 +450,67 @@ impl Session {
         sql: &str,
         context: Option<Arc<QueryContext>>,
     ) -> Result<StatementPlan> {
-        let prepared = crate::table_function::prepare_with_cache_for_query(
-            &self.catalog,
+        let catalog = self.catalog.pin();
+        if let Some(context) = context.as_ref() {
+            context.set_catalog_snapshot(catalog.clone())?;
+        }
+        // CREATE TEMP VIEW retains the original query source for diagnostics,
+        // so its inner query is parsed once more here. Keep that parse in the
+        // SQL phase rather than folding it into table-function preparation.
+        let parse_started = Instant::now();
+        let statements = crate::sql::parse_statements(sql);
+        if let Some(context) = context.as_ref() {
+            context
+                .metrics
+                .record_sql_parse_time(parse_started.elapsed());
+        }
+        let mut statements = statements?;
+        if statements.len() != 1 {
+            return Err(Error::InvalidArgument(
+                "exactly one SQL statement is required".to_owned(),
+            ));
+        }
+        let statement = statements.remove(0);
+        let table_function_started = Instant::now();
+        let prepared = crate::table_function::prepare_statement_with_cache_for_query(
+            &catalog,
             &self.engine.inner.config,
             &self.engine.inner.metadata_cache,
-            sql,
+            statement,
             context.clone(),
         )
-        .await?;
+        .await;
+        if let Some(context) = context.as_ref() {
+            context
+                .metrics
+                .record_table_function_prepare_time(table_function_started.elapsed());
+        }
+        let prepared = prepared?;
         let crate::table_function::PreparedSql {
             statement,
             generated_tables,
         } = prepared;
         let _generated_tables =
-            crate::table_function::GeneratedTablesGuard::new(&self.catalog, generated_tables);
+            crate::table_function::GeneratedTablesGuard::new(&catalog, generated_tables);
         async {
-            let bound = crate::sql::bind_statement(&self.catalog, statement)?;
+            let bind_started = Instant::now();
+            let bound = crate::sql::bind_statement(&catalog, statement);
+            if let Some(context) = context.as_ref() {
+                context.metrics.record_bind_time(bind_started.elapsed());
+            }
+            let bound = bound?;
             if let Some(context) = context.as_ref() {
                 crate::execution::prepare_plan(bound.logical_plan(), Arc::clone(context)).await?;
                 context.seal_object_snapshots();
             }
-            crate::sql::optimize_statement(bound, context.as_deref())
+            let optimize_started = Instant::now();
+            let optimized = crate::sql::optimize_statement(bound, context.as_deref());
+            if let Some(context) = context.as_ref() {
+                context
+                    .metrics
+                    .record_optimize_time(optimize_started.elapsed());
+            }
+            optimized
         }
         .await
     }
@@ -323,27 +520,50 @@ impl Session {
         statement: sqlparser::ast::Statement,
         context: Option<Arc<QueryContext>>,
     ) -> Result<StatementPlan> {
+        let catalog = self.catalog.pin();
+        if let Some(context) = context.as_ref() {
+            context.set_catalog_snapshot(catalog.clone())?;
+        }
+        let table_function_started = Instant::now();
         let prepared = crate::table_function::prepare_statement_with_cache_for_query(
-            &self.catalog,
+            &catalog,
             &self.engine.inner.config,
             &self.engine.inner.metadata_cache,
             statement,
             context.clone(),
         )
-        .await?;
+        .await;
+        if let Some(context) = context.as_ref() {
+            context
+                .metrics
+                .record_table_function_prepare_time(table_function_started.elapsed());
+        }
+        let prepared = prepared?;
         let crate::table_function::PreparedSql {
             statement,
             generated_tables,
         } = prepared;
         let _generated_tables =
-            crate::table_function::GeneratedTablesGuard::new(&self.catalog, generated_tables);
+            crate::table_function::GeneratedTablesGuard::new(&catalog, generated_tables);
         async {
-            let bound = crate::sql::bind_statement(&self.catalog, statement)?;
+            let bind_started = Instant::now();
+            let bound = crate::sql::bind_statement(&catalog, statement);
+            if let Some(context) = context.as_ref() {
+                context.metrics.record_bind_time(bind_started.elapsed());
+            }
+            let bound = bound?;
             if let Some(context) = context.as_ref() {
                 crate::execution::prepare_plan(bound.logical_plan(), Arc::clone(context)).await?;
                 context.seal_object_snapshots();
             }
-            crate::sql::optimize_statement(bound, context.as_deref())
+            let optimize_started = Instant::now();
+            let optimized = crate::sql::optimize_statement(bound, context.as_deref());
+            if let Some(context) = context.as_ref() {
+                context
+                    .metrics
+                    .record_optimize_time(optimize_started.elapsed());
+            }
+            optimized
         }
         .await
     }
@@ -378,8 +598,13 @@ impl Session {
             self.engine.inner.config.batch_size,
             self.engine.inner.spill_quota.start_query(),
             self.engine.inner.spill_io.clone(),
+            self.engine.inner.compute_scheduler.clone(),
             self.engine.inner.config.execution.clone(),
+            self.engine.inner.config.max_concurrent_queries,
         )?);
+        if let Some(database) = self.engine.inner.database.as_ref() {
+            context.set_native_database_cleanup(Arc::downgrade(database));
+        }
         context.configure_compute_lanes(self.engine.inner.config.compute_threads);
         Ok(context)
     }
@@ -463,10 +688,19 @@ fn instrument_output(
         while let Some(item) = input.next().await {
             match item {
                 Ok(batch) => {
-                    if let Err(error) = context.check_cancelled() {
+                    if !context.native_commit_is_durable()
+                        && let Err(error) = context.check_cancelled()
+                    {
                         context.metrics.finish();
                         let error = context.tasks.first_failure().unwrap_or(error);
-                        yield Err(context.error_with_cleanup_after_tasks(error).await);
+                        let mut error = context.error_with_cleanup_after_tasks(error).await;
+                        context.release_catalog_snapshot();
+                        if let Err(cleanup) = _engine_keepalive.drain_native_retired() {
+                            error = Error::Execution(format!(
+                                "{error}; additionally failed to clean retired native snapshots: {cleanup}"
+                            ));
+                        }
+                        yield Err(error);
                         return;
                     }
                     context.metrics.record_output(
@@ -482,14 +716,54 @@ fn instrument_output(
                     // A QueryResult may remain alive after the consumer sees
                     // an execution error.  Clean this query's files now rather
                     // than waiting for QueryContext::drop().
-                    yield Err(context.error_with_cleanup_after_tasks(error).await);
+                    let mut error = context.error_with_cleanup_after_tasks(error).await;
+                    context.release_catalog_snapshot();
+                    if let Err(cleanup) = _engine_keepalive.drain_native_retired() {
+                        error = Error::Execution(format!(
+                            "{error}; additionally failed to clean retired native snapshots: {cleanup}"
+                        ));
+                    }
+                    if context.native_commit_is_durable() {
+                        _engine_keepalive
+                            .inner
+                            .native_poisoned
+                            .store(true, Ordering::Release);
+                        error = context.error_after_native_commit(error);
+                    }
+                    yield Err(error);
                     return;
                 }
             }
         }
         context.metrics.finish();
-        if let Err(error) = context.cleanup_spill_after_tasks().await {
+        if let Err(mut error) = context.cleanup_spill_after_tasks().await {
+            context.release_catalog_snapshot();
+            if let Err(cleanup) = _engine_keepalive.drain_native_retired() {
+                error = Error::Execution(format!(
+                    "{error}; additionally failed to clean retired native snapshots: {cleanup}"
+                ));
+            }
+            if context.native_commit_is_durable() {
+                _engine_keepalive
+                    .inner
+                    .native_poisoned
+                    .store(true, Ordering::Release);
+                error = context.error_after_native_commit(error);
+            }
             yield Err(error);
+            return;
+        }
+        context.release_catalog_snapshot();
+        if let Err(error) = _engine_keepalive.drain_native_retired() {
+            if context.native_commit_is_durable() {
+                _engine_keepalive
+                    .inner
+                    .native_poisoned
+                    .store(true, Ordering::Release);
+                yield Err(context.error_after_native_commit(error));
+            } else {
+                yield Err(error);
+            }
         }
     })
 }
@@ -549,3 +823,9 @@ fn ensure_directory_parent(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests;
+
+#[path = "engine/memory_snapshot.rs"]
+mod memory_snapshot;
+
+#[path = "engine/native_write.rs"]
+mod native_write;

@@ -4,13 +4,15 @@ use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use super::next_provider_id;
-use super::parquet_mapping::{nullable_schema, remap_predicate, remap_projection, reorder_schema};
+use super::parquet_mapping::{
+    nullable_schema, remap_exact_predicate, remap_predicate, remap_projection, reorder_schema,
+};
 use crate::{
     EngineConfig, Error, ParquetOptions, ParquetSchemaMode, Result,
     datasource::{
-        MetadataCache, ParquetTable, ScanRequest, ScanTask, TableProvider, TableSourceIdentity,
-        TableStatistics, schema_evolution::align_batch_to_schema,
+        MetadataCache, ParquetTable, PredicateGuarantee, ScanRequest, ScanTask, TableProvider,
+        TableSourceIdentity, TableStatistics, provider::next_provider_id,
+        schema_evolution::align_batch_to_schema_preserving_dictionaries,
     },
     runtime::{
         QueryContext, RecordBatchStream, boxed_memory_batch_stream, boxed_record_batch_stream,
@@ -112,29 +114,58 @@ impl RegisteredParquetTable {
         &self,
         provider: &Arc<dyn TableProvider>,
         request: ScanRequest,
-    ) -> Result<(ScanRequest, SchemaRef)> {
+    ) -> Result<(ScanRequest, SchemaRef, Vec<usize>)> {
+        let predicate_guarantee = request.predicate_guarantee;
         let target = request.projected_schema(&self.schema)?;
         let provider_schema = provider.schema();
-        let projection = match request.projection {
-            Some(indices) => Some(remap_projection(&self.schema, &provider_schema, &indices)?),
-            None => Some(remap_projection(
+        let logical_projection = request
+            .projection
+            .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+        let target_dictionary_columns = logical_projection
+            .iter()
+            .enumerate()
+            .filter_map(|(output, source)| {
+                request
+                    .dictionary_columns
+                    .contains(source)
+                    .then_some(output)
+            })
+            .collect();
+        let projection = Some(remap_projection(
+            &self.schema,
+            &provider_schema,
+            &logical_projection,
+        )?);
+        let predicate = match (request.predicate.as_ref(), predicate_guarantee) {
+            (Some(predicate), PredicateGuarantee::Exact) => Some(remap_exact_predicate(
+                predicate,
                 &self.schema,
                 &provider_schema,
-                &(0..self.schema.fields().len()).collect::<Vec<_>>(),
             )?),
+            (Some(predicate), PredicateGuarantee::BestEffort) => {
+                remap_predicate(predicate, &self.schema, &provider_schema)
+            }
+            (None, PredicateGuarantee::Exact) => {
+                return Err(Error::Internal(
+                    "registered exact Parquet scan is missing its predicate".to_owned(),
+                ));
+            }
+            (None, PredicateGuarantee::BestEffort) => None,
         };
-        let predicate = request
-            .predicate
-            .as_ref()
-            .and_then(|predicate| remap_predicate(predicate, &self.schema, &provider_schema));
+        let dictionary_columns =
+            remap_projection(&self.schema, &provider_schema, &request.dictionary_columns)?;
         Ok((
             ScanRequest {
                 projection,
                 predicate,
                 limit: request.limit,
                 batch_size: request.batch_size,
+                decode_batch_size: request.decode_batch_size,
+                dictionary_columns,
+                predicate_guarantee,
             },
             target,
+            target_dictionary_columns,
         ))
     }
 }
@@ -162,6 +193,15 @@ impl TableProvider for RegisteredParquetTable {
 
     fn explain_scan(&self) -> Option<String> {
         Some("format=parquet morsel=row_group metadata=singleflight".to_owned())
+    }
+
+    fn supports_exact_filter(&self, predicate: &crate::datasource::ScanPredicate) -> bool {
+        self.schema_mode == ParquetSchemaMode::Strict
+            && crate::datasource::exact_filter::supported(
+                predicate,
+                &self.schema,
+                &self.physical_schema,
+            )
     }
 
     fn query_statistics(&self, context: &QueryContext) -> TableStatistics {
@@ -208,11 +248,16 @@ impl TableProvider for RegisteredParquetTable {
         let provider = context.prepared_provider(self.id).ok_or_else(|| {
             Error::Internal("registered Parquet table scanned before query preparation".to_owned())
         })?;
-        let (request, target) = self.remap_request(&provider, request)?;
+        let (request, target, dictionary_columns) = self.remap_request(&provider, request)?;
         let mut input = provider.scan(request, context).await?;
         Ok(boxed_record_batch_stream(async_stream::try_stream! {
             while let Some(batch) = input.next().await {
-                yield align_batch_to_schema(batch?, Arc::clone(&target), "registered Parquet table")?;
+                yield align_batch_to_schema_preserving_dictionaries(
+                    batch?,
+                    Arc::clone(&target),
+                    "registered Parquet table",
+                    &dictionary_columns,
+                )?;
             }
         }))
     }
@@ -226,7 +271,7 @@ impl TableProvider for RegisteredParquetTable {
         let provider = context.prepared_provider(self.id).ok_or_else(|| {
             Error::Internal("registered Parquet table scanned before query preparation".to_owned())
         })?;
-        let (request, target) = self.remap_request(&provider, request)?;
+        let (request, target, dictionary_columns) = self.remap_request(&provider, request)?;
         let tasks = provider.scan_tasks(request, context, target_tasks).await?;
         Ok(tasks
             .into_iter()
@@ -234,15 +279,17 @@ impl TableProvider for RegisteredParquetTable {
                 let id = task.id();
                 let mut input = task.into_stream();
                 let target = Arc::clone(&target);
+                let dictionary_columns = dictionary_columns.clone();
                 ScanTask::new(
                     id,
                     boxed_memory_batch_stream(async_stream::try_stream! {
                         while let Some(batch) = input.next().await {
                             let batch = batch?;
-                            let aligned = align_batch_to_schema(
+                            let aligned = align_batch_to_schema_preserving_dictionaries(
                                 batch.batch().clone(),
                                 Arc::clone(&target),
                                 "registered Parquet table",
+                                &dictionary_columns,
                             )?;
                             yield batch.replace(aligned, "registered Parquet alignment")?;
                         }

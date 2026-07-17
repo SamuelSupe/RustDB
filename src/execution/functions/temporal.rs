@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, ArrayRef, Date32Array, StringArray, TimestampMicrosecondArray},
+    array::{
+        Array, ArrayRef, Date32Array, Int32Array, Int64Array, StringArray,
+        TimestampMicrosecondArray,
+    },
     compute::{
         cast,
         kernels::temporal::{DatePart, date_part as arrow_date_part},
@@ -27,6 +30,45 @@ pub(super) fn date_part(part: DateTimePart, array: &ArrayRef) -> Result<ArrayRef
     };
     let output = arrow_date_part(array.as_ref(), part)?;
     Ok(cast(output.as_ref(), &DataType::Int64)?)
+}
+
+pub(super) fn to_timestamp_seconds(array: &ArrayRef) -> Result<ArrayRef> {
+    let values = downcast::<Int64Array>(array, "Int64")?;
+    let output = (0..values.len())
+        .map(|row| {
+            values
+                .is_valid(row)
+                .then(|| {
+                    values.value(row).checked_mul(1_000_000).ok_or_else(|| {
+                        Error::Execution(format!(
+                            "to_timestamp_seconds overflowed TIMESTAMP at row {row}"
+                        ))
+                    })
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(TimestampMicrosecondArray::from(output)))
+}
+
+pub(super) fn integer_to_date(array: &ArrayRef) -> Result<ArrayRef> {
+    let days = cast(array.as_ref(), &DataType::Int32)?;
+    let days = downcast::<Int32Array>(&days, "Int32")?;
+    Ok(Arc::new(Date32Array::from_iter(days.iter())))
+}
+
+pub(super) fn is_integer(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
 }
 
 pub(super) fn date_trunc(part: DateTimePart, array: &ArrayRef) -> Result<ArrayRef> {
@@ -217,3 +259,6 @@ fn downcast<'a, T: 'static>(array: &'a ArrayRef, name: &str) -> Result<&'a T> {
         .downcast_ref::<T>()
         .ok_or_else(|| Error::Internal(format!("expected {name} array, got {}", array.data_type())))
 }
+
+#[cfg(test)]
+mod tests;

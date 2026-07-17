@@ -317,6 +317,23 @@ impl MemoryReservation {
         }
     }
 
+    /// Transfers part of this reservation into an independent lease without
+    /// changing pool usage. This is used when one admitted workspace produces
+    /// several bounded output batches that must release memory independently.
+    pub(crate) fn split_off(&mut self, bytes: usize) -> Result<Self> {
+        if bytes > self.bytes {
+            return Err(Error::Internal(format!(
+                "cannot split {bytes} bytes from a {}-byte memory reservation",
+                self.bytes
+            )));
+        }
+        self.bytes -= bytes;
+        Ok(Self {
+            pool: self.pool.clone(),
+            bytes,
+        })
+    }
+
     /// Transfers an already-accounted reservation into this handle without
     /// changing pool usage. Both handles must belong to the same pool.
     pub(crate) fn absorb(&mut self, mut other: Self) -> Result<()> {
@@ -446,6 +463,23 @@ mod tests {
         assert_eq!(pool.used(), 20);
         assert!(reservation.try_resize(101).is_err());
         assert_eq!(reservation.size(), 20);
+        drop(reservation);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn reservation_can_split_without_changing_pool_usage() {
+        let pool = MemoryPool::new(100);
+        let mut reservation = pool.try_reserve(80).unwrap();
+        let split = reservation.split_off(30).unwrap();
+
+        assert_eq!(reservation.size(), 50);
+        assert_eq!(split.size(), 30);
+        assert_eq!(pool.used(), 80);
+        assert!(reservation.split_off(51).is_err());
+
+        drop(split);
+        assert_eq!(pool.used(), 50);
         drop(reservation);
         assert_eq!(pool.used(), 0);
     }

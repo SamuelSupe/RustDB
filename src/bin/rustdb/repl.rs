@@ -11,7 +11,7 @@ pub async fn run(
     metrics: bool,
 ) -> Result<()> {
     eprintln!(
-        "RustDB v{}; end SQL with ';', or use .help",
+        "RustDB v{}; end SQL with ';'; use .help or .help zh",
         env!("CARGO_PKG_VERSION")
     );
     let mut pending = String::new();
@@ -101,9 +101,16 @@ fn handle_meta(session: &Session, command: &str) -> bool {
             }
             false
         }
-        ".help" => {
+        ".help" | ".help en" => {
             eprintln!(".tables  list registered external tables");
             eprintln!(".quit    exit the shell");
+            eprintln!(".help zh show Chinese help");
+            false
+        }
+        ".help zh" | ".help zh-cn" => {
+            eprintln!(".tables  列出已注册的外部表");
+            eprintln!(".quit    退出交互终端");
+            eprintln!(".help    显示英文帮助");
             false
         }
         _ => {

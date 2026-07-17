@@ -100,17 +100,18 @@ async fn global_membership_hash_avoids_cartesian_candidates_and_parallelizes() {
 
 #[tokio::test]
 async fn global_membership_hash_falls_back_to_spill_when_build_memory_is_rejected() {
+    const RIGHT_ROWS: i64 = 4_096;
     for join_type in [JoinType::Mark, JoinType::NullAwareAnti] {
         let (left_schema, right_schema) = schemas();
         let left = RecordBatch::try_new(
             Arc::clone(&left_schema),
             vec![
-                Arc::new(Int64Array::from(vec![Some(7), Some(2_000), None])),
+                Arc::new(Int64Array::from(vec![Some(7), Some(10_000), None])),
                 Arc::new(Int64Array::from(vec![0, 1, 2])),
             ],
         )
         .unwrap();
-        let mut right = (0..1_024).map(Some).collect::<Vec<_>>();
+        let mut right = (0..RIGHT_ROWS).map(Some).collect::<Vec<_>>();
         right.push(None);
         let right = RecordBatch::try_new(
             Arc::clone(&right_schema),
@@ -139,14 +140,27 @@ async fn global_membership_hash_falls_back_to_spill_when_build_memory_is_rejecte
         .unwrap();
 
         if join_type == JoinType::Mark {
-            let markers = batches[0]
-                .column(2)
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap();
-            assert!(markers.value(0));
-            assert!(markers.is_null(1));
-            assert!(markers.is_null(2));
+            let mut markers_by_id = [None; 3];
+            let mut seen = [false; 3];
+            for batch in &batches {
+                let ids = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let markers = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    let id = usize::try_from(ids.value(row)).unwrap();
+                    seen[id] = true;
+                    markers_by_id[id] = markers.is_valid(row).then(|| markers.value(row));
+                }
+            }
+            assert_eq!(seen, [true; 3]);
+            assert_eq!(markers_by_id, [Some(true), None, None]);
         } else {
             assert!(batches.is_empty());
         }

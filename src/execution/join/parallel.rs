@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 #[cfg(test)]
 use std::{
@@ -23,16 +23,29 @@ use crate::{
 };
 
 use super::{
-    CellValue, EvaluatedKeys, ProbeCursor, condition::JoinPredicates, evaluate_keys_accounted,
-    evaluate_optional_values, matched::BuildMatchTracker, optional_array, optional_memory,
-    output::build_unmatched_right_envelope, probe::GlobalMembershipState,
+    EvaluatedKeys, ProbeCursor,
+    condition::JoinPredicates,
+    evaluate_keys_accounted, evaluate_optional_values,
+    hash_table::JoinHashTable,
+    matched::BuildMatchTracker,
+    optional_array, optional_memory,
+    output::{BatchOutputTarget, JoinEmission, build_unmatched_right_envelope},
+    probe::GlobalMembershipState,
 };
+
+mod aggregate;
+mod morsel;
+mod multiplicity;
+
+#[allow(unused_imports)]
+pub(super) use aggregate::probe_global_aggregate;
+pub(super) use multiplicity::probe_global_multiplicity;
 
 const MIN_PARALLEL_MEMORY: usize = 64 << 20;
 
 pub(super) struct FrozenBuild {
     batch: RecordBatch,
-    hash_table: HashMap<Vec<CellValue>, Vec<u32>>,
+    hash_table: JoinHashTable,
     right_values: Option<EvaluatedKeys>,
     global_membership: Option<GlobalMembershipState>,
     null_equal_keys: bool,
@@ -43,7 +56,7 @@ pub(super) struct FrozenBuild {
 impl FrozenBuild {
     pub(super) fn new(
         batch: RecordBatch,
-        hash_table: HashMap<Vec<CellValue>, Vec<u32>>,
+        hash_table: JoinHashTable,
         right_values: Option<EvaluatedKeys>,
         global_membership: Option<GlobalMembershipState>,
         null_equal_keys: bool,
@@ -239,25 +252,28 @@ async fn run_lane_inner(
             return Ok(());
         };
         let left_batch = left_batch?;
-        let left_values = {
+        let (left_values, left_keys) = {
+            let _permit = context
+                .acquire_compute_until_cancelled(cancellation)
+                .await?;
             let _active = context.scheduler.enter_lane();
-            evaluate_optional_values(
+            let left_values = evaluate_optional_values(
                 predicates.left_value(),
                 left_batch.batch(),
                 context,
                 "parallel join probe membership value",
-            )?
-        };
-        let left_keys = if build.global_membership.is_some() {
-            None
-        } else {
-            let _active = context.scheduler.enter_lane();
-            Some(evaluate_keys_accounted(
-                left_key_expressions,
-                left_batch.batch(),
-                context,
-                "parallel join probe keys",
-            )?)
+            )?;
+            let left_keys = if build.global_membership.is_some() {
+                None
+            } else {
+                Some(evaluate_keys_accounted(
+                    left_key_expressions,
+                    left_batch.batch(),
+                    context,
+                    "parallel join probe keys",
+                )?)
+            };
+            (left_values, left_keys)
         };
         let probe_keys = if build.global_membership.is_some() {
             std::slice::from_ref(optional_array(&left_values).ok_or_else(|| {
@@ -288,10 +304,13 @@ async fn run_lane_inner(
                 .saturating_add(optional_memory(&left_keys))
                 .saturating_add(optional_memory(&left_values)),
         );
+        let mut target = BatchOutputTarget;
         loop {
-            let output = cursor.next_batch(context).await?;
-            let Some(output) = output else { break };
-            send(sender, output, cancellation, context).await?;
+            match cursor.next_output(&mut target, context).await? {
+                JoinEmission::Batch(output) => send(sender, output, cancellation, context).await?,
+                JoinEmission::Consumed { .. } => {}
+                JoinEmission::Exhausted => break,
+            }
         }
     }
 }

@@ -1,16 +1,21 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow::{
-    array::{Decimal128Array, Float64Array, Int64Array, StringArray},
-    datatypes::{DataType, Field, Schema},
+    array::{
+        Array, ArrayRef, BinaryArray, Decimal128Array, DictionaryArray, Float64Array, Int64Array,
+        StringArray, UInt32Array,
+    },
+    datatypes::{DataType, Field, Schema, UInt32Type},
     record_batch::RecordBatch,
 };
 use futures::TryStreamExt;
 
 use super::{
-    OutputMode, aggregate, build_output_envelope, build_partial_batch, output_chunk_len,
-    partial_schema, spill,
+    OutputMode, aggregate, build_output_envelope, build_partial_batch, dense_dictionary,
+    key::{GroupIndex, GroupKeyEncoder},
+    output_chunk_len, partial_schema, spill,
     state::{AggregateState, GroupState},
+    try_apply_dense_dictionary_batch,
 };
 use crate::{
     Error,
@@ -19,6 +24,242 @@ use crate::{
 };
 
 use super::super::value::CellValue;
+
+#[tokio::test]
+async fn low_cardinality_encoded_groups_preserve_count_and_decimal_sum() {
+    let decimal_type = DataType::Decimal128(10, 2);
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, true),
+        Field::new("quantity", decimal_type.clone(), true),
+    ]));
+    let batch = |keys: Vec<Option<&str>>, values: Vec<Option<i128>>| {
+        let quantities = Decimal128Array::from(values)
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(StringArray::from(keys)), Arc::new(quantities)],
+        )
+        .unwrap()
+    };
+    let batches = vec![
+        batch(
+            vec![Some("A"), Some("A"), Some("B"), None],
+            vec![Some(100), None, Some(250), Some(400)],
+        ),
+        batch(
+            vec![Some("B"), Some("A"), None, Some("B")],
+            vec![Some(50), Some(300), None, Some(75)],
+        ),
+    ];
+    let aggregates = vec![
+        AggregateExpr {
+            function: AggregateFunction::Count,
+            expr: None,
+            distinct: false,
+            data_type: DataType::Int64,
+            display_name: "count(*)".into(),
+        },
+        AggregateExpr {
+            function: AggregateFunction::Sum,
+            expr: Some(BoundExpr::column(1, decimal_type, "quantity")),
+            distinct: false,
+            data_type: DataType::Decimal128(38, 2),
+            display_name: "sum(quantity)".into(),
+        },
+    ];
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, true),
+        Field::new("rows", DataType::Int64, false),
+        Field::new("quantity", DataType::Decimal128(38, 2), true),
+    ]));
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(64 << 20), temp.path()).unwrap();
+    context.configure_compute_lanes(4);
+    let output = aggregate(
+        boxed_record_batch_stream(futures::stream::iter(batches.into_iter().map(Ok))),
+        vec![BoundExpr::column(0, DataType::Utf8, "key")],
+        aggregates,
+        output_schema,
+        Arc::clone(&context),
+        64,
+    )
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    let mut actual = HashMap::new();
+    for batch in &output {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sums = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let key = (!keys.is_null(row)).then(|| keys.value(row).to_owned());
+            actual.insert(key, (counts.value(row), sums.value(row)));
+        }
+    }
+    assert_eq!(actual[&Some("A".into())], (3, 400));
+    assert_eq!(actual[&Some("B".into())], (3, 375));
+    assert_eq!(actual[&None], (2, 400));
+    drop(output);
+    assert_eq!(context.memory.used(), 0);
+}
+
+#[test]
+fn dense_workspace_shortage_falls_back_without_state_pollution() {
+    let group_arrays = vec![Arc::new(
+        DictionaryArray::<UInt32Type>::try_new(
+            UInt32Array::from(vec![Some(0), Some(0)]),
+            Arc::new(StringArray::from(vec!["A"])),
+        )
+        .unwrap(),
+    ) as ArrayRef];
+    let key_encoder = GroupKeyEncoder::new(&[BoundExpr::column(0, DataType::Utf8, "key")]);
+    let encoded_groups = key_encoder.encode(&group_arrays).unwrap();
+    let aggregate = AggregateExpr {
+        function: AggregateFunction::Sum,
+        expr: Some(BoundExpr::column(1, DataType::Decimal128(38, 0), "value")),
+        distinct: false,
+        data_type: DataType::Decimal128(38, 0),
+        display_name: "sum(value)".into(),
+    };
+    let values = Arc::new(
+        Decimal128Array::from(vec![1, 2])
+            .with_precision_and_scale(38, 0)
+            .unwrap(),
+    ) as ArrayRef;
+    let aggregates = vec![aggregate];
+    let aggregate_arrays = vec![Some(values)];
+    let required = dense_dictionary::workspace_estimate(aggregates.len());
+    let workspace_pool = MemoryPool::new(required);
+    let blocker = workspace_pool.try_reserve(required).unwrap();
+    let mut workspace = workspace_pool.reservation();
+    let state_pool = MemoryPool::new(1 << 20);
+    let mut state_memory = state_pool.reservation();
+    let mut group_index = GroupIndex::new();
+    let mut states = Vec::new();
+
+    let applied = try_apply_dense_dictionary_batch(
+        &key_encoder,
+        &encoded_groups,
+        &group_arrays,
+        &aggregates,
+        &aggregate_arrays,
+        2,
+        &mut group_index,
+        &mut states,
+        &mut state_memory,
+        &mut workspace,
+    )
+    .unwrap();
+    assert!(!applied);
+    assert!(group_index.is_empty());
+    assert!(states.is_empty());
+    assert_eq!(workspace.size(), 0);
+    assert_eq!(state_memory.size(), 0);
+
+    drop(blocker);
+    let no_state_pool = MemoryPool::new(0);
+    let mut no_state_memory = no_state_pool.reservation();
+    let applied = try_apply_dense_dictionary_batch(
+        &key_encoder,
+        &encoded_groups,
+        &group_arrays,
+        &aggregates,
+        &aggregate_arrays,
+        2,
+        &mut group_index,
+        &mut states,
+        &mut no_state_memory,
+        &mut workspace,
+    )
+    .unwrap();
+    assert!(!applied);
+    assert!(group_index.is_empty());
+    assert!(states.is_empty());
+    assert_eq!(workspace.size(), 0);
+    assert_eq!(no_state_memory.size(), 0);
+}
+
+#[test]
+fn dense_workspace_long_utf8_binary_payload_restores_original_reservation() {
+    let long_utf8 = "u".repeat(8 << 10);
+    let long_binary = vec![7_u8; 8 << 10];
+    let group_arrays = vec![
+        Arc::new(
+            DictionaryArray::<UInt32Type>::try_new(
+                UInt32Array::from(vec![Some(0)]),
+                Arc::new(StringArray::from(vec![long_utf8.as_str()])),
+            )
+            .unwrap(),
+        ) as ArrayRef,
+        Arc::new(
+            DictionaryArray::<UInt32Type>::try_new(
+                UInt32Array::from(vec![Some(0)]),
+                Arc::new(BinaryArray::from(vec![long_binary.as_slice()])),
+            )
+            .unwrap(),
+        ) as ArrayRef,
+    ];
+    let key_encoder = GroupKeyEncoder::new(&[
+        BoundExpr::column(0, DataType::Utf8, "text_key"),
+        BoundExpr::column(1, DataType::Binary, "binary_key"),
+    ]);
+    let encoded_groups = key_encoder.encode(&group_arrays).unwrap();
+    let aggregates = vec![AggregateExpr {
+        function: AggregateFunction::Sum,
+        expr: Some(BoundExpr::column(2, DataType::Decimal128(38, 0), "value")),
+        distinct: false,
+        data_type: DataType::Decimal128(38, 0),
+        display_name: "sum(value)".into(),
+    }];
+    let aggregate_arrays = vec![Some(Arc::new(
+        Decimal128Array::from(vec![1])
+            .with_precision_and_scale(38, 0)
+            .unwrap(),
+    ) as ArrayRef)];
+    let base = dense_dictionary::workspace_estimate(aggregates.len());
+    let original = 97;
+    let workspace_pool = MemoryPool::new(original + base + 128);
+    let mut workspace = workspace_pool.try_reserve(original).unwrap();
+    let state_pool = MemoryPool::new(1 << 20);
+    let mut state_memory = state_pool.reservation();
+    let mut group_index = GroupIndex::new();
+    let mut states = Vec::new();
+
+    let applied = try_apply_dense_dictionary_batch(
+        &key_encoder,
+        &encoded_groups,
+        &group_arrays,
+        &aggregates,
+        &aggregate_arrays,
+        1,
+        &mut group_index,
+        &mut states,
+        &mut state_memory,
+        &mut workspace,
+    )
+    .unwrap();
+
+    assert!(!applied);
+    assert!(group_index.is_empty());
+    assert!(states.is_empty());
+    assert_eq!(state_memory.size(), 0);
+    assert_eq!(workspace.size(), original);
+    assert_eq!(workspace_pool.used(), original);
+}
 
 #[tokio::test]
 async fn output_materialization_transfers_its_workspace_into_the_batch_lease() {
@@ -103,10 +344,13 @@ fn decimal_aggregates_preserve_scale_nulls_and_overflow() {
         .unwrap();
     assert_eq!(avg.finish().unwrap(), CellValue::Float64(1.5));
 
-    let overflow_expr = aggregate_expr(AggregateFunction::Sum, DataType::Decimal128(3, 0));
+    let overflow_expr = aggregate_expr(AggregateFunction::Sum, DataType::Decimal128(38, 0));
     let mut overflow = AggregateState::new(&overflow_expr);
     overflow
-        .update(&overflow_expr, Some(CellValue::Decimal128(999)))
+        .update(
+            &overflow_expr,
+            Some(CellValue::Decimal128(10_i128.pow(38) - 1)),
+        )
         .unwrap();
     overflow
         .update(&overflow_expr, Some(CellValue::Decimal128(1)))
@@ -197,8 +441,8 @@ fn signed_sum_partial_can_cross_i64_boundary_then_cancel() {
         ],
     );
 
-    assert_eq!(direct.unwrap(), CellValue::Int64(i64::MAX));
-    assert_eq!(merged.unwrap(), CellValue::Int64(i64::MAX));
+    assert_eq!(direct.unwrap(), CellValue::Decimal128(i128::from(i64::MAX)));
+    assert_eq!(merged.unwrap(), CellValue::Decimal128(i128::from(i64::MAX)));
 }
 
 #[test]
@@ -241,21 +485,22 @@ fn decimal_average_partial_preserves_full_i128_sum() {
 }
 
 #[test]
-fn unsigned_sum_partial_defers_overflow_until_final_value() {
+fn unsigned_sum_widens_past_u64() {
     let expression = aggregate_expr(AggregateFunction::Sum, DataType::UInt64);
     let direct = finished_state(
         &expression,
         [CellValue::UInt64(u64::MAX), CellValue::UInt64(1)],
     )
-    .unwrap_err();
+    .unwrap();
     let merged = merge_partial_states(
         &expression,
         [vec![CellValue::UInt64(u64::MAX), CellValue::UInt64(1)]],
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(direct.to_string(), "execution error: sum overflowed UINT64");
-    assert_eq!(merged.to_string(), direct.to_string());
+    let expected = CellValue::Decimal128(i128::from(u64::MAX) + 1);
+    assert_eq!(direct, expected);
+    assert_eq!(merged, expected);
 }
 
 fn finished_state(
@@ -294,15 +539,29 @@ fn merge_partial_states(
 }
 
 fn aggregate_expr(function: AggregateFunction, data_type: DataType) -> AggregateExpr {
+    let output_type = match (&function, &data_type) {
+        (AggregateFunction::Avg, _) => DataType::Float64,
+        (AggregateFunction::Sum, DataType::Decimal128(_, scale)) => {
+            DataType::Decimal128(38, *scale)
+        }
+        (
+            AggregateFunction::Sum,
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64,
+        ) => DataType::Decimal128(38, 0),
+        _ => data_type.clone(),
+    };
     AggregateExpr {
         function,
         expr: Some(BoundExpr::column(0, data_type.clone(), "value")),
         distinct: false,
-        data_type: if function == AggregateFunction::Avg {
-            DataType::Float64
-        } else {
-            data_type
-        },
+        data_type: output_type,
         display_name: function.to_string(),
     }
 }
@@ -504,7 +763,7 @@ async fn spilling_signed_sum_preserves_transient_wide_partial_and_cleans_up() {
     let expected = collect_grouped_sums(input.clone(), Arc::clone(&high_context))
         .await
         .unwrap();
-    assert_eq!(expected[&0], i64::MAX);
+    assert_eq!(expected[&0], i128::from(i64::MAX));
     assert_eq!(high_context.metrics.snapshot().spill_bytes, 0);
     drop(high_context);
 
@@ -547,17 +806,17 @@ async fn spilling_signed_sum_preserves_transient_wide_partial_and_cleans_up() {
 async fn collect_grouped_sums(
     input: RecordBatch,
     context: Arc<QueryContext>,
-) -> crate::Result<HashMap<i64, i64>> {
+) -> crate::Result<HashMap<i64, i128>> {
     let stream = boxed_record_batch_stream(futures::stream::once(async move { Ok(input) }));
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("key", DataType::Int64, false),
-        Field::new("total", DataType::Int64, true),
+        Field::new("total", DataType::Decimal128(38, 0), true),
     ]));
     let sum = AggregateExpr {
         function: AggregateFunction::Sum,
         expr: Some(BoundExpr::column(1, DataType::Int64, "value")),
         distinct: false,
-        data_type: DataType::Int64,
+        data_type: DataType::Decimal128(38, 0),
         display_name: "sum(value)".into(),
     };
     let batches = aggregate(
@@ -581,7 +840,7 @@ async fn collect_grouped_sums(
         let sums = batch
             .column(1)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Decimal128Array>()
             .unwrap();
         for row in 0..batch.num_rows() {
             values.insert(keys.value(row), sums.value(row));
@@ -736,7 +995,12 @@ async fn multiple_distinct_aggregates_share_group_scope_and_preserve_ordinary_ro
             DataType::Int64,
             DataType::Int64,
         ),
-        distinct_expr(AggregateFunction::Sum, 1, DataType::Int64, DataType::Int64),
+        distinct_expr(
+            AggregateFunction::Sum,
+            1,
+            DataType::Int64,
+            DataType::Decimal128(38, 0),
+        ),
         distinct_expr(
             AggregateFunction::Avg,
             1,
@@ -755,7 +1019,7 @@ async fn multiple_distinct_aggregates_share_group_scope_and_preserve_ordinary_ro
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("grp", DataType::Utf8, false),
         Field::new("distinct_count", DataType::Int64, false),
-        Field::new("distinct_sum", DataType::Int64, true),
+        Field::new("distinct_sum", DataType::Decimal128(38, 0), true),
         Field::new("distinct_avg", DataType::Float64, true),
         Field::new("all_rows", DataType::Int64, false),
         Field::new("distinct_text", DataType::Int64, false),
@@ -790,7 +1054,7 @@ async fn multiple_distinct_aggregates_share_group_scope_and_preserve_ordinary_ro
         let sums = batch
             .column(2)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Decimal128Array>()
             .unwrap();
         let averages = batch
             .column(3)
@@ -839,7 +1103,7 @@ async fn decimal_distinct_sum_and_average_keep_exact_dedup_values() {
     )]));
     let batch = RecordBatch::try_new(input_schema, vec![Arc::new(values)]).unwrap();
     let output_schema = Arc::new(Schema::new(vec![
-        Field::new("total", decimal_type.clone(), true),
+        Field::new("total", DataType::Decimal128(38, 2), true),
         Field::new("average", DataType::Float64, true),
         Field::new("count", DataType::Int64, false),
     ]));
@@ -848,7 +1112,7 @@ async fn decimal_distinct_sum_and_average_keep_exact_dedup_values() {
             AggregateFunction::Sum,
             0,
             decimal_type.clone(),
-            decimal_type.clone(),
+            DataType::Decimal128(38, 2),
         ),
         distinct_expr(
             AggregateFunction::Avg,
@@ -915,7 +1179,7 @@ async fn spilled_distinct_values_merge_once_across_bounded_task_lanes() {
         .collect::<Vec<_>>();
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("unique", DataType::Int64, false),
-        Field::new("distinct_total", DataType::Int64, true),
+        Field::new("distinct_total", DataType::Decimal128(38, 0), true),
         Field::new("rows", DataType::Int64, false),
     ]));
     let aggregates = vec![
@@ -925,7 +1189,12 @@ async fn spilled_distinct_values_merge_once_across_bounded_task_lanes() {
             DataType::Int64,
             DataType::Int64,
         ),
-        distinct_expr(AggregateFunction::Sum, 0, DataType::Int64, DataType::Int64),
+        distinct_expr(
+            AggregateFunction::Sum,
+            0,
+            DataType::Int64,
+            DataType::Decimal128(38, 0),
+        ),
         AggregateExpr {
             function: AggregateFunction::Count,
             expr: None,
@@ -956,7 +1225,7 @@ async fn spilled_distinct_values_merge_once_across_bounded_task_lanes() {
     let total = batches[0]
         .column(1)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Decimal128Array>()
         .unwrap();
     let rows = batches[0]
         .column(2)
@@ -964,7 +1233,10 @@ async fn spilled_distinct_values_merge_once_across_bounded_task_lanes() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(unique.value(0), UNIQUE);
-    assert_eq!(total.value(0), UNIQUE * (UNIQUE - 1) / 2);
+    assert_eq!(
+        total.value(0),
+        i128::from(UNIQUE) * i128::from(UNIQUE - 1) / 2
+    );
     assert_eq!(rows.value(0), UNIQUE * 2);
     let metrics = context.metrics.snapshot();
     assert!(metrics.spill_files > 0);

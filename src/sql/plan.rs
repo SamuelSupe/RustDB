@@ -9,6 +9,12 @@ use crate::{
 
 use super::{AggregateExpr, BoundExpr, SortExpr, WindowExpr};
 
+pub(crate) const UNMATERIALIZED_FIELD_KEY: &str = "rustdb.internal.unmaterialized";
+
+pub(crate) fn field_is_materialized(field: &Field) -> bool {
+    !field.metadata().contains_key(UNMATERIALIZED_FIELD_KEY)
+}
+
 #[derive(Clone, Debug)]
 pub struct PlanSchema {
     arrow: SchemaRef,
@@ -172,6 +178,9 @@ pub enum LogicalPlan {
         statistics: TableStatistics,
         projection: Option<Vec<usize>>,
         pushed_filter: Option<BoundExpr>,
+        /// Fully lowered predicate owned by the source. Its presence means the
+        /// residual Filter has been removed from the logical plan.
+        exact_filter: Option<crate::datasource::ScanPredicate>,
         limit: Option<usize>,
         schema: PlanSchema,
     },
@@ -352,6 +361,8 @@ impl LogicalPlan {
                 provider,
                 statistics,
                 projection,
+                pushed_filter,
+                exact_filter,
                 limit,
                 ..
             } => {
@@ -360,7 +371,14 @@ impl LogicalPlan {
                     .map(|details| format!(" {details}"))
                     .unwrap_or_default();
                 output.push_str(&format!(
-                    "{indent}Scan table={table_name} projection={projection:?} limit={limit:?} rows={:?} bytes={:?} files={} pipeline=fused lane_limit={lanes}{source}\n",
+                    "{indent}Scan table={table_name} projection={projection:?} filter={} limit={limit:?} rows={:?} bytes={:?} files={} pipeline=fused lane_limit={lanes}{source}\n",
+                    if exact_filter.is_some() {
+                        "exact"
+                    } else if pushed_filter.is_some() {
+                        "best_effort"
+                    } else {
+                        "none"
+                    },
                     statistics.row_count,
                     statistics.total_byte_size,
                     statistics.file_count,

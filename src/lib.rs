@@ -22,7 +22,7 @@ pub use config::{
     S3Config, SpillConfig,
 };
 pub use datasource::ParquetSchemaMode;
-pub use engine::{Engine, QueryCancellation, QueryResult, Session};
+pub use engine::{Engine, EngineMemorySnapshot, QueryCancellation, QueryResult, Session};
 pub use error::{Error, Result};
 pub use prepared::{ParameterValue, PreparedStatement};
 pub use runtime::{OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot, RecordBatchStream};

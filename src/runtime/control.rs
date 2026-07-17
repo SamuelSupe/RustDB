@@ -3,7 +3,10 @@ use std::{fmt, future::Future, sync::Arc};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, Result};
+use crate::{
+    Error, Result,
+    runtime::{QueryLocalFileHandle, QueryLocalFiles},
+};
 
 type Cleanup = Box<dyn FnOnce() + Send + 'static>;
 
@@ -15,6 +18,7 @@ pub struct QueryControl {
 struct Inner {
     token: CancellationToken,
     cleanups: Mutex<Vec<Cleanup>>,
+    local_files: QueryLocalFiles,
 }
 
 impl QueryControl {
@@ -23,12 +27,22 @@ impl QueryControl {
             inner: Arc::new(Inner {
                 token: CancellationToken::new(),
                 cleanups: Mutex::new(Vec::new()),
+                local_files: QueryLocalFiles::default(),
             }),
         }
     }
 
+    pub(crate) fn local_file_handle(&self, uri: &str) -> Arc<QueryLocalFileHandle> {
+        self.inner.local_files.handle(uri)
+    }
+
+    pub(crate) fn clear_local_files(&self) {
+        self.inner.local_files.clear();
+    }
+
     pub fn cancel(&self) {
         self.inner.token.cancel();
+        self.clear_local_files();
         let cleanups = std::mem::take(&mut *self.inner.cleanups.lock());
         for cleanup in cleanups {
             cleanup();
@@ -88,6 +102,24 @@ mod tests {
     };
 
     use super::QueryControl;
+
+    #[test]
+    fn local_file_handles_are_query_scoped_and_released_on_cancel() {
+        let control = QueryControl::new();
+        let first = control.local_file_handle("file:///data.parquet");
+        let same = control.local_file_handle("file:///data.parquet");
+        assert!(Arc::ptr_eq(&first, &same));
+
+        let other = QueryControl::new().local_file_handle("file:///data.parquet");
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let retained = Arc::downgrade(&first);
+        drop(first);
+        drop(same);
+        assert!(retained.upgrade().is_some());
+        control.cancel();
+        assert!(retained.upgrade().is_none());
+    }
 
     #[tokio::test]
     async fn cancellation_notifies_waiters_and_runs_cleanup_once() {

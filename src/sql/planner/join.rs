@@ -23,6 +23,7 @@ pub(super) struct JoinBinding {
     pub(super) keys: Vec<(BoundExpr, BoundExpr)>,
     pub(super) residual: Option<BoundExpr>,
     pub(super) using_columns: Vec<UsingColumn>,
+    pub(super) unhashable_equality_reason: Option<String>,
 }
 
 pub(super) fn bind_join_constraint(
@@ -37,6 +38,7 @@ pub(super) fn bind_join_constraint(
                 keys: Vec::new(),
                 residual: None,
                 using_columns: Vec::new(),
+                unhashable_equality_reason: None,
             };
             bind_join_on(expr, &combined, left.arrow().fields().len(), &mut binding)?;
             Ok(binding)
@@ -212,6 +214,7 @@ fn bind_using(
         keys: Vec::with_capacity(names.len()),
         residual: None,
         using_columns: Vec::with_capacity(names.len()),
+        unhashable_equality_reason: None,
     };
     for name in names {
         let [part] = name.0.as_slice() else {
@@ -247,6 +250,12 @@ fn bind_using(
         let ExprKind::Binary { left, right, .. } = equality.kind else {
             unreachable!("equality binder must produce a binary expression")
         };
+        if left.data_type != right.data_type {
+            return Err(Error::InvalidArgument(format!(
+                "JOIN ... USING column `{ident}` has incompatible hash-key types {} and {}; use JOIN ... ON with an explicit CAST to one common type",
+                left.data_type, right.data_type,
+            )));
+        }
         binding.keys.push((*left, *right));
         binding.using_columns.push(UsingColumn {
             name: ident.clone(),
@@ -292,22 +301,28 @@ fn bind_join_on(
             expression_side(right, left_width),
         )
     {
-        match (left_side, right_side) {
-            (JoinExprSide::Left, JoinExprSide::Right) => {
-                binding.keys.push((
-                    (**left).clone(),
-                    rebase_right((**right).clone(), left_width)?,
-                ));
+        let keys = match (left_side, right_side) {
+            (JoinExprSide::Left, JoinExprSide::Right) => Some((
+                (**left).clone(),
+                rebase_right((**right).clone(), left_width)?,
+            )),
+            (JoinExprSide::Right, JoinExprSide::Left) => Some((
+                (**right).clone(),
+                rebase_right((**left).clone(), left_width)?,
+            )),
+            _ => None,
+        };
+        if let Some((left_key, right_key)) = keys {
+            if left_key.data_type == right_key.data_type {
+                binding.keys.push((left_key, right_key));
                 return Ok(());
             }
-            (JoinExprSide::Right, JoinExprSide::Left) => {
-                binding.keys.push((
-                    (**right).clone(),
-                    rebase_right((**left).clone(), left_width)?,
-                ));
-                return Ok(());
-            }
-            _ => {}
+            binding.unhashable_equality_reason.get_or_insert_with(|| {
+                format!(
+                    "join equality `{}` has incompatible hash-key types {} and {}",
+                    bound.display_name, left_key.data_type, right_key.data_type,
+                )
+            });
         }
     }
     binding.residual = Some(match binding.residual.take() {

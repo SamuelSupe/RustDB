@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use arrow::{
     array::StringArray,
@@ -9,7 +9,7 @@ use futures::{StreamExt, stream};
 
 use crate::Result;
 use crate::runtime::{BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream};
-use crate::sql::{LogicalPlan, StatementPlan};
+use crate::sql::{BoundExpr, JoinType, LogicalPlan, StatementPlan};
 
 use super::{aggregate, expr, join, pipeline, repeat, runtime_filter, scalar, scan, sort, window};
 
@@ -47,7 +47,12 @@ pub(super) async fn prepare_plan(plan: &LogicalPlan, context: Arc<QueryContext>)
     plan.collect_scan_providers(&mut providers);
     for provider in providers {
         context.check_cancelled()?;
-        provider.prepare(Arc::clone(&context)).await?;
+        let started = Instant::now();
+        let prepared = provider.prepare(Arc::clone(&context)).await;
+        context
+            .metrics
+            .record_provider_prepare_time(started.elapsed());
+        prepared?;
     }
     Ok(())
 }
@@ -94,14 +99,21 @@ fn execute_plan_inner(
             provider,
             projection,
             pushed_filter,
+            exact_filter,
             limit,
             schema,
             ..
         } => boxed_memory_batch_stream(async_stream::try_stream! {
+            let filter = match exact_filter {
+                Some(predicate) => scan::ScanFilter::Exact(predicate),
+                None => pushed_filter
+                    .as_ref()
+                    .map_or(scan::ScanFilter::None, scan::ScanFilter::BestEffort),
+            };
             let mut input = scan::scan(
                 provider,
                 projection,
-                pushed_filter.as_ref(),
+                filter,
                 limit,
                 Arc::clone(schema.arrow()),
                 Arc::clone(&context),
@@ -223,14 +235,56 @@ fn execute_plan_inner(
             group_exprs,
             aggregate_exprs,
             schema,
-        } => aggregate::aggregate(
-            execute_plan_with_parent(*input, Arc::clone(&context), Some(parent_id)),
-            group_exprs,
-            aggregate_exprs,
-            Arc::clone(schema.arrow()),
-            context,
-            batch_size,
-        ),
+        } => match aggregate::join_match::match_plan(*input, &group_exprs, &aggregate_exprs) {
+            Ok(mut matched) => {
+                let join_operator = context.metrics.register_operator("Join", Some(parent_id));
+                let join_id = join_operator.id();
+                let runtime_filter = install_join_runtime_filter(
+                    &context,
+                    &mut matched.left,
+                    &matched.on,
+                    JoinType::Inner,
+                );
+                let left_schema = Arc::clone(matched.left.schema().arrow());
+                let right_schema = Arc::clone(matched.right.schema().arrow());
+                join::join_global_aggregate(
+                    execute_join_input(*matched.left, Arc::clone(&context), Some(join_id)),
+                    execute_join_input(*matched.right, Arc::clone(&context), Some(join_id)),
+                    matched.on,
+                    left_schema,
+                    right_schema,
+                    Arc::clone(matched.schema.arrow()),
+                    matched.aggregates,
+                    Arc::clone(schema.arrow()),
+                    context,
+                    batch_size,
+                    runtime_filter,
+                    join_operator,
+                )
+            }
+            Err(input) => {
+                let input = match pipeline::try_execute_grouped(
+                    input,
+                    &group_exprs,
+                    &aggregate_exprs,
+                    Arc::clone(&context),
+                    Some(parent_id),
+                ) {
+                    Ok(stream) => stream,
+                    Err(input) => {
+                        execute_plan_with_parent(*input, Arc::clone(&context), Some(parent_id))
+                    }
+                };
+                aggregate::aggregate(
+                    input,
+                    group_exprs,
+                    aggregate_exprs,
+                    Arc::clone(schema.arrow()),
+                    context,
+                    batch_size,
+                )
+            }
+        },
         LogicalPlan::Sort {
             input,
             expressions,
@@ -254,17 +308,7 @@ fn execute_plan_inner(
             join_type,
             schema,
         } => {
-            let runtime_filter = if context.execution.runtime_filter_bytes != 0
-                && matches!(
-                    join_type,
-                    crate::sql::JoinType::Inner | crate::sql::JoinType::Semi
-                )
-                && on.len() == 1
-            {
-                runtime_filter::install(&mut left, &on[0].0)
-            } else {
-                None
-            };
+            let runtime_filter = install_join_runtime_filter(&context, &mut left, &on, join_type);
             let left_schema = Arc::clone(left.schema().arrow());
             let right_schema = Arc::clone(right.schema().arrow());
             join::join_with_runtime_filter(
@@ -281,8 +325,36 @@ fn execute_plan_inner(
                 context,
                 batch_size,
                 runtime_filter,
+                Some(parent_id),
             )
         }
+    }
+}
+
+fn execute_join_input(
+    plan: LogicalPlan,
+    context: Arc<QueryContext>,
+    parent_id: Option<u64>,
+) -> MemoryBatchStream {
+    match pipeline::try_execute_join_input(plan, Arc::clone(&context), parent_id) {
+        Ok(stream) => stream,
+        Err(plan) => execute_plan_with_parent(*plan, context, parent_id),
+    }
+}
+
+fn install_join_runtime_filter(
+    context: &QueryContext,
+    left: &mut LogicalPlan,
+    on: &[(BoundExpr, BoundExpr)],
+    join_type: JoinType,
+) -> Option<Arc<runtime_filter::RuntimeFilterSlot>> {
+    if context.execution.runtime_filter_bytes != 0
+        && matches!(join_type, JoinType::Inner | JoinType::Semi)
+        && on.len() == 1
+    {
+        runtime_filter::install(left, &on[0].0)
+    } else {
+        None
     }
 }
 

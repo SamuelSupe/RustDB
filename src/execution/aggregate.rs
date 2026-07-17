@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -8,7 +8,7 @@ use futures::StreamExt;
 
 use crate::Result;
 use crate::runtime::{
-    BatchEnvelope, IntoMemoryBatchStream, MemoryBatchStream, QueryContext,
+    BatchEnvelope, IntoMemoryBatchStream, MemoryBatchStream, MemoryReservation, QueryContext,
     boxed_memory_batch_stream,
 };
 use crate::sql::{AggregateExpr, AggregateFunction, BoundExpr};
@@ -19,7 +19,11 @@ use super::{
 };
 
 mod admission;
+mod batch;
+mod dense_dictionary;
 mod distinct;
+pub(in crate::execution) mod join_match;
+pub(in crate::execution) mod join_sink;
 mod key;
 mod parallel;
 mod spill;
@@ -29,7 +33,8 @@ pub(super) mod state;
 mod tests;
 
 use admission::PartialMergeAdmission;
-use key::{GroupKey, GroupKeyEncoder};
+use dense_dictionary::DenseDictionaryBatch;
+use key::{EncodedGroupIdCache, GroupIndex, GroupKey, GroupKeyEncoder};
 use spill::{
     MergeOutcome, PartitionTask, StateSpiller, adaptive_spill_partitions, merge_partition,
     pop_largest_partition, repartition_partition, spill_largest_partition, spill_states,
@@ -94,6 +99,7 @@ fn serial_aggregate(
         InputMode::Raw,
         OutputMode::Final,
         None,
+        false,
     )
 }
 
@@ -116,6 +122,7 @@ fn serial_partial_aggregate(
         InputMode::Raw,
         OutputMode::Partial,
         Some(partial_merge_admission),
+        true,
     )
 }
 
@@ -137,6 +144,7 @@ fn merge_partial_aggregate(
         InputMode::Partial,
         OutputMode::Final,
         None,
+        false,
     )
 }
 
@@ -163,9 +171,10 @@ fn aggregate_with_modes(
     input_mode: InputMode,
     output_mode: OutputMode,
     partial_merge_admission: Option<PartialMergeAdmission>,
+    lane_already_active: bool,
 ) -> MemoryBatchStream {
     boxed_memory_batch_stream(async_stream::try_stream! {
-        let mut group_index: HashMap<GroupKey, usize> = HashMap::new();
+        let mut group_index = GroupIndex::new();
         let mut states = Vec::<GroupState>::new();
         let key_encoder = GroupKeyEncoder::new(&groups);
         // Keep a bounded part of the query budget available for decoding and
@@ -183,7 +192,7 @@ fn aggregate_with_modes(
         let mut spilled: Option<StateSpiller> = None;
 
         if groups.is_empty() {
-            group_index.insert(GroupKey::Encoded(Vec::new()), 0);
+            let _ = group_index.insert(GroupKey::Encoded(Vec::new()), 0)?;
             states.push(GroupState::new(Vec::new(), &aggregates));
             reservation.try_grow(estimate_group_bytes(&states[0]))?;
         }
@@ -191,16 +200,17 @@ fn aggregate_with_modes(
         while let Some(batch) = input.next().await {
             context.check_cancelled()?;
             let batch = batch?;
-            if input_mode == InputMode::Raw
-                && groups.is_empty()
-                && count_star_only(&aggregates)
-            {
-                let state = states
-                    .first_mut()
-                    .ok_or_else(|| crate::Error::Internal("global aggregate state is missing".into()))?;
-                for aggregate in &mut state.aggregates {
-                    aggregate.add_count_star_batch(batch.batch().num_rows())?;
-                }
+            // Parallel partial lanes already hold this permit across their
+            // yielded batch. Serial and final aggregation acquire one here so
+            // every batch's CPU work participates in engine-wide fairness.
+            let _compute = if lane_already_active {
+                None
+            } else {
+                Some(context.acquire_compute().await?)
+            };
+            let _active = (!lane_already_active).then(|| context.scheduler.enter_lane());
+            if input_mode == InputMode::Raw && groups.is_empty() && batch::supports(&aggregates) {
+                update_global_batch(&mut states, &aggregates, batch.batch(), &context)?;
                 continue;
             }
             // Expression kernels and Arrow row encoding retain derived arrays
@@ -244,46 +254,103 @@ fn aggregate_with_modes(
             workspace.try_resize(workspace_bytes)?;
             context.metrics.observe_memory(context.memory.used());
 
+            if input_mode == InputMode::Raw
+                && try_apply_dense_dictionary_batch(
+                    &key_encoder,
+                    &encoded_groups,
+                    &group_arrays,
+                    &aggregates,
+                    aggregate_arrays
+                        .as_deref()
+                        .expect("raw aggregate arrays were evaluated"),
+                    batch.batch().num_rows(),
+                    &mut group_index,
+                    &mut states,
+                    &mut reservation,
+                    &mut workspace,
+                )?
+            {
+                continue;
+            }
+
+            let mut group_cache = EncodedGroupIdCache::new();
             for row in 0..batch.batch().num_rows() {
-                let index_key = key_encoder.key(&encoded_groups, &group_arrays, row)?;
-                let index = if let Some(index) = group_index.get(&index_key) {
-                    *index
+                let borrowed_key = encoded_groups.borrowed_key(row);
+                let index = if let Some(index) =
+                    borrowed_key.and_then(|key| group_cache.get(key))
+                {
+                    index
                 } else {
-                    let state_key = group_arrays
-                        .iter()
-                        .map(|array| cell(array, row))
-                        .collect::<Result<Vec<_>>>()?;
-                    let state = GroupState::new(state_key, &aggregates);
-                    let bytes = estimate_group_bytes(&state)
-                        .saturating_add(index_key.memory_size());
-                    while reservation.try_grow(bytes).is_err() {
-                        if states.is_empty() {
-                            Err(spill::single_group_error(
-                                bytes,
-                                &context,
-                                reservation.pool().limit(),
-                            ))?;
-                        }
-                        let spiller = spilled.get_or_insert_with(|| {
-                            StateSpiller::new(
-                                &context,
-                                adaptive_spill_partitions(&context, reservation.size()),
+                    let mut owned_key = None;
+                    let existing = if let Some(key) = borrowed_key {
+                        group_index.get_encoded(key)
+                    } else {
+                        owned_key = Some(key_encoder.key(&encoded_groups, &group_arrays, row)?);
+                        group_index.get(
+                            owned_key
+                                .as_ref()
+                                .expect("non-row group key was materialized"),
+                        )
+                    };
+                    let index = if let Some(index) = existing {
+                        index
+                    } else {
+                        // Arrow row bytes are copied only for a new persistent
+                        // group. Existing groups were resolved through the
+                        // borrowed `&[u8]` lookup above.
+                        let index_key = owned_key.unwrap_or_else(|| {
+                            GroupKey::Encoded(
+                                borrowed_key
+                                    .expect("row-encoded group has borrowed bytes")
+                                    .to_vec(),
                             )
                         });
-                        let resident_bytes = spill_largest_partition(
-                            &mut states,
-                            &mut group_index,
-                            &groups,
-                            &aggregates,
-                            Arc::clone(&partial_schema),
-                            spiller,
-                            &context,
-                        )?;
-                        reservation.try_resize(resident_bytes)?;
+                        let state_key = group_arrays
+                            .iter()
+                            .map(|array| cell(array, row))
+                            .collect::<Result<Vec<_>>>()?;
+                        let state = GroupState::new(state_key, &aggregates);
+                        let bytes = estimate_group_bytes(&state)
+                            .saturating_add(index_key.memory_size());
+                        while reservation.try_grow(bytes).is_err() {
+                            if states.is_empty() {
+                                Err(spill::single_group_error(
+                                    bytes,
+                                    &context,
+                                    reservation.pool().limit(),
+                                ))?;
+                            }
+                            let spiller = spilled.get_or_insert_with(|| {
+                                StateSpiller::new(
+                                    &context,
+                                    adaptive_spill_partitions(&context, reservation.size()),
+                                )
+                            });
+                            let resident_bytes = spill_largest_partition(
+                                &mut states,
+                                &mut group_index,
+                                &groups,
+                                &aggregates,
+                                Arc::clone(&partial_schema),
+                                spiller,
+                                &context,
+                            )?;
+                            // Victim removal compacts `states` and remaps every
+                            // surviving index. No borrowed batch key may retain
+                            // an id from the previous generation.
+                            group_cache.clear();
+                            reservation.try_resize(resident_bytes)?;
+                        }
+                        let index = states.len();
+                        states.push(state);
+                        let _ = group_index.insert(index_key, index)?;
+                        index
+                    };
+                    // Cache only ids resolved by the persistent index. Failed
+                    // reservations and failed insertions never become visible.
+                    if let Some(key) = borrowed_key {
+                        group_cache.insert(key, index);
                     }
-                    let index = states.len();
-                    states.push(state);
-                    group_index.insert(index_key, index);
                     index
                 };
                 let state = &mut states[index];
@@ -466,6 +533,132 @@ fn aggregate_with_modes(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn try_apply_dense_dictionary_batch(
+    key_encoder: &GroupKeyEncoder,
+    encoded_groups: &key::EncodedGroupRows,
+    group_arrays: &[arrow::array::ArrayRef],
+    aggregates: &[AggregateExpr],
+    aggregate_arrays: &[Option<arrow::array::ArrayRef>],
+    rows: usize,
+    group_index: &mut GroupIndex,
+    states: &mut Vec<GroupState>,
+    reservation: &mut MemoryReservation,
+    workspace: &mut MemoryReservation,
+) -> Result<bool> {
+    let original_workspace = workspace.size();
+    if workspace
+        .try_grow(dense_dictionary::workspace_estimate(aggregates.len()))
+        .is_err()
+    {
+        return Ok(false);
+    }
+    let batch = match DenseDictionaryBatch::try_new(
+        encoded_groups,
+        group_arrays,
+        aggregates,
+        aggregate_arrays,
+        rows,
+    ) {
+        Ok(Some(batch)) => batch,
+        Ok(None) => {
+            workspace.try_resize(original_workspace)?;
+            return Ok(false);
+        }
+        Err(error) => {
+            workspace.try_resize(original_workspace)?;
+            return Err(error);
+        }
+    };
+    let dynamic_workspace = match batch.dynamic_workspace_estimate(encoded_groups, group_arrays) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            drop(batch);
+            workspace.try_resize(original_workspace)?;
+            return Err(error);
+        }
+    };
+    if workspace.try_grow(dynamic_workspace).is_err() {
+        drop(batch);
+        workspace.try_resize(original_workspace)?;
+        return Ok(false);
+    }
+
+    let mut state_by_slot = vec![None; batch.representatives().len()];
+    let mut pending_by_slot = vec![None; batch.representatives().len()];
+    let mut pending = Vec::<(GroupKey, GroupState)>::new();
+    let mut pending_bytes = 0usize;
+
+    // Resolve each used dictionary slot exactly once. All keys, states and the
+    // complete reservation are prepared before the persistent index changes.
+    for (slot, representative) in batch.representatives().iter().enumerate() {
+        let Some(row) = representative else {
+            continue;
+        };
+        let borrowed_key = encoded_groups.borrowed_key(*row);
+        let mut owned_key = None;
+        let existing = if let Some(key) = borrowed_key {
+            group_index.get_encoded(key)
+        } else {
+            owned_key = Some(key_encoder.key(encoded_groups, group_arrays, *row)?);
+            group_index.get(
+                owned_key
+                    .as_ref()
+                    .expect("non-row group key was materialized"),
+            )
+        };
+        if let Some(index) = existing {
+            state_by_slot[slot] = Some(index);
+            continue;
+        }
+        let index_key = owned_key.unwrap_or_else(|| {
+            GroupKey::Encoded(
+                borrowed_key
+                    .expect("row-encoded dictionary group has borrowed bytes")
+                    .to_vec(),
+            )
+        });
+        if let Some(index) = pending.iter().position(|(key, _)| key == &index_key) {
+            pending_by_slot[slot] = Some(index);
+            continue;
+        }
+
+        let state_key = group_arrays
+            .iter()
+            .map(|array| cell(array, *row))
+            .collect::<Result<Vec<_>>>()?;
+        let state = GroupState::new(state_key, aggregates);
+        pending_bytes = pending_bytes
+            .saturating_add(estimate_group_bytes(&state))
+            .saturating_add(index_key.memory_size());
+        pending_by_slot[slot] = Some(pending.len());
+        pending.push((index_key, state));
+    }
+
+    if reservation.try_grow(pending_bytes).is_err() {
+        drop(pending);
+        drop(pending_by_slot);
+        drop(state_by_slot);
+        drop(batch);
+        workspace.try_resize(original_workspace)?;
+        return Ok(false);
+    }
+
+    let first_new_state = states.len();
+    for (offset, (key, state)) in pending.into_iter().enumerate() {
+        let index = first_new_state + offset;
+        states.push(state);
+        let _ = group_index.insert(key, index)?;
+    }
+    for (slot, pending_index) in pending_by_slot.into_iter().enumerate() {
+        if let Some(pending_index) = pending_index {
+            state_by_slot[slot] = Some(first_new_state + pending_index);
+        }
+    }
+    batch.apply(&state_by_slot, states)?;
+    Ok(true)
+}
+
 fn aggregate_workspace_estimate(batch: &RecordBatch, groups: &[BoundExpr]) -> usize {
     batch
         .get_array_memory_size()
@@ -571,11 +764,41 @@ async fn build_output_envelope(
     BatchEnvelope::from_reservation(batch, workspace, "aggregate output")
 }
 
-fn count_star_only(aggregates: &[AggregateExpr]) -> bool {
-    !aggregates.is_empty()
-        && aggregates.iter().all(|aggregate| {
-            aggregate.function == AggregateFunction::Count && aggregate.expr.is_none()
+fn update_global_batch(
+    states: &mut [GroupState],
+    aggregates: &[AggregateExpr],
+    input: &RecordBatch,
+    context: &QueryContext,
+) -> Result<()> {
+    let workspace_estimate = aggregates
+        .iter()
+        .filter_map(|aggregate| aggregate.expr.as_ref())
+        .map(|expression| {
+            super::expr::projection_workspace_bytes(std::slice::from_ref(expression), input)
         })
+        .fold(1usize, usize::saturating_add);
+    let mut workspace = context.memory.try_reserve(workspace_estimate)?;
+    let arrays = aggregates
+        .iter()
+        .map(|aggregate| {
+            aggregate
+                .expr
+                .as_ref()
+                .map(|expression| evaluate(expression, input))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    workspace.try_resize(
+        arrays
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|array| derived_array_bytes(input, array))
+            .fold(1usize, usize::saturating_add),
+    )?;
+    let state = states
+        .first_mut()
+        .ok_or_else(|| crate::Error::Internal("global aggregate state is missing".into()))?;
+    batch::update(&mut state.aggregates, aggregates, &arrays, input.num_rows())
 }
 
 fn aggregate_state_limit(query_limit: usize, output_mode: OutputMode, lanes: usize) -> usize {

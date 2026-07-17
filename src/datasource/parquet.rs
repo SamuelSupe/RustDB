@@ -6,19 +6,32 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::Semaphore;
 
+mod filtered_limit;
+mod fixed;
+mod preplan;
+mod row_group_chunk;
+
 use super::{
-    MetadataCache, ScanRequest, ScanTask, TableProvider, TableSourceIdentity, TableStatistics,
+    MetadataCache, PredicateGuarantee, ScanRequest, ScanTask, TableProvider, TableSourceIdentity,
+    TableStatistics,
     hive::HivePartitions,
     parquet_bloom::{bloom_prunes_row_group, supports_bloom},
+    parquet_decode_batch,
+    parquet_dictionary::DictionaryDecode,
     parquet_index_metadata::load_page_index_metadata,
     parquet_metadata::{
-        load_parquet_metadata, registration_metadata_limit, resize_schema_budget,
+        ParquetMetadata, load_parquet_metadata, registration_metadata_limit, resize_schema_budget,
         schema_memory_size,
     },
     parquet_page_pruning::{prune_pages, supports_page_index},
+    parquet_predicate_cache,
     parquet_pruning::can_prune_row_group,
     parquet_pruning_budget::PruningBudget,
-    parquet_scan::{ParquetMorsel, ParquetMorselStream, morsel_stream, scan_morsels},
+    parquet_row_filter::{ParquetRowFilter, workspace_bytes as row_filter_workspace_bytes},
+    parquet_scan::{
+        NativeSidecarMorsel, ParquetFilePlan, ParquetMorsel, ParquetMorselStream, morsel_stream,
+        scan_morsels,
+    },
     provider::prepare_object_sources,
     schema_evolution::{
         ParquetSchemaMode, SchemaSource, canonical_type, canonicalize_schema, merge_file_schemas,
@@ -30,6 +43,9 @@ use crate::{
     runtime::{MemoryReservation, QueryContext, RecordBatchStream, estimate_schema_batch_bytes},
     storage::{LocationResolver, ObjectSource},
 };
+use filtered_limit::{FilteredLimit, reader_limit};
+
+const QUERY_METADATA_REUSE_DIVISOR: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct ParquetTable {
@@ -44,6 +60,9 @@ pub struct ParquetTable {
     io_concurrency: usize,
     parquet_scan: ParquetScanConfig,
     _schema_reservation: Option<Arc<MemoryReservation>>,
+    query_metadata: Option<Arc<[ParquetMetadata]>>,
+    fixed_files: bool,
+    native_predicate_sidecars: Option<Arc<[Option<super::native::NativePredicateSidecar>]>>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +146,11 @@ impl ParquetTable {
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
         let mut file_schemas = Vec::with_capacity(files.len());
+        let mut query_metadata = context.as_ref().map(|_| Vec::with_capacity(files.len()));
+        let query_metadata_limit = context
+            .as_ref()
+            .map(|context| context.memory.limit() / QUERY_METADATA_REUSE_DIVISOR);
+        let mut query_metadata_bytes = 0_usize;
         for file in &files {
             let metadata = load_parquet_metadata(
                 file,
@@ -147,6 +171,18 @@ impl ParquetTable {
                     .unwrap_or(u64::MAX),
             );
             bytes = bytes.saturating_add(file.snapshot().size);
+            if query_metadata.is_some() {
+                let next_bytes = query_metadata_bytes.saturating_add(metadata.reserved_bytes());
+                if query_metadata_limit.is_some_and(|limit| next_bytes <= limit) {
+                    query_metadata_bytes = next_bytes;
+                    query_metadata
+                        .as_mut()
+                        .expect("query metadata retention is enabled")
+                        .push(metadata);
+                } else {
+                    query_metadata = None;
+                }
+            }
         }
 
         let mut physical_schema = match explicit_schema {
@@ -217,6 +253,9 @@ impl ParquetTable {
             io_concurrency,
             parquet_scan,
             _schema_reservation: schema_reservation.map(Arc::new),
+            query_metadata: query_metadata.map(Arc::from),
+            fixed_files: false,
+            native_predicate_sidecars: None,
         })
     }
 
@@ -276,7 +315,19 @@ impl TableProvider for ParquetTable {
     }
 
     fn explain_scan(&self) -> Option<String> {
-        Some("format=parquet morsel=row_group metadata=singleflight".to_owned())
+        let morsel = if self.fixed_files {
+            "row_group_chunk(max=4)"
+        } else {
+            "row_group"
+        };
+        Some(format!(
+            "format=parquet morsel={morsel} metadata=singleflight"
+        ))
+    }
+
+    fn supports_exact_filter(&self, predicate: &super::ScanPredicate) -> bool {
+        self.schema_mode == ParquetSchemaMode::Strict
+            && super::exact_filter::supported(predicate, &self.schema, &self.physical_schema)
     }
 
     async fn prepare(&self, context: Arc<QueryContext>) -> Result<()> {
@@ -297,8 +348,27 @@ impl TableProvider for ParquetTable {
         let files = Arc::clone(&self.files);
         let table_schema = Arc::clone(&self.schema);
         let hive = self.hive.clone();
-        let batch_size = request.batch_size;
+        let decode_batch_size = parquet_decode_batch::admitted_size(
+            &request,
+            output_schema.as_ref(),
+            self.schema.as_ref(),
+            context.memory.limit(),
+            self.io_concurrency,
+        );
         let limit = request.limit;
+        let pruning_budget = PruningBudget::for_query(&self.parquet_scan, context.memory.limit());
+        let preplanned_metadata = preplan::try_preload(
+            self.fixed_files,
+            &self.files,
+            &request,
+            &context,
+            &self.metadata_cache,
+            &self.parquet_scan,
+            self.io_concurrency,
+            self.io_concurrency,
+            &pruning_budget,
+        )
+        .await?;
         let morsels = plan_morsels(ScanPlanning {
             files,
             output_schema: Arc::clone(&output_schema),
@@ -310,6 +380,13 @@ impl TableProvider for ParquetTable {
             context: Arc::clone(&context),
             metadata_cache: self.metadata_cache.clone(),
             parquet_scan: self.parquet_scan.clone(),
+            query_metadata: self.query_metadata.clone(),
+            decode_batch_size,
+            predicate_cache_lanes: self.io_concurrency,
+            pruning_budget,
+            preplanned_metadata,
+            fixed_files: self.fixed_files,
+            native_predicate_sidecars: self.native_predicate_sidecars.clone(),
         });
         Ok(scan_morsels(
             morsels,
@@ -317,7 +394,7 @@ impl TableProvider for ParquetTable {
             hive,
             context,
             self.io_concurrency,
-            batch_size,
+            decode_batch_size,
             limit,
         ))
     }
@@ -334,9 +411,35 @@ impl TableProvider for ParquetTable {
             ));
         }
         let output_schema = request.projected_schema(&self.schema)?;
-        let batch_size = request.batch_size;
-        let preclaim = estimate_schema_batch_bytes(output_schema.as_ref(), batch_size);
+        let decode_batch_size = parquet_decode_batch::admitted_size(
+            &request,
+            output_schema.as_ref(),
+            self.schema.as_ref(),
+            context.memory.limit(),
+            target_tasks,
+        );
+        let preclaim = estimate_schema_batch_bytes(output_schema.as_ref(), decode_batch_size)
+            .saturating_add(row_filter_workspace_bytes(
+                request.predicate.as_ref(),
+                &self.schema,
+                decode_batch_size,
+            ));
+        let filtered_limit = FilteredLimit::for_request(&request);
         let hive = self.hive.clone();
+        let target_tasks = target_tasks.max(1);
+        let pruning_budget = PruningBudget::for_query(&self.parquet_scan, context.memory.limit());
+        let preplanned_metadata = preplan::try_preload(
+            self.fixed_files,
+            &self.files,
+            &request,
+            &context,
+            &self.metadata_cache,
+            &self.parquet_scan,
+            self.io_concurrency,
+            target_tasks,
+            &pruning_budget,
+        )
+        .await?;
         let mut morsels = plan_morsels(ScanPlanning {
             files: Arc::clone(&self.files),
             output_schema: Arc::clone(&output_schema),
@@ -348,6 +451,13 @@ impl TableProvider for ParquetTable {
             context: Arc::clone(&context),
             metadata_cache: self.metadata_cache.clone(),
             parquet_scan: self.parquet_scan.clone(),
+            query_metadata: self.query_metadata.clone(),
+            decode_batch_size,
+            predicate_cache_lanes: target_tasks.max(1),
+            pruning_budget,
+            preplanned_metadata,
+            fixed_files: self.fixed_files,
+            native_predicate_sidecars: self.native_predicate_sidecars.clone(),
         });
 
         // Prefetch at most one first morsel per configured lane. This reveals
@@ -355,7 +465,6 @@ impl TableProvider for ParquetTable {
         // workers, while keeping planning metadata bounded for files with very
         // many row groups. Remaining morsels stay lazy behind the shared
         // planning stream.
-        let target_tasks = target_tasks.max(1);
         let mut first_morsels = Vec::with_capacity(target_tasks);
         while first_morsels.len() < target_tasks {
             context.check_cancelled()?;
@@ -385,11 +494,18 @@ impl TableProvider for ParquetTable {
                 let hive = hive.clone();
                 let task_context = Arc::clone(&context);
                 let stream_context = Arc::clone(&task_context);
+                let filtered_limit = filtered_limit.clone();
                 ScanTask::from_public(
                     id,
                     crate::runtime::boxed_record_batch_stream(try_stream! {
                         let mut next = Some(first_morsel);
-                        loop {
+                        'scan: loop {
+                            if filtered_limit
+                                .as_ref()
+                                .is_some_and(|limit| limit.exhausted())
+                            {
+                                break;
+                            }
                             let morsel = match next.take() {
                                 Some(morsel) => morsel,
                                 None => {
@@ -401,25 +517,60 @@ impl TableProvider for ParquetTable {
                                 }
                             };
                             stream_context.check_cancelled()?;
-                            // Compute lanes may outnumber the configured object
-                            // I/O concurrency. Keep independently schedulable
-                            // row groups, but admit only the configured number
-                            // of active Parquet readers at once.
-                            let _io_permit = Arc::clone(&io_permits)
-                                .acquire_owned()
-                                .await
-                                .map_err(|_| Error::Internal(
-                                    "Parquet I/O concurrency limiter closed unexpectedly".into(),
-                                ))?;
                             let mut input = morsel_stream(
                                 morsel,
                                 Arc::clone(&output_schema),
                                 hive.clone(),
                                 Arc::clone(&stream_context),
-                                batch_size,
+                                decode_batch_size,
                             );
-                            while let Some(batch) = input.next().await {
-                                yield batch?;
+                            loop {
+                                // Compute lanes may outnumber configured object
+                                // I/O concurrency. Admit only the poll that
+                                // obtains the next batch; release the permit
+                                // before yielding to a potentially slow
+                                // consumer so backpressure cannot pin an I/O
+                                // slot.
+                                let batch = {
+                                    let _io_permit = Arc::clone(&io_permits)
+                                        .acquire_owned()
+                                        .await
+                                        .map_err(|_| Error::Internal(
+                                            "Parquet I/O concurrency limiter closed unexpectedly".into(),
+                                        ))?;
+                                    // The shared budget may have been consumed
+                                    // while this lane waited for I/O admission.
+                                    if filtered_limit
+                                        .as_ref()
+                                        .is_some_and(|limit| limit.exhausted())
+                                    {
+                                        break 'scan;
+                                    }
+                                    input.next().await
+                                };
+                                let Some(batch) = batch else {
+                                    break;
+                                };
+                                let batch = batch?;
+                                let Some(filtered_limit) = filtered_limit.as_ref() else {
+                                    yield batch;
+                                    continue;
+                                };
+                                if batch.num_rows() == 0 {
+                                    continue;
+                                }
+                                let claimed = filtered_limit.claim(batch.num_rows());
+                                if claimed == 0 {
+                                    break 'scan;
+                                }
+                                if claimed < batch.num_rows() {
+                                    yield batch.slice(0, claimed);
+                                } else {
+                                    yield batch;
+                                }
+                                if filtered_limit.exhausted() {
+                                    break 'scan;
+                                }
                             }
                         }
                     }),
@@ -443,17 +594,24 @@ struct ScanPlanning {
     context: Arc<QueryContext>,
     metadata_cache: MetadataCache,
     parquet_scan: ParquetScanConfig,
+    query_metadata: Option<Arc<[ParquetMetadata]>>,
+    decode_batch_size: usize,
+    predicate_cache_lanes: usize,
+    pruning_budget: PruningBudget,
+    preplanned_metadata: Option<preplan::MetadataPreplan>,
+    fixed_files: bool,
+    native_predicate_sidecars: Option<Arc<[Option<super::native::NativePredicateSidecar>]>>,
 }
 
+// `try_stream!` expands in the dependency's edition, where let-chains are not
+// available. Keep the sidecar admission branches explicit.
+#[allow(clippy::collapsible_if)]
 fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
     Box::pin(try_stream! {
         if plan.request.limit == Some(0) {
             return;
         }
-        let pruning_budget = PruningBudget::for_query(
-            &plan.parquet_scan,
-            plan.context.memory.limit(),
-        );
+        let mut preplanned_metadata = plan.preplanned_metadata;
         let use_page_index = plan.parquet_scan.page_index == ParquetPruningMode::Auto
             && supports_page_index(plan.request.predicate.as_ref());
         let use_bloom = plan.parquet_scan.bloom_filter == ParquetPruningMode::Auto
@@ -474,13 +632,32 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
             plan.context.check_cancelled()?;
             let file = &plan.files[file_index];
             let snapshot = plan.context.object_snapshot(file.uri())?;
-            let mut metadata = load_parquet_metadata(
-                file,
-                snapshot.clone(),
-                Some(&plan.context),
-                &plan.metadata_cache,
-                usize::MAX,
-            ).await?;
+            let (mut metadata, page_index_attempted) =
+                if let Some(preplanned) = preplanned_metadata
+                    .as_mut()
+                    .and_then(|metadata| metadata.take(file_index))
+                {
+                    preplanned.into_parts()
+                } else if let Some(metadata) = plan
+                    .query_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(file_index))
+                    .filter(|_| !use_page_index && &snapshot == file.snapshot())
+                {
+                    (metadata.clone(), false)
+                } else {
+                    (
+                        load_parquet_metadata(
+                            file,
+                            snapshot.clone(),
+                            Some(&plan.context),
+                            &plan.metadata_cache,
+                            usize::MAX,
+                        )
+                        .await?,
+                        false,
+                    )
+                };
             let reader_metadata = metadata.reader_metadata();
             let file_schema = Arc::clone(reader_metadata.schema());
             validate_scan_schema(
@@ -493,6 +670,30 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                 hive.validate_physical_schema(&file_schema)?;
             }
             let projection = file_projection(&file_schema, &plan.output_schema);
+            let row_filter = if plan.request.predicate_guarantee == PredicateGuarantee::Exact {
+                if plan.schema_mode != ParquetSchemaMode::Strict {
+                    Err(Error::Internal(
+                        "exact Parquet scan reached a non-strict schema mode".to_owned(),
+                    ))?
+                }
+                Some(ParquetRowFilter::try_new_exact(
+                    plan.request.predicate.as_ref(),
+                    &file_schema,
+                    &plan.table_schema,
+                )?)
+            } else if plan.schema_mode == ParquetSchemaMode::Strict {
+                ParquetRowFilter::try_new_strict(
+                    plan.request.predicate.as_ref(),
+                    &file_schema,
+                    &plan.table_schema,
+                )
+            } else {
+                ParquetRowFilter::try_new(
+                    plan.request.predicate.as_ref(),
+                    &file_schema,
+                    &plan.table_schema,
+                )
+            };
             let row_groups = reader_metadata.metadata().num_row_groups();
             let candidate_bytes = row_groups
                 .checked_mul(size_of::<usize>())
@@ -540,7 +741,7 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                         plan.request.predicate.as_ref(),
                         &plan.context,
                         &plan.metadata_cache,
-                        &pruning_budget,
+                        &plan.pruning_budget,
                     ).await? {
                         plan.context.metrics.add_parquet_bloom_row_groups_pruned(1);
                         plan.context.metrics.add_row_groups_pruned(1);
@@ -554,21 +755,104 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                 plan.context.metrics.add_files_pruned(1);
                 continue;
             }
-            if use_page_index {
+            if use_page_index && !page_index_attempted {
                 metadata = load_page_index_metadata(
                     file,
                     &snapshot,
                     metadata,
                     &plan.context,
                     &plan.metadata_cache,
-                    &pruning_budget,
+                    &plan.pruning_budget,
                 ).await?;
             }
+            let dictionary = if plan.schema_mode == ParquetSchemaMode::Strict
+                && !plan.request.dictionary_columns.is_empty()
+            {
+                DictionaryDecode::try_new(
+                    metadata.reader_metadata(),
+                    &file_schema,
+                    &plan.table_schema,
+                    &plan.output_schema,
+                    &plan.request.dictionary_columns,
+                    &plan.context,
+                )?
+            } else {
+                None
+            };
+            let file_plan = Arc::new(ParquetFilePlan::try_new(
+                Arc::clone(&plan.files),
+                file_index,
+                snapshot,
+                metadata,
+                projection,
+                row_filter,
+                dictionary,
+                &plan.context,
+            )?);
+            let native_sidecar = if plan.request.predicate_guarantee
+                == PredicateGuarantee::Exact
+            {
+                let predicate = Arc::new(
+                    plan.request
+                        .predicate
+                        .clone()
+                        .expect("exact Native sidecar scans have a predicate"),
+                );
+                plan.native_predicate_sidecars
+                    .as_ref()
+                    .and_then(|sidecars| sidecars.get(file_index))
+                    .and_then(Option::as_ref)
+                    .filter(|sidecar| {
+                        sidecar.supports_predicate(
+                            &predicate,
+                            &plan.table_schema,
+                            &file_schema,
+                        )
+                    })
+                    .map(|sidecar| {
+                        let projection = if file_plan.dictionary_columns().is_empty() {
+                            sidecar
+                                .projection_candidate(
+                                &predicate,
+                                &plan.table_schema,
+                                &file_schema,
+                                file_plan.projection(),
+                                )
+                                .map(Arc::new)
+                        } else {
+                            None
+                        };
+                        NativeSidecarMorsel {
+                            sidecar: sidecar.clone(),
+                            projection,
+                            predicate: Arc::clone(&predicate),
+                            table_schema: Arc::clone(&plan.table_schema),
+                        }
+                    })
+            } else {
+                None
+            };
+            // Preserve bounded reader chunks. The first full-projection slice
+            // handles only naturally single-row-group morsels; larger chunks
+            // stay on the proven Parquet path until streaming sidecar output is
+            // implemented.
+            let chunk_size = row_group_chunk::size(
+                plan.fixed_files,
+                plan.request.limit,
+                candidate_groups.len(),
+                plan.predicate_cache_lanes,
+            );
+            let mut chunk = (chunk_size > 1).then(|| row_group_chunk::RowGroupChunk::new(chunk_size));
 
             let mut has_unpruned_group = false;
             for row_group in candidate_groups {
                 let row_count = usize::try_from(
-                    metadata.reader_metadata().metadata().row_group(row_group).num_rows(),
+                    file_plan
+                        .metadata()
+                        .reader_metadata()
+                        .metadata()
+                        .row_group(row_group)
+                        .num_rows(),
                 ).map_err(|_| Error::Execution(format!(
                     "Parquet row group {row_group} in {} has an invalid row count",
                     file.uri(),
@@ -576,7 +860,7 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                 let page_pruning = if use_page_index {
                     prune_pages(
                         file.uri(),
-                        metadata.reader_metadata().metadata(),
+                        file_plan.metadata().reader_metadata().metadata(),
                         &file_schema,
                         &plan.table_schema,
                         row_group,
@@ -601,28 +885,121 @@ fn plan_morsels(plan: ScanPlanning) -> ParquetMorselStream {
                     }
                     _ => (None, row_count),
                 };
+                let apply_row_filter = true;
                 has_unpruned_group = true;
                 if row_count == 0 {
                     continue;
                 }
-                let row_limit = plan.request.limit.map(|_| {
-                    let limit = effective_rows.min(pushdown_remaining);
-                    pushdown_remaining = pushdown_remaining.saturating_sub(limit);
-                    limit
-                });
-                yield ParquetMorsel {
-                    file_index,
-                    file: file.clone(),
-                    snapshot: snapshot.clone(),
-                    metadata: metadata.clone(),
-                    projection: projection.clone(),
-                    row_group,
-                    row_limit,
-                    row_selection,
-                };
+                let row_limit = reader_limit(
+                    &plan.request,
+                    effective_rows,
+                    &mut pushdown_remaining,
+                );
+                let predicate_cache = parquet_predicate_cache::plan(
+                    if apply_row_filter {
+                        file_plan.row_filter()
+                    } else {
+                        None
+                    },
+                    file_plan.projection(),
+                    &file_schema,
+                    row_count,
+                    plan.decode_batch_size,
+                    plan.context.memory.limit(),
+                    plan.predicate_cache_lanes,
+                );
+                if let Some(chunk) = &mut chunk {
+                    debug_assert!(row_limit.is_none());
+                    if !chunk.can_accept(apply_row_filter) {
+                        let completed = std::mem::replace(
+                            chunk,
+                            row_group_chunk::RowGroupChunk::new(chunk_size),
+                        );
+                        let (
+                            row_groups,
+                            chunk_selection,
+                            chunk_cache,
+                            chunk_apply_row_filter,
+                            chunk_sidecar_leases,
+                        ) = completed.finish();
+                        yield ParquetMorsel {
+                            file: Arc::clone(&file_plan),
+                            row_groups,
+                            row_limit: None,
+                            row_selection: chunk_selection,
+                            predicate_cache: chunk_cache,
+                            apply_row_filter: chunk_apply_row_filter,
+                            sidecar_selection_leases: chunk_sidecar_leases,
+                            native_sidecar: native_sidecar.clone(),
+                        };
+                    }
+                    chunk.push(
+                        row_group,
+                        row_count,
+                        row_selection,
+                        predicate_cache,
+                        apply_row_filter,
+                        None,
+                    )?;
+                    if chunk.is_full() {
+                        let completed = std::mem::replace(
+                            chunk,
+                            row_group_chunk::RowGroupChunk::new(chunk_size),
+                        );
+                        let (
+                            row_groups,
+                            row_selection,
+                            predicate_cache,
+                            apply_row_filter,
+                            sidecar_selection_leases,
+                        ) = completed.finish();
+                        yield ParquetMorsel {
+                            file: Arc::clone(&file_plan),
+                            row_groups,
+                            row_limit: None,
+                            row_selection,
+                            predicate_cache,
+                            apply_row_filter,
+                            sidecar_selection_leases,
+                            native_sidecar: native_sidecar.clone(),
+                        };
+                    }
+                } else {
+                    yield ParquetMorsel {
+                        file: Arc::clone(&file_plan),
+                        row_groups: vec![row_group],
+                        row_limit,
+                        row_selection,
+                        predicate_cache,
+                        apply_row_filter,
+                        sidecar_selection_leases: Vec::new(),
+                        native_sidecar: native_sidecar.clone(),
+                    };
+                }
                 if pushdown_remaining == 0 {
                     break;
                 }
+            }
+            if let Some(chunk) = chunk
+                && !chunk.is_empty()
+            {
+                let (
+                    row_groups,
+                    row_selection,
+                    predicate_cache,
+                    apply_row_filter,
+                    sidecar_selection_leases,
+                ) = chunk.finish();
+                yield ParquetMorsel {
+                    file: Arc::clone(&file_plan),
+                    row_groups,
+                    row_limit: None,
+                    row_selection,
+                    predicate_cache,
+                    apply_row_filter,
+                    sidecar_selection_leases,
+                    native_sidecar: native_sidecar.clone(),
+                };
             }
             if !has_unpruned_group {
                 plan.context.metrics.add_files_pruned(1);
@@ -739,6 +1116,18 @@ mod deep_pruning_tests;
 #[cfg(test)]
 #[path = "parquet_predicate_budget_tests.rs"]
 mod predicate_budget_tests;
+#[cfg(test)]
+#[path = "parquet/preplan_tests.rs"]
+mod preplan_tests;
+#[cfg(test)]
+#[path = "parquet_row_filter_q6_read_tests.rs"]
+mod row_filter_q6_read_tests;
+#[cfg(test)]
+#[path = "parquet_row_filter_read_tests.rs"]
+mod row_filter_read_tests;
+#[cfg(test)]
+#[path = "parquet/row_group_chunk_read_tests.rs"]
+mod row_group_chunk_read_tests;
 #[cfg(test)]
 #[path = "parquet_tests.rs"]
 mod tests;

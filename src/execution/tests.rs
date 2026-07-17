@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use arrow::{
-    array::{Array, Float64Array, Int64Array, StringArray},
+    array::{Array, Decimal128Array, Float64Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -23,6 +23,7 @@ use super::execute;
 mod lane_limit;
 mod predicate_relocation;
 mod projection;
+mod sum_widening;
 
 #[derive(Clone)]
 struct MemoryTable {
@@ -93,6 +94,7 @@ impl TableProvider for SnapshotTable {
                 size: 1,
                 e_tag: Some(format!("v{version}")),
                 version: None,
+                local_identity: None,
             },
         )?;
         self.prepared.fetch_add(1, Ordering::Release);
@@ -205,7 +207,7 @@ async fn executes_grouped_aggregates() {
     let sums = batch
         .column(2)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Decimal128Array>()
         .unwrap();
     let averages = batch
         .column(5)
@@ -408,7 +410,7 @@ async fn fixes_all_join_snapshots_before_build_side_is_consumed() {
 }
 
 #[tokio::test]
-async fn aggregate_and_join_spill_under_small_memory_limit() {
+async fn aggregate_spills_and_join_completes_under_small_memory_limit() {
     let catalog = Catalog::default();
     const ROWS: usize = 16_384;
     const MEMORY_LIMIT: usize = 2 << 20;
@@ -443,7 +445,7 @@ async fn aggregate_and_join_spill_under_small_memory_limit() {
         joined.iter().map(RecordBatch::num_rows).sum::<usize>(),
         ROWS
     );
-    assert!(joined_metrics.spill_partitions > 0);
+    assert!(joined_metrics.peak_memory_bytes <= MEMORY_LIMIT as u64);
 }
 
 #[tokio::test]

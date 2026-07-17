@@ -41,7 +41,9 @@ impl PartialMergeAdmission {
             _ = context.control.cancelled() => Err(cancelled(context)),
             _ = self.ready.wait() => Ok(()),
         };
-        context.scheduler.record_wait(started.elapsed());
+        let wait = started.elapsed();
+        context.scheduler.record_wait(wait);
+        context.metrics.record_barrier_wait(wait);
         result
     }
 
@@ -96,6 +98,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(matches!(error, Error::Cancelled));
+        assert!(context.metrics.snapshot().barrier_wait > Duration::ZERO);
     }
 
     #[tokio::test]

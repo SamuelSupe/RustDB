@@ -1,16 +1,11 @@
 use std::{ops::Deref, sync::Arc};
 
-use arrow::{
-    array::ArrayRef, compute::concat_batches, datatypes::SchemaRef, record_batch::RecordBatch,
-};
+use arrow::{array::ArrayRef, datatypes::SchemaRef, record_batch::RecordBatch};
 use futures::StreamExt;
 
 use crate::{
     Result,
-    runtime::{
-        BatchEnvelope, IntoMemoryBatchStream, MemoryBatchStream, QueryContext,
-        boxed_memory_batch_stream,
-    },
+    runtime::{IntoMemoryBatchStream, MemoryBatchStream, QueryContext, boxed_memory_batch_stream},
     sql::{BoundExpr, ExprKind, JoinType, ScalarValue},
 };
 
@@ -20,15 +15,25 @@ use super::{
     value::{CellValue, cell},
 };
 
+mod aggregate_output;
+mod build;
 mod condition;
 mod grace;
+mod hash_table;
 mod matched;
-mod output;
+mod metrics;
+mod multiplicity;
+pub(in crate::execution) mod output;
 mod parallel;
 mod probe;
 mod sort_merge;
 mod spill;
+mod spilled;
 
+pub(in crate::execution) use aggregate_output::join_global_aggregate;
+
+#[cfg(test)]
+mod binary_tests;
 #[cfg(test)]
 mod correlation_tests;
 #[cfg(test)]
@@ -39,18 +44,16 @@ mod tests;
 mod tracker_fallback_tests;
 
 use condition::JoinPredicates;
+use hash_table::JoinHashTable;
 use matched::BuildMatchTracker;
-use output::build_unmatched_right_envelope;
+use metrics::JoinPhaseMetrics;
+use output::{BatchOutputTarget, JoinEmission, build_unmatched_right_envelope};
+#[cfg(test)]
+use probe::try_build_hash_table;
 use probe::{
     GlobalMembershipState, ProbeCursor, try_build_existence_hash_table_with_nulls,
-    try_build_hash_table, try_build_hash_table_with_nulls,
+    try_build_hash_table_with_nulls,
 };
-use spill::{BuildPartition, Side};
-
-// A streaming build starts spilling after only a bounded prefix is buffered.
-// Reserve growth for the unseen suffix so common large scans do not begin
-// with a tiny fanout and immediately rewrite the complete build side.
-const STREAMING_BUILD_GROWTH_RESERVE: u64 = 4;
 
 // The physical join boundary carries both input schemas, output schema, keys,
 // execution state, and sizing. Keeping this explicit avoids a public options
@@ -89,6 +92,7 @@ where
         context,
         batch_size,
         None,
+        None,
     )
 }
 
@@ -107,11 +111,13 @@ pub(crate) fn join_with_runtime_filter<L, R>(
     context: Arc<QueryContext>,
     batch_size: usize,
     runtime_filter: Option<Arc<RuntimeFilterSlot>>,
+    join_operator_id: Option<u64>,
 ) -> MemoryBatchStream
 where
     L: IntoMemoryBatchStream,
     R: IntoMemoryBatchStream,
 {
+    let phases = JoinPhaseMetrics::register(&context, join_operator_id);
     let use_global_membership_hash = on.is_empty()
         && residual.is_none()
         && null_aware.is_some()
@@ -141,462 +147,76 @@ where
                 "NullAwareAnti join requires a null-aware membership comparison".into(),
             ))?;
         }
+        let build_phase = phases.start_build();
         let mut reservation = context.memory.reservation();
-        let mut right_batches: Vec<RecordBatch> = Vec::new();
-        let mut right_bytes = 0usize;
-        let mut right_rows = 0usize;
-        let mut right_partitions = None;
-        let mut in_memory_build = None;
-        // Retaining both source batches and the future concat buffer can use
-        // roughly twice the logical build bytes. Cap the buffered side so
-        // scan/kernel workspaces and bounded queues always retain headroom.
-        let build_buffer_limit = context.memory.limit().checked_div(4).unwrap_or(0).max(1);
-
-        while let Some(batch) = right.next().await {
-            context.check_cancelled()?;
-            let batch = batch?;
-            let bytes = batch.memory_size();
-            let projected_bytes = right_bytes.saturating_add(bytes);
-            let projected_rows = right_rows.saturating_add(batch.batch().num_rows());
-            // Reserve the future concat buffer while the source envelope still
-            // accounts for the retained input batch.
-            if projected_bytes > build_buffer_limit
-                || reservation.try_grow(bytes).is_err()
-            {
-                reservation.shrink(right_bytes);
-                let footprint = spill::estimated_build_footprint(
-                    u64::try_from(projected_bytes).unwrap_or(u64::MAX),
-                    u64::try_from(projected_rows).unwrap_or(u64::MAX),
-                    right_key_expressions.len(),
-                )
-                .saturating_mul(STREAMING_BUILD_GROWTH_RESERVE);
-                let partitions = spill::adaptive_partition_count(
-                    &context,
-                    usize::try_from(footprint).unwrap_or(usize::MAX),
-                );
-                let mut spiller = spill::PartitionSpiller::with_partitions(
-                    &context,
-                    "join-right",
-                    partitions,
-                );
-                for buffered in right_batches.drain(..) {
-                    let buffered_bytes = buffered.get_array_memory_size();
-                    spill::spill_batch_with_null_keys(
-                        buffered,
-                        &right_key_expressions,
-                        Side::Right,
-                        join_type,
-                        null_equal_keys,
-                        &mut spiller,
-                        0,
-                    )?;
-                    reservation.shrink(buffered_bytes);
-                }
-                let (batch, batch_memory) = batch.into_parts();
-                spill::spill_batch_with_null_keys(
-                    batch,
-                    &right_key_expressions,
-                    Side::Right,
-                    join_type,
-                    null_equal_keys,
-                    &mut spiller,
-                    0,
-                )?;
-                drop(batch_memory);
-                while let Some(batch) = right.next().await {
-                    let (batch, batch_memory) = batch?.into_parts();
-                    spill::spill_batch_with_null_keys(
-                        batch,
-                        &right_key_expressions,
-                        Side::Right,
-                        join_type,
-                        null_equal_keys,
-                        &mut spiller,
-                        0,
-                    )?;
-                    drop(batch_memory);
-                }
-                right_partitions = Some(spiller.finish_manifest()?);
-                break;
-            }
-            let (batch, batch_memory) = batch.into_parts();
-            reservation.absorb(batch_memory)?;
-            right_bytes = right_bytes.saturating_add(bytes);
-            right_rows = projected_rows;
-            right_batches.push(batch);
-        }
-
-        if right_partitions.is_none() {
-            let right_batch = if right_batches.is_empty() {
-                RecordBatch::new_empty(Arc::clone(&right_schema))
-            } else {
-                concat_batches(&right_schema, &right_batches)?
-            };
-            drop(right_batches);
-            reservation.shrink(right_bytes);
-            let rows = right_batch.num_rows();
-            let (hash_table, right_values, global_membership) = if use_global_membership_hash {
-                let right_values = evaluate_optional_values(
-                    predicates.right_value(),
-                    &right_batch,
-                    &context,
-                    "join build membership value",
-                )?;
-                let right_array = optional_array(&right_values).ok_or_else(|| {
-                    crate::Error::Internal(
-                        "global membership hash is missing its right value array".into(),
-                    )
-                })?;
-                let state = GlobalMembershipState::new(rows, right_array);
-                let hash_table = try_build_hash_table(
-                    std::slice::from_ref(right_array),
-                    rows,
-                    true,
-                    &mut reservation,
-                )?;
-                (hash_table, right_values, Some(state))
-            } else {
-                let right_keys = evaluate_keys_accounted(
-                    &right_key_expressions,
-                    &right_batch,
-                    &context,
-                    "join build keys",
-                )?;
-                let inequality_value = predicates
-                    .existence_inequality_right_value(join_type, left_schema.fields().len());
-                let inequality_values = evaluate_optional_values(
-                    inequality_value.as_ref(),
-                    &right_batch,
-                    &context,
-                    "join build existence inequality value",
-                )?;
-                let hash_table = if let Some(values) = optional_array(&inequality_values) {
-                    try_build_existence_hash_table_with_nulls(
-                        &right_keys,
-                        rows,
-                        null_equal_keys,
-                        values,
-                        &mut reservation,
-                    )?
-                } else {
-                    try_build_hash_table_with_nulls(
-                        &right_keys,
-                        rows,
-                        can_deduplicate_build(join_type, &predicates),
-                        null_equal_keys,
-                        &mut reservation,
-                    )?
-                };
-                drop(inequality_values);
-                drop(right_keys);
-                let right_values = evaluate_optional_values(
-                    predicates.right_value(),
-                    &right_batch,
-                    &context,
-                    "join build membership value",
-                )?;
-                (hash_table, right_values, None)
-            };
-            match hash_table {
-                Some(hash_table) => {
-                    if let Some(matched_build) =
-                        try_build_match_tracker(join_type, rows, &mut reservation)
-                    {
-                        in_memory_build = Some((
-                            right_batch,
-                            hash_table,
-                            right_values,
-                            global_membership,
-                            matched_build,
-                        ));
-                    } else {
-                        drop(hash_table);
-                        drop(right_values);
-                        right_partitions = Some(spill_build_batch(
-                            right_batch,
-                            &right_key_expressions,
-                            join_type,
-                            null_equal_keys,
-                            &context,
-                            &mut reservation,
-                        )?);
-                    }
-                }
-                None => {
-                    drop(right_values);
-                    right_partitions = Some(spill_build_batch(
-                        right_batch,
-                        &right_key_expressions,
-                        join_type,
-                        null_equal_keys,
-                        &context,
-                        &mut reservation,
-                    )?);
-                }
-            }
-        }
+        let outcome = build::build(
+            &mut right,
+            &right_key_expressions,
+            &predicates,
+            use_global_membership_hash,
+            left_schema.fields().len(),
+            &right_schema,
+            join_type,
+            null_equal_keys,
+            &context,
+            &mut reservation,
+        ).await?;
+        let (right_partitions, mut in_memory_build) = match outcome {
+            build::BuildOutcome::InMemory(build) => (None, Some(build)),
+            build::BuildOutcome::Spilled(partitions) => (Some(partitions), None),
+        };
 
         if let Some(runtime_filter) = &runtime_filter {
-            if let Some((_, hash_table, _, _, _)) = &in_memory_build {
-                runtime_filter.publish_hash(hash_table, &context);
+            if let Some(build) = &in_memory_build {
+                let _permit = context.acquire_compute().await?;
+                let _active = context.scheduler.enter_lane();
+                let hash_table = build.hash_table();
+                if let Some(values) = hash_table.generic_values() {
+                    runtime_filter.publish_hash(values, &context);
+                } else if let Some(keys) = hash_table.fixed_keys() {
+                    runtime_filter.publish_fixed_keys(keys, &context);
+                } else if let Some(keys) = hash_table.utf8_keys() {
+                    runtime_filter.publish_utf8_keys(keys, &context);
+                } else if let Some(keys) = hash_table.binary_keys() {
+                    runtime_filter.publish_binary_keys(keys, &context);
+                } else {
+                    runtime_filter.publish_none();
+                }
             } else {
                 runtime_filter.publish_none();
             }
         }
-
         if let Some(right_partitions) = right_partitions {
-            let left_partitions = spill::spill_stream(
-                &mut left,
-                &left_key_expressions,
-                Side::Left,
-                join_type,
+            drop(build_phase);
+            let _spill_phase = phases.start_spill(&context);
+            let mut output = spilled::execute(
+                left,
+                right_partitions,
+                left_key_expressions,
+                right_key_expressions,
+                Arc::clone(&left_schema),
+                Arc::clone(&right_schema),
+                predicates,
                 null_equal_keys,
-                &context,
-                "join-left",
-                right_partitions.len(),
-            ).await?;
-            let initial = spill::initial_tasks(left_partitions, right_partitions);
-            context.metrics.record_spill(
-                0,
-                u64::try_from(initial.len()).unwrap_or(u64::MAX),
+                join_type,
+                Arc::clone(&schema),
+                Arc::clone(&context),
+                batch_size,
+                reservation,
             );
-            if grace::is_supported(&context, &initial) {
-                let mut output = grace::join(
-                    initial,
-                    left_key_expressions.clone(),
-                    right_key_expressions.clone(),
-                    Arc::clone(&left_schema),
-                    Arc::clone(&right_schema),
-                    predicates.clone(),
-                    null_equal_keys,
-                    join_type,
-                    Arc::clone(&schema),
-                    Arc::clone(&context),
-                    batch_size,
-                );
-                while let Some(batch) = output.next().await {
-                    yield batch?;
-                }
-                return;
-            }
-            let mut pending = initial;
-            while let Some(task) = spill::pop_largest_task(&mut pending) {
-                context.check_cancelled()?;
-                let build = match spill::load_build_partition(
-                    &task.right,
-                    &right_schema,
-                    &context,
-                    &mut reservation,
-                    task.build,
-                )? {
-                    BuildPartition::Loaded(right_batch) => {
-                        let right_keys = evaluate_keys_accounted(
-                            &right_key_expressions,
-                            &right_batch,
-                            &context,
-                            "join spill build keys",
-                        )?;
-                        let rows = right_batch.num_rows();
-                        let inequality_value = predicates.existence_inequality_right_value(
-                            join_type,
-                            left_schema.fields().len(),
-                        );
-                        let inequality_values = evaluate_optional_values(
-                            inequality_value.as_ref(),
-                            &right_batch,
-                            &context,
-                            "join spill existence inequality value",
-                        )?;
-                        let hash_table = if let Some(values) = optional_array(&inequality_values) {
-                            try_build_existence_hash_table_with_nulls(
-                                &right_keys,
-                                rows,
-                                null_equal_keys,
-                                values,
-                                &mut reservation,
-                            )?
-                        } else {
-                            try_build_hash_table_with_nulls(
-                                &right_keys,
-                                rows,
-                                can_deduplicate_build(join_type, &predicates),
-                                null_equal_keys,
-                                &mut reservation,
-                            )?
-                        };
-                        drop(inequality_values);
-                        drop(right_keys);
-                        let right_values = evaluate_optional_values(
-                            predicates.right_value(),
-                            &right_batch,
-                            &context,
-                            "join spill build membership value",
-                        )?;
-                        match hash_table {
-                            Some(hash_table)
-                                if let Some(matched_build) = try_build_match_tracker(
-                                    join_type,
-                                    rows,
-                                    &mut reservation,
-                                ) =>
-                            {
-                                PartitionHashBuild::Ready(
-                                    right_batch,
-                                    hash_table,
-                                    right_values,
-                                    matched_build,
-                                )
-                            }
-                            Some(hash_table) => {
-                                drop(hash_table);
-                                drop(right_values);
-                                PartitionHashBuild::TooLarge(rows)
-                            }
-                            None => {
-                                drop(right_values);
-                                PartitionHashBuild::TooLarge(rows)
-                            }
-                        }
-                    }
-                    BuildPartition::TooLarge { rows } => PartitionHashBuild::TooLarge(rows),
-                };
-                match build {
-                    PartitionHashBuild::Ready(
-                        right_batch,
-                        hash_table,
-                        right_values,
-                        matched_build,
-                    ) => {
-                        for file in &task.left {
-                            for left_batch in context.spill.read_file(file)? {
-                                let left_batch = left_batch?;
-                                let left_batch = BatchEnvelope::try_new(
-                                    left_batch,
-                                    &context.memory,
-                                    "join spill probe",
-                                )?;
-                                let left_keys = evaluate_keys_accounted(
-                                    &left_key_expressions,
-                                    left_batch.batch(),
-                                    &context,
-                                    "join spill probe keys",
-                                )?;
-                                let left_values = evaluate_optional_values(
-                                    predicates.left_value(),
-                                    left_batch.batch(),
-                                    &context,
-                                    "join spill probe membership value",
-                                )?;
-                                let mut probe = ProbeCursor::new(
-                                    left_batch.batch(),
-                                    &right_batch,
-                                    &left_keys,
-                                    &hash_table,
-                                    &predicates,
-                                    optional_array(&left_values),
-                                    optional_array(&right_values),
-                                    None,
-                                    null_equal_keys,
-                                    matched_build.clone(),
-                                    join_type,
-                                    Arc::clone(&schema),
-                                    batch_size,
-                                    reservation
-                                        .size()
-                                        .saturating_add(left_batch.memory_size())
-                                        .saturating_add(left_keys.memory_size())
-                                        .saturating_add(optional_memory(&left_values))
-                                        .saturating_add(optional_memory(&right_values)),
-                                );
-                                while let Some(output) = probe.next_batch(&context).await? {
-                                    yield output;
-                                }
-                            }
-                        }
-                        if let Some(matched) = &matched_build {
-                            let mut start = 0;
-                            loop {
-                                let indices = matched
-                                    .unmatched_from(
-                                        start,
-                                        batch_size.max(1),
-                                        &context,
-                                        reservation.size(),
-                                    )
-                                    .await?;
-                                let Some(last) = indices.last().copied() else { break };
-                                start = last as usize + 1;
-                                yield build_unmatched_right_envelope(
-                                    &left_schema,
-                                    &right_batch,
-                                    &indices,
-                                    Arc::clone(&schema),
-                                    &context,
-                                    reservation.size().saturating_add(indices.memory_size()),
-                                ).await?;
-                            }
-                        }
-                        spill::remove_task(&context, &task)?;
-                        reservation.try_resize(0)?;
-                    }
-                    PartitionHashBuild::TooLarge(rows) => {
-                        reservation.try_resize(0)?;
-                        if task.depth < context.execution.max_repartition_depth {
-                            let next_depth = task.depth + 1;
-                            let repartitioned = spill::repartition(
-                                &task,
-                                &left_key_expressions,
-                                &right_key_expressions,
-                                join_type,
-                                null_equal_keys,
-                                next_depth,
-                                &context,
-                            )?;
-                            if let Some(repartitioned) = repartitioned {
-                                let shrank = repartitioned.largest_build_rows < rows;
-                                if shrank || task.stagnant_repartitions == 0 {
-                                    spill::remove_task(&context, &task)?;
-                                    let stagnant = if shrank {
-                                        0
-                                    } else {
-                                        task.stagnant_repartitions + 1
-                                    };
-                                    for mut child in repartitioned.tasks {
-                                        child.stagnant_repartitions = stagnant;
-                                        pending.push(child);
-                                    }
-                                    continue;
-                                }
-                                spill::remove_tasks(&context, &repartitioned.tasks)?;
-                            }
-                        }
-
-                        let mut fallback = sort_merge::fallback_with_null_keys(
-                            task,
-                            left_key_expressions.clone(),
-                            right_key_expressions.clone(),
-                            Arc::clone(&left_schema),
-                            Arc::clone(&right_schema),
-                            predicates.clone(),
-                            null_equal_keys,
-                            join_type,
-                            Arc::clone(&schema),
-                            Arc::clone(&context),
-                            batch_size,
-                        );
-                        while let Some(output) = fallback.next().await {
-                            yield output?;
-                        }
-                        reservation.try_resize(0)?;
-                    }
-                }
+            while let Some(batch) = output.next().await {
+                yield batch?;
             }
             return;
         }
 
+        drop(build_phase);
+        let _probe_phase = phases.start_probe(&context);
+
         let (right_batch, hash_table, right_values, global_membership, matched_build) = in_memory_build
             .take()
-            .expect("a non-spilling join has an in-memory build");
+            .expect("a non-spilling join has an in-memory build")
+            .into_parts();
         if parallel::is_supported(&context, reservation.size()) {
             let build = parallel::FrozenBuild::new(
                 right_batch,
@@ -626,21 +246,26 @@ where
         while let Some(batch) = left.next().await {
             context.check_cancelled()?;
             let left_batch = batch?;
-            let left_values = evaluate_optional_values(
-                predicates.left_value(),
-                left_batch.batch(),
-                &context,
-                "join probe membership value",
-            )?;
-            let left_keys = if global_membership.is_some() {
-                None
-            } else {
-                Some(evaluate_keys_accounted(
-                    &left_key_expressions,
+            let (left_values, left_keys) = {
+                let _permit = context.acquire_compute().await?;
+                let _active = context.scheduler.enter_lane();
+                let left_values = evaluate_optional_values(
+                    predicates.left_value(),
                     left_batch.batch(),
                     &context,
-                    "join probe keys",
-                )?)
+                    "join probe membership value",
+                )?;
+                let left_keys = if global_membership.is_some() {
+                    None
+                } else {
+                    Some(evaluate_keys_accounted(
+                        &left_key_expressions,
+                        left_batch.batch(),
+                        &context,
+                        "join probe keys",
+                    )?)
+                };
+                (left_values, left_keys)
             };
             let probe_keys = if global_membership.is_some() {
                 std::slice::from_ref(optional_array(&left_values).ok_or_else(|| {
@@ -672,8 +297,13 @@ where
                     .saturating_add(optional_memory(&left_values))
                     .saturating_add(optional_memory(&right_values)),
             );
-            while let Some(output) = probe.next_batch(&context).await? {
-                yield output;
+            let mut target = BatchOutputTarget;
+            loop {
+                match probe.next_output(&mut target, &context).await? {
+                    JoinEmission::Batch(output) => yield output,
+                    JoinEmission::Consumed { .. } => {}
+                    JoinEmission::Exhausted => break,
+                }
             }
         }
         if let Some(matched) = &matched_build {
@@ -735,16 +365,6 @@ where
         context,
         batch_size,
     )
-}
-
-enum PartitionHashBuild {
-    Ready(
-        RecordBatch,
-        std::collections::HashMap<Vec<CellValue>, Vec<u32>>,
-        Option<EvaluatedKeys>,
-        Option<BuildMatchTracker>,
-    ),
-    TooLarge(usize),
 }
 
 fn evaluate_keys(expressions: &[BoundExpr], batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
@@ -814,36 +434,6 @@ fn try_build_match_tracker(
     } else {
         Some(None)
     }
-}
-
-fn spill_build_batch(
-    batch: RecordBatch,
-    keys: &[BoundExpr],
-    join_type: JoinType,
-    null_equal_keys: bool,
-    context: &QueryContext,
-    reservation: &mut crate::runtime::MemoryReservation,
-) -> Result<spill::PartitionManifest> {
-    reservation.try_resize(batch.get_array_memory_size())?;
-    let footprint = spill::estimated_build_footprint(
-        u64::try_from(spill::batch_logical_buffer_bytes(&batch)).unwrap_or(u64::MAX),
-        u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
-        keys.len(),
-    );
-    let partitions =
-        spill::adaptive_partition_count(context, usize::try_from(footprint).unwrap_or(usize::MAX));
-    let mut spiller = spill::PartitionSpiller::with_partitions(context, "join-right", partitions);
-    spill::spill_batch_with_null_keys(
-        batch,
-        keys,
-        Side::Right,
-        join_type,
-        null_equal_keys,
-        &mut spiller,
-        0,
-    )?;
-    reservation.try_resize(0)?;
-    spiller.finish_manifest()
 }
 
 pub(super) fn evaluate_keys_accounted(

@@ -99,8 +99,16 @@ pub(super) fn explain_analyze_stream(
         context.metrics.finish();
         let metrics = context.metrics.snapshot();
         let mut summary = format!(
-            "{explain}\nGlobal Metrics\n  elapsed={:?}\n  scanned_rows={} scanned_batches={} scanned_bytes={}\n  returned_rows={} returned_batches={} returned_bytes={}\n  discovered_files={} files_pruned={} row_groups_pruned={}\n  parquet_page_index_bytes={} parquet_bloom_bytes={} pages_pruned={} page_rows_pruned={} bloom_row_groups_pruned={} pruning_budget_skips={}\n  s3_requests={} s3_bytes={}\n  csv_source_bytes={} csv_decompressed_bytes={} csv_morsels={} csv_parser_lanes={}\n  metadata_cache_hits={} metadata_cache_misses={} metadata_singleflight_wait={:?}\n  peak_memory_bytes={} peak_active_lanes={} scheduler_wait={:?}\n  spill_bytes={} spill_read_bytes={} spill_write_bytes={} spill_logical_input_bytes={} spill_write_amplification_millionths={} active_spill_bytes={} peak_active_spill_bytes={}\n  spill_files={} active_spill_files={} peak_active_spill_files={} spill_partitions={} repartition_bytes={} max_repartition_depth={} max_partition_bytes={} quota_rejections={}\n  join_candidate_pairs={} join_short_circuits={} runtime_filter_hits={} cancel_to_quiesce={:?}\n",
+            "{explain}\nGlobal Metrics\n  elapsed={:?} query_admission_wait={:?}\n  sql_parse={:?} table_function_prepare={:?} bind={:?} provider_prepare={:?} optimize={:?}\n  native_verification={:?} native_full_verification_segments={}\n  scanned_rows={} scanned_batches={} scanned_bytes={}\n  returned_rows={} returned_batches={} returned_bytes={}\n  discovered_files={} files_pruned={} row_groups_pruned={}\n  parquet_page_index_bytes={} parquet_bloom_bytes={} pages_pruned={} page_rows_pruned={} bloom_row_groups_pruned={} pruning_budget_skips={}\n  s3_requests={} s3_bytes={}\n  csv_source_bytes={} csv_decompressed_bytes={} csv_morsels={} csv_parser_lanes={}\n  metadata_cache_hits={} metadata_cache_misses={} metadata_singleflight_wait={:?}\n  peak_memory_bytes={} peak_active_lanes={} scheduler_wait={:?}\n  spill_bytes={} spill_read_bytes={} spill_write_bytes={} spill_logical_input_bytes={} spill_write_amplification_millionths={} active_spill_bytes={} peak_active_spill_bytes={}\n  spill_files={} active_spill_files={} peak_active_spill_files={} spill_partitions={} repartition_bytes={} max_repartition_depth={} max_partition_bytes={} quota_rejections={}\n  join_candidate_pairs={} join_short_circuits={} runtime_filter_hits={} cancel_to_quiesce={:?}\n",
             metrics.elapsed,
+            metrics.query_admission_wait,
+            metrics.sql_parse_time,
+            metrics.table_function_prepare_time,
+            metrics.bind_time,
+            metrics.provider_prepare_time,
+            metrics.optimize_time,
+            metrics.native_verification_time,
+            metrics.native_full_verification_segments,
             metrics.rows_scanned,
             metrics.batches_scanned,
             metrics.bytes_scanned,

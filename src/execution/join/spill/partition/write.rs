@@ -22,6 +22,10 @@ use super::super::super::{CellValue, evaluate_keys, row_key};
 use super::super::PARTITIONS;
 use super::PartitionSpiller;
 
+mod scheduled;
+
+pub(in crate::execution::join) use scheduled::spill_batch_with_null_keys_scheduled;
+
 const TAKE_ARRAY_METADATA_BYTES: usize = 256;
 
 #[derive(Clone, Copy)]

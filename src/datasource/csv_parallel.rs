@@ -1,59 +1,26 @@
-use std::{
-    sync::Arc,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::{sync::Arc, sync::atomic::AtomicUsize};
 
-use arrow::{csv::ReaderBuilder, datatypes::SchemaRef};
-use async_stream::try_stream;
-use bytes::Bytes;
-use parking_lot::Mutex;
-use tokio::{io::AsyncReadExt, sync::mpsc};
+use arrow::datatypes::SchemaRef;
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
-use super::{
-    ScanRequest, ScanTask,
-    csv_infer::format,
-    csv_input::{input_error, open_csv_input},
-    csv_morsel::RecordMorselizer,
-};
+use super::{ScanRequest, ScanTask};
 use crate::{
     CsvOptions, Error, Result,
-    runtime::{
-        MemoryReservation, QueryContext, boxed_record_batch_stream, estimate_schema_batch_bytes,
-    },
+    runtime::{QueryContext, estimate_schema_batch_bytes},
     storage::ObjectSource,
 };
 
-struct CsvMorsel {
-    bytes: Bytes,
-    decompressed_offset: u64,
-    memory: Arc<MorselMemory>,
-}
+mod decoder;
+mod morsel_target;
+mod producer;
+mod read_size;
 
-impl Drop for CsvMorsel {
-    fn drop(&mut self) {
-        self.memory.shrink(self.bytes.len());
-    }
-}
-
-struct MorselMemory {
-    reservation: Mutex<MemoryReservation>,
-}
-
-impl MorselMemory {
-    fn new(reservation: MemoryReservation) -> Self {
-        Self {
-            reservation: Mutex::new(reservation),
-        }
-    }
-
-    fn absorb(&self, reservation: MemoryReservation) -> Result<()> {
-        self.reservation.lock().absorb(reservation)
-    }
-
-    fn shrink(&self, bytes: usize) {
-        self.reservation.lock().shrink(bytes);
-    }
-}
+#[cfg(test)]
+use decoder::receive_morsel;
+use decoder::{DecodeTask, decode_stream};
+#[cfg(test)]
+use producer::MorselMemory;
+use producer::{CsvMorsel, produce_morsels};
 
 pub(super) struct ParallelCsvScan {
     pub(super) file: ObjectSource,
@@ -78,38 +45,44 @@ pub(super) fn scan_tasks(
         task_count,
         target_morsel_bytes,
     } = scan;
+    if task_count == 0 {
+        return Err(Error::InvalidArgument(
+            "parallel CSV scan requires at least one task".to_owned(),
+        ));
+    }
     let output_schema = request.projected_schema(&schema)?;
     let preclaim = estimate_schema_batch_bytes(output_schema.as_ref(), request.batch_size);
     let remaining = request.limit.map(|limit| Arc::new(AtomicUsize::new(limit)));
     let uri: Arc<str> = Arc::from(file.uri());
-    let mut senders = Vec::with_capacity(task_count);
-    let mut receivers = Vec::with_capacity(task_count);
-    for _ in 0..task_count {
-        let (sender, receiver) = mpsc::channel(1);
-        senders.push(sender);
-        receivers.push(receiver);
-    }
+    let (sender, receiver) = mpsc::channel(task_count);
+    let receiver = Arc::new(AsyncMutex::new(receiver));
+    let decoder_ready = Arc::new(Notify::new());
 
     let producer_context = Arc::clone(&context);
     let producer_options = options.clone();
+    let producer_ready = Arc::clone(&decoder_ready);
     context.tasks.spawn("CSV morsel producer", async move {
+        tokio::select! {
+            _ = producer_context.control.cancelled() => producer_context.check_cancelled()?,
+            () = producer_ready.notified() => {}
+        }
         produce_morsels(
             file,
             producer_options,
             has_header,
             target_morsel_bytes,
-            senders,
+            task_count,
+            sender,
             producer_context,
         )
         .await
     })?;
 
-    Ok(receivers
-        .into_iter()
-        .enumerate()
-        .map(|(task, mut receiver)| {
-            let task_context = Arc::clone(&context);
+    Ok((0..task_count)
+        .map(|task| {
             let stream_context = Arc::clone(&context);
+            let receiver = Arc::clone(&receiver);
+            let producer_ready = Arc::clone(&decoder_ready);
             let schema = Arc::clone(&schema);
             let output_schema = Arc::clone(&output_schema);
             let options = options.clone();
@@ -117,301 +90,151 @@ pub(super) fn scan_tasks(
             let remaining = remaining.clone();
             let uri = Arc::clone(&uri);
             let batch_size = request.batch_size;
-            ScanTask::from_public(
+            ScanTask::new(
                 task,
-                boxed_record_batch_stream(try_stream! {
-                    'morsels: loop {
-                        if remaining.as_ref().is_some_and(|remaining| {
-                            remaining.load(Ordering::Acquire) == 0
-                        }) {
-                            break;
-                        }
-                        let morsel = tokio::select! {
-                            _ = stream_context.control.cancelled() => {
-                                stream_context.check_cancelled().map(|()| None)
-                            },
-                            morsel = receiver.recv() => Ok(morsel),
-                        }?;
-                        let Some(morsel) = morsel else {
-                            stream_context.check_cancelled()?;
-                            break;
-                        };
-                        let morsel_bytes = morsel.bytes.len();
-                        let mut builder = ReaderBuilder::new(Arc::clone(&schema))
-                            .with_format(format(&options, false))
-                            .with_batch_size(batch_size)
-                            .with_truncated_rows(false);
-                        if let Some(projection) = &projection {
-                            builder = builder.with_projection(projection.clone());
-                        }
-                        let mut decoder = builder.build_decoder();
-                        let mut offset = 0;
-                        let mut bytes_scanned = u64::try_from(morsel_bytes).unwrap_or(u64::MAX);
-                        loop {
-                            // A ready decoder can otherwise refill the shared
-                            // bounded pipeline queue before sibling CSV lanes
-                            // are scheduled. Yield once per output batch so
-                            // independently framed morsels decode concurrently.
-                            tokio::task::yield_now().await;
-                            stream_context.check_cancelled()?;
-                            if remaining.as_ref().is_some_and(|remaining| {
-                                remaining.load(Ordering::Acquire) == 0
-                            }) {
-                                break 'morsels;
-                            }
-                            let decoded = {
-                                let _parser_lane = stream_context.metrics.enter_csv_parser_lane();
-                                decoder.decode(&morsel.bytes[offset..]).map_err(|error| {
-                                    csv_decode_error(
-                                        &uri,
-                                        morsel.decompressed_offset.saturating_add(
-                                            u64::try_from(offset).unwrap_or(u64::MAX),
-                                        ),
-                                        error,
-                                    )
-                                })?
-                            };
-                            offset += decoded;
-                            let batch = {
-                                let _parser_lane = stream_context.metrics.enter_csv_parser_lane();
-                                decoder.flush().map_err(|error| {
-                                    csv_decode_error(
-                                        &uri,
-                                        morsel.decompressed_offset.saturating_add(
-                                            u64::try_from(offset).unwrap_or(u64::MAX),
-                                        ),
-                                        error,
-                                    )
-                                })?
-                            };
-                            let Some(batch) = batch else {
-                                if offset == morsel.bytes.len() {
-                                    break;
-                                }
-                                if decoded == 0 {
-                                    Err(Error::Internal(
-                                        "CSV morsel decoder made no progress".to_owned(),
-                                    ))?;
-                                }
-                                continue;
-                            };
-                            let claimed = remaining.as_ref().map_or(batch.num_rows(), |remaining| {
-                                claim_rows(remaining, batch.num_rows())
-                            });
-                            if claimed == 0 {
-                                break 'morsels;
-                            }
-                            let batch = if claimed < batch.num_rows() {
-                                batch.slice(0, claimed)
-                            } else {
-                                batch
-                            };
-                            stream_context.metrics.record_scan(
-                                u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
-                                1,
-                                bytes_scanned,
-                            );
-                            bytes_scanned = 0;
-                            debug_assert_eq!(batch.schema(), output_schema);
-                            yield batch;
-                        }
-                    }
+                decode_stream(DecodeTask {
+                    schema,
+                    output_schema,
+                    options,
+                    projection,
+                    remaining,
+                    uri,
+                    batch_size,
+                    output_preclaim_bytes: preclaim.max(1),
+                    receiver,
+                    producer_ready,
+                    context: stream_context,
                 }),
-                task_context,
-                preclaim,
-                "parallel CSV scan task",
             )
         })
         .collect())
-}
-
-async fn produce_morsels(
-    file: ObjectSource,
-    options: CsvOptions,
-    has_header: bool,
-    target_bytes: usize,
-    senders: Vec<mpsc::Sender<CsvMorsel>>,
-    context: Arc<QueryContext>,
-) -> Result<()> {
-    let snapshot = context.object_snapshot(file.uri())?;
-    let mut input = open_csv_input(
-        &file,
-        &snapshot,
-        options.compression,
-        Some((&context.control, &context.metrics)),
-    )
-    .await?;
-    let max_read_bytes = context.memory.limit().saturating_div(8).clamp(1, 1 << 20);
-    let read_bytes = target_bytes.clamp(1, max_read_bytes);
-    let _read_memory = context
-        .reserve_memory(read_bytes, "CSV input buffer")
-        .await
-        .map_err(|error| csv_memory_error(file.uri(), 0, error))?;
-    let mut read_buffer = vec![0_u8; read_bytes];
-    let mut splitter =
-        RecordMorselizer::new(target_bytes, options.quote, options.escape, has_header);
-    let morsel_memory = Arc::new(MorselMemory::new(context.memory.reservation()));
-    let mut next_sender = 0;
-    let mut decompressed_offset = 0_u64;
-
-    loop {
-        let read = tokio::select! {
-            _ = context.control.cancelled() => return context.check_cancelled(),
-            result = input.read(&mut read_buffer) => {
-                result.map_err(|error| input_error(file.uri(), error))?
-            },
-        };
-        if read == 0 {
-            break;
-        }
-        context
-            .metrics
-            .add_csv_decompressed_bytes(u64::try_from(read).unwrap_or(u64::MAX));
-        let buffered_before = splitter.buffered_len();
-        let buffered_offset =
-            decompressed_offset.saturating_sub(u64::try_from(buffered_before).unwrap_or(u64::MAX));
-        decompressed_offset =
-            decompressed_offset.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-        let growth = context
-            .reserve_memory_while_holding(
-                read,
-                buffered_before.saturating_add(read_bytes),
-                "CSV morsel buffer",
-            )
-            .await
-            .map_err(|error| csv_memory_error(file.uri(), buffered_offset, error))?;
-        morsel_memory.absorb(growth)?;
-        let morsels = splitter.push(&read_buffer[..read]);
-        let discarded = release_discarded_bytes(
-            &morsel_memory,
-            buffered_before.saturating_add(read),
-            splitter.buffered_len(),
-            &morsels,
-        );
-        send_morsels(
-            morsels,
-            buffered_offset.saturating_add(u64::try_from(discarded).unwrap_or(u64::MAX)),
-            &senders,
-            &mut next_sender,
-            Arc::clone(&morsel_memory),
-            &context,
-        )
-        .await?;
-    }
-    let buffered_before = splitter.buffered_len();
-    let buffered_offset =
-        decompressed_offset.saturating_sub(u64::try_from(buffered_before).unwrap_or(u64::MAX));
-    let morsels = splitter.finish();
-    let discarded = release_discarded_bytes(&morsel_memory, buffered_before, 0, &morsels);
-    send_morsels(
-        morsels,
-        buffered_offset.saturating_add(u64::try_from(discarded).unwrap_or(u64::MAX)),
-        &senders,
-        &mut next_sender,
-        morsel_memory,
-        &context,
-    )
-    .await
-}
-
-fn csv_memory_error(uri: &str, decompressed_offset: u64, error: Error) -> Error {
-    match error {
-        Error::ResourceExhausted(message) => Error::ResourceExhausted(format!(
-            "CSV record buffer for {uri} at decompressed offset {decompressed_offset}: {message}"
-        )),
-        error => error,
-    }
-}
-
-fn release_discarded_bytes(
-    memory: &MorselMemory,
-    input_bytes: usize,
-    buffered_bytes: usize,
-    morsels: &[Bytes],
-) -> usize {
-    let retained = morsels.iter().fold(buffered_bytes, |total, morsel| {
-        total.saturating_add(morsel.len())
-    });
-    let discarded = input_bytes.saturating_sub(retained);
-    memory.shrink(discarded);
-    discarded
-}
-
-async fn send_morsels(
-    morsels: Vec<Bytes>,
-    mut decompressed_offset: u64,
-    senders: &[mpsc::Sender<CsvMorsel>],
-    next_sender: &mut usize,
-    memory: Arc<MorselMemory>,
-    context: &QueryContext,
-) -> Result<()> {
-    for bytes in morsels {
-        let next_offset =
-            decompressed_offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        let mut morsel = CsvMorsel {
-            bytes,
-            decompressed_offset,
-            memory: Arc::clone(&memory),
-        };
-        context.metrics.add_csv_morsels(1);
-        let mut delivered = false;
-        for _ in 0..senders.len() {
-            let index = *next_sender % senders.len();
-            *next_sender = (*next_sender).wrapping_add(1);
-            match tokio::select! {
-                _ = context.control.cancelled() => return context.check_cancelled(),
-                result = senders[index].send(morsel) => result,
-            } {
-                Ok(()) => {
-                    delivered = true;
-                    break;
-                }
-                Err(error) => morsel = error.0,
-            }
-        }
-        if !delivered {
-            return Ok(());
-        }
-        decompressed_offset = next_offset;
-    }
-    Ok(())
-}
-
-fn csv_decode_error(uri: &str, decompressed_offset: u64, error: arrow::error::ArrowError) -> Error {
-    Error::Execution(format!(
-        "CSV decode failed for {uri} at decompressed offset {decompressed_offset}: {error}"
-    ))
-}
-
-fn claim_rows(remaining: &AtomicUsize, available: usize) -> usize {
-    let mut current = remaining.load(Ordering::Acquire);
-    loop {
-        let claimed = current.min(available);
-        if claimed == 0 {
-            return 0;
-        }
-        match remaining.compare_exchange_weak(
-            current,
-            current - claimed,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return claimed,
-            Err(updated) => current = updated,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::produce_morsels;
+    use arrow::{
+        array::{Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+    use bytes::Bytes;
+    use futures::{StreamExt, TryStreamExt, stream};
+    use tokio::{sync::Mutex as AsyncMutex, time::timeout};
+
+    use super::{CsvMorsel, MorselMemory, produce_morsels, receive_morsel};
     use crate::{
-        CsvOptions, Error, S3Config,
+        CsvHeader, CsvOptions, Engine, EngineConfig, Error, S3Config,
+        datasource::{CsvTable, ScanRequest, ScanTask, TableProvider},
         runtime::{MemoryPool, QueryContext},
         storage::LocationResolver,
     };
+
+    #[tokio::test]
+    async fn shared_queue_releases_the_receiver_before_decode_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let context =
+            Arc::new(QueryContext::new(MemoryPool::new(1 << 20), directory.path()).unwrap());
+        let memory = Arc::new(MorselMemory::new(context.memory.try_reserve(2).unwrap()));
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let receiver = Arc::new(AsyncMutex::new(receiver));
+        for offset in 0..2_u64 {
+            sender
+                .send(CsvMorsel {
+                    bytes: Bytes::from_static(b"x"),
+                    decompressed_offset: offset,
+                    memory: Arc::clone(&memory),
+                })
+                .await
+                .unwrap();
+        }
+
+        let first = receive_morsel(&receiver, &context).await.unwrap().unwrap();
+        let second = timeout(
+            std::time::Duration::from_secs(1),
+            receive_morsel(&receiver, &context),
+        )
+        .await
+        .expect("holding one morsel must not retain the receiver lock")
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (first.decompressed_offset, second.decompressed_offset),
+            (0, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn decoder_reuse_preserves_record_aligned_projection_and_scheduler_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reuse.csv");
+        let mut contents = String::from("id,note,unused\n1,\"first\ncontinued\",x\n");
+        for id in 2..=16 {
+            contents.push_str(&format!("{id},value-{id},x\n"));
+        }
+        std::fs::write(&path, contents).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("note", DataType::Utf8, false),
+            Field::new("unused", DataType::Utf8, false),
+        ]));
+        let options = CsvOptions::builder()
+            .schema(schema)
+            .header(CsvHeader::Present)
+            .build();
+        let config = EngineConfig::builder()
+            .compute_threads(2)
+            .io_concurrency(4)
+            .csv_target_morsel_bytes(8)
+            .spill_directory(directory.path().join("spill"))
+            .build();
+        let table = CsvTable::try_new(vec![path.to_string_lossy().into_owned()], options, &config)
+            .await
+            .unwrap();
+        let engine = Engine::new(config).unwrap();
+        let context = engine.query_context_for_test().unwrap();
+        context.configure_compute_lanes(4);
+        table.prepare(Arc::clone(&context)).await.unwrap();
+        context.seal_object_snapshots();
+        let baseline = context.memory.used();
+        let mut request = ScanRequest::new(1);
+        request.projection = Some(vec![1]);
+        let tasks = table
+            .scan_tasks(request, Arc::clone(&context), 4)
+            .await
+            .unwrap();
+        let batches = stream::iter(tasks.into_iter().map(ScanTask::into_stream))
+            .flatten_unordered(4)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut values = batches
+            .iter()
+            .flat_map(|batch| {
+                let strings = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..strings.len())
+                    .map(|row| strings.value(row).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        values.sort();
+        assert_eq!(values.len(), 16);
+        assert!(values.iter().any(|value| value == "first\ncontinued"));
+        let metrics = context.metrics.snapshot();
+        assert!(metrics.csv_morsels > 4);
+        assert!(metrics.csv_source_io_time > std::time::Duration::ZERO);
+        assert!(metrics.csv_framing_time > std::time::Duration::ZERO);
+        assert!(metrics.csv_decode_compute_time > std::time::Duration::ZERO);
+        let (active, peak, queued, _) = engine.compute_scheduler_counts_for_test();
+        assert_eq!((active, queued), (0, 0));
+        assert!((1..=2).contains(&peak));
+        drop(batches);
+        assert_eq!(context.memory.used(), baseline);
+    }
 
     #[tokio::test]
     async fn oversized_record_error_reports_uri_and_decompressed_offset() {
@@ -434,6 +257,7 @@ mod tests {
             .register_object_snapshot(file.uri(), file.snapshot().clone())
             .unwrap();
         context.seal_object_snapshots();
+        let baseline = context.memory.used();
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
 
         let error = produce_morsels(
@@ -441,8 +265,9 @@ mod tests {
             CsvOptions::default(),
             true,
             1024 * 1024,
-            vec![sender],
-            context,
+            1,
+            sender,
+            Arc::clone(&context),
         )
         .await
         .unwrap_err();
@@ -455,5 +280,49 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("query limit"), "{message}");
+        assert_eq!(context.memory.used(), baseline);
+    }
+
+    #[tokio::test]
+    async fn closed_consumer_stops_the_source_before_eof() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("closed.csv");
+        let contents = b"1\n".repeat(1 << 20);
+        std::fs::write(&path, &contents).unwrap();
+        let files = LocationResolver::new(S3Config::default())
+            .resolve(&[path.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        let file = files[0].clone();
+        let context =
+            Arc::new(QueryContext::new(MemoryPool::new(4 << 20), directory.path()).unwrap());
+        context
+            .register_object_snapshot(file.uri(), file.snapshot().clone())
+            .unwrap();
+        context.seal_object_snapshots();
+        let baseline = context.memory.used();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+
+        timeout(
+            std::time::Duration::from_secs(1),
+            produce_morsels(
+                file,
+                CsvOptions::default(),
+                false,
+                1 << 20,
+                1,
+                sender,
+                Arc::clone(&context),
+            ),
+        )
+        .await
+        .expect("closed consumer did not stop the CSV source")
+        .unwrap();
+        assert!(
+            context.metrics.snapshot().csv_source_bytes < u64::try_from(contents.len()).unwrap(),
+            "closed consumer read the complete CSV source"
+        );
+        assert_eq!(context.memory.used(), baseline);
     }
 }

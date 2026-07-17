@@ -6,16 +6,21 @@ use std::{
 
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float16Array, Float32Array,
-        Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-        LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-        new_null_array,
+        Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, DictionaryArray, Float16Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array, new_null_array,
     },
     compute::cast,
-    datatypes::DataType,
+    datatypes::{
+        ArrowDictionaryKeyType, DataType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type,
+        UInt16Type, UInt32Type, UInt64Type,
+    },
 };
 
 use crate::{Error, Result};
+
+mod temporal;
 
 #[derive(Clone, Debug)]
 pub(crate) enum CellValue {
@@ -115,10 +120,7 @@ pub(crate) fn cell(array: &ArrayRef, row: usize) -> Result<CellValue> {
         | DataType::Time32(_)
         | DataType::Time64(_)
         | DataType::Timestamp(_, _)
-        | DataType::Duration(_) => {
-            let numeric = cast(array.as_ref(), &DataType::Int64)?;
-            CellValue::Int64(downcast::<Int64Array>(&numeric)?.value(row))
-        }
+        | DataType::Duration(_) => temporal::cell(array, row)?,
         DataType::UInt8 => CellValue::UInt64(u64::from(downcast::<UInt8Array>(array)?.value(row))),
         DataType::UInt16 => {
             CellValue::UInt64(u64::from(downcast::<UInt16Array>(array)?.value(row)))
@@ -145,6 +147,21 @@ pub(crate) fn cell(array: &ArrayRef, row: usize) -> Result<CellValue> {
         DataType::Decimal128(_, _) => {
             CellValue::Decimal128(downcast::<Decimal128Array>(array)?.value(row))
         }
+        DataType::Dictionary(key, _) => match key.as_ref() {
+            DataType::Int8 => dictionary_cell::<Int8Type>(array, row)?,
+            DataType::Int16 => dictionary_cell::<Int16Type>(array, row)?,
+            DataType::Int32 => dictionary_cell::<Int32Type>(array, row)?,
+            DataType::Int64 => dictionary_cell::<Int64Type>(array, row)?,
+            DataType::UInt8 => dictionary_cell::<UInt8Type>(array, row)?,
+            DataType::UInt16 => dictionary_cell::<UInt16Type>(array, row)?,
+            DataType::UInt32 => dictionary_cell::<UInt32Type>(array, row)?,
+            DataType::UInt64 => dictionary_cell::<UInt64Type>(array, row)?,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "execution does not support dictionary keys of type {other}"
+                )));
+            }
+        },
         other => {
             return Err(Error::Unsupported(format!(
                 "execution does not support values of type {other}"
@@ -152,6 +169,14 @@ pub(crate) fn cell(array: &ArrayRef, row: usize) -> Result<CellValue> {
         }
     };
     Ok(value)
+}
+
+fn dictionary_cell<K: ArrowDictionaryKeyType>(array: &ArrayRef, row: usize) -> Result<CellValue> {
+    let dictionary = downcast::<DictionaryArray<K>>(array)?;
+    let Some(index) = dictionary.key(row) else {
+        return Ok(CellValue::Null);
+    };
+    cell(dictionary.values(), index)
 }
 
 pub(crate) fn canonicalize_sort_key(array: ArrayRef) -> Result<ArrayRef> {
@@ -301,3 +326,6 @@ fn normalized_float(value: f64) -> u64 {
         value.to_bits()
     }
 }
+
+#[cfg(test)]
+mod tests;

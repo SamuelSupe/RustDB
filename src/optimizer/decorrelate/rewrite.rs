@@ -1,7 +1,7 @@
 use crate::sql::{BinaryOp, BoundExpr, ExprKind};
 use crate::{Error, Result};
 
-pub(super) fn remap_columns(expr: &mut BoundExpr, mapping: &[usize]) -> Result<()> {
+pub(in crate::optimizer) fn remap_columns(expr: &mut BoundExpr, mapping: &[usize]) -> Result<()> {
     rewrite(expr, &mut |index| {
         mapping
             .get(index)

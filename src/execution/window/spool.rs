@@ -74,9 +74,8 @@ impl PendingPartition {
         self.key == key
     }
 
-    pub(super) fn write(
+    pub(super) fn update(
         &mut self,
-        batch: &RecordBatch,
         start: usize,
         len: usize,
         expressions: &[WindowExpr],
@@ -121,6 +120,15 @@ impl PendingPartition {
                 self.retained_payload[index] = stable;
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn write_slice(
+        &mut self,
+        batch: &RecordBatch,
+        start: usize,
+        len: usize,
+    ) -> Result<()> {
         self.writer.write_batch(&batch.slice(start, len))
     }
 

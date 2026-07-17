@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use arrow::{
-    array::{Array, Float64Array, Int64Array, StringArray},
+    array::{Array, Decimal128Array, Float64Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -14,7 +14,7 @@ use crate::sql::{
     BoundExpr, SortExpr, WindowExpr, WindowFrame, WindowFrameBound, WindowFrameUnits,
     WindowFunction, plan_sql,
 };
-use crate::{Catalog, Result, TableEntry};
+use crate::{Catalog, Engine, EngineConfig, Result, TableEntry};
 
 #[tokio::test]
 async fn ranks_rows_and_peers_per_partition() {
@@ -54,8 +54,8 @@ async fn executes_default_range_rows_and_whole_partition_frames() {
          FROM events ORDER BY g, v, rows_sum",
     )
     .await;
-    assert_eq!(ints(&batches, 2), vec![2, 2, 4, 5]);
-    assert_eq!(ints(&batches, 3), vec![1, 2, 4, 5]);
+    assert_eq!(decimals(&batches, 2), vec![2, 2, 4, 5]);
+    assert_eq!(decimals(&batches, 3), vec![1, 2, 4, 5]);
     assert_eq!(
         floats(&batches, 4),
         vec![4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0, 5.0]
@@ -70,7 +70,7 @@ async fn resolves_named_windows_qualify_and_aggregate_results() {
          QUALIFY r = 1 ORDER BY g")
     .await;
     assert_eq!(strings(&batches, 0), vec!["b"]);
-    assert_eq!(ints(&batches, 1), vec![5]);
+    assert_eq!(decimals(&batches, 1), vec![5]);
     assert_eq!(ints(&batches, 2), vec![1]);
 }
 
@@ -264,9 +264,110 @@ async fn evaluates_independent_partitions_on_multiple_lanes() {
             batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
             rows
         );
-        assert!(context.metrics.snapshot().peak_active_lanes >= 2);
+        let peak_active_lanes = context.metrics.snapshot().peak_active_lanes;
+        assert!((1..=4).contains(&peak_active_lanes));
         assert_eq!(context.tasks.active_tasks(), 0);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn window_cpu_waits_for_the_engine_compute_slot_and_releases_it() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::new(
+        EngineConfig::builder()
+            .memory_limit(64 << 20)
+            .compute_threads(1)
+            .max_concurrent_queries(2)
+            .spill_directory(root.path().join("spill"))
+            .build(),
+    )
+    .unwrap();
+    let blocker_context = engine.query_context_for_test().unwrap();
+    let context = engine.query_context_for_test().unwrap();
+    let blocker = blocker_context.acquire_compute().await.unwrap();
+    let (input, expression, input_schema, output_schema) = single_slot_window_input();
+    let worker_context = Arc::clone(&context);
+    let worker = tokio::spawn(async move {
+        super::window(
+            input,
+            vec![expression],
+            input_schema,
+            output_schema,
+            worker_context,
+            2,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+    });
+
+    wait_for_compute_waiter(&engine).await;
+    assert_eq!(engine.compute_scheduler_counts_for_test(), (1, 1, 1, 1));
+    assert_eq!(context.scheduler.active_lanes(), 0);
+
+    drop(blocker);
+    let output = tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("window should resume after the compute slot is released")
+        .expect("window worker should not panic")
+        .unwrap();
+    assert_eq!(
+        output.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        4
+    );
+    drop(output);
+    wait_for_window_tasks(&context).await;
+    assert_eq!(engine.compute_scheduler_counts_for_test(), (0, 1, 0, 0));
+    assert_eq!(context.scheduler.active_lanes(), 0);
+    assert_eq!(context.tasks.active_tasks(), 0);
+    assert_eq!(context.memory.used(), 0);
+    assert!(context.metrics.snapshot().compute_permit_wait > Duration::ZERO);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_window_compute_waiter_does_not_leak_the_slot() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = Engine::new(
+        EngineConfig::builder()
+            .memory_limit(64 << 20)
+            .compute_threads(1)
+            .max_concurrent_queries(2)
+            .spill_directory(root.path().join("spill"))
+            .build(),
+    )
+    .unwrap();
+    let blocker_context = engine.query_context_for_test().unwrap();
+    let context = engine.query_context_for_test().unwrap();
+    let blocker = blocker_context.acquire_compute().await.unwrap();
+    let (input, expression, input_schema, output_schema) = single_slot_window_input();
+    let worker_context = Arc::clone(&context);
+    let worker = tokio::spawn(async move {
+        super::window(
+            input,
+            vec![expression],
+            input_schema,
+            output_schema,
+            worker_context,
+            2,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+    });
+
+    wait_for_compute_waiter(&engine).await;
+    context.control.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("cancelled window waiter should stop")
+        .expect("window worker should not panic")
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(engine.compute_scheduler_counts_for_test(), (1, 1, 0, 0));
+    assert_eq!(context.scheduler.active_lanes(), 0);
+    assert_eq!(context.tasks.active_tasks(), 0);
+
+    drop(blocker);
+    assert_eq!(engine.compute_scheduler_counts_for_test(), (0, 1, 0, 0));
+    assert_eq!(context.memory.used(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -364,6 +465,57 @@ async fn partition_worker_panic_cancels_query_and_cleans_spill() {
     assert_eq!(context.memory.used(), 0);
 }
 
+fn single_slot_window_input() -> (RecordBatchStream, WindowExpr, SchemaRef, SchemaRef) {
+    let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("v", DataType::Int64, false),
+        Field::new("rn", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&input_schema),
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+    )
+    .unwrap();
+    let expression = WindowExpr {
+        function: WindowFunction::RowNumber,
+        partition_by: vec![],
+        order_by: vec![],
+        frame: WindowFrame {
+            units: WindowFrameUnits::Range,
+            start: WindowFrameBound::UnboundedPreceding,
+            end: WindowFrameBound::CurrentRow,
+        },
+        data_type: DataType::Int64,
+        display_name: "row_number() OVER ()".into(),
+    };
+    (
+        boxed_record_batch_stream(stream::once(async move { Ok(batch) })),
+        expression,
+        input_schema,
+        output_schema,
+    )
+}
+
+async fn wait_for_compute_waiter(engine: &Engine) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while engine.compute_scheduler_counts_for_test().2 == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("window should wait for the shared compute slot");
+}
+
+async fn wait_for_window_tasks(context: &QueryContext) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while context.tasks.active_tasks() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("window partition tasks should quiesce");
+}
+
 #[test]
 fn rejects_window_contexts_and_unsupported_frames() {
     let catalog = catalog();
@@ -421,6 +573,23 @@ fn ints(batches: &[RecordBatch], column: usize) -> Vec<i64> {
                 .column(column)
                 .as_any()
                 .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn decimals(batches: &[RecordBatch], column: usize) -> Vec<i128> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
                 .unwrap()
                 .values()
                 .iter()

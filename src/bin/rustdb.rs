@@ -21,6 +21,10 @@ fn main() {
         .init();
 
     let args = Args::parse();
+    if args.help_zh {
+        print!("{}", args::HELP_ZH);
+        return;
+    }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, hash::Hash, mem::size_of, sync::Arc};
+use std::{collections::HashMap, mem::size_of, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 
@@ -10,7 +10,8 @@ use crate::{
 
 use super::{SpillPartition, estimate_index_key_bytes, partition_for_key};
 use crate::execution::aggregate::{
-    CellValue, GroupState, build_partial_batch, estimate_group_bytes, key::GroupKey,
+    CellValue, GroupState, build_partial_batch, estimate_group_bytes,
+    key::{GroupIndex, ReleaseGroupIndex},
 };
 
 // Policy charge used to rotate long aggregate streams after a bounded number
@@ -119,9 +120,9 @@ impl StateSpiller {
     }
 }
 
-pub(in crate::execution::aggregate) fn spill_states<K>(
+pub(in crate::execution::aggregate) fn spill_states<I>(
     states: &mut Vec<GroupState>,
-    group_index: &mut HashMap<K, usize>,
+    group_index: &mut I,
     groups: &[BoundExpr],
     aggregates: &[AggregateExpr],
     schema: SchemaRef,
@@ -129,7 +130,7 @@ pub(in crate::execution::aggregate) fn spill_states<K>(
     context: &QueryContext,
 ) -> Result<()>
 where
-    K: Eq + Hash,
+    I: ReleaseGroupIndex,
 {
     if states.is_empty() {
         return Ok(());
@@ -137,7 +138,7 @@ where
     // The caller releases its state reservation immediately after this
     // function returns. Drop the hash table allocation now as `clear()` keeps
     // both buckets and duplicated key allocations alive.
-    *group_index = HashMap::new();
+    group_index.release();
     states.sort_unstable_by_key(|state| partition_for_key(&state.key, spiller.partitions.len(), 0));
 
     let mut start = 0;
@@ -186,7 +187,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(in crate::execution::aggregate) fn spill_largest_partition(
     states: &mut Vec<GroupState>,
-    group_index: &mut HashMap<GroupKey, usize>,
+    group_index: &mut GroupIndex,
     groups: &[BoundExpr],
     aggregates: &[AggregateExpr],
     schema: SchemaRef,
@@ -203,13 +204,12 @@ pub(in crate::execution::aggregate) fn spill_largest_partition(
         partition_bytes[partition] =
             partition_bytes[partition].saturating_add(estimate_group_bytes(state));
     }
-    for (key, index) in group_index.iter() {
-        if let Some(state) = states.get(*index) {
+    group_index.for_each_entry(|index, key_bytes| {
+        if let Some(state) = states.get(index) {
             let partition = partition_for_key(&state.key, partitions, 0);
-            partition_bytes[partition] =
-                partition_bytes[partition].saturating_add(key.memory_size());
+            partition_bytes[partition] = partition_bytes[partition].saturating_add(key_bytes);
         }
-    }
+    });
     let victim = partition_bytes
         .iter()
         .enumerate()
@@ -228,15 +228,8 @@ pub(in crate::execution::aggregate) fn spill_largest_partition(
             survivors.push(state);
         }
     }
-    let mut survivor_index = HashMap::with_capacity(group_index.len());
-    for (key, old_index) in std::mem::take(group_index) {
-        let new_index = remap.get(old_index).copied().unwrap_or(usize::MAX);
-        if new_index != usize::MAX {
-            survivor_index.insert(key, new_index);
-        }
-    }
+    group_index.remap(&remap);
     *states = survivors;
-    *group_index = survivor_index;
 
     let mut victim_index = HashMap::<u8, usize>::new();
     spill_states(
@@ -253,18 +246,13 @@ pub(in crate::execution::aggregate) fn spill_largest_partition(
 
 pub(in crate::execution::aggregate) fn resident_state_bytes(
     states: &[GroupState],
-    group_index: &HashMap<GroupKey, usize>,
+    group_index: &GroupIndex,
 ) -> usize {
     states
         .iter()
         .map(estimate_group_bytes)
         .fold(0usize, usize::saturating_add)
-        .saturating_add(
-            group_index
-                .keys()
-                .map(GroupKey::memory_size)
-                .fold(0usize, usize::saturating_add),
-        )
+        .saturating_add(group_index.retained_key_bytes())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,7 +422,11 @@ mod tests {
 
     use super::{StateSpiller, spill_largest_partition, spill_states};
     use crate::{
-        execution::aggregate::{CellValue, GroupState, key::GroupKey, spill::partition_for_key},
+        execution::aggregate::{
+            CellValue, GroupState,
+            key::{GroupIndex, GroupKey},
+            spill::partition_for_key,
+        },
         runtime::{MemoryPool, QueryContext},
         sql::{AggregateExpr, AggregateFunction, BoundExpr},
     };
@@ -522,11 +514,12 @@ mod tests {
             .iter()
             .map(|key| GroupState::new(vec![CellValue::Int64(*key)], &aggregates))
             .collect::<Vec<_>>();
-        let mut group_index = keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| (GroupKey::Cells(vec![CellValue::Int64(*key)]), index))
-            .collect::<HashMap<_, _>>();
+        let mut group_index = GroupIndex::new();
+        for (index, key) in keys.iter().enumerate() {
+            group_index
+                .insert(GroupKey::Cells(vec![CellValue::Int64(*key)]), index)
+                .unwrap();
+        }
 
         let root = tempfile::tempdir().unwrap();
         let context = QueryContext::new(MemoryPool::new(4 << 20), root.path()).unwrap();

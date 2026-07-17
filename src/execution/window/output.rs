@@ -121,8 +121,16 @@ pub(super) fn process(
                     "window replay expression workspace",
                 )
                 .await?;
-            let order_keys = evaluate_keys(&order_exprs, replay.batch())?;
-            let inputs = aggregate_inputs(&expressions, replay.batch())?;
+            let (order_keys, inputs) = {
+                let _compute = context.acquire_compute().await?;
+                let _active = context.scheduler.enter_lane();
+                #[cfg(test)]
+                super::fault_injection::panic_if_armed(context.query_id);
+                (
+                    evaluate_keys(&order_exprs, replay.batch())?,
+                    aggregate_inputs(&expressions, replay.batch())?,
+                )
+            };
             let mut offset = 0usize;
 
             while offset < replay.num_rows() {
@@ -155,48 +163,52 @@ pub(super) fn process(
                             ))?;
                         }
                     }
-                    let summary = peer_batch.as_ref().expect("peer row established");
-                    let lengths = summary
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| Error::Internal(
-                            "window peer sidecar length column is not UINT64".into(),
-                        ))?;
-                    peer_remaining = lengths.value(peer_row);
-                    if peer_remaining == 0 {
-                        Err(Error::Internal(
-                            "window peer sidecar contains an empty peer".into(),
-                        ))?;
-                    }
-                    let mapping = &sidecar_metadata.expression_columns;
-                    let next_payload = mapping
-                        .iter()
-                        .enumerate()
-                        .try_fold(0usize, |bytes, (index, column)| -> Result<usize> {
-                            let Some(column) = column else { return Ok(bytes) };
-                            if !is_variable(&expressions[index].data_type) {
-                                return Ok(bytes);
-                            }
-                            Ok(bytes.saturating_add(array_value_payload_bytes(
-                                summary.column(*column),
-                                peer_row,
-                            )?))
-                        })?;
-                    // New peer values and the prior peer values coexist during
-                    // cloning/replacement.
-                    state_memory.try_grow(next_payload)?;
-                    let mut next_values = vec![None; expressions.len()];
-                    for (index, column) in mapping.iter().enumerate() {
-                        if let Some(column) = column {
-                            next_values[index] = Some(cell(summary.column(*column), peer_row)?);
+                    {
+                        let _compute = context.acquire_compute().await?;
+                        let _active = context.scheduler.enter_lane();
+                        let summary = peer_batch.as_ref().expect("peer row established");
+                        let lengths = summary
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .ok_or_else(|| Error::Internal(
+                                "window peer sidecar length column is not UINT64".into(),
+                            ))?;
+                        peer_remaining = lengths.value(peer_row);
+                        if peer_remaining == 0 {
+                            Err(Error::Internal(
+                                "window peer sidecar contains an empty peer".into(),
+                            ))?;
                         }
+                        let mapping = &sidecar_metadata.expression_columns;
+                        let next_payload = mapping
+                            .iter()
+                            .enumerate()
+                            .try_fold(0usize, |bytes, (index, column)| -> Result<usize> {
+                                let Some(column) = column else { return Ok(bytes) };
+                                if !is_variable(&expressions[index].data_type) {
+                                    return Ok(bytes);
+                                }
+                                Ok(bytes.saturating_add(array_value_payload_bytes(
+                                    summary.column(*column),
+                                    peer_row,
+                                )?))
+                            })?;
+                        // New peer values and the prior peer values coexist during
+                        // cloning/replacement.
+                        state_memory.try_grow(next_payload)?;
+                        let mut next_values = vec![None; expressions.len()];
+                        for (index, column) in mapping.iter().enumerate() {
+                            if let Some(column) = column {
+                                next_values[index] = Some(cell(summary.column(*column), peer_row)?);
+                            }
+                        }
+                        let previous_values = std::mem::replace(&mut peer_values, next_values);
+                        drop(previous_values);
+                        state_memory.shrink(peer_payload);
+                        peer_payload = next_payload;
+                        peer_row += 1;
                     }
-                    let previous_values = std::mem::replace(&mut peer_values, next_values);
-                    drop(previous_values);
-                    state_memory.shrink(peer_payload);
-                    peer_payload = next_payload;
-                    peer_row += 1;
                 }
 
                 let peer_rows = sidecar
@@ -214,34 +226,38 @@ pub(super) fn process(
                     rows = rows.min(peer_rows);
                 }
                 let operation_limit = context.memory.operation_limit();
-                let plan = loop {
-                    let plan = plan_chunk(
-                        &expressions,
-                        &partition,
-                        &inputs,
-                        &order_keys,
-                        &peer_values,
-                        &retained_payload,
-                        previous_order_credit,
-                        replay.batch(),
-                        offset,
-                        rows,
-                    )?;
-                    let required = held
-                        .saturating_add(plan.state_growth)
-                        .saturating_add(plan.workspace);
-                    if required <= operation_limit {
-                        break plan;
+                let plan = {
+                    let _compute = context.acquire_compute().await?;
+                    let _active = context.scheduler.enter_lane();
+                    loop {
+                        let plan = plan_chunk(
+                            &expressions,
+                            &partition,
+                            &inputs,
+                            &order_keys,
+                            &peer_values,
+                            &retained_payload,
+                            previous_order_credit,
+                            replay.batch(),
+                            offset,
+                            rows,
+                        )?;
+                        let required = held
+                            .saturating_add(plan.state_growth)
+                            .saturating_add(plan.workspace);
+                        if required <= operation_limit {
+                            break plan;
+                        }
+                        if rows == 1 {
+                            Err(Error::ResourceExhausted(format!(
+                                "window cannot emit one row requiring {} workspace and {} retained bytes (query limit {})",
+                                plan.workspace,
+                                held.saturating_add(plan.state_growth),
+                                operation_limit,
+                            )))?;
+                        }
+                        rows = (rows / 2).max(1);
                     }
-                    if rows == 1 {
-                        Err(Error::ResourceExhausted(format!(
-                            "window cannot emit one row requiring {} workspace and {} retained bytes (query limit {})",
-                            plan.workspace,
-                            held.saturating_add(plan.state_growth),
-                            operation_limit,
-                        )))?;
-                    }
-                    rows = (rows / 2).max(1);
                 };
 
                 if plan.state_growth != 0 {
@@ -263,29 +279,32 @@ pub(super) fn process(
                         "window output workspace",
                     )
                     .await?;
-                let mut values = expressions
-                    .iter()
-                    .map(|_| Vec::with_capacity(rows))
-                    .collect::<Vec<Vec<CellValue>>>();
+                let output = {
+                    let _compute = context.acquire_compute().await?;
+                    let _active = context.scheduler.enter_lane();
+                    let mut values = expressions
+                        .iter()
+                        .map(|_| Vec::with_capacity(rows))
+                        .collect::<Vec<Vec<CellValue>>>();
 
-                for row in offset..offset + rows {
-                    row_number = row_number.checked_add(1).ok_or_else(|| {
-                        Error::Execution("ROW_NUMBER overflowed INT64".into())
-                    })?;
-                    let order = row_key(&order_keys, row)?;
-                    if previous_order
-                        .as_ref()
-                        .is_some_and(|previous| previous != &order)
-                    {
-                        rank = row_number;
-                        dense_rank = dense_rank.checked_add(1).ok_or_else(|| {
-                            Error::Execution("DENSE_RANK overflowed INT64".into())
+                    for row in offset..offset + rows {
+                        row_number = row_number.checked_add(1).ok_or_else(|| {
+                            Error::Execution("ROW_NUMBER overflowed INT64".into())
                         })?;
-                    }
-                    previous_order = Some(order);
+                        let order = row_key(&order_keys, row)?;
+                        if previous_order
+                            .as_ref()
+                            .is_some_and(|previous| previous != &order)
+                        {
+                            rank = row_number;
+                            dense_rank = dense_rank.checked_add(1).ok_or_else(|| {
+                                Error::Execution("DENSE_RANK overflowed INT64".into())
+                            })?;
+                        }
+                        previous_order = Some(order);
 
-                    for (index, expression) in expressions.iter().enumerate() {
-                        let value = match &expression.function {
+                        for (index, expression) in expressions.iter().enumerate() {
+                            let value = match &expression.function {
                             WindowFunction::RowNumber => CellValue::Int64(row_number),
                             WindowFunction::Rank => CellValue::Int64(rank),
                             WindowFunction::DenseRank => CellValue::Int64(dense_rank),
@@ -339,28 +358,32 @@ pub(super) fn process(
                                 .ok_or_else(|| Error::Internal(
                                     "RANGE window aggregate has no peer result".into(),
                                 ))?,
-                        };
-                        values[index].push(value);
+                            };
+                            values[index].push(value);
+                        }
+                        if sidecar.is_some() {
+                            peer_remaining -= 1;
+                        }
                     }
-                    if sidecar.is_some() {
-                        peer_remaining -= 1;
-                    }
-                }
 
-                let mut columns = replay.batch().slice(offset, rows).columns().to_vec();
-                for (index, output_values) in values.iter().enumerate() {
-                    columns.push(values_to_array(
-                        output_values,
-                        &expressions[index].data_type,
-                    )?);
-                }
-                // values own the transient variable-width copies credited in
-                // workspace; release them before workspace is reconciled to
-                // the final Arrow batch and before yielding.
-                drop(values);
-                let output = RecordBatch::try_new(Arc::clone(&schema), columns)?;
-                offset += rows;
-                yield BatchEnvelope::from_reservation(output, workspace, "window output")?;
+                    let mut columns = replay.batch().slice(offset, rows).columns().to_vec();
+                    for (index, output_values) in values.iter().enumerate() {
+                        columns.push(values_to_array(
+                            output_values,
+                            &expressions[index].data_type,
+                        )?);
+                    }
+                    // values own the transient variable-width copies credited in
+                    // workspace; release them before workspace is reconciled to
+                    // the final Arrow batch and before yielding.
+                    drop(values);
+                    let output = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+                    offset += rows;
+                    BatchEnvelope::from_reservation(output, workspace, "window output")?
+                };
+                // Yielding returns to the partition worker, which may block on
+                // its output channel. Both compute guards are gone first.
+                yield output;
             }
             drop(inputs);
             drop(order_keys);

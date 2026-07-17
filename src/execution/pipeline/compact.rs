@@ -3,9 +3,89 @@ use crate::{
     sql::{BoundExpr, ExprKind},
 };
 
+use super::PipelineOperator;
+
+pub(super) struct CompactPlan {
+    pub(super) filters: Vec<BoundExpr>,
+    pub(super) projection: Option<CompactProjection>,
+}
+
+pub(super) struct CompactProjection {
+    pub(super) expressions: Vec<BoundExpr>,
+    pub(super) schema: arrow::datatypes::SchemaRef,
+}
+
+/// Compiles the common projected Scan -> Filter -> terminal Project shape so
+/// every expression can run against the compact physical scan columns. More
+/// complex projection chains keep using the full-schema fallback.
+pub(super) fn plan(
+    operators: &[PipelineOperator],
+    projection: Option<&[usize]>,
+) -> Result<Option<CompactPlan>> {
+    let Some(projection) = projection.filter(|projection| !projection.is_empty()) else {
+        return Ok(None);
+    };
+    if operators.is_empty() {
+        return Ok(None);
+    }
+
+    let (filter_operators, terminal_projection) = match operators.split_last() {
+        Some((
+            PipelineOperator::Projection {
+                expressions,
+                schema,
+            },
+            filters,
+        )) if filters
+            .iter()
+            .all(|operator| matches!(operator, PipelineOperator::Filter(_))) =>
+        {
+            (filters, Some((expressions, schema)))
+        }
+        _ if operators
+            .iter()
+            .all(|operator| matches!(operator, PipelineOperator::Filter(_))) =>
+        {
+            (operators, None)
+        }
+        _ => return Ok(None),
+    };
+
+    let filters = filter_operators
+        .iter()
+        .map(|operator| {
+            let PipelineOperator::Filter(predicate) = operator else {
+                unreachable!("filter prefix was checked above")
+            };
+            remap(predicate, projection)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let projection = terminal_projection
+        .map(|(expressions, schema)| -> Result<CompactProjection> {
+            let expressions = expressions
+                .iter()
+                .map(|expression| remap(expression, projection))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(CompactProjection {
+                expressions,
+                schema: std::sync::Arc::clone(schema),
+            })
+        })
+        .transpose()?;
+    Ok(Some(CompactPlan {
+        filters,
+        projection,
+    }))
+}
+
 /// Rebinds a filter from the logical scan schema to the compact physical
 /// projection returned by the data source.
+#[cfg(test)]
 pub(super) fn remap_filter(expr: &BoundExpr, projection: &[usize]) -> Result<BoundExpr> {
+    remap(expr, projection)
+}
+
+fn remap(expr: &BoundExpr, projection: &[usize]) -> Result<BoundExpr> {
     let mut remapped = expr.clone();
     remap_expr(&mut remapped, projection)?;
     Ok(remapped)
@@ -19,7 +99,7 @@ fn remap_expr(expr: &mut BoundExpr, projection: &[usize]) -> Result<()> {
                 .position(|projected| projected == index)
                 .ok_or_else(|| {
                     Error::Internal(format!(
-                        "filter column {index} is missing from the scan projection"
+                        "expression column {index} is missing from the scan projection"
                     ))
                 })?;
         }
@@ -115,6 +195,6 @@ mod tests {
     #[test]
     fn rejects_filter_columns_missing_from_projection() {
         let error = remap_filter(&comparison(3, 10), &[0, 1]).unwrap_err();
-        assert!(error.to_string().contains("filter column 3"));
+        assert!(error.to_string().contains("expression column 3"));
     }
 }

@@ -3,6 +3,9 @@ use crate::sql::{BoundExpr, LogicalPlan};
 
 mod constant;
 mod decorrelate;
+mod estimate;
+mod exact_filter;
+mod filter_coalesce;
 mod join_order;
 mod predicate_relocation;
 mod projection;
@@ -20,8 +23,10 @@ pub fn optimize(mut plan: LogicalPlan) -> Result<LogicalPlan> {
     plan = decorrelate::apply(plan)?;
     plan = predicate_relocation::apply(plan);
     plan = q21_summary::apply(plan)?;
+    plan = filter_coalesce::apply(plan);
     push_filter(&mut plan);
-    join_order::choose_build_sides(&mut plan);
+    join_order::choose_build_sides(&mut plan)?;
+    plan = exact_filter::apply(plan);
     projection::push_required_columns(&mut plan);
     push_limit(&mut plan);
     verify::executable(&plan)?;

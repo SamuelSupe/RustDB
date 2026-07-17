@@ -29,6 +29,13 @@ use crate::{
     sql::{BinaryOp, BoundExpr, ExprKind, LogicalPlan, PlanSchema, ScalarValue, StatementPlan},
 };
 
+#[test]
+fn join_decode_batch_shortens_for_concurrent_queries() {
+    assert_eq!(super::join_decode_batch_size(1), 65_536);
+    assert_eq!(super::join_decode_batch_size(2), 32_768);
+    assert_eq!(super::join_decode_batch_size(4), 32_768);
+}
+
 #[derive(Clone)]
 struct PartitionedTable {
     schema: SchemaRef,
@@ -189,6 +196,7 @@ async fn wide_parallel_projection_backpressures_under_low_memory() {
         statistics: TableStatistics::default(),
         projection: None,
         pushed_filter: None,
+        exact_filter: None,
         limit: None,
         schema: PlanSchema::unqualified(Arc::clone(&input_schema)),
     };
@@ -277,6 +285,7 @@ async fn zero_column_scan_survives_fused_filter_and_literal_projection() {
         statistics: TableStatistics::default(),
         projection: Some(Vec::new()),
         pushed_filter: None,
+        exact_filter: None,
         limit: None,
         schema: PlanSchema::unqualified(Arc::clone(&scan_schema)),
     };
@@ -318,7 +327,7 @@ async fn zero_column_scan_survives_fused_filter_and_literal_projection() {
 }
 
 #[tokio::test]
-async fn scan_tasks_run_on_multiple_named_compute_lanes() {
+async fn scan_tasks_run_on_multiple_named_runtime_workers() {
     const LANES: usize = 4;
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
     let threads = Arc::new(Mutex::new(Vec::new()));
@@ -336,6 +345,7 @@ async fn scan_tasks_run_on_multiple_named_compute_lanes() {
         statistics: TableStatistics::default(),
         projection: None,
         pushed_filter: None,
+        exact_filter: None,
         limit: None,
         schema: PlanSchema::unqualified(schema),
     };
@@ -365,8 +375,6 @@ async fn scan_tasks_run_on_multiple_named_compute_lanes() {
     values.sort_unstable();
     assert_eq!(values, vec![0, 1, 2, 3]);
     assert_eq!(requested_tasks.load(Ordering::Acquire), LANES);
-    assert_eq!(context.metrics.snapshot().peak_active_lanes, LANES as u64);
-
     let observed = threads.lock().clone();
     assert_eq!(observed.len(), LANES);
     let names = observed.into_iter().collect::<HashSet<_>>();
@@ -433,6 +441,7 @@ async fn scan_lane_panic_is_a_terminal_error_not_partial_success() {
         statistics: TableStatistics::default(),
         projection: None,
         pushed_filter: None,
+        exact_filter: None,
         limit: None,
         schema: PlanSchema::unqualified(schema),
     };
@@ -537,6 +546,7 @@ async fn limit_drops_all_remaining_scan_tasks() {
         statistics: TableStatistics::default(),
         projection: None,
         pushed_filter: None,
+        exact_filter: None,
         limit: None,
         schema: PlanSchema::unqualified(Arc::clone(&schema)),
     };

@@ -2,6 +2,8 @@ mod batch;
 mod compute;
 mod context;
 mod control;
+mod global_scheduler;
+mod local_file;
 mod memory;
 mod metrics;
 mod scheduler;
@@ -16,6 +18,8 @@ pub(crate) use batch::{
 pub(crate) use compute::ComputeRuntime;
 pub use context::QueryContext;
 pub use control::QueryControl;
+pub(crate) use global_scheduler::{GlobalComputePermit, GlobalComputeScheduler};
+pub(crate) use local_file::{QueryLocalFileHandle, QueryLocalFiles};
 pub use memory::{MemoryPool, MemoryReservation};
 pub(crate) use metrics::OperatorHandle;
 pub use metrics::{OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot};

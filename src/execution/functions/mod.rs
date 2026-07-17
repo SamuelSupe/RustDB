@@ -31,6 +31,7 @@ pub(super) fn evaluate(
         | ScalarFunction::RTrim
         | ScalarFunction::Concat
         | ScalarFunction::Replace
+        | ScalarFunction::RegexpReplace
         | ScalarFunction::StartsWith
         | ScalarFunction::EndsWith
         | ScalarFunction::Contains => string::evaluate(function, args),
@@ -42,6 +43,7 @@ pub(super) fn evaluate(
         | ScalarFunction::Round => numeric::evaluate(function, args, output_type),
         ScalarFunction::DatePart(part) => temporal::date_part(part, &args[0]),
         ScalarFunction::DateTrunc(part) => temporal::date_trunc(part, &args[0]),
+        ScalarFunction::ToTimestampSeconds => temporal::to_timestamp_seconds(&args[0]),
     }
 }
 
@@ -52,6 +54,9 @@ pub(super) fn cast_array(array: &ArrayRef, target: &DataType) -> Result<ArrayRef
             cast_array(&utf8, target)
         }
         (DataType::Utf8, DataType::Date32) => temporal::string_to_date(array),
+        (source, DataType::Date32) if temporal::is_integer(source) => {
+            temporal::integer_to_date(array)
+        }
         (DataType::Utf8, DataType::Timestamp(TimeUnit::Microsecond, None)) => {
             temporal::string_to_timestamp(array)
         }

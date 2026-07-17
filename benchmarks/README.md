@@ -1,5 +1,13 @@
 # Benchmarks
 
+## ClickBench functionality pass
+
+The active v0.7 acceptance workload is one complete 43-query ClickBench pass
+on the official 1M Parquet partition with a 4-CPU/16-GiB OrbStack container. It
+does not compare RustDB with another engine and does not repeat measurements. See
+[`clickbench/README.md`](clickbench/README.md) for the resource contract and
+runner.
+
 Benchmark SQL should use `read_parquet(...)` or `read_csv(...)` so a run is
 self-contained. The benchmark driver performs warmups, consumes every output
 batch, and emits per-run plus p50/p95 JSON including memory, scan, S3, and spill
@@ -27,6 +35,11 @@ Every suite manifest and report records the Cargo profile, Rust flags, and
 compiler version. The runners reject a report unless its memory, thread,
 batch, I/O, and metadata-cache configuration matches the requested matrix
 entry. Do not compare a warm run from one engine with a cold run from another.
+
+## Legacy differential tooling
+
+The comparison-oriented runners below are retained for historical regression
+investigation, but they are not part of the active v0.7 release target.
 
 ## DuckDB correctness checksum
 

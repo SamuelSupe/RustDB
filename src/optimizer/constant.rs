@@ -159,7 +159,13 @@ fn fold_expr(expr: &mut BoundExpr) {
 
 fn fold_current(expr: &BoundExpr) -> Option<BoundExpr> {
     match &expr.kind {
-        ExprKind::Binary { left, op, right } => fold_binary(left, *op, right, &expr.data_type),
+        ExprKind::Binary { left, op, right } => fold_binary(left, *op, right, &expr.data_type)
+            .or_else(|| {
+                (matches!(left.kind, ExprKind::Literal(_))
+                    && matches!(right.kind, ExprKind::Literal(_)))
+                .then(|| fold_evaluated(expr))
+                .flatten()
+            }),
         ExprKind::Unary { op, expr } => fold_unary(*op, expr),
         ExprKind::IsNull { expr, negated } => {
             let value = literal(expr)?;
@@ -550,7 +556,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::fold_expr;
-    use crate::sql::{BoundExpr, ExprKind, ScalarFunction, ScalarValue};
+    use crate::sql::{BinaryOp, BoundExpr, ExprKind, ScalarFunction, ScalarValue};
 
     #[test]
     fn folds_constant_scalar_functions() {
@@ -568,6 +574,26 @@ mod tests {
         assert_eq!(
             expression.kind,
             ExprKind::Literal(ScalarValue::Utf8("abc".into()))
+        );
+    }
+
+    #[test]
+    fn folds_date_month_interval_for_scan_predicates() {
+        let mut expression = BoundExpr {
+            kind: ExprKind::Binary {
+                left: Box::new(BoundExpr::literal(ScalarValue::Date32(8_766))),
+                op: BinaryOp::Add,
+                right: Box::new(BoundExpr::literal(ScalarValue::MonthInterval(12))),
+            },
+            data_type: DataType::Date32,
+            display_name: "DATE '1994-01-01' + INTERVAL '1' YEAR".into(),
+        };
+
+        fold_expr(&mut expression);
+
+        assert_eq!(
+            expression.kind,
+            ExprKind::Literal(ScalarValue::Date32(9_131))
         );
     }
 }

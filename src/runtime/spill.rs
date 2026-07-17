@@ -305,6 +305,28 @@ impl SpillManager {
         &self.state.directory
     }
 
+    pub(crate) async fn run_query_io<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(QueryControl) -> Result<T> + Send + 'static,
+    {
+        self.state.ensure_active()?;
+        let permit = self.state.io_tracker.start()?;
+        let io_pool = self.state.io_pool.clone();
+        let control = self.state.control.clone();
+        let operation_control = control.clone();
+        let mut cancel_on_drop = CancelOnDrop::new(control.clone());
+        let outcome = tokio::task::spawn_blocking(move || {
+            io_pool.run_cancelable(&control, move || {
+                let _permit = permit;
+                operation(operation_control)
+            })
+        })
+        .await;
+        cancel_on_drop.disarm();
+        outcome.map_err(|error| Error::Internal(format!("query I/O task failed: {error}")))?
+    }
+
     pub(crate) fn active_file_count(&self) -> usize {
         self.state.files.len()
     }
@@ -445,6 +467,30 @@ impl SpillManager {
             Err(Error::Cancelled)
         } else {
             Ok(())
+        }
+    }
+}
+
+struct CancelOnDrop {
+    control: Option<QueryControl>,
+}
+
+impl CancelOnDrop {
+    fn new(control: QueryControl) -> Self {
+        Self {
+            control: Some(control),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.control.take();
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(control) = self.control.take() {
+            control.cancel();
         }
     }
 }

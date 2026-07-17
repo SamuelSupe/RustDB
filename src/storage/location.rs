@@ -12,7 +12,7 @@ use object_store::{
 };
 use url::Url;
 
-use crate::{Error, Result, S3Config, runtime::QueryContext};
+use crate::{Error, Result, S3Config, runtime::QueryContext, storage::LocalFileIdentity};
 
 mod endpoint;
 mod source_list;
@@ -26,6 +26,7 @@ pub struct ObjectSnapshot {
     pub size: u64,
     pub e_tag: Option<String>,
     pub version: Option<String>,
+    pub(crate) local_identity: Option<LocalFileIdentity>,
 }
 
 impl From<&ObjectMeta> for ObjectSnapshot {
@@ -34,6 +35,7 @@ impl From<&ObjectMeta> for ObjectSnapshot {
             size: meta.size,
             e_tag: meta.e_tag.clone(),
             version: meta.version.clone(),
+            local_identity: None,
         }
     }
 }
@@ -44,6 +46,21 @@ impl ObjectSnapshot {
     /// size remains a required fallback identity check.
     pub(crate) fn validate_get_response(&self, uri: &str, meta: &ObjectMeta) -> Result<()> {
         let actual = Self::from(meta);
+        self.validate_wire_snapshot(uri, &actual)
+    }
+
+    pub(crate) fn validate_snapshot(&self, uri: &str, actual: &Self) -> Result<()> {
+        self.validate_wire_snapshot(uri, actual)?;
+        let local_identity_changed = self
+            .local_identity
+            .is_some_and(|expected| actual.local_identity != Some(expected));
+        if local_identity_changed {
+            return Err(self.changed_error(uri, actual));
+        }
+        Ok(())
+    }
+
+    fn validate_wire_snapshot(&self, uri: &str, actual: &Self) -> Result<()> {
         let e_tag_changed = self
             .e_tag
             .as_deref()
@@ -52,14 +69,27 @@ impl ObjectSnapshot {
             .version
             .as_deref()
             .is_some_and(|expected| actual.version.as_deref() != Some(expected));
-        if self.size != actual.size || e_tag_changed || version_changed {
-            return Err(Error::Execution(format!(
-                "object changed during query: {uri}: expected size {}, ETag {:?}, version {:?}; \
-                 GET returned size {}, ETag {:?}, version {:?}",
-                self.size, self.e_tag, self.version, actual.size, actual.e_tag, actual.version,
-            )));
+        let size_changed = self.size != actual.size;
+        if size_changed || e_tag_changed || version_changed {
+            return Err(self.changed_error(uri, actual));
         }
         Ok(())
+    }
+
+    fn changed_error(&self, uri: &str, actual: &Self) -> Error {
+        Error::Execution(format!(
+            "object changed during query: {uri}: expected size {}, ETag {:?}, version {:?}, \
+             local identity {:?}; read returned size {}, ETag {:?}, version {:?}, local \
+             identity {:?}",
+            self.size,
+            self.e_tag,
+            self.version,
+            self.local_identity,
+            actual.size,
+            actual.e_tag,
+            actual.version,
+            actual.local_identity,
+        ))
     }
 }
 
@@ -70,17 +100,46 @@ pub struct ObjectSource {
     location: Path,
     snapshot: ObjectSnapshot,
     s3: bool,
+    local_path: Option<PathBuf>,
 }
 
 impl ObjectSource {
-    fn new(uri: String, store: Arc<dyn ObjectStore>, meta: ObjectMeta, s3: bool) -> Self {
+    fn new(
+        uri: String,
+        store: Arc<dyn ObjectStore>,
+        meta: ObjectMeta,
+        s3: bool,
+        local_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             uri,
             store,
             location: meta.location.clone(),
             snapshot: ObjectSnapshot::from(&meta),
             s3,
+            local_path,
         }
+    }
+
+    fn new_local(
+        uri: String,
+        store: Arc<dyn ObjectStore>,
+        meta: ObjectMeta,
+        local_path: PathBuf,
+    ) -> Result<Self> {
+        let metadata = std::fs::metadata(&local_path)
+            .map_err(|error| Error::io(Some(local_path.clone()), error))?;
+        if meta.size != metadata.len() {
+            return Err(Error::Execution(format!(
+                "object changed while its identity was captured: {uri}: object store reported \
+                 size {}, local metadata reported size {}",
+                meta.size,
+                metadata.len()
+            )));
+        }
+        let mut source = Self::new(uri, store, meta, false, Some(local_path));
+        source.snapshot.local_identity = LocalFileIdentity::from_metadata(&metadata);
+        Ok(source)
     }
 
     pub fn uri(&self) -> &str {
@@ -103,6 +162,10 @@ impl ObjectSource {
         self.s3
     }
 
+    pub(crate) fn local_path(&self) -> Option<&FsPath> {
+        self.local_path.as_deref()
+    }
+
     pub fn get_options_for(&self, snapshot: &ObjectSnapshot) -> GetOptions {
         GetOptions {
             if_match: snapshot.e_tag.clone(),
@@ -119,7 +182,22 @@ impl ObjectSource {
     /// immutable for the duration of either query.
     pub async fn head_snapshot(&self) -> Result<ObjectSnapshot> {
         let current = self.store.head(&self.location).await?;
-        Ok(ObjectSnapshot::from(&current))
+        let mut snapshot = ObjectSnapshot::from(&current);
+        if let Some(path) = &self.local_path {
+            let metadata =
+                std::fs::metadata(path).map_err(|error| Error::io(Some(path.clone()), error))?;
+            if snapshot.size != metadata.len() {
+                return Err(Error::Execution(format!(
+                    "object changed while its identity was captured: {}: object store reported \
+                     size {}, local metadata reported size {}",
+                    self.uri,
+                    snapshot.size,
+                    metadata.len()
+                )));
+            }
+            snapshot.local_identity = LocalFileIdentity::from_metadata(&metadata);
+        }
+        Ok(snapshot)
     }
 }
 
@@ -283,7 +361,7 @@ impl LocationResolver {
                 };
                 let Some(meta) = next else { break };
                 let uri = format!("s3://{bucket}/{}", meta.location);
-                objects.push(ObjectSource::new(uri, Arc::clone(&store), meta, true))?;
+                objects.push(ObjectSource::new(uri, Arc::clone(&store), meta, true, None))?;
             }
         } else {
             let head = store.head(&path);
@@ -303,6 +381,7 @@ impl LocationResolver {
                 Arc::clone(&store),
                 meta,
                 true,
+                None,
             ))?;
         }
         Ok(())
@@ -367,7 +446,8 @@ async fn resolve_local(
                 ))
             })?
             .to_string();
-        objects.push(ObjectSource::new(uri, Arc::clone(&store), meta, false))?;
+        let source = ObjectSource::new_local(uri, Arc::clone(&store), meta, canonical)?;
+        objects.push(source)?;
     }
     Ok(())
 }

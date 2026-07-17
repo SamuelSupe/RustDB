@@ -1,0 +1,26 @@
+[package]
+name = "rustdb-v07-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+arrow = { version = "=59.1.0", default-features = false }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+rustdb = { path = "../../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlparser = "=0.62.0"
+sysinfo = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

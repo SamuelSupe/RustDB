@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -12,6 +15,12 @@ use crate::{
     },
     storage::{ObjectSnapshot, ObjectSource},
 };
+
+static NEXT_PROVIDER_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_provider_id() -> u64 {
+    NEXT_PROVIDER_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Coarse statistics available before a scan starts.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -115,12 +124,30 @@ pub enum ScanPredicate {
     Or(Vec<ScanPredicate>),
 }
 
+/// Whether a source predicate is merely an optimization hint or is the
+/// semantic owner of the SQL filter. Exact is crate-private because providers
+/// outside RustDB must never be asked to uphold this internal contract.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PredicateGuarantee {
+    #[default]
+    BestEffort,
+    Exact,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanRequest {
     pub projection: Option<Vec<usize>>,
     pub predicate: Option<ScanPredicate>,
     pub limit: Option<usize>,
     pub batch_size: usize,
+    /// Optional source decode granularity for private sink pipelines. Sources
+    /// may consume it only from `scan_tasks`; public scans retain `batch_size`.
+    pub(crate) decode_batch_size: Option<usize>,
+    /// Full provider-schema columns whose physical dictionary representation
+    /// may be retained by sources that can prove it is safe. This is an
+    /// internal execution hint; providers may ignore it.
+    pub(crate) dictionary_columns: Vec<usize>,
+    pub(crate) predicate_guarantee: PredicateGuarantee,
 }
 
 /// One independently pollable unit of scan work. File-backed providers should
@@ -179,6 +206,9 @@ impl ScanRequest {
             predicate: None,
             limit: None,
             batch_size,
+            decode_batch_size: None,
+            dictionary_columns: Vec::new(),
+            predicate_guarantee: PredicateGuarantee::BestEffort,
         }
     }
 
@@ -187,6 +217,15 @@ impl ScanRequest {
             Some(indices) => Ok(Arc::new(schema.project(indices)?)),
             None => Ok(Arc::clone(schema)),
         }
+    }
+
+    pub(crate) fn reject_unsupported_exact(&self, provider: &str) -> Result<()> {
+        if self.predicate_guarantee == PredicateGuarantee::Exact {
+            return Err(Error::Internal(format!(
+                "{provider} received an unsupported exact filter guarantee"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -205,6 +244,12 @@ pub trait TableProvider: Send + Sync {
     /// Short source-specific details appended to a Scan in EXPLAIN.
     fn explain_scan(&self) -> Option<String> {
         None
+    }
+
+    /// Returns true only when this provider can make `predicate` the semantic
+    /// filter for every object in the query snapshot.
+    fn supports_exact_filter(&self, _predicate: &ScanPredicate) -> bool {
+        false
     }
 
     /// Returns statistics for the object set fixed in `context`. Registered
@@ -282,7 +327,14 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use super::ScanRequest;
+    use super::{ScanRequest, next_provider_id};
+
+    #[test]
+    fn provider_ids_share_one_monotonic_allocator() {
+        let first = next_provider_id();
+        let second = next_provider_id();
+        assert!(second > first);
+    }
 
     #[test]
     fn projection_preserves_requested_order() {
@@ -296,5 +348,13 @@ mod tests {
         let projected = request.projected_schema(&schema).unwrap();
         assert_eq!(projected.field(0).name(), "b");
         assert_eq!(projected.field(1).name(), "a");
+    }
+
+    #[test]
+    fn non_parquet_provider_rejects_an_exact_guarantee() {
+        let mut request = ScanRequest::new(1024);
+        request.predicate_guarantee = super::PredicateGuarantee::Exact;
+        let error = request.reject_unsupported_exact("CSV").unwrap_err();
+        assert!(matches!(error, crate::Error::Internal(message) if message.contains("CSV")));
     }
 }

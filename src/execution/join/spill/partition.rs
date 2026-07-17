@@ -16,7 +16,9 @@ const MAX_SPILL_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 mod write;
 
-pub(in crate::execution::join) use write::{Side, spill_batch_with_null_keys, spill_stream};
+pub(in crate::execution::join) use write::{
+    Side, spill_batch_with_null_keys, spill_batch_with_null_keys_scheduled, spill_stream,
+};
 #[cfg(test)]
 pub(in crate::execution::join) use write::{partition_for_key, spill_batch};
 

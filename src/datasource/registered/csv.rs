@@ -3,14 +3,12 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 
-use super::{
-    csv_mapping::{remap_predicate, remap_projection, reorder_schema},
-    next_provider_id,
-};
+use super::csv_mapping::{remap_predicate, remap_projection, reorder_schema};
 use crate::{
     CsvHeader, CsvOptions, EngineConfig, Error, Result,
     datasource::{
         CsvTable, ScanRequest, ScanTask, TableProvider, TableSourceIdentity, TableStatistics,
+        provider::next_provider_id,
     },
     runtime::{QueryContext, RecordBatchStream},
 };
@@ -100,6 +98,7 @@ impl RegisteredCsvTable {
         provider: &Arc<dyn TableProvider>,
         request: ScanRequest,
     ) -> Result<ScanRequest> {
+        request.reject_unsupported_exact("registered CSV provider")?;
         let provider_schema = provider.schema();
         let logical_projection = request
             .projection
@@ -115,6 +114,11 @@ impl RegisteredCsvTable {
             predicate,
             limit: request.limit,
             batch_size: request.batch_size,
+            // CSV keeps its configured public decode size.
+            decode_batch_size: None,
+            // CSV has no source dictionary representation to preserve.
+            dictionary_columns: Vec::new(),
+            predicate_guarantee: request.predicate_guarantee,
         })
     }
 }

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Array, Decimal128Array, Int64Array, StringArray};
 use futures::StreamExt;
 use rustdb::{CsvHeader, CsvOptions, Engine, EngineConfig, QueryResult, Result};
 
@@ -140,7 +140,7 @@ async fn high_cardinality_aggregate_spills_and_cleans_query_directory() -> Resul
         let totals = batch
             .column(2)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Decimal128Array>()
             .unwrap();
         for row in 0..batch.num_rows() {
             actual.insert(keys.value(row), (counts.value(row), totals.value(row)));
@@ -148,7 +148,7 @@ async fn high_cardinality_aggregate_spills_and_cleans_query_directory() -> Resul
     }
     assert_eq!(actual.len(), GROUPS as usize);
     for key in 0..GROUPS {
-        let expected_total = REPEATS * key + REPEATS * (REPEATS - 1) / 2;
+        let expected_total = i128::from(REPEATS * key + REPEATS * (REPEATS - 1) / 2);
         assert_eq!(actual[&key], (REPEATS, expected_total));
     }
     assert_spilled_within_limit(&result, MEMORY_LIMIT);

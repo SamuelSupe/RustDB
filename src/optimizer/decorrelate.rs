@@ -10,6 +10,7 @@ mod pull;
 mod rewrite;
 
 use pull::{Correlation, pull};
+pub(super) use rewrite::remap_columns;
 use rewrite::{combine_and, outer_to_columns, right_residual_to_join};
 
 pub(super) fn apply(plan: LogicalPlan) -> Result<LogicalPlan> {

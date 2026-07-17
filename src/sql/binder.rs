@@ -233,20 +233,17 @@ fn bind_in_list(
         BinaryOp::Eq
     };
     let connective = if negated { BinaryOp::And } else { BinaryOp::Or };
-    let mut comparisons = list.iter().map(|candidate| {
-        make_binary(
-            needle.clone(),
-            comparison,
-            bind_expr_scoped(candidate, schema, outer)?,
-        )
-    });
-    let mut output = comparisons
-        .next()
-        .expect("non-empty IN list established above")?;
-    for comparison in comparisons {
-        output = make_binary(output, connective, comparison?)?;
-    }
-    Ok(output)
+    let comparisons = list
+        .iter()
+        .map(|candidate| {
+            make_binary(
+                needle.clone(),
+                comparison,
+                bind_expr_scoped(candidate, schema, outer)?,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    combine_binary_balanced(comparisons, connective)
 }
 
 fn bind_between(
@@ -383,6 +380,31 @@ pub(super) fn make_binary(left: BoundExpr, op: BinaryOp, right: BoundExpr) -> Re
         data_type,
         display_name,
     })
+}
+
+pub(super) fn combine_binary_balanced(
+    mut expressions: Vec<BoundExpr>,
+    op: BinaryOp,
+) -> Result<BoundExpr> {
+    if expressions.is_empty() {
+        return Err(Error::Internal(
+            "cannot combine an empty expression list".to_owned(),
+        ));
+    }
+    while expressions.len() > 1 {
+        let mut next = Vec::with_capacity(expressions.len().div_ceil(2));
+        let mut iterator = expressions.into_iter();
+        while let Some(left) = iterator.next() {
+            match iterator.next() {
+                Some(right) => next.push(make_binary(left, op, right)?),
+                None => next.push(left),
+            }
+        }
+        expressions = next;
+    }
+    Ok(expressions
+        .pop()
+        .expect("non-empty expression list retained"))
 }
 
 pub(super) fn make_unary(op: UnaryOp, expr: BoundExpr) -> Result<BoundExpr> {

@@ -1,7 +1,7 @@
 use std::{fs::File, sync::Arc};
 
 use arrow::{
-    array::{Int64Array, StringArray},
+    array::{Decimal128Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -76,7 +76,7 @@ async fn reads_magic_detected_multi_member_csv_from_minio() -> Result<()> {
         let metrics = result.metrics();
         let batch = result.stream().next().await.unwrap()?;
         assert_eq!(int64_value_at(&batch, 0), 2);
-        assert_eq!(int64_value_at(&batch, 1), 3);
+        assert_eq!(decimal_value_at(&batch, 1), 3);
         assert_eq!(string_value_at(&batch, 2), "a".repeat(2_048));
         assert_eq!(string_value_at(&batch, 3), "b".repeat(2_048));
         drop(result);
@@ -643,6 +643,15 @@ fn int64_value_at(batch: &RecordBatch, column: usize) -> i64 {
         .column(column)
         .as_any()
         .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0)
+}
+
+fn decimal_value_at(batch: &RecordBatch, column: usize) -> i128 {
+    batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
         .unwrap()
         .value(0)
 }

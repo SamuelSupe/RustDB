@@ -55,11 +55,98 @@ fn exposes_left_semi_and_anti_joins_with_left_only_schema() {
     }
 }
 
+#[test]
+fn keeps_an_unhashable_wide_decimal_equality_as_a_residual() {
+    let catalog = wide_decimal_catalog(true);
+    let StatementPlan::Query(plan) = plan_sql(
+        &catalog,
+        "SELECT l.id FROM l JOIN r ON l.id = r.id AND l.amount = r.amount",
+    )
+    .unwrap() else {
+        panic!("expected query plan");
+    };
+
+    let explain = plan.explain();
+    assert!(explain.contains("Join keys=1"), "{explain}");
+    assert!(explain.contains("residual=true"), "{explain}");
+}
+
+#[test]
+fn rejects_a_join_with_only_an_unhashable_wide_decimal_equality() {
+    let catalog = wide_decimal_catalog(false);
+    let error = plan_sql(
+        &catalog,
+        "SELECT l.amount FROM l JOIN r ON l.amount = r.amount",
+    )
+    .unwrap_err();
+
+    assert!(matches!(&error, Error::InvalidArgument(_)));
+    let message = error.to_string();
+    assert!(message.contains("incompatible hash-key types"), "{message}");
+    assert!(message.contains("explicit CAST"), "{message}");
+}
+
+#[test]
+fn rejects_wide_decimal_join_using_without_a_common_type() {
+    let catalog = wide_decimal_catalog(false);
+    let error = plan_sql(&catalog, "SELECT amount FROM l JOIN r USING (amount)").unwrap_err();
+
+    assert!(matches!(&error, Error::InvalidArgument(_)));
+    let message = error.to_string();
+    assert!(message.contains("JOIN ... USING"), "{message}");
+    assert!(message.contains("explicit CAST"), "{message}");
+}
+
+#[test]
+fn lossless_decimal_coercion_still_produces_a_hash_key() {
+    let catalog = Catalog::default();
+    register_fields(
+        &catalog,
+        "l",
+        vec![Field::new("amount", DataType::Decimal128(10, 2), false)],
+    );
+    register_fields(
+        &catalog,
+        "r",
+        vec![Field::new("amount", DataType::Decimal128(12, 4), false)],
+    );
+    let StatementPlan::Query(plan) = plan_sql(
+        &catalog,
+        "SELECT l.amount FROM l JOIN r ON l.amount = r.amount",
+    )
+    .unwrap() else {
+        panic!("expected query plan");
+    };
+
+    let explain = plan.explain();
+    assert!(explain.contains("Join keys=1"), "{explain}");
+    assert!(explain.contains("residual=false"), "{explain}");
+}
+
 fn register_schema(catalog: &Catalog, name: &str, data_type: DataType) {
-    let schema = Arc::new(Schema::new(vec![Field::new("id", data_type, false)]));
+    register_fields(catalog, name, vec![Field::new("id", data_type, false)]);
+}
+
+fn register_fields(catalog: &Catalog, name: &str, fields: Vec<Field>) {
+    let schema = Arc::new(Schema::new(fields));
     catalog
         .register(TableEntry::new(name, Arc::new(SchemaTable(schema))))
         .unwrap();
+}
+
+fn wide_decimal_catalog(with_id: bool) -> Catalog {
+    let catalog = Catalog::default();
+    let fields = |data_type| {
+        let mut fields = Vec::new();
+        if with_id {
+            fields.push(Field::new("id", DataType::Int64, false));
+        }
+        fields.push(Field::new("amount", data_type, false));
+        fields
+    };
+    register_fields(&catalog, "l", fields(DataType::Decimal128(35, 2)));
+    register_fields(&catalog, "r", fields(DataType::Decimal128(38, 6)));
+    catalog
 }
 
 struct SchemaTable(SchemaRef);

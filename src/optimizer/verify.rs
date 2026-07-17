@@ -80,6 +80,12 @@ pub(super) fn executable(plan: &LogicalPlan) -> Result<()> {
             for (left, right) in on {
                 check(left)?;
                 check(right)?;
+                if left.data_type != right.data_type {
+                    return Err(Error::Internal(format!(
+                        "physical join hash key types differ for '{}' ({}) and '{}' ({})",
+                        left.display_name, left.data_type, right.display_name, right.data_type,
+                    )));
+                }
             }
             check_optional(residual)?;
             if let Some((left, right)) = null_aware {
@@ -92,6 +98,10 @@ pub(super) fn executable(plan: &LogicalPlan) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "verify_tests.rs"]
+mod tests;
 
 fn check_many(expressions: &[BoundExpr]) -> Result<()> {
     for expression in expressions {

@@ -1,4 +1,4 @@
-use std::{mem::size_of, sync::Arc};
+use std::{fmt, mem::size_of, sync::Arc};
 
 use arrow::datatypes::Schema;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
@@ -31,6 +31,19 @@ struct MetadataInner {
     metadata: ArrowReaderMetadata,
     _reservation: Option<MemoryReservation>,
     _pruning_lease: Option<PruningLease>,
+}
+
+impl fmt::Debug for ParquetMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParquetMetadata")
+            .field(
+                "row_groups",
+                &self.inner.metadata.metadata().num_row_groups(),
+            )
+            .field("reserved_bytes", &self.reserved_bytes())
+            .finish()
+    }
 }
 
 impl ParquetMetadata {
@@ -68,8 +81,7 @@ impl ParquetMetadata {
             })
     }
 
-    #[cfg(test)]
-    fn reserved_bytes(&self) -> usize {
+    pub(super) fn reserved_bytes(&self) -> usize {
         self.inner
             ._reservation
             .as_ref()

@@ -1,5 +1,8 @@
 use std::{fs::File, sync::Arc, time::Duration};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::{self, FileTimes};
+
 use arrow::{
     array::Int64Array,
     datatypes::{DataType, Field, Schema},
@@ -31,6 +34,37 @@ async fn hits_and_invalidates_on_object_identity() {
     let stats = cache.stats();
     assert_eq!(stats.hits, 1);
     assert_eq!(stats.misses, 3);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn local_identity_change_misses_with_unchanged_weak_etag() {
+    let (_directory, source, metadata) = fixture_with_directory().await;
+    let before = source.snapshot().clone();
+    let cache = MetadataCache::new(usize::MAX);
+    cache.insert_footer(&source, &before, metadata);
+    assert!(cache.get_footer(&source, &before).is_some());
+
+    let path = source.local_path().unwrap();
+    let original = fs::read(path).unwrap();
+    let modified = fs::metadata(path).unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    fs::write(path, &original).unwrap();
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(modified))
+        .unwrap();
+
+    let after = source.head_snapshot().await.unwrap();
+    assert_eq!(before.size, after.size);
+    assert_eq!(
+        before.e_tag, after.e_tag,
+        "weak local ETag unexpectedly changed"
+    );
+    assert_ne!(before.local_identity, after.local_identity);
+    assert!(cache.get_footer(&source, &after).is_none());
 }
 
 #[tokio::test]
@@ -317,6 +351,15 @@ async fn cancelled_waiter_does_not_wait_for_bloom_loader() {
 }
 
 pub(super) async fn fixture() -> (crate::storage::ObjectSource, ArrowReaderMetadata) {
+    let (_directory, source, metadata) = fixture_with_directory().await;
+    (source, metadata)
+}
+
+async fn fixture_with_directory() -> (
+    tempfile::TempDir,
+    crate::storage::ObjectSource,
+    ArrowReaderMetadata,
+) {
     let directory = tempdir().unwrap();
     let path = directory.path().join("cache.parquet");
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -339,5 +382,5 @@ pub(super) async fn fixture() -> (crate::storage::ObjectSource, ArrowReaderMetad
         .unwrap()
         .pop()
         .unwrap();
-    (source, metadata)
+    (directory, source, metadata)
 }

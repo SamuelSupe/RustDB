@@ -15,6 +15,15 @@ pub(crate) fn align_batch_to_schema(
     target: SchemaRef,
     uri: &str,
 ) -> Result<RecordBatch> {
+    align_batch_to_schema_preserving_dictionaries(batch, target, uri, &[])
+}
+
+pub(crate) fn align_batch_to_schema_preserving_dictionaries(
+    batch: RecordBatch,
+    target: SchemaRef,
+    uri: &str,
+    dictionary_columns: &[usize],
+) -> Result<RecordBatch> {
     let target = canonicalize_schema(target);
     let source_schema = batch.schema();
     let mut target_names = BTreeSet::new();
@@ -29,7 +38,9 @@ pub(crate) fn align_batch_to_schema(
     }
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(target.fields().len());
-    for field in target.fields() {
+    let mut output_fields = target.fields().to_vec();
+    let mut preserved = false;
+    for (target_index, field) in target.fields().iter().enumerate() {
         let mut matches = source_schema
             .fields()
             .iter()
@@ -53,7 +64,20 @@ pub(crate) fn align_batch_to_schema(
                         "source contains NULL values for a non-nullable target",
                     ));
                 }
-                checked_cast(source, field.data_type(), uri, field.name())?
+                if dictionary_columns.contains(&target_index)
+                    && preservable_dictionary(source.data_type(), field.data_type())
+                {
+                    output_fields[target_index] = Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(source.data_type().clone()),
+                    );
+                    preserved = true;
+                    Arc::clone(source)
+                } else {
+                    checked_cast(source, field.data_type(), uri, field.name())?
+                }
             }
             None if field.is_nullable() => new_null_array(field.data_type(), batch.num_rows()),
             None => {
@@ -67,8 +91,24 @@ pub(crate) fn align_batch_to_schema(
         columns.push(column);
     }
 
+    let output_schema = if preserved {
+        Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            output_fields,
+            target.metadata().clone(),
+        ))
+    } else {
+        target
+    };
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    RecordBatch::try_new_with_options(target, columns, &options).map_err(Error::from)
+    RecordBatch::try_new_with_options(output_schema, columns, &options).map_err(Error::from)
+}
+
+fn preservable_dictionary(source: &DataType, target: &DataType) -> bool {
+    matches!(source, DataType::Dictionary(_, value) if value.as_ref() == target)
+        && matches!(
+            target,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+        )
 }
 
 fn checked_cast(array: &ArrayRef, target: &DataType, uri: &str, column: &str) -> Result<ArrayRef> {
@@ -83,20 +123,22 @@ fn checked_cast(array: &ArrayRef, target: &DataType, uri: &str, column: &str) ->
             "dictionary-encoded target schemas are not canonical",
         ));
     }
-    let merged =
-        merge_types(&source, target, ParquetSchemaMode::SafeWidening).map_err(|reason| {
-            alignment_error(
+    if !internal_decimal_widening(&source, target) {
+        let merged =
+            merge_types(&source, target, ParquetSchemaMode::SafeWidening).map_err(|reason| {
+                alignment_error(
+                    uri,
+                    column,
+                    &format!("cannot safely align {source:?} to {target:?}: {reason}"),
+                )
+            })?;
+        if &merged != target {
+            return Err(alignment_error(
                 uri,
                 column,
-                &format!("cannot safely align {source:?} to {target:?}: {reason}"),
-            )
-        })?;
-    if &merged != target {
-        return Err(alignment_error(
-            uri,
-            column,
-            &format!("conversion from {source:?} to {target:?} is not lossless"),
-        ));
+                &format!("conversion from {source:?} to {target:?} is not lossless"),
+            ));
+        }
     }
 
     let options = CastOptions {
@@ -120,6 +162,20 @@ fn checked_cast(array: &ArrayRef, target: &DataType, uri: &str, column: &str) ->
         ));
     }
     Ok(casted)
+}
+
+fn internal_decimal_widening(source: &DataType, target: &DataType) -> bool {
+    match (source, target) {
+        (
+            DataType::Decimal32(source_precision, source_scale),
+            DataType::Decimal128(target_precision, target_scale),
+        )
+        | (
+            DataType::Decimal64(source_precision, source_scale),
+            DataType::Decimal128(target_precision, target_scale),
+        ) => source_scale == target_scale && source_precision <= target_precision,
+        _ => false,
+    }
 }
 
 fn alignment_error(uri: &str, column: &str, reason: &str) -> Error {

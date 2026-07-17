@@ -42,6 +42,17 @@ reported instead of being silently ignored.
 - An "object changed during query" error is intentional consistency
   protection; retry after the writer has finished publishing the object.
 
+The same error on a local Parquet file may report an unchanged size and ETag.
+On Linux and macOS RustDB also pins device, inode, mtime, and ctime, so an
+in-place rewrite with restored mtime or an atomic same-size replacement is
+still rejected. Local Parquet readers share one query/file descriptor, use
+positional reads, and compare both that descriptor and the current path before
+and after ranges; deletion and truncation are also reported as object changes.
+Finish publication before starting the query; do not overwrite a file in place
+while it is being scanned. Local CSV validates its opened descriptor before
+reading and before EOF, but an atomic replacement after open can finish against
+the consistent old CSV descriptor.
+
 ## CSV input, schema, or memory errors
 
 CSV remains strict UTF-8. Supply an explicit Arrow schema when sampling would
@@ -84,10 +95,12 @@ let options = CsvOptions::builder()
 
 For the CLI, use `--csv-target-morsel-bytes` or
 `--no-csv-parallel-single-file`. `--metrics` reports `csv_source_bytes`,
-`csv_decompressed_bytes`, `csv_morsels`, and `csv_parser_lanes`; a large
-decompressed/source ratio is expected for highly compressible input. See the
-[v0.5 migration guide](migration-v0.5.md) when replacing `CsvOptions` struct
-literals with the builder.
+`csv_decompressed_bytes`, `csv_morsels`, parser lanes, source I/O, framing and
+decode time; a large decompressed/source ratio is expected for highly
+compressible input. Source/decompressed bytes also include schema/header
+sampling performed by the query. Cumulative per-lane timings can exceed query
+wall time. See the [v0.5 migration guide](migration-v0.5.md) when replacing
+`CsvOptions` struct literals with the builder.
 
 ## Adaptive execution settings
 
@@ -102,8 +115,11 @@ only a pruning hint and does not replace residual SQL predicates.
 When diagnosing resource pressure, inspect active/peak Spill bytes and files,
 repartition bytes/depth, maximum partition size, quota rejections, runtime
 filter hits, metadata cache hits/misses, and singleflight wait alongside the
-CSV counters. These metrics distinguish source decompression pressure from a
-skewed blocking operator or concurrent metadata load.
+CSV counters. For local Parquet, compare `parquet_reader_builds` with
+`parquet_local_file_opens`: fixed scans may group two through four row groups
+per reader and reader clones for one query/file share a lazy descriptor. These
+metrics distinguish source decompression pressure, reader setup, descriptor
+churn, a skewed blocking operator, and concurrent metadata load.
 Singleflight followers count as cache misses with wait time; only a persistent
 LRU lookup counts as a hit.
 

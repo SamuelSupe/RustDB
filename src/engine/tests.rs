@@ -19,6 +19,13 @@ use crate::{
 };
 
 mod csv_lifecycle;
+mod join_aggregate;
+mod memory_snapshot;
+mod native;
+mod native_backup;
+mod native_gc;
+mod native_integrity;
+mod native_parquet;
 
 #[test]
 fn rejects_zero_sized_batches() {
@@ -244,6 +251,37 @@ async fn creates_describes_queries_and_drops_temp_views() {
     assert!(session.catalog().table("answer").is_none());
     assert!(session.execute("DROP VIEW answer").await.is_err());
     collect(session.execute("DROP VIEW IF EXISTS answer").await.unwrap()).await;
+}
+
+#[tokio::test]
+async fn command_results_report_admission_and_parse_phases() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = Engine::new(
+        EngineConfig::builder()
+            .max_concurrent_queries(1)
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )
+    .unwrap()
+    .session();
+
+    // Holding the first QueryResult keeps its query permit alive and makes the
+    // command's admission wait deterministic.
+    let blocker = session.execute("SELECT 1").await.unwrap();
+    let command_session = session.clone();
+    let command = tokio::spawn(async move { command_session.execute("SHOW TABLES").await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(blocker);
+
+    let result = command.await.unwrap().unwrap();
+    let metrics = result.metrics().snapshot();
+    assert!(metrics.query_admission_wait >= Duration::from_millis(10));
+    assert!(metrics.sql_parse_time > Duration::ZERO);
+    assert!(metrics.elapsed < metrics.query_admission_wait);
+    assert_eq!(metrics.table_function_prepare_time, Duration::ZERO);
+    assert_eq!(metrics.bind_time, Duration::ZERO);
+    assert_eq!(metrics.provider_prepare_time, Duration::ZERO);
+    assert_eq!(metrics.optimize_time, Duration::ZERO);
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use arrow::{
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncReadExt;
 
-use super::csv_input::{input_error, open_csv_input};
+use super::csv_input::{CsvInput, input_error, open_csv_input};
 use crate::{
     CsvHeader, CsvOptions, Error, Result,
     runtime::{MemoryReservation, QueryContext},
@@ -179,11 +179,8 @@ async fn read_sample(
         }
         let before = bytes.len();
         let remaining = reserved.saturating_sub(bytes.len());
-        let mut limited = input.as_mut().take(remaining as u64);
-        let read = limited
-            .read_buf(&mut bytes)
-            .await
-            .map_err(|error| input_error(file.uri(), error))?;
+        let read =
+            read_sample_chunk(&mut input, &mut bytes, remaining, file.uri(), context).await?;
         if let Some(context) = context {
             context
                 .metrics
@@ -223,6 +220,24 @@ async fn read_sample(
             reserved = next;
         }
     }
+}
+
+async fn read_sample_chunk(
+    input: &mut CsvInput,
+    bytes: &mut BytesMut,
+    remaining: usize,
+    uri: &str,
+    context: Option<&QueryContext>,
+) -> Result<usize> {
+    let mut limited = input.as_mut().take(remaining as u64);
+    let result = match context {
+        Some(context) => tokio::select! {
+            _ = context.control.cancelled() => return Err(Error::Cancelled),
+            result = limited.read_buf(bytes) => result,
+        },
+        None => limited.read_buf(bytes).await,
+    };
+    result.map_err(|error| input_error(uri, error))
 }
 
 struct CsvSample {
@@ -383,9 +398,15 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use tempfile::tempdir;
 
-    use super::{complete_prefix, detect_header, infer_table_schema, sample_byte_cap};
+    use bytes::BytesMut;
+    use tokio::io::duplex;
+
+    use super::{
+        complete_prefix, detect_header, infer_table_schema, read_sample_chunk, sample_byte_cap,
+    };
     use crate::{
         CsvHeader, CsvOptions, Error, S3Config,
+        datasource::csv_input::CsvInput,
         runtime::{MemoryPool, QueryContext},
         storage::LocationResolver,
     };
@@ -409,6 +430,32 @@ mod tests {
         assert_eq!(sample_byte_cap(1), 1);
         assert_eq!(sample_byte_cap(1024), 256);
         assert_eq!(sample_byte_cap(usize::MAX), 64 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn pending_sample_read_is_woken_by_query_cancellation() {
+        let directory = tempdir().unwrap();
+        let context = QueryContext::new(MemoryPool::new(4096), directory.path()).unwrap();
+        let (_writer, reader) = duplex(1);
+        let mut input: CsvInput = Box::pin(reader);
+        let mut bytes = BytesMut::new();
+        let cancel = async {
+            tokio::task::yield_now().await;
+            context.cancel();
+        };
+
+        let (result, ()) = tokio::join!(
+            read_sample_chunk(
+                &mut input,
+                &mut bytes,
+                1,
+                "memory://pending",
+                Some(&context)
+            ),
+            cancel,
+        );
+
+        assert!(matches!(result, Err(Error::Cancelled)));
     }
 
     #[tokio::test]

@@ -65,7 +65,7 @@ fn assert_smoke_value(name: &str, batch: &RecordBatch) {
         }
         "Q12" => {
             assert_eq!(string(batch, 0), "MAIL");
-            assert_eq!((int64(batch, 1), int64(batch, 2)), (1, 0));
+            assert_eq!((decimal(batch, 1), decimal(batch, 2)), (1, 0));
         }
         "Q13" => assert_eq!((int64(batch, 0), int64(batch, 1)), (1, 1)),
         "Q14" => {

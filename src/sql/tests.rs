@@ -232,6 +232,13 @@ async fn explain_analyze_executes_and_reports_global_metrics() {
         .value(0);
     assert!(output.contains("Projection"));
     assert!(output.contains("Global Metrics"));
+    assert!(output.contains("query_admission_wait="));
+    assert!(output.contains("sql_parse="));
+    assert!(output.contains("table_function_prepare="));
+    assert!(output.contains("bind="));
+    assert!(output.contains("provider_prepare="));
+    assert!(output.contains("optimize="));
+    assert!(output.contains("native_full_verification_segments="));
     assert!(output.contains("returned_rows=1"));
     assert!(output.contains("Operator Metrics"));
     assert!(output.contains("name=Projection"));

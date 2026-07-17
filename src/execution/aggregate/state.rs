@@ -7,7 +7,10 @@ use crate::{
     sql::{AggregateExpr, AggregateFunction},
 };
 
-use super::super::value::{CellValue, cell};
+use super::{
+    super::value::{CellValue, cell},
+    dense_dictionary::DecimalPartial,
+};
 
 pub(super) struct GroupState {
     pub(super) key: Vec<CellValue>,
@@ -51,10 +54,12 @@ pub(in crate::execution) enum AggregateState {
     SumSigned {
         value: i128,
         seen: bool,
+        precision: u8,
     },
     SumUnsigned {
         value: u128,
         seen: bool,
+        precision: u8,
     },
     SumFloat {
         value: f64,
@@ -82,23 +87,27 @@ impl AggregateState {
     pub(in crate::execution) fn new(expression: &AggregateExpr) -> Self {
         match expression.function {
             AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum => match expression.data_type {
-                DataType::UInt64 => Self::SumUnsigned {
-                    value: 0,
-                    seen: false,
-                },
-                DataType::Float64 => Self::SumFloat {
+            AggregateFunction::Sum => match expression.expr.as_ref().map(|expr| &expr.data_type) {
+                Some(DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64) => {
+                    Self::SumUnsigned {
+                        value: 0,
+                        seen: false,
+                        precision: sum_precision(expression),
+                    }
+                }
+                Some(DataType::Float16 | DataType::Float32 | DataType::Float64) => Self::SumFloat {
                     value: 0.0,
                     seen: false,
                 },
-                DataType::Decimal128(precision, _) => Self::SumDecimal {
+                Some(DataType::Decimal128(_, _)) => Self::SumDecimal {
                     value: 0,
                     seen: false,
-                    precision,
+                    precision: sum_precision(expression),
                 },
                 _ => Self::SumSigned {
                     value: 0,
                     seen: false,
+                    precision: sum_precision(expression),
                 },
             },
             AggregateFunction::Min => Self::Min(None),
@@ -130,7 +139,9 @@ impl AggregateState {
                         .ok_or_else(|| Error::Execution("count overflowed INT64".into()))?;
                 }
             }
-            Self::SumSigned { value: sum, seen } => match value.unwrap_or(CellValue::Null) {
+            Self::SumSigned {
+                value: sum, seen, ..
+            } => match value.unwrap_or(CellValue::Null) {
                 CellValue::Null => {}
                 CellValue::Int64(value) => {
                     *sum = sum
@@ -140,7 +151,9 @@ impl AggregateState {
                 }
                 other => return Err(unexpected_value(expression, &other)),
             },
-            Self::SumUnsigned { value: sum, seen } => match value.unwrap_or(CellValue::Null) {
+            Self::SumUnsigned {
+                value: sum, seen, ..
+            } => match value.unwrap_or(CellValue::Null) {
                 CellValue::Null => {}
                 CellValue::UInt64(value) => {
                     *sum = sum
@@ -196,17 +209,36 @@ impl AggregateState {
         Ok(())
     }
 
-    pub(super) fn add_count_star_batch(&mut self, rows: usize) -> Result<()> {
+    pub(super) fn update_dense_count_star(&mut self, rows: i64) -> Result<()> {
         let Self::Count(count) = self else {
             return Err(Error::Internal(
-                "batch COUNT(*) update reached a non-count state".into(),
+                "dense dictionary COUNT(*) reached a non-count state".into(),
             ));
         };
-        let rows = i64::try_from(rows)
-            .map_err(|_| Error::Execution("count input exceeded INT64".into()))?;
+        if rows < 0 {
+            return Err(Error::Internal(
+                "dense dictionary COUNT(*) received a negative partial".into(),
+            ));
+        }
         *count = count
             .checked_add(rows)
             .ok_or_else(|| Error::Execution("count overflowed INT64".into()))?;
+        Ok(())
+    }
+
+    pub(super) fn update_dense_decimal_sum(&mut self, partial: &DecimalPartial) -> Result<()> {
+        let Self::SumDecimal {
+            value: sum, seen, ..
+        } = self
+        else {
+            return Err(Error::Internal(
+                "dense dictionary decimal SUM reached an incompatible state".into(),
+            ));
+        };
+        if let Some(value) = partial.apply_to(*sum)? {
+            *sum = value;
+            *seen = true;
+        }
         Ok(())
     }
 
@@ -217,12 +249,14 @@ impl AggregateState {
             | Self::SumUnsigned { seen: false, .. }
             | Self::SumFloat { seen: false, .. }
             | Self::SumDecimal { seen: false, .. } => Ok(CellValue::Null),
-            Self::SumSigned { value, .. } => i64::try_from(*value)
-                .map(CellValue::Int64)
-                .map_err(|_| Error::Execution("sum overflowed INT64".into())),
-            Self::SumUnsigned { value, .. } => u64::try_from(*value)
-                .map(CellValue::UInt64)
-                .map_err(|_| Error::Execution("sum overflowed UINT64".into())),
+            Self::SumSigned {
+                value, precision, ..
+            } => decimal_value(*value, *precision, "sum"),
+            Self::SumUnsigned {
+                value, precision, ..
+            } => i128::try_from(*value)
+                .map_err(|_| Error::Execution("sum overflowed DECIMAL128".into()))
+                .and_then(|value| decimal_value(value, *precision, "sum")),
             Self::SumFloat { value, .. } => Ok(CellValue::Float64(*value)),
             Self::SumDecimal {
                 value, precision, ..
@@ -248,10 +282,10 @@ impl AggregateState {
             Self::AvgDecimal { sum, count, .. } => {
                 Ok(vec![encode_i128(*sum), CellValue::UInt64(*count)])
             }
-            Self::SumSigned { value, seen } => {
+            Self::SumSigned { value, seen, .. } => {
                 Ok(vec![encode_i128(*value), CellValue::Boolean(*seen)])
             }
-            Self::SumUnsigned { value, seen } => {
+            Self::SumUnsigned { value, seen, .. } => {
                 Ok(vec![encode_u128(*value), CellValue::Boolean(*seen)])
             }
             Self::SumFloat { value, seen } => {
@@ -327,7 +361,7 @@ impl AggregateState {
                     )
                 })?;
             }
-            Self::SumSigned { value, seen } => {
+            Self::SumSigned { value, seen, .. } => {
                 let partial = cell(batch.column(*column), row)?;
                 let partial_seen = cell(batch.column(*column + 1), row)?;
                 *column += 2;
@@ -340,7 +374,7 @@ impl AggregateState {
                 })?;
                 *seen |= partial_seen;
             }
-            Self::SumUnsigned { value, seen } => {
+            Self::SumUnsigned { value, seen, .. } => {
                 let partial = cell(batch.column(*column), row)?;
                 let partial_seen = cell(batch.column(*column + 1), row)?;
                 *column += 2;
@@ -386,6 +420,13 @@ impl AggregateState {
             }
         }
         Ok(())
+    }
+}
+
+fn sum_precision(expression: &AggregateExpr) -> u8 {
+    match expression.data_type {
+        DataType::Decimal128(precision, _) => precision,
+        _ => 38,
     }
 }
 

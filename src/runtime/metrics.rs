@@ -12,7 +12,9 @@ use super::MemoryPool;
 
 mod amplification;
 mod operator;
+mod phase;
 mod snapshot;
+mod timing;
 pub(crate) use operator::OperatorHandle;
 pub use operator::OperatorMetricsSnapshot;
 use operator::OperatorRegistry;
@@ -44,11 +46,24 @@ struct Inner {
     parquet_page_rows_pruned: AtomicU64,
     parquet_bloom_row_groups_pruned: AtomicU64,
     parquet_pruning_budget_skips: AtomicU64,
+    parquet_reader_builds: AtomicU64,
+    parquet_local_file_opens: AtomicU64,
+    parquet_narrow_decimal_columns: AtomicU64,
+    native_predicate_sidecar_bytes_read: AtomicU64,
+    native_predicate_sidecar_rows_evaluated: AtomicU64,
+    native_predicate_sidecar_rows_selected: AtomicU64,
+    native_predicate_sidecar_exact_bypasses: AtomicU64,
+    native_predicate_sidecar_full_projection_bypasses: AtomicU64,
+    native_predicate_sidecar_full_projection_rows: AtomicU64,
+    native_predicate_sidecar_full_projection_fallback_row_groups: AtomicU64,
+    native_predicate_sidecar_fallbacks: AtomicU64,
     s3_requests: AtomicU64,
     s3_bytes_transferred: AtomicU64,
     peak_memory_bytes: AtomicU64,
     peak_active_lanes: AtomicU64,
     scheduler_wait_ns: AtomicU64,
+    phase: phase::PhaseMetrics,
+    timing: timing::TimingMetrics,
     spill_bytes: AtomicU64,
     spill_partitions: AtomicU64,
     spill_read_bytes: AtomicU64,
@@ -101,11 +116,24 @@ impl QueryMetrics {
                 parquet_page_rows_pruned: AtomicU64::new(0),
                 parquet_bloom_row_groups_pruned: AtomicU64::new(0),
                 parquet_pruning_budget_skips: AtomicU64::new(0),
+                parquet_reader_builds: AtomicU64::new(0),
+                parquet_local_file_opens: AtomicU64::new(0),
+                parquet_narrow_decimal_columns: AtomicU64::new(0),
+                native_predicate_sidecar_bytes_read: AtomicU64::new(0),
+                native_predicate_sidecar_rows_evaluated: AtomicU64::new(0),
+                native_predicate_sidecar_rows_selected: AtomicU64::new(0),
+                native_predicate_sidecar_exact_bypasses: AtomicU64::new(0),
+                native_predicate_sidecar_full_projection_bypasses: AtomicU64::new(0),
+                native_predicate_sidecar_full_projection_rows: AtomicU64::new(0),
+                native_predicate_sidecar_full_projection_fallback_row_groups: AtomicU64::new(0),
+                native_predicate_sidecar_fallbacks: AtomicU64::new(0),
                 s3_requests: AtomicU64::new(0),
                 s3_bytes_transferred: AtomicU64::new(0),
                 peak_memory_bytes: AtomicU64::new(0),
                 peak_active_lanes: AtomicU64::new(0),
                 scheduler_wait_ns: AtomicU64::new(0),
+                phase: phase::PhaseMetrics::default(),
+                timing: timing::TimingMetrics::default(),
                 spill_bytes: AtomicU64::new(0),
                 spill_partitions: AtomicU64::new(0),
                 spill_read_bytes: AtomicU64::new(0),
@@ -219,6 +247,68 @@ impl QueryMetrics {
 
     pub(crate) fn add_parquet_pruning_budget_skip(&self) {
         add(&self.inner.parquet_pruning_budget_skips, 1);
+    }
+
+    pub(crate) fn add_parquet_reader_build(&self) {
+        add(&self.inner.parquet_reader_builds, 1);
+    }
+
+    pub(crate) fn add_parquet_local_file_open(&self) {
+        add(&self.inner.parquet_local_file_opens, 1);
+    }
+
+    pub(crate) fn add_parquet_narrow_decimal_columns(&self, columns: u64) {
+        add(&self.inner.parquet_narrow_decimal_columns, columns);
+    }
+
+    pub(crate) fn record_native_predicate_sidecar_read(&self, bytes: u64) {
+        add(&self.inner.native_predicate_sidecar_bytes_read, bytes);
+    }
+
+    pub(crate) fn record_native_predicate_sidecar_selection(
+        &self,
+        evaluated_rows: u64,
+        selected_rows: u64,
+    ) {
+        add(
+            &self.inner.native_predicate_sidecar_rows_evaluated,
+            evaluated_rows,
+        );
+        add(
+            &self.inner.native_predicate_sidecar_rows_selected,
+            selected_rows,
+        );
+    }
+
+    pub(crate) fn add_native_predicate_sidecar_exact_bypass(&self) {
+        add(&self.inner.native_predicate_sidecar_exact_bypasses, 1);
+    }
+
+    pub(crate) fn record_native_predicate_sidecar_full_projection(&self, rows: u64) {
+        add(
+            &self.inner.native_predicate_sidecar_full_projection_bypasses,
+            1,
+        );
+        add(
+            &self.inner.native_predicate_sidecar_full_projection_rows,
+            rows,
+        );
+    }
+
+    pub(crate) fn add_native_predicate_sidecar_full_projection_fallback_row_groups(
+        &self,
+        row_groups: u64,
+    ) {
+        add(
+            &self
+                .inner
+                .native_predicate_sidecar_full_projection_fallback_row_groups,
+            row_groups,
+        );
+    }
+
+    pub(crate) fn add_native_predicate_sidecar_fallback(&self) {
+        add(&self.inner.native_predicate_sidecar_fallbacks, 1);
     }
 
     pub fn add_s3_requests(&self, count: u64) {
@@ -396,8 +486,18 @@ impl QueryMetrics {
             .unwrap_or_default();
         let spill_logical_input_bytes = load(&self.inner.spill_logical_input_bytes);
         let spill_write_bytes = load(&self.inner.spill_write_bytes);
+        let timing = self.inner.timing.snapshot();
+        let phase = self.inner.phase.snapshot();
         QueryMetricsSnapshot {
             elapsed: self.elapsed(),
+            query_admission_wait: phase.query_admission_wait,
+            sql_parse_time: phase.sql_parse_time,
+            table_function_prepare_time: phase.table_function_prepare_time,
+            bind_time: phase.bind_time,
+            provider_prepare_time: phase.provider_prepare_time,
+            optimize_time: phase.optimize_time,
+            native_verification_time: phase.native_verification_time,
+            native_full_verification_segments: phase.native_full_verification_segments,
             rows_scanned: load(&self.inner.rows_scanned),
             rows_returned: load(&self.inner.rows_returned),
             batches_scanned: load(&self.inner.batches_scanned),
@@ -413,12 +513,58 @@ impl QueryMetrics {
             parquet_page_rows_pruned: load(&self.inner.parquet_page_rows_pruned),
             parquet_bloom_row_groups_pruned: load(&self.inner.parquet_bloom_row_groups_pruned),
             parquet_pruning_budget_skips: load(&self.inner.parquet_pruning_budget_skips),
+            parquet_reader_builds: load(&self.inner.parquet_reader_builds),
+            parquet_local_file_opens: load(&self.inner.parquet_local_file_opens),
+            parquet_narrow_decimal_columns: load(&self.inner.parquet_narrow_decimal_columns),
+            native_predicate_sidecar_bytes_read: load(
+                &self.inner.native_predicate_sidecar_bytes_read,
+            ),
+            native_predicate_sidecar_rows_evaluated: load(
+                &self.inner.native_predicate_sidecar_rows_evaluated,
+            ),
+            native_predicate_sidecar_rows_selected: load(
+                &self.inner.native_predicate_sidecar_rows_selected,
+            ),
+            native_predicate_sidecar_exact_bypasses: load(
+                &self.inner.native_predicate_sidecar_exact_bypasses,
+            ),
+            native_predicate_sidecar_full_projection_bypasses: load(
+                &self.inner.native_predicate_sidecar_full_projection_bypasses,
+            ),
+            native_predicate_sidecar_full_projection_rows: load(
+                &self.inner.native_predicate_sidecar_full_projection_rows,
+            ),
+            native_predicate_sidecar_full_projection_fallback_row_groups: load(
+                &self
+                    .inner
+                    .native_predicate_sidecar_full_projection_fallback_row_groups,
+            ),
+            native_predicate_sidecar_fallbacks: load(
+                &self.inner.native_predicate_sidecar_fallbacks,
+            ),
             s3_requests: load(&self.inner.s3_requests),
             s3_bytes_transferred: load(&self.inner.s3_bytes_transferred),
             current_memory_bytes: pool_used,
             peak_memory_bytes: load(&self.inner.peak_memory_bytes).max(pool_peak),
             peak_active_lanes: load(&self.inner.peak_active_lanes),
             scheduler_wait: Duration::from_nanos(load(&self.inner.scheduler_wait_ns)),
+            compute_permit_wait: timing.compute_permit_wait,
+            queue_backpressure_wait: timing.queue_backpressure_wait,
+            csv_morsel_queue_wait: timing.csv_morsel_queue_wait,
+            scan_pipeline_output_queue_wait: timing.scan_pipeline_output_queue_wait,
+            aggregate_lane_dispatch_queue_wait: timing.aggregate_lane_dispatch_queue_wait,
+            aggregate_partial_output_queue_wait: timing.aggregate_partial_output_queue_wait,
+            barrier_wait: timing.barrier_wait,
+            parquet_range_read_time: timing.parquet_range_read_time,
+            parquet_range_bytes_read: timing.parquet_range_bytes_read,
+            parquet_decode_compute_time: timing.parquet_decode_compute_time,
+            parquet_decode_compute_permit_wait: timing.parquet_decode_compute_permit_wait,
+            parquet_decode_polls: timing.parquet_decode_polls,
+            parquet_decode_pending_polls: timing.parquet_decode_pending_polls,
+            parquet_row_filter_compute_time: timing.parquet_row_filter_compute_time,
+            parquet_row_filter_evaluations: timing.parquet_row_filter_evaluations,
+            parquet_row_filter_input_rows: timing.parquet_row_filter_input_rows,
+            parquet_alignment_time: timing.parquet_alignment_time,
             spill_bytes: load(&self.inner.spill_bytes),
             spill_partitions: load(&self.inner.spill_partitions),
             spill_read_bytes: load(&self.inner.spill_read_bytes),
@@ -444,6 +590,9 @@ impl QueryMetrics {
             csv_decompressed_bytes: load(&self.inner.csv_decompressed_bytes),
             csv_morsels: load(&self.inner.csv_morsels),
             peak_csv_parser_lanes: load(&self.inner.peak_csv_parser_lanes),
+            csv_source_io_time: timing.csv_source_io_time,
+            csv_framing_time: timing.csv_framing_time,
+            csv_decode_compute_time: timing.csv_decode_compute_time,
             metadata_cache_hits: load(&self.inner.metadata_cache_hits),
             metadata_cache_misses: load(&self.inner.metadata_cache_misses),
             metadata_singleflight_wait: Duration::from_nanos(load(

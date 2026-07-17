@@ -56,7 +56,7 @@ pub(super) fn aggregate(
             let partial_merge_admission = partial_merge_admission.clone();
             let tasks = context.tasks.clone();
             tasks.spawn("aggregate-partial-lane", async move {
-                run_lane(
+                let result = run_lane(
                     receiver,
                     partial_sender,
                     groups,
@@ -65,7 +65,11 @@ pub(super) fn aggregate(
                     batch_size,
                     partial_merge_admission,
                 )
-                .await?;
+                .await;
+                if result.is_err() {
+                    hold_input_failure_publication_for_test(context.query_id).await;
+                }
+                result?;
                 lane_event_sender
                     .send(LaneEvent::Done)
                     .map_err(|_| Error::Cancelled)
@@ -85,20 +89,39 @@ pub(super) fn aggregate(
             let batch = batch?;
             let sender = &lane_senders[next_lane];
             let started = Instant::now();
-            let sent: Result<()> = tokio::select! {
-                biased;
-                _ = context.control.cancelled() => Err(context
-                    .check_cancelled()
-                    .expect_err("cancelled query has a terminal error")),
-                event = lane_event_receiver.recv() => Err(input_lane_error(event)),
-                result = sender.send(batch) => result.map_err(|_| {
-                    match lane_event_receiver.try_recv() {
-                        Ok(event) => input_lane_error(Some(event)),
-                        Err(_) => Error::Execution(
-                            "parallel aggregate lane stopped before input completed".into(),
-                        ),
+            let sent: Result<()> = match sender.try_send(batch) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(batch)) => {
+                    let backpressure_started = Instant::now();
+                    release_input_failure_for_test(context.query_id);
+                    let outcome: Option<Result<()>> = tokio::select! {
+                        biased;
+                        _ = context.control.cancelled() => Some(Err(context
+                            .check_cancelled()
+                            .expect_err("cancelled query has a terminal error"))),
+                        event = lane_event_receiver.recv() => Some(Err(input_lane_error(event))),
+                        result = sender.send(batch) => match result {
+                            Ok(()) => Some(Ok(())),
+                            Err(_) => None,
+                        },
+                    };
+                    context
+                        .metrics
+                        .record_aggregate_lane_dispatch_queue_wait(
+                            backpressure_started.elapsed(),
+                        );
+                    match outcome {
+                        Some(result) => result,
+                        None => {
+                            release_failure_publication_for_test(context.query_id);
+                            Err(wait_for_lane_failure(&mut lane_event_receiver, &context).await)
+                        }
                     }
-                }),
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    release_failure_publication_for_test(context.query_id);
+                    Err(wait_for_lane_failure(&mut lane_event_receiver, &context).await)
+                }
             };
             context.scheduler.record_wait(started.elapsed());
             sent?;
@@ -166,7 +189,7 @@ pub(super) fn aggregate(
 }
 
 async fn run_lane(
-    mut receiver: mpsc::Receiver<BatchEnvelope>,
+    receiver: mpsc::Receiver<BatchEnvelope>,
     partial_sender: mpsc::Sender<BatchEnvelope>,
     groups: Vec<BoundExpr>,
     aggregates: Vec<AggregateExpr>,
@@ -174,16 +197,7 @@ async fn run_lane(
     batch_size: usize,
     partial_merge_admission: PartialMergeAdmission,
 ) -> Result<()> {
-    let lane_context = Arc::clone(&context);
-    let lane_input = boxed_memory_batch_stream(async_stream::try_stream! {
-        while let Some(batch) = receiver.recv().await {
-            // The guard remains alive across `yield` until the partial
-            // aggregator asks for its next batch, covering batch processing
-            // without counting an idle receiver.
-            let _active = lane_context.scheduler.enter_lane();
-            yield batch;
-        }
-    });
+    let lane_input = lane_input_stream(receiver, Arc::clone(&context));
     let mut partial = serial_partial_aggregate(
         lane_input,
         groups,
@@ -193,14 +207,86 @@ async fn run_lane(
         partial_merge_admission,
     );
     while let Some(batch) = partial.next().await {
-        partial_sender
-            .send(batch?)
-            .await
-            .map_err(|_| Error::Cancelled)?;
+        let batch = batch?;
+        let sent = match partial_sender.try_send(batch) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(batch)) => {
+                let started = Instant::now();
+                let result = tokio::select! {
+                    _ = context.control.cancelled() => Err(context
+                        .check_cancelled()
+                        .expect_err("cancelled query has a terminal error")),
+                    result = partial_sender.send(batch) => {
+                        result.map_err(|_| Error::Cancelled)
+                    },
+                };
+                context
+                    .metrics
+                    .record_aggregate_partial_output_queue_wait(started.elapsed());
+                result
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Cancelled),
+        };
+        sent?;
     }
     #[cfg(test)]
     fault_injection::panic_if_armed(context.query_id);
     Ok(())
+}
+
+#[cfg(not(test))]
+fn lane_input_stream(
+    mut receiver: mpsc::Receiver<BatchEnvelope>,
+    context: Arc<QueryContext>,
+) -> MemoryBatchStream {
+    boxed_memory_batch_stream(async_stream::try_stream! {
+        while let Some(batch) = receiver.recv().await {
+            // Both guards remain alive across `yield` until the partial
+            // aggregator asks for its next batch. Channel waits therefore do
+            // not occupy global compute capacity, while batch processing does.
+            let _compute = context.acquire_compute().await?;
+            let _active = context.scheduler.enter_lane();
+            yield batch;
+        }
+    })
+}
+
+#[cfg(test)]
+fn lane_input_stream(
+    mut receiver: mpsc::Receiver<BatchEnvelope>,
+    context: Arc<QueryContext>,
+) -> MemoryBatchStream {
+    boxed_memory_batch_stream(async_stream::try_stream! {
+        while let Some(batch) = receiver.recv().await {
+            fault_injection::fail_input_on_dispatch_pressure(context.query_id).await?;
+            let _compute = context.acquire_compute().await?;
+            let _active = context.scheduler.enter_lane();
+            yield batch;
+        }
+    })
+}
+
+#[inline]
+fn release_input_failure_for_test(query_id: uuid::Uuid) {
+    #[cfg(test)]
+    fault_injection::release_input_failure(query_id);
+    #[cfg(not(test))]
+    let _ = query_id;
+}
+
+async fn hold_input_failure_publication_for_test(query_id: uuid::Uuid) {
+    #[cfg(test)]
+    fault_injection::hold_input_failure_publication(query_id).await;
+    #[cfg(not(test))]
+    let _ = query_id;
+}
+
+#[inline]
+fn release_failure_publication_for_test(query_id: uuid::Uuid) {
+    #[cfg(test)]
+    fault_injection::release_failure_publication(query_id);
+    #[cfg(not(test))]
+    let _ = query_id;
 }
 
 fn input_lane_error(event: Option<LaneEvent>) -> Error {
@@ -214,13 +300,42 @@ fn input_lane_error(event: Option<LaneEvent>) -> Error {
     }
 }
 
+async fn wait_for_lane_failure(
+    lane_events: &mut mpsc::UnboundedReceiver<LaneEvent>,
+    context: &QueryContext,
+) -> Error {
+    tokio::select! {
+        biased;
+        _ = context.control.cancelled() => context
+            .check_cancelled()
+            .expect_err("cancelled query has a terminal error"),
+        event = lane_events.recv() => context
+            .tasks
+            .first_failure()
+            .unwrap_or_else(|| input_lane_error(event)),
+    }
+}
+
 #[cfg(test)]
 mod fault_injection {
-    use std::{collections::HashSet, sync::Mutex};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex},
+    };
 
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
+    use crate::{Error, Result};
+
     static PANIC_QUERIES: Mutex<Option<HashSet<Uuid>>> = Mutex::new(None);
+    static INPUT_FAILURE_QUERIES: Mutex<Option<HashMap<Uuid, InputFailure>>> = Mutex::new(None);
+
+    struct InputFailure {
+        claimed: bool,
+        input_release: Arc<Notify>,
+        publication_release: Arc<Notify>,
+    }
 
     pub(super) fn arm(query_id: Uuid) {
         PANIC_QUERIES
@@ -238,6 +353,79 @@ mod fault_injection {
             .is_some_and(|queries| queries.remove(&query_id));
         if armed {
             panic!("injected parallel aggregate lane panic");
+        }
+    }
+
+    pub(super) fn arm_input_failure(query_id: Uuid) {
+        INPUT_FAILURE_QUERIES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                query_id,
+                InputFailure {
+                    claimed: false,
+                    input_release: Arc::new(Notify::new()),
+                    publication_release: Arc::new(Notify::new()),
+                },
+            );
+    }
+
+    pub(super) async fn fail_input_on_dispatch_pressure(query_id: Uuid) -> Result<()> {
+        let release = INPUT_FAILURE_QUERIES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_mut()
+            .and_then(|queries| queries.get_mut(&query_id))
+            .and_then(|failure| {
+                (!failure.claimed).then(|| {
+                    failure.claimed = true;
+                    Arc::clone(&failure.input_release)
+                })
+            });
+        let Some(release) = release else {
+            return Ok(());
+        };
+        release.notified().await;
+        Err(Error::Execution(
+            "injected parallel aggregate lane input failure".into(),
+        ))
+    }
+
+    pub(super) fn release_input_failure(query_id: Uuid) {
+        let release = INPUT_FAILURE_QUERIES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .and_then(|queries| queries.get(&query_id))
+            .map(|failure| Arc::clone(&failure.input_release));
+        if let Some(release) = release {
+            release.notify_one();
+        }
+    }
+
+    pub(super) async fn hold_input_failure_publication(query_id: Uuid) {
+        let release = INPUT_FAILURE_QUERIES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .and_then(|queries| queries.get(&query_id))
+            .filter(|failure| failure.claimed)
+            .map(|failure| Arc::clone(&failure.publication_release));
+        if let Some(release) = release {
+            release.notified().await;
+        }
+    }
+
+    pub(super) fn release_failure_publication(query_id: Uuid) {
+        let release = INPUT_FAILURE_QUERIES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_mut()
+            .and_then(|queries| queries.remove(&query_id))
+            .map(|failure| failure.publication_release);
+        if let Some(release) = release {
+            release.notify_one();
         }
     }
 }

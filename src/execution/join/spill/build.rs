@@ -18,6 +18,11 @@ pub(in crate::execution::join) enum BuildPartition {
     TooLarge { rows: usize },
 }
 
+pub(in crate::execution::join) enum BuildPartitionRead {
+    Batches(Vec<RecordBatch>),
+    TooLarge { rows: usize },
+}
+
 pub(in crate::execution::join) fn load_build_partition(
     files: &[SpillFile],
     schema: &SchemaRef,
@@ -25,6 +30,21 @@ pub(in crate::execution::join) fn load_build_partition(
     reservation: &mut MemoryReservation,
     stats: BuildPartitionStats,
 ) -> Result<BuildPartition> {
+    match read_build_partition(files, schema, context, reservation, stats)? {
+        BuildPartitionRead::Batches(batches) => {
+            compact_build_partition(batches, schema, reservation, stats.rows)
+        }
+        BuildPartitionRead::TooLarge { rows } => Ok(BuildPartition::TooLarge { rows }),
+    }
+}
+
+pub(in crate::execution::join) fn read_build_partition(
+    files: &[SpillFile],
+    schema: &SchemaRef,
+    context: &QueryContext,
+    reservation: &mut MemoryReservation,
+    stats: BuildPartitionStats,
+) -> Result<BuildPartitionRead> {
     // Manifest statistics replace the former measurement read. Reserve the
     // retained buffers, one concat output, and IPC block metadata up front.
     let required = compaction_reservation_bytes(
@@ -35,15 +55,24 @@ pub(in crate::execution::join) fn load_build_partition(
         schema.fields().len(),
     );
     if reservation.try_resize(required).is_err() {
-        return Ok(BuildPartition::TooLarge { rows: stats.rows });
+        return Ok(BuildPartitionRead::TooLarge { rows: stats.rows });
     }
 
-    let mut batches = Vec::with_capacity(files.len());
+    let mut batches = Vec::with_capacity(stats.batches.max(files.len()));
     for file in files {
-        if let Some(batch) = compact_spill_file(file, schema, context)? {
-            batches.push(batch);
+        for batch in context.spill.read_file(file)? {
+            batches.push(batch?);
         }
     }
+    Ok(BuildPartitionRead::Batches(batches))
+}
+
+pub(in crate::execution::join) fn compact_build_partition(
+    batches: Vec<RecordBatch>,
+    schema: &SchemaRef,
+    reservation: &mut MemoryReservation,
+    rows: usize,
+) -> Result<BuildPartition> {
     let batch = compact_batches(batches, schema)?
         .unwrap_or_else(|| RecordBatch::new_empty(Arc::clone(schema)));
     if reservation
@@ -52,7 +81,7 @@ pub(in crate::execution::join) fn load_build_partition(
     {
         drop(batch);
         reservation.try_resize(0)?;
-        return Ok(BuildPartition::TooLarge { rows: stats.rows });
+        return Ok(BuildPartition::TooLarge { rows });
     }
     Ok(BuildPartition::Loaded(batch))
 }
@@ -75,31 +104,6 @@ pub(super) fn compaction_reservation_bytes(
         .saturating_add(max_batch_bytes)
         .saturating_add(batches.saturating_mul(IPC_BLOCK_METADATA_BYTES))
         .saturating_add(retained_metadata)
-}
-
-fn compact_spill_file(
-    file: &SpillFile,
-    schema: &SchemaRef,
-    context: &QueryContext,
-) -> Result<Option<RecordBatch>> {
-    let mut pending = Vec::with_capacity(COMPACTION_FAN_IN);
-    let mut compacted = Vec::new();
-    for batch in context.spill.read_file(file)? {
-        pending.push(batch?);
-        if pending.len() == COMPACTION_FAN_IN {
-            compacted.push(
-                compact_batches(std::mem::take(&mut pending), schema)?
-                    .expect("a full compaction group is not empty"),
-            );
-            pending = Vec::with_capacity(COMPACTION_FAN_IN);
-        }
-    }
-    if !pending.is_empty() {
-        compacted.push(
-            compact_batches(pending, schema)?.expect("a pending compaction group is not empty"),
-        );
-    }
-    compact_batches(compacted, schema)
 }
 
 fn compact_batches(

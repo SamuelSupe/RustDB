@@ -396,6 +396,7 @@ pub enum ScalarFunction {
     RTrim,
     Concat,
     Replace,
+    RegexpReplace,
     StartsWith,
     EndsWith,
     Contains,
@@ -407,6 +408,7 @@ pub enum ScalarFunction {
     Round,
     DatePart(DateTimePart),
     DateTrunc(DateTimePart),
+    ToTimestampSeconds,
 }
 
 impl fmt::Display for ScalarFunction {
@@ -424,6 +426,7 @@ impl fmt::Display for ScalarFunction {
                 Self::RTrim => "rtrim",
                 Self::Concat => "concat",
                 Self::Replace => "replace",
+                Self::RegexpReplace => "regexp_replace",
                 Self::StartsWith => "starts_with",
                 Self::EndsWith => "ends_with",
                 Self::Contains => "contains",
@@ -433,6 +436,7 @@ impl fmt::Display for ScalarFunction {
                 Self::Ceil => "ceil",
                 Self::Floor => "floor",
                 Self::Round => "round",
+                Self::ToTimestampSeconds => "to_timestamp_seconds",
                 Self::DatePart(_) | Self::DateTrunc(_) => unreachable!(),
             }),
         }

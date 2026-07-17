@@ -51,9 +51,12 @@ fn q21_shaped_filters_move_below_semi_and_anti_joins() {
                  )";
     let explain = format!("{:?}", crate::sql::plan_sql(&catalog, sql).unwrap());
     let summary = position(&explain, "LeftJoin");
-    let order_status = position(&explain, "Filter orderstatus = 1");
-    let receipt = position(&explain, "Filter receipt > commit");
-    let nation = position(&explain, "Filter nation = 20");
+    // Adjacent safe filters may be coalesced into one pipeline predicate. The
+    // contract is their placement below the summary Join, not one plan node
+    // per SQL conjunct.
+    let order_status = position(&explain, "orderstatus = 1");
+    let receipt = position(&explain, "receipt > commit");
+    let nation = position(&explain, "nation = 20");
     let scan = position(&explain, "Scan table=relocation_q21_left");
 
     assert!(!explain.contains("SemiJoin"), "{explain}");
