@@ -85,7 +85,7 @@ if [ "$dry_run" -eq 0 ]; then
   rmdir "$root/share/rustdb" 2>/dev/null || true
 fi
 if [ "$found" -eq 1 ]; then
-  say "RustDB removed from $prefix." "RustDB 已从 $prefix 卸载。"
+  say "RustDB removed from $prefix." "RustDB 已从 ${prefix} 卸载。"
 else
-  say "No RustDB distribution files found in $prefix." "在 $prefix 中未发现 RustDB 发行文件。"
+  say "No RustDB distribution files found in $prefix." "在 ${prefix} 中未发现 RustDB 发行文件。"
 fi

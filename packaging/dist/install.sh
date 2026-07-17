@@ -75,4 +75,4 @@ install -m 0644 "$package/docs/INSTALL.zh-CN.md" "$doc/INSTALL.zh-CN.md"
 
 say \
   "RustDB installed in $prefix. Run: $prefix/bin/rustdb --help" \
-  "RustDB 已安装到 $prefix。运行：$prefix/bin/rustdb --help-zh"
+  "RustDB 已安装到 ${prefix}。运行：${prefix}/bin/rustdb --help-zh"
