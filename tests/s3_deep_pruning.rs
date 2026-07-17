@@ -61,7 +61,11 @@ async fn exercise_bloom_matrix(endpoint: &str, uri: &str) -> Result<()> {
     assert_eq!(positive.parquet_bloom_filter_bytes_read, 0);
     assert!(positive.metadata_cache_hits > 0);
     assert_eq!(positive.parquet_bloom_row_groups_pruned, 0);
-    assert_eq!(positive.rows_scanned, parquet_pruning::ROWS as u64);
+    assert_eq!(
+        positive.parquet_row_filter_input_rows,
+        parquet_pruning::ROWS as u64
+    );
+    assert_eq!(positive.rows_scanned, 1);
     assert_s3_read(&positive);
 
     let (unsupported, fallback) = count(&session, uri, "score = 50.5").await?;
@@ -69,7 +73,11 @@ async fn exercise_bloom_matrix(endpoint: &str, uri: &str) -> Result<()> {
     assert_eq!(fallback.parquet_bloom_filter_bytes_read, 0);
     assert_eq!(fallback.parquet_bloom_row_groups_pruned, 0);
     assert_eq!(fallback.parquet_pruning_budget_skips, 0);
-    assert_eq!(fallback.rows_scanned, parquet_pruning::ROWS as u64);
+    assert_eq!(
+        fallback.parquet_row_filter_input_rows,
+        parquet_pruning::ROWS as u64
+    );
+    assert_eq!(fallback.rows_scanned, 1);
     assert_s3_read(&fallback);
 
     let mut disabled = engine_config(endpoint);
@@ -82,7 +90,11 @@ async fn exercise_bloom_matrix(endpoint: &str, uri: &str) -> Result<()> {
     assert_eq!(disabled_metrics.parquet_bloom_filter_bytes_read, 0);
     assert_eq!(disabled_metrics.parquet_bloom_row_groups_pruned, 0);
     assert_eq!(disabled_metrics.parquet_pruning_budget_skips, 0);
-    assert_eq!(disabled_metrics.rows_scanned, parquet_pruning::ROWS as u64);
+    assert_eq!(
+        disabled_metrics.parquet_row_filter_input_rows,
+        parquet_pruning::ROWS as u64
+    );
+    assert_eq!(disabled_metrics.rows_scanned, 0);
     assert_s3_read(&disabled_metrics);
     Ok(())
 }
@@ -101,7 +113,11 @@ async fn exercise_budget_fallbacks(
     assert_eq!(query_budget.parquet_page_index_bytes_read, 0);
     assert_eq!(query_budget.parquet_bloom_filter_bytes_read, 0);
     assert_eq!(query_budget.parquet_pruning_budget_skips, 1);
-    assert_eq!(query_budget.rows_scanned, parquet_pruning::ROWS as u64);
+    assert_eq!(
+        query_budget.parquet_row_filter_input_rows,
+        parquet_pruning::ROWS as u64
+    );
+    assert_eq!(query_budget.rows_scanned, 0);
     assert_s3_read(&query_budget);
 
     let mut file_budget = engine_config(endpoint);
@@ -112,7 +128,11 @@ async fn exercise_budget_fallbacks(
     assert_eq!(file_budget.parquet_page_index_bytes_read, 0);
     assert_eq!(file_budget.parquet_bloom_filter_bytes_read, 0);
     assert_eq!(file_budget.parquet_pruning_budget_skips, 1);
-    assert_eq!(file_budget.rows_scanned, parquet_pruning::ROWS as u64);
+    assert_eq!(
+        file_budget.parquet_row_filter_input_rows,
+        parquet_pruning::ROWS as u64
+    );
+    assert_eq!(file_budget.rows_scanned, 0);
     assert_s3_read(&file_budget);
     Ok(())
 }
