@@ -34,7 +34,15 @@ test_with_minio() {
 hosted_test_with_minio() {
   require_minio
   test_jobs=${RUSTDB_TEST_JOBS:-1}
-  run cargo test --locked --all-targets --jobs "$test_jobs" -- \
+  run cargo test --locked --lib --bins \
+    --test csv_validation \
+    --test hive_parquet \
+    --test parquet_query \
+    --test query_engine \
+    --test runtime_filter_pruning \
+    --test s3_deep_pruning \
+    --test s3_query \
+    --jobs "$test_jobs" -- \
     --skip execution::tests::aggregate_spills_and_join_completes_under_small_memory_limit
 }
 
@@ -72,7 +80,7 @@ usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|check|relea
   lint         formatting and strict Clippy
   test         all-target tests; requires a live configured MinIO
   minio-test   alias for test
-  hosted-test  live-MinIO tests without the long low-memory Spill case
+  hosted-test  representative live-MinIO tests without dedicated Spill suites
   portable     all-target tests without requiring MinIO (S3 tests may skip)
   check        compile every target without running tests
   release      portable release build of every target

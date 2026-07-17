@@ -73,15 +73,17 @@ also confirms the `ubuntu-24.04-arm` label.
 
 GitHub documents that arm64 macOS hosted runners do not support nested
 virtualization. Consequently, the Linux x64 job is the single hosted
-live-MinIO integration gate. It runs the representative suite once and skips
-the long, extreme low-memory Spill case; the complete suite remains available
-through the OrbStack release-candidate gate above. Linux arm64 and macOS arm64
-compile every target natively, while the Distribution workflow builds and
-validates their release packages. This split exercises the supported
-architectures without repeating the same resource-heavy suite on every runner
-or pretending a containerized service ran on macOS. GitHub-provided Actions
-are documented as arm64 compatible; the workflows therefore use only
-`actions/checkout` and `actions/cache`, not community setup Actions.
+live-MinIO integration gate. It runs the core library, CLI, CSV, Parquet, and
+MinIO suites once, while excluding the dedicated low-memory Spill integration
+binaries and the long extreme-memory unit case. The complete suite remains
+available through the OrbStack release-candidate gate above. Linux arm64 and
+macOS arm64 compile every target natively, while the Distribution workflow
+builds and validates their release packages. This split exercises the
+supported architectures without repeating the same resource-heavy suite on
+every runner or pretending a containerized service ran on macOS.
+GitHub-provided Actions are documented as arm64 compatible; the workflows
+therefore use only `actions/checkout` and `actions/cache`, not community setup
+Actions.
 
 Cargo caches contain registry and Git dependency sources only, are separated
 by operating system and architecture, and do not cache `target/`. GitHub notes
