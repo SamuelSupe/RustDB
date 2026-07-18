@@ -134,9 +134,7 @@ async fn copy_late_cancellation_reports_that_output_is_already_durable() {
     result.cancel();
     match result.stream().next().await.unwrap() {
         Ok(_) | Err(crate::Error::CopyPostCommitFailure { .. }) => {}
-        Err(error) => panic!(
-            "late cancellation must never report a retryable outcome: {error}"
-        ),
+        Err(error) => panic!("late cancellation must never report a retryable outcome: {error}"),
     }
     assert!(output.exists());
 }
