@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-0.7.0--alpha.1-orange)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.8.0--alpha.1-orange)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -37,17 +37,18 @@ is not a runtime dependency, and project code forbids `unsafe`.
   singleflight.
 - **High-throughput CSV** — raw, gzip, and zstd input with quote-aware framing
   and bounded parallel decoding of a single large file.
-- **Persistent Native analytics** — atomic bulk import, append, replacement,
-  snapshot reads, restart recovery, and validated local backup/restore.
+- **Persistent Native analytics** — transactional DML/DDL, stable row versions,
+  checksummed WAL recovery, snapshot isolation, maintenance, and verified
+  local/S3 backup and restore.
 - **Resource-aware execution** — multi-lane pipelines, global/query memory
   budgets, cancellation, bounded queues, and governed Spill for blocking
   operators.
-- **Embedded by default** — a small stable outer Rust API plus a streaming CLI;
+- **Embedded by default** — a small, focused outer Rust API plus a streaming CLI;
   no server process is required.
 
 ## At a glance
 
-| Area | Current v0.7 alpha scope |
+| Area | Current v0.8 alpha scope |
 | --- | --- |
 | Sources | CSV, gzip CSV, zstd CSV, Parquet |
 | Storage | Local filesystem, S3/MinIO, persistent local Native database |
@@ -181,11 +182,72 @@ while let Some(batch) = write.stream().next().await {
 # }
 ```
 
-Bulk `INSERT INTO ... SELECT` and `CREATE OR REPLACE TABLE ... AS SELECT` are
-also supported. Publication is atomic: running queries keep their pinned
-snapshot while later queries see the new catalog generation. Native storage is
-not a row-oriented transactional database; row-level DML, MVCC, and general
-transactions are outside the current scope.
+`INSERT`, `UPDATE FROM`, `DELETE USING`, `TRUNCATE`, DML `RETURNING`, and safe
+transactional table/view DDL use the same publication protocol. Running queries
+keep their pinned snapshot while later queries see the new Catalog generation.
+The checksummed WAL, stable row identities, delete vectors, optimistic
+multi-writer snapshot isolation, and typed transaction API survive restart.
+
+Native quotas are optional hard commit limits. The engine limit covers the
+complete database directory and commit-publication headroom; table limits
+cover current, retained, staged, and transaction snapshots. Configure an
+engine limit, a default table limit, and explicit overrides when opening:
+
+```rust,no_run
+use rustdb::{Engine, EngineConfig};
+
+# fn open() -> rustdb::Result<()> {
+let config = EngineConfig::builder()
+    .native_engine_limit_bytes(Some(20 << 30))
+    .native_default_table_limit_bytes(Some(5 << 30))
+    .native_table_limit_bytes("events", 10 << 30)
+    .build();
+let engine = Engine::open("./warehouse", config)?;
+# Ok(())
+# }
+```
+
+Quota values are supplied on every open and are not persisted. A rejected
+write reports structured engine/table, current, new, peak, and limit bytes.
+
+Persistent objects use `main` by default and may be addressed as
+`schema.object`. RustDB supports `CREATE SCHEMA`, `DROP SCHEMA`, `SHOW SCHEMAS`,
+and `information_schema.schemata`; qualified names work across DML, DDL, COPY,
+and maintenance. Transactional mutation results must be consumed to
+end-of-stream: cancellation or abandonment after staging rolls back the
+transaction. A `CopyPostCommitFailure` means COPY output is already durable and
+must not be retried.
+
+Commit failures have explicit terminal meaning. `NativeCommitPostCommitFailure`
+means the transaction is committed; `Transaction::commit_info()` retains its
+generation. `CommitOutcomeUnknown` leaves the transaction indeterminate: do not
+retry `commit` or `rollback` on that handle, reopen the database, and reconcile
+the visible Catalog generation before issuing another write. SQL `COMMIT`
+follows the same rule and clears the session's active transaction.
+
+The CLI opens this database with `rustdb --database ./warehouse`. Existing
+v0.7 databases remain read-only until `rustdb migrate ./warehouse` validates
+the source, creates or verifies an exact `.v0.7-backup` catalog snapshot, and
+atomically enables the v0.8 WAL.
+Consistent backup and restore are available for local directories and S3:
+
+```sh
+rustdb backup ./warehouse ./warehouse-backup
+rustdb --s3-region us-east-1 backup ./warehouse s3://bucket/rustdb/snapshot
+rustdb restore ./warehouse-backup ./warehouse-restored
+```
+
+If an embedded caller abandons an in-flight remote-backup future, RustDB keeps
+the Engine-owned upload running until it either publishes a complete manifest
+or aborts multipart uploads and removes unmanifested objects. A process or host
+crash cannot run that cleanup; configure the bucket's incomplete-multipart
+lifecycle policy as an operational backstop. A crash after multipart completion
+but before manifest publication can leave a completed unreachable object.
+RustDB refuses to append more data to that non-empty manifest-less destination;
+inspect and remove the dedicated destination prefix before retrying.
+Local remote-backup/restore work directories are private, ownership-marked,
+and locked. Expired crash leftovers are reclaimed conservatively on Engine
+startup; unknown, forged, symlinked, fresh, or active paths are never removed.
 
 ## Architecture
 
@@ -212,6 +274,10 @@ The full execution model is documented in [architecture.md](docs/architecture.md
 
 ## Functional status
 
+- The v0.8 release-candidate gate passed one focused OrbStack reliability run,
+  including live-MinIO CSV/Parquet COPY and Native backup/restore. See the
+  [acceptance contract](docs/acceptance.md) and
+  [release notes](docs/releases/v0.8.0-alpha.1.md).
 - TPC-H Q1-Q22 query coverage is retained in [`benchmarks/tpch`](benchmarks/tpch).
 - The v0.7 functional ClickBench gate runs all 43 official queries once in a
   four-CPU/16-GiB container profile.
@@ -224,10 +290,11 @@ are in the [ClickBench guide](benchmarks/clickbench/README.md).
 
 ## Current boundaries
 
-RustDB currently does not provide row-level update/delete, schema alteration,
-general transactions, MVCC, a server protocol, distributed execution, or
-DuckDB database-file/SQL compatibility. JSON, ORC, Iceberg, and Parquet writing
-are also outside v0.7. Result order is unspecified without an outer `ORDER BY`.
+Serializable isolation, savepoints, `MERGE`/upsert, constraints, indexes,
+public time travel, a server protocol, distributed execution, and DuckDB
+database-file/SQL compatibility are outside v0.8. JSON/ORC/Iceberg scans and
+nested LIST/STRUCT/MAP execution are also excluded. Result order is unspecified
+without an outer `ORDER BY`.
 
 ## Documentation
 
@@ -240,7 +307,10 @@ are also outside v0.7. Result order is unspecified without an outer `ORDER BY`.
 | [S3 and MinIO](docs/s3.md) | Credentials, endpoints, and object-store behavior |
 | [Troubleshooting](docs/troubleshooting.md) | Resource, Spill, corruption, and input errors |
 | [Acceptance](docs/acceptance.md) | Correctness and release checks |
-| [v0.7 migration](docs/migration-v0.7.md) | Current execution-core and benchmark changes |
+| [v0.8 release notes](docs/releases/v0.8.0-alpha.1.md) | New transactional Native storage, SQL, COPY, and operations surface |
+| [v0.7 migration](docs/migration-v0.7.md) | Historical execution-core and benchmark changes |
+| [v0.8 migration](docs/migration-v0.8.md) | WAL format, explicit database migration, and transaction API |
+| [v0.8 roadmap](docs/roadmap-v0.8.md) | Native v3, DML/DDL, COPY/maintenance, and SQL/time delivery stages |
 
 ## Development
 

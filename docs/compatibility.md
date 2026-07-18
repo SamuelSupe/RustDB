@@ -5,19 +5,19 @@ database-file-compatible with DuckDB.
 
 ## SQL support
 
-| Area | v0.7 alpha development support |
+| Area | v0.8 alpha.1 development support |
 | --- | --- |
 | Query shape | `SELECT`, non-recursive CTEs, non-LATERAL derived tables, recursive parenthesized set-expression trees |
 | Filtering | `WHERE`, three-valued Boolean logic, comparisons, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`, `LIKE`/`NOT LIKE` with `ESCAPE`, `IN` lists |
-| Aggregation | `GROUP BY` expressions, aliases and ordinals; `HAVING` including projection aliases; `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`; single-expression `COUNT/SUM/AVG(DISTINCT ...)` (`MIN/MAX DISTINCT` normalize to ordinary aggregates) |
+| Aggregation | `GROUP BY` expressions, aliases and ordinals; `GROUPING SETS`, `ROLLUP`, `CUBE`, `GROUPING`/`GROUPING_ID`; `HAVING` aliases; `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`; aggregate `FILTER`; multi-expression `COUNT(DISTINCT ...)`; ordering clauses on the order-insensitive built-ins |
 | Result shape | aliases, `DISTINCT` for non-aggregate projections, `ORDER BY`, `LIMIT`, `OFFSET` |
 | Set operations | `UNION ALL`, `UNION [DISTINCT]`, `INTERSECT ALL`, `INTERSECT [DISTINCT]`, `EXCEPT ALL`, `EXCEPT [DISTINCT]`; positional lossless type alignment; result `ORDER BY` by output name or ordinal |
 | Joins | equi `INNER`, `LEFT`, `RIGHT`, `FULL`, `LEFT SEMI`, and `LEFT ANTI`, optional cross-side residual predicates, and `USING`; subqueries also decorrelate to `MARK`, null-aware anti, and single-row joins |
-| Windows | `row_number`, `rank`, `dense_rank`, `ntile`, `percent_rank`, `cume_dist`, and `COUNT/SUM/AVG/MIN/MAX OVER`; `PARTITION BY`, `ORDER BY`, named `WINDOW`, and `QUALIFY`; default frames plus `ROWS`/`RANGE` from `UNBOUNDED PRECEDING` to `CURRENT ROW` or `UNBOUNDED FOLLOWING` |
+| Windows | `row_number`, `rank`, `dense_rank`, `ntile`, `percent_rank`, `cume_dist`, `lead`, `lag`, `first_value`, `last_value`, and aggregate windows; `PARTITION BY`, `ORDER BY`, named `WINDOW`, `QUALIFY`, bounded `ROWS`, one-key numeric bounded `RANGE`, and `GROUPS` frames |
 | Subqueries | non-correlated and one-level correlated scalar, `IN`, `NOT IN`, `EXISTS`, and `NOT EXISTS`; correlation requires an equality key; scalar requires one column and at most one row |
-| Expressions | arithmetic, comparison, Boolean, `CASE`, strict `CAST`, exact Decimal128 arithmetic, typed `TIMESTAMP`, and Date/Timestamp plus/minus DAY/MONTH/YEAR intervals |
+| Expressions | arithmetic, comparison, Boolean, `CASE`, strict `CAST`, exact Decimal128 arithmetic, `DATE`, `TIME(p)`, `TIMESTAMP(p)`, `TIMESTAMPTZ`, IANA `AT TIME ZONE`, UUID, and standard compound intervals through nanoseconds |
 | Scalar functions | `substring`/`substr`, `length`/`char_length`, `lower`, `upper`, `trim`/`ltrim`/`rtrim`, `concat`, `replace`, `regexp_replace`/`regex_replace`, `starts_with`, `ends_with`, `contains`, `coalesce`, `nullif`, `abs`, `ceil`, `floor`, `round`, `extract`/`date_part`, `year`, `month`, `day`, `date_trunc`, `to_timestamp_seconds` |
-| Session commands | `CREATE [OR REPLACE] TEMP VIEW`, `DROP VIEW [IF EXISTS]`, `REFRESH TABLE`, `SHOW TABLES`, `DESCRIBE`, `EXPLAIN`, `EXPLAIN ANALYZE`; a persistent engine also accepts `CREATE [OR REPLACE] TABLE name AS SELECT` and `INSERT INTO name SELECT` |
+| Session commands | transaction control, temp/persistent views, `CREATE`/`ALTER`/`DROP`/`TRUNCATE` Native tables, `INSERT`, `UPDATE FROM`, `DELETE USING`, DML `RETURNING`, `COPY`, `COMPACT`, `VACUUM`, `ANALYZE`, `CHECKPOINT`, `REFRESH`, `SHOW`, `DESCRIBE`, and `EXPLAIN [ANALYZE]` |
 | File functions | `read_csv(...)`, `read_parquet(...)`, including inside CTEs and derived relations |
 | Rust parameter API | `Session::prepare` with positional `?` or numbered `$n` placeholders and typed `ParameterValue`; query and `EXPLAIN` statements only |
 
@@ -28,12 +28,14 @@ intersection, and difference. `INTERSECT ALL` and `EXCEPT ALL` preserve
 duplicate multiplicity. Set operations `BY NAME` and `MINUS` are rejected.
 
 Window functions are allowed in projection and `QUALIFY`, after aggregation
-and `HAVING`; they are rejected in `WHERE`, `GROUP BY`, and `HAVING`. Ranking
-and aggregate windows share a sort when their specifications match. Bounded
-offset frames, `GROUPS`, window `DISTINCT`/`FILTER`/ordered arguments/NULL
-treatment, window inheritance or overrides, nested windows, and functions such
-as `lead`, `lag`, `first_value`, and `last_value` are not supported. `ntile`
-currently requires a positive integer constant.
+and `HAVING`; they are rejected in `WHERE`, `GROUP BY`, and `HAVING`. Matching
+specifications share a sort. General frames are evaluated from a query-scoped,
+memory-accounted file index; the common whole-partition, ROWS-prefix, and
+RANGE-peer-prefix cases retain their streaming fast paths. Bounded RANGE
+currently requires exactly one numeric ORDER BY expression and an integer
+offset. Window DISTINCT, IGNORE/RESPECT NULLS, named-window inheritance,
+nested windows, and non-integer frame offsets remain unsupported. `ntile`
+requires a positive integer constant.
 An `ORDER BY` inside `OVER` defines window semantics but does not promise final
 row order; use the query's outer `ORDER BY` for that.
 
@@ -44,26 +46,26 @@ key references remain available internally for name binding. Parser-visible
 `LEFT SEMI` and `LEFT ANTI` return only left-side columns and preserve duplicate
 left rows. `NATURAL`, pure non-equi, and `CROSS` joins remain unsupported.
 
-Prepared values are substituted into a parsed statement and then use the same
-Binder and execution path as literal SQL. Parameters cannot replace identifiers
-or `read_csv`/`read_parquet` arguments. SQL `PREPARE`/`EXECUTE`, server-side
-prepared statements, and automatic parameter type inference remain outside
-v0.6 alpha. Set operations `BY NAME`/`MINUS`, bounded or `GROUPS` window frames,
-`lead`/`lag`/value windows, and `NATURAL`/pure non-equi/`CROSS` joins are the
-explicitly delayed SQL capabilities.
+Prepared values are substituted into a parsed AST and then use the normal
+Binder, object snapshot, and optimizer path. They cannot replace identifiers,
+file patterns, or table-function options. v0.8 parameter values include TIME,
+arbitrary timestamp precision, TIMESTAMPTZ, UUID, and all three Arrow interval
+families. SQL `PREPARE`/`EXECUTE`, server-side plan caching, and inferred
+parameter types remain outside the embedded API.
 
-`DISTINCT ON`, multi-argument aggregate DISTINCT, ordered aggregates,
-aggregate `FILTER`, pure-inequality correlation, recursive correlation, and
-LATERAL are rejected. Output order is unspecified unless the query has an
-outer `ORDER BY`.
-Timezone-aware Arrow timestamps may be compared, combined in `CASE`/`COALESCE`,
-and used with supported intervals only when their timezone metadata matches.
-Strict casts and `date_trunc` on timezone-aware timestamps remain rejected;
-`AT TIME ZONE` and implicit timezone conversion are not performed.
-Timezone-free `TIMESTAMP(p)` typed literals accept `p <= 6` and round to the
-declared precision before entering the microsecond engine type. Precision-
-qualified cast targets below six digits are rejected instead of silently
-discarding `p`; use `TIMESTAMP` or `TIMESTAMP(6)` for strict casts.
+Current aggregate functions are mathematically order-insensitive. Argument
+`ORDER BY` and `WITHIN GROUP` expressions are bound and validated, then
+normalized away; order-sensitive list/string/percentile aggregates are not yet
+provided. `DISTINCT ON`, pure-inequality correlation, recursive correlation,
+and LATERAL remain rejected. Output order is unspecified unless the query has
+an outer `ORDER BY`.
+
+Timezone-aware timestamps are normalized to an absolute UTC instant for
+comparison and common-type resolution. `AT TIME ZONE` attaches an IANA zone to
+a naive timestamp or returns local wall time from a zoned timestamp. A
+nonexistent DST local time fails; an ambiguous fall-back time deterministically
+chooses the later instant. TIME/TIMESTAMP precision 0 through 9 is retained in
+the Arrow physical unit, and strict conversion checks range and malformed text.
 Explicit integer-to-`DATE` casts interpret the input as epoch days, and
 `to_timestamp_seconds(integer)` returns a timezone-free microsecond Timestamp
 with checked overflow. A UTF-8 literal compared directly with a Date or
@@ -84,10 +86,16 @@ remains exact and deterministic.
 
 Arrow `RecordBatch` is the execution boundary. Primitive Boolean, signed and
 unsigned integer, floating-point, Decimal128 (precision up to 38), UTF-8,
-Binary, Date, Timestamp, and supported Interval arrays pass through scans.
+Binary, Date, Time, Timestamp/TIMESTAMPTZ, UUID as FixedSizeBinary(16), and all
+Arrow Interval families pass through scans and the Native store.
 Decimal overflow, divide-by-zero, invalid casts, malformed input, and scalar
 subquery cardinality errors fail the query. Nested Parquet arrays can be
 projected to output but are not expression, group, sort, or join keys.
+
+Because Arrow/Parquet 59 cannot write every interval family directly, Native
+segments use a private little-endian fixed-width encoding and reconstruct the
+logical Arrow interval arrays at scan time. This encoding is internal to the
+Native format and is not exposed by `COPY TO PARQUET`.
 
 CSV is strict UTF-8 and supports raw, gzip, and zstd input. `Auto` compression
 uses magic bytes rather than the filename and accepts concatenated gzip members
@@ -149,20 +157,74 @@ These values are additive diagnostics, not performance guarantees.
 
 ## Persistent Native alpha
 
-`Engine::open(path, config)` persists immutable Native segments and a versioned
-Catalog. Bulk CTAS, append-from-query, and whole-table replacement are atomic
-at the Catalog generation boundary. Queries pin immutable snapshots, and local
-backup/restore copies and validates one reachable generation without replacing
-an existing destination. A post-rename durability failure is reported as
-`CommitOutcomeUnknown`. `Engine::new` continues to provide the v0.5-style
-ephemeral engine. Native table names are limited to 255 UTF-8 bytes; Catalog
-generation encoding is checked against its per-table disk reservation before a
-write starts.
+`Engine::open(path, config)` persists immutable base/delta segments, versioned
+delete vectors, schemas, tables, and views in a versioned Catalog. CTAS,
+INSERT, UPDATE, DELETE, TRUNCATE, and transactional DDL publish atomically at a
+Catalog generation boundary. `Engine::new` remains ephemeral. Local and
+S3/MinIO backup publish a validated manifest last; restore refuses to replace
+an existing destination. The CLI exposes `backup` and `restore` subcommands.
 
-Native table-manifest v2 may bind an optional `.rdbpred` companion to each
-Parquet segment. Legacy v1 manifests and v2 segments without a companion remain
-readable and use the ordinary Parquet predicate path; they are not upgraded in
-place. Re-import or rewrite the source data to generate eligible sidecars.
+v0.8 database marker v2 adds a checksummed, contiguous-LSN WAL. Commit intent is
+synced before Catalog `CURRENT` publication; open replays a durable unpublished
+generation and rejects corrupt records or generation gaps. Database marker v1
+remains readable but is write-protected until `rustdb migrate PATH` creates a
+matching v0.7 backup and atomically enables WAL.
+
+Transactions use optimistic multi-writer snapshot isolation. Read-only and
+read-write handles, prepared statements, SQL transaction control, read-your-
+writes, automatic rollback on drop, and active-result checks are supported.
+Disjoint row changes rebase; concurrent writes to the same stable row or
+Catalog object use first-committer-wins. Write skew is permitted by the stated
+isolation level.
+
+Transaction commit errors preserve their durable boundary. A known
+post-publication failure leaves the handle committed and exposes `commit_info`;
+an unreconciled WAL/Catalog publication leaves it indeterminate. Neither state
+can be retried or rolled back on the original handle. Reopen recovery is the
+required reconciliation boundary.
+
+Persistent schema namespaces are catalog state. `main` is the default;
+`CREATE SCHEMA`, `DROP SCHEMA`, `SHOW SCHEMAS`, and
+`information_schema.schemata` are supported, and qualified names are accepted
+by query, DML, DDL, COPY, maintenance, temporary-view, and
+external-registration paths. Catalog manifest v1 is read as `main`; new
+generations use manifest v2. Cancelling, abandoning, or failing a transaction
+result after it staged a mutation rolls back the whole transaction because
+statement savepoints are not implemented.
+
+`NativeStorageConfig` exposes optional hard limits for the complete Native
+database directory, a default per-table limit, and named table overrides. The
+CLI exposes all three and accepts repeatable `table=size` overrides. Limits are
+reopen-time policy rather than persisted format state. Quota rejection uses
+`Error::NativeDiskQuotaExceeded` with the scope and current/new/peak/limit byte
+counts, before durable publication.
+
+Local COPY publishes by synced rename and remote COPY publishes its manifest
+last. If output is durable but result delivery fails, RustDB returns the
+structured `CopyPostCommitFailure` outcome; retrying the same destination is
+not safe. A process crash can leave a UUID-named local staging file or a remote
+child object before publication. RustDB never deletes those objects
+automatically and refuses to append another attempt to the same destination;
+inspect and remove the incomplete output before retrying.
+
+Remote backup work is Engine-owned once its consistent local snapshot has been
+created. Dropping the public future does not strand an in-process upload: the
+worker finishes a valid manifest or aborts multipart uploads and removes
+unmanifested keys. Abrupt process loss is outside in-process cleanup and should
+be covered by the bucket's incomplete-multipart lifecycle policy. That policy
+does not cover an object completed immediately before a manifest-less crash;
+RustDB refuses to reuse a non-empty destination without a manifest so retries
+cannot amplify the orphan. Operators must inspect and remove that dedicated
+prefix before retrying. Local snapshot/download temporaries are independently
+owned and locked; expired crash orphans are reclaimed conservatively at Engine
+startup (and before remote restore), while unknown or active paths are kept.
+
+Native table-manifest v3 retains the optional v2 `.rdbpred` companion and adds
+stable physical row identity plus versioned, checksummed `.rdbdel` delete
+vectors. Scans subtract deleted rows before exposing a batch and charge retained
+bitmaps and filter workspace to query memory. Legacy v1/v2 manifests remain
+readable and are not rewritten in place. Re-import or rewrite source data to
+produce current-format snapshots.
 Sidecars are query-neutral. The file format can index `Int8/16/32/64`,
 `Date32`, and `Decimal128(precision <= 18)`; the first query slice accelerates
 complete exact AND trees made from direct `=`, `<>`, `<`, `<=`, `>`, `>=`,
@@ -199,11 +261,11 @@ public Arrow boundary.
 
 ## Deliberate exclusions
 
-There are no row-level updates/deletes, schema alteration, WAL transactions,
-row MVCC, replication, server protocol, or distributed executor. Remote Native
-backup is not yet included in alpha.1. Unsafe CSV byte-range splitting,
-Parquet export, persistent data-page caching, JSON, ORC, Iceberg, and service
-protocols remain outside v0.6 alpha.
+Serializable isolation, predicate locks, savepoints, public time travel,
+`MERGE`/upsert, relational constraints, secondary indexes, recursive CTEs,
+LATERAL/UNNEST, nested LIST/STRUCT/MAP/JSON execution, replication, service
+protocols, and distributed execution are excluded from v0.8. ORC, Iceberg,
+JSON scan and persistent data-page caching are also outside this release.
 
 S3 credentials come from the default credential chain or an application-owned
 in-memory provider. Secrets are not accepted in SQL or endpoint URLs. See

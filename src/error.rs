@@ -31,11 +31,37 @@ pub enum Error {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    #[error(
+        "native {scope} disk quota exceeded{path}: current {current_bytes} bytes + new {added_bytes} bytes reaches peak {peak_bytes} bytes, limit {limit_bytes} bytes",
+        scope = native_quota_scope(.table.as_deref()),
+        path = display_required_path(.path)
+    )]
+    NativeDiskQuotaExceeded {
+        path: PathBuf,
+        table: Option<String>,
+        current_bytes: u64,
+        added_bytes: u64,
+        peak_bytes: u64,
+        limit_bytes: u64,
+    },
+
     #[error("query cancelled")]
     Cancelled,
 
     #[error("catalog error: {0}")]
     Catalog(String),
+
+    #[error("transaction {transaction_id} is not active: {state}")]
+    TransactionClosed {
+        transaction_id: String,
+        state: &'static str,
+    },
+
+    #[error("transaction {transaction_id} conflict: {message}")]
+    TransactionConflict {
+        transaction_id: String,
+        message: String,
+    },
 
     #[error("native storage error{path}: {message}", path = display_required_path(.path))]
     NativeStorage { path: PathBuf, message: String },
@@ -61,6 +87,12 @@ pub enum Error {
         message: String,
     },
 
+    #[error(
+        "COPY output committed durably{path}, but post-commit handling failed: {message}",
+        path = display_required_path(.path)
+    )]
+    CopyPostCommitFailure { path: PathBuf, message: String },
+
     #[error("execution error: {0}")]
     Execution(String),
 
@@ -78,6 +110,12 @@ fn display_required_path(path: &Path) -> String {
     format!(" at {}", path.display())
 }
 
+fn native_quota_scope(table: Option<&str>) -> String {
+    table
+        .map(|name| format!("table '{name}'"))
+        .unwrap_or_else(|| "engine".to_owned())
+}
+
 impl Error {
     pub fn io(path: impl Into<Option<PathBuf>>, source: std::io::Error) -> Self {
         Self::Io {
@@ -90,6 +128,24 @@ impl Error {
         Self::NativeStorage {
             path: path.into(),
             message: message.into(),
+        }
+    }
+
+    pub(crate) fn native_disk_quota_exceeded(
+        path: impl Into<PathBuf>,
+        table: Option<String>,
+        current_bytes: u64,
+        added_bytes: u64,
+        peak_bytes: u64,
+        limit_bytes: u64,
+    ) -> Self {
+        Self::NativeDiskQuotaExceeded {
+            path: path.into(),
+            table,
+            current_bytes,
+            added_bytes,
+            peak_bytes,
+            limit_bytes,
         }
     }
 
@@ -115,6 +171,16 @@ impl Error {
             path: path.into(),
             transaction_id: transaction_id.into(),
             generation,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn copy_post_commit_failure(
+        path: impl Into<PathBuf>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::CopyPostCommitFailure {
+            path: path.into(),
             message: message.into(),
         }
     }

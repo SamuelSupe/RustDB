@@ -25,6 +25,23 @@ pub enum ParameterValue {
     Binary(Vec<u8>),
     Date32(i32),
     TimestampMicrosecond(i64),
+    Time {
+        value: i64,
+        unit: TimeUnit,
+    },
+    Timestamp {
+        value: i64,
+        unit: TimeUnit,
+        timezone: Option<String>,
+    },
+    Uuid([u8; 16]),
+    MonthInterval(i32),
+    DayInterval(i32),
+    MonthDayNanoInterval {
+        months: i32,
+        days: i32,
+        nanoseconds: i64,
+    },
 }
 
 #[derive(Clone)]
@@ -62,6 +79,11 @@ impl PreparedStatement {
     }
 
     pub async fn execute(&self, parameters: &[ParameterValue]) -> Result<QueryResult> {
+        let statement = self.instantiate(parameters)?;
+        self.session.execute_prepared(statement).await
+    }
+
+    pub(crate) fn instantiate(&self, parameters: &[ParameterValue]) -> Result<Statement> {
         if parameters.len() != self.layout.count {
             return Err(Error::InvalidArgument(format!(
                 "prepared statement expects {} parameters, got {}",
@@ -75,7 +97,7 @@ impl PreparedStatement {
             .collect::<Result<Vec<_>>>()?;
         let mut statement = self.template.clone();
         self.layout.substitute(&mut statement, &replacements)?;
-        self.session.execute_prepared(statement).await
+        Ok(statement)
     }
 }
 
@@ -235,6 +257,9 @@ impl ParameterValue {
 
     fn sql_literal(&self) -> Result<String> {
         Ok(match self {
+            Self::Null(DataType::Timestamp(unit, Some(timezone))) => {
+                internal_timestamp_sql(None, *unit, timezone)?
+            }
             Self::Null(data_type) => format!("CAST(NULL AS {})", sql_type(data_type)?),
             Self::Boolean(value) => value.to_string(),
             Self::Int64(value) => format!("CAST('{}' AS BIGINT)", value),
@@ -270,6 +295,42 @@ impl ParameterValue {
             Self::TimestampMicrosecond(value) => format!(
                 "TIMESTAMP '{}'",
                 crate::sql::temporal::format_timestamp_microsecond(*value)
+            ),
+            Self::Time { value, unit } => format!(
+                "TIME({}) '{}'",
+                temporal_precision(*unit),
+                crate::sql::temporal::format_time(*value, *unit)?
+            ),
+            Self::Timestamp {
+                value,
+                unit,
+                timezone,
+            } => {
+                if let Some(timezone) = timezone {
+                    return internal_timestamp_sql(Some(*value), *unit, timezone);
+                }
+                let kind = if timezone.is_some() {
+                    "TIMESTAMPTZ"
+                } else {
+                    "TIMESTAMP"
+                };
+                let suffix = if timezone.is_some() { "+00:00" } else { "" };
+                format!(
+                    "{kind}({}) '{}{suffix}'",
+                    temporal_precision(*unit),
+                    crate::sql::temporal::format_timestamp(*value, *unit),
+                )
+            }
+            Self::Uuid(value) => format!("UUID '{}'", uuid::Uuid::from_bytes(*value)),
+            Self::MonthInterval(months) => format!("INTERVAL '{months}' MONTH"),
+            Self::DayInterval(days) => format!("INTERVAL '{days}' DAY"),
+            Self::MonthDayNanoInterval {
+                months,
+                days,
+                nanoseconds,
+            } => format!(
+                "INTERVAL '{months} months {days} days {} seconds'",
+                format_interval_seconds(*nanoseconds)
             ),
         })
     }
@@ -331,12 +392,83 @@ fn sql_type(data_type: &DataType) -> Result<String> {
         DataType::Binary => "BLOB".into(),
         DataType::Date32 => "DATE".into(),
         DataType::Timestamp(TimeUnit::Microsecond, None) => "TIMESTAMP".into(),
+        DataType::Time32(unit) | DataType::Time64(unit) => {
+            format!("TIME({})", temporal_precision(*unit))
+        }
+        DataType::Timestamp(unit, timezone) => {
+            let kind = if timezone.is_some() {
+                "TIMESTAMPTZ"
+            } else {
+                "TIMESTAMP"
+            };
+            format!("{kind}({})", temporal_precision(*unit))
+        }
+        DataType::FixedSizeBinary(16) => "UUID".into(),
+        DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth) => {
+            "INTERVAL YEAR TO MONTH".into()
+        }
+        DataType::Interval(arrow::datatypes::IntervalUnit::DayTime) => "INTERVAL DAY".into(),
+        DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano) => {
+            "INTERVAL DAY TO SECOND".into()
+        }
         other => {
             return Err(Error::Unsupported(format!(
                 "typed NULL parameter of type {other} is not supported"
             )));
         }
     })
+}
+
+fn temporal_precision(unit: TimeUnit) -> u8 {
+    match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 3,
+        TimeUnit::Microsecond => 6,
+        TimeUnit::Nanosecond => 9,
+    }
+}
+
+fn internal_timestamp_sql(value: Option<i64>, unit: TimeUnit, timezone: &str) -> Result<String> {
+    let timezone = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+        Error::InvalidArgument(format!(
+            "timestamp parameter has unknown IANA timezone '{timezone}'"
+        ))
+    })?;
+    let function = if value.is_some() {
+        "__rustdb_internal_parameter_timestamp"
+    } else {
+        "__rustdb_internal_parameter_timestamp_null"
+    };
+    let value = value
+        .map(|value| format!("'{value}', "))
+        .unwrap_or_default();
+    Ok(format!(
+        "{function}({value}'{}', '{timezone}')",
+        temporal_unit_name(unit)
+    ))
+}
+
+fn temporal_unit_name(unit: TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Second => "second",
+        TimeUnit::Millisecond => "millisecond",
+        TimeUnit::Microsecond => "microsecond",
+        TimeUnit::Nanosecond => "nanosecond",
+    }
+}
+
+fn format_interval_seconds(nanoseconds: i64) -> String {
+    let negative = nanoseconds.is_negative();
+    let absolute = nanoseconds.unsigned_abs();
+    let seconds = absolute / 1_000_000_000;
+    let fraction = absolute % 1_000_000_000;
+    let sign = if negative { "-" } else { "" };
+    if fraction == 0 {
+        format!("{sign}{seconds}")
+    } else {
+        let fraction = format!("{fraction:09}");
+        format!("{sign}{seconds}.{}", fraction.trim_end_matches('0'))
+    }
 }
 
 fn validate_decimal(precision: u8, scale: i8) -> Result<()> {

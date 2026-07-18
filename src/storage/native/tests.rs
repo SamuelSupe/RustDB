@@ -247,6 +247,139 @@ fn reopen_removes_a_valid_unpublished_snapshot() {
 }
 
 #[test]
+fn concurrent_writes_rebase_disjoint_tables_and_conflict_on_the_same_table() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = NativeDatabase::open(directory.path().join("database")).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1_i64]))],
+    )
+    .unwrap();
+
+    let left = prepared_create(&database, "left_table", Arc::clone(&schema), &batch);
+    let right = prepared_create(&database, "right_table", Arc::clone(&schema), &batch);
+    assert_eq!(database.commit_write(left).unwrap().generation(), 1);
+    assert_eq!(database.commit_write(right).unwrap().generation(), 2);
+    assert_eq!(database.table_snapshots().len(), 2);
+
+    let first = prepared_create(&database, "same_table", Arc::clone(&schema), &batch);
+    let second = prepared_create(&database, "same_table", schema, &batch);
+    assert_eq!(database.commit_write(first).unwrap().generation(), 3);
+    assert!(matches!(
+        database.commit_write(second).unwrap_err(),
+        Error::TransactionConflict { .. }
+    ));
+    assert_eq!(database.catalog_generation(), 3);
+}
+
+#[test]
+fn publication_gate_keeps_quota_check_and_publish_atomic() {
+    use std::{
+        sync::mpsc::{RecvTimeoutError, channel, sync_channel},
+        thread,
+        time::Duration,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut database =
+        NativeDatabase::open(directory.path().join("quota-publication-gate")).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1_i64]))],
+    )
+    .unwrap();
+    let first = prepared_create(&database, "events", Arc::clone(&schema), &batch);
+    let second = prepared_create(&database, "events", schema, &batch);
+    let first_bytes =
+        super::disk_budget::directories_storage_bytes(first.quota_directories(database.path()))
+            .unwrap();
+    let second_bytes =
+        super::disk_budget::directories_storage_bytes(second.quota_directories(database.path()))
+            .unwrap();
+    database.quota.default_table_limit_bytes = Some(first_bytes.max(second_bytes));
+    let database = Arc::new(database);
+
+    let (entered_tx, entered_rx) = sync_channel(0);
+    let (release_tx, release_rx) = channel();
+    let (first_ready_tx, first_ready_rx) = channel();
+    let (cleanup_tx, cleanup_rx) = channel();
+    let first_database = Arc::clone(&database);
+    let first_thread = thread::spawn(move || {
+        super::quota_publication_test_hook::arm(entered_tx, release_rx);
+        let published = first_database.publish_transaction_write(first).unwrap();
+        first_ready_tx.send(()).unwrap();
+        cleanup_rx.recv().unwrap();
+        super::transaction_commit::abort(&first_database, vec![published]).unwrap();
+        super::quota::prune_published(&first_database);
+    });
+    entered_rx.recv().unwrap();
+
+    let (second_tx, second_rx) = channel();
+    let second_database = Arc::clone(&database);
+    let second_thread = thread::spawn(move || {
+        let result = second_database.publish_transaction_write(second);
+        second_tx.send(result).unwrap();
+    });
+    assert!(matches!(
+        second_rx.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+
+    release_tx.send(()).unwrap();
+    first_ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let error = match second_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+        Err(error) => error,
+        Ok(published) => {
+            super::transaction_commit::abort(&database, vec![published]).unwrap();
+            panic!("second publication unexpectedly passed the shared table quota");
+        }
+    };
+    assert!(matches!(
+        error,
+        Error::NativeDiskQuotaExceeded {
+            table: Some(table),
+            ..
+        } if table == "events"
+    ));
+    cleanup_tx.send(()).unwrap();
+    first_thread.join().unwrap();
+    second_thread.join().unwrap();
+    assert!(database.active_quota_writes.lock().is_empty());
+    assert_eq!(
+        super::disk_budget::directories_storage_bytes([database.path().join("tables")]).unwrap(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(database.path().join("staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+fn prepared_create(
+    database: &NativeDatabase,
+    name: &str,
+    schema: Arc<Schema>,
+    batch: &RecordBatch,
+) -> super::PreparedSnapshot {
+    let plan = database
+        .plan_write(
+            name,
+            NativeWriteMode::Create,
+            database.catalog_generation(),
+            schema,
+            1024 * 1024,
+        )
+        .unwrap();
+    let mut writer = database.start_write(plan).unwrap();
+    writer.write_batch(batch).unwrap();
+    writer.finish().unwrap()
+}
+
+#[test]
 fn rejects_catalog_manifest_from_another_database() {
     let directory = tempfile::tempdir().unwrap();
     let first = directory.path().join("first");

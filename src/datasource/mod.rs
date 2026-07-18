@@ -26,6 +26,7 @@ mod parquet_scan;
 mod provider;
 mod registered;
 mod schema_evolution;
+mod system;
 
 pub use csv::CsvTable;
 pub(crate) use metadata_cache::MetadataCache;
@@ -38,3 +39,4 @@ pub use provider::{
 pub(crate) use provider::{ScanTask, TableSourceIdentity};
 pub(crate) use registered::{RegisteredCsvTable, RegisteredParquetTable};
 pub use schema_evolution::ParquetSchemaMode;
+pub(crate) use system::{NativeSystemSnapshot, NativeSystemTable, SystemTableKind};

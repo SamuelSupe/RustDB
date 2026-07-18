@@ -40,6 +40,21 @@ pub(crate) fn evaluate_constant_expression(expr: &crate::sql::BoundExpr) -> Resu
     expr::evaluate(expr, &batch)
 }
 
+pub(crate) fn evaluate_expression(
+    expression: &crate::sql::BoundExpr,
+    batch: &RecordBatch,
+) -> Result<ArrayRef> {
+    expr::evaluate(expression, batch)
+}
+
+pub(crate) fn project_expressions(
+    expressions: &[crate::sql::BoundExpr],
+    schema: arrow::datatypes::SchemaRef,
+    batch: &RecordBatch,
+) -> Result<RecordBatch> {
+    expr::project(expressions, schema, batch)
+}
+
 /// Builds a lazy record-batch stream. Work starts when the caller polls it.
 #[cfg(test)]
 pub async fn execute(plan: StatementPlan, context: Arc<QueryContext>) -> Result<RecordBatchStream> {

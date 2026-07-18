@@ -80,8 +80,9 @@ fn eligible(array: &BoundExpr, literal: &ScalarValue) -> bool {
                 | ScalarValue::Decimal128 { .. }
                 | ScalarValue::Date32(_)
                 | ScalarValue::TimestampMicrosecond(_)
-                | ScalarValue::DayInterval(_)
-                | ScalarValue::MonthInterval(_)
+                | ScalarValue::Timestamp { .. }
+                | ScalarValue::Time { .. }
+                | ScalarValue::Uuid(_)
         )
 }
 

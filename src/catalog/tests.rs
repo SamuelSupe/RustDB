@@ -92,6 +92,22 @@ fn pinned_catalog_keeps_a_stable_local_snapshot() {
 }
 
 #[test]
+fn pinned_catalog_keeps_table_and_view_identity_together() {
+    let catalog = Catalog::default();
+    catalog
+        .register_view(entry("item", "view"), "SELECT 1", false)
+        .unwrap();
+    let pinned = catalog.pin();
+
+    catalog.register(entry("item", "table")).unwrap();
+
+    assert!(pinned.is_view("item"));
+    assert_eq!(marker(&pinned, "item"), "view");
+    assert!(!catalog.is_view("item"));
+    assert_eq!(marker(&catalog, "item"), "table");
+}
+
+#[test]
 fn stale_persistent_publish_is_rejected_without_changing_visibility() {
     let persistent = PersistentCatalog::default();
     persistent.publish(0, [entry("first", "first")]).unwrap();

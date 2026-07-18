@@ -51,8 +51,23 @@ pub(super) fn executable(plan: &LogicalPlan) -> Result<()> {
             input, expressions, ..
         } => {
             for expression in expressions {
-                if let crate::sql::WindowFunction::Aggregate(aggregate) = &expression.function {
-                    check_optional(&aggregate.expr)?;
+                match &expression.function {
+                    crate::sql::WindowFunction::Aggregate(aggregate) => {
+                        check_optional(&aggregate.expr)?;
+                    }
+                    crate::sql::WindowFunction::Lead { expr, default, .. }
+                    | crate::sql::WindowFunction::Lag { expr, default, .. } => {
+                        check(expr)?;
+                        check(default)?;
+                    }
+                    crate::sql::WindowFunction::FirstValue(expr)
+                    | crate::sql::WindowFunction::LastValue(expr) => check(expr)?,
+                    crate::sql::WindowFunction::RowNumber
+                    | crate::sql::WindowFunction::Rank
+                    | crate::sql::WindowFunction::DenseRank
+                    | crate::sql::WindowFunction::Ntile(_)
+                    | crate::sql::WindowFunction::PercentRank
+                    | crate::sql::WindowFunction::CumeDist => {}
                 }
                 check_many(&expression.partition_by)?;
                 for order in &expression.order_by {

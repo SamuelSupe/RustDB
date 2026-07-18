@@ -300,9 +300,14 @@ fn predicate_value(value: &ScalarValue) -> Option<PredicateValue> {
         }),
         ScalarValue::Date32(value) => Some(PredicateValue::Date32(*value)),
         ScalarValue::TimestampMicrosecond(value) => Some(PredicateValue::TimestampMicros(*value)),
-        ScalarValue::DayInterval(_) | ScalarValue::MonthInterval(_) => None,
+        ScalarValue::DayInterval(_)
+        | ScalarValue::MonthInterval(_)
+        | ScalarValue::MonthDayNanoInterval { .. } => None,
         ScalarValue::Utf8(value) => Some(PredicateValue::Utf8(value.clone())),
-        ScalarValue::Binary(_) => None,
+        ScalarValue::Binary(_)
+        | ScalarValue::Timestamp { .. }
+        | ScalarValue::Time { .. }
+        | ScalarValue::Uuid(_) => None,
     }
 }
 

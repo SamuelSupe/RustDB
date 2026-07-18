@@ -119,8 +119,24 @@ pub(super) enum SharedLoadError {
     InvalidArgument(String),
     Unsupported(String),
     ResourceExhausted(String),
+    NativeDiskQuotaExceeded {
+        path: PathBuf,
+        table: Option<String>,
+        current_bytes: u64,
+        added_bytes: u64,
+        peak_bytes: u64,
+        limit_bytes: u64,
+    },
     Cancelled,
     Catalog(String),
+    TransactionClosed {
+        transaction_id: String,
+        state: &'static str,
+    },
+    TransactionConflict {
+        transaction_id: String,
+        message: String,
+    },
     NativeStorage {
         path: PathBuf,
         message: String,
@@ -134,6 +150,10 @@ pub(super) enum SharedLoadError {
         path: PathBuf,
         transaction_id: String,
         generation: u64,
+        message: String,
+    },
+    CopyPostCommitFailure {
+        path: PathBuf,
         message: String,
     },
     Execution(String),
@@ -155,8 +175,37 @@ impl SharedLoadError {
             Error::InvalidArgument(message) => Self::InvalidArgument(message.clone()),
             Error::Unsupported(message) => Self::Unsupported(message.clone()),
             Error::ResourceExhausted(message) => Self::ResourceExhausted(message.clone()),
+            Error::NativeDiskQuotaExceeded {
+                path,
+                table,
+                current_bytes,
+                added_bytes,
+                peak_bytes,
+                limit_bytes,
+            } => Self::NativeDiskQuotaExceeded {
+                path: path.clone(),
+                table: table.clone(),
+                current_bytes: *current_bytes,
+                added_bytes: *added_bytes,
+                peak_bytes: *peak_bytes,
+                limit_bytes: *limit_bytes,
+            },
             Error::Cancelled => Self::Cancelled,
             Error::Catalog(message) => Self::Catalog(message.clone()),
+            Error::TransactionClosed {
+                transaction_id,
+                state,
+            } => Self::TransactionClosed {
+                transaction_id: transaction_id.clone(),
+                state,
+            },
+            Error::TransactionConflict {
+                transaction_id,
+                message,
+            } => Self::TransactionConflict {
+                transaction_id: transaction_id.clone(),
+                message: message.clone(),
+            },
             Error::NativeStorage { path, message } => Self::NativeStorage {
                 path: path.clone(),
                 message: message.clone(),
@@ -179,6 +228,10 @@ impl SharedLoadError {
                 path: path.clone(),
                 transaction_id: transaction_id.clone(),
                 generation: *generation,
+                message: message.clone(),
+            },
+            Error::CopyPostCommitFailure { path, message } => Self::CopyPostCommitFailure {
+                path: path.clone(),
                 message: message.clone(),
             },
             Error::Execution(message) => Self::Execution(message.clone()),
@@ -210,8 +263,37 @@ impl SharedLoadError {
             Self::InvalidArgument(message) => Error::InvalidArgument(message),
             Self::Unsupported(message) => Error::Unsupported(message),
             Self::ResourceExhausted(message) => Error::ResourceExhausted(message),
+            Self::NativeDiskQuotaExceeded {
+                path,
+                table,
+                current_bytes,
+                added_bytes,
+                peak_bytes,
+                limit_bytes,
+            } => Error::NativeDiskQuotaExceeded {
+                path,
+                table,
+                current_bytes,
+                added_bytes,
+                peak_bytes,
+                limit_bytes,
+            },
             Self::Cancelled => Error::Cancelled,
             Self::Catalog(message) => Error::Catalog(message),
+            Self::TransactionClosed {
+                transaction_id,
+                state,
+            } => Error::TransactionClosed {
+                transaction_id,
+                state,
+            },
+            Self::TransactionConflict {
+                transaction_id,
+                message,
+            } => Error::TransactionConflict {
+                transaction_id,
+                message,
+            },
             Self::NativeStorage { path, message } => Error::NativeStorage { path, message },
             Self::CommitOutcomeUnknown {
                 path,
@@ -233,6 +315,9 @@ impl SharedLoadError {
                 generation,
                 message,
             },
+            Self::CopyPostCommitFailure { path, message } => {
+                Error::CopyPostCommitFailure { path, message }
+            }
             Self::Execution(message) => Error::Execution(message),
             Self::Internal(message) => Error::Internal(message),
         }

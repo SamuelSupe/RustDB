@@ -3,7 +3,8 @@
 [English](README.md)
 
 本发行包提供独立的 `rustdb` 命令，用于查询本地磁盘和 S3-compatible
-对象存储上的 CSV、Parquet 数据。查询引擎直接嵌入命令行程序，不需要启动服务端。
+对象存储上的 CSV、Parquet 数据，以及管理本地持久化 Native OLAP 数据库。查询引擎
+直接嵌入命令行程序，不需要启动服务端。
 
 ## 快速开始
 
@@ -12,6 +13,7 @@
 ```sh
 ./bin/rustdb --version
 ./bin/rustdb -c "SELECT count(*) FROM read_parquet('/data/*.parquet')"
+./bin/rustdb --database ./warehouse -c "CREATE TABLE events AS SELECT * FROM read_parquet('/data/events.parquet')"
 ```
 
 或者安装到系统：

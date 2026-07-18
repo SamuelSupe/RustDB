@@ -10,6 +10,18 @@ pub(crate) enum WindowFunction {
     Ntile(u64),
     PercentRank,
     CumeDist,
+    Lead {
+        expr: BoundExpr,
+        offset: u64,
+        default: BoundExpr,
+    },
+    Lag {
+        expr: BoundExpr,
+        offset: u64,
+        default: BoundExpr,
+    },
+    FirstValue(BoundExpr),
+    LastValue(BoundExpr),
     Aggregate(AggregateExpr),
 }
 
@@ -17,12 +29,15 @@ pub(crate) enum WindowFunction {
 pub(crate) enum WindowFrameUnits {
     Rows,
     Range,
+    Groups,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WindowFrameBound {
     UnboundedPreceding,
+    Preceding(u64),
     CurrentRow,
+    Following(u64),
     UnboundedFollowing,
 }
 
@@ -55,10 +70,26 @@ pub(crate) struct WindowExpr {
 
 impl WindowExpr {
     pub(crate) fn referenced_columns(&self, output: &mut Vec<usize>) {
-        if let WindowFunction::Aggregate(aggregate) = &self.function
-            && let Some(expression) = &aggregate.expr
-        {
-            expression.referenced_columns(output);
+        match &self.function {
+            WindowFunction::Aggregate(aggregate) => {
+                if let Some(expression) = &aggregate.expr {
+                    expression.referenced_columns(output);
+                }
+            }
+            WindowFunction::Lead { expr, default, .. }
+            | WindowFunction::Lag { expr, default, .. } => {
+                expr.referenced_columns(output);
+                default.referenced_columns(output);
+            }
+            WindowFunction::FirstValue(expr) | WindowFunction::LastValue(expr) => {
+                expr.referenced_columns(output);
+            }
+            WindowFunction::RowNumber
+            | WindowFunction::Rank
+            | WindowFunction::DenseRank
+            | WindowFunction::Ntile(_)
+            | WindowFunction::PercentRank
+            | WindowFunction::CumeDist => {}
         }
         for expression in &self.partition_by {
             expression.referenced_columns(output);

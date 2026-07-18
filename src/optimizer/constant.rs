@@ -78,10 +78,25 @@ pub(super) fn fold_plan(plan: &mut LogicalPlan) {
         } => {
             fold_plan(input);
             for expression in expressions {
-                if let crate::sql::WindowFunction::Aggregate(aggregate) = &mut expression.function
-                    && let Some(argument) = &mut aggregate.expr
-                {
-                    fold_expr(argument);
+                match &mut expression.function {
+                    crate::sql::WindowFunction::Aggregate(aggregate) => {
+                        if let Some(argument) = &mut aggregate.expr {
+                            fold_expr(argument);
+                        }
+                    }
+                    crate::sql::WindowFunction::Lead { expr, default, .. }
+                    | crate::sql::WindowFunction::Lag { expr, default, .. } => {
+                        fold_expr(expr);
+                        fold_expr(default);
+                    }
+                    crate::sql::WindowFunction::FirstValue(expr)
+                    | crate::sql::WindowFunction::LastValue(expr) => fold_expr(expr),
+                    crate::sql::WindowFunction::RowNumber
+                    | crate::sql::WindowFunction::Rank
+                    | crate::sql::WindowFunction::DenseRank
+                    | crate::sql::WindowFunction::Ntile(_)
+                    | crate::sql::WindowFunction::PercentRank
+                    | crate::sql::WindowFunction::CumeDist => {}
                 }
                 expression.partition_by.iter_mut().for_each(fold_expr);
                 for order in &mut expression.order_by {
@@ -521,6 +536,18 @@ fn equal(left: &ScalarValue, right: &ScalarValue) -> Option<bool> {
         }
         (ScalarValue::DayInterval(left), ScalarValue::DayInterval(right)) => left == right,
         (ScalarValue::MonthInterval(left), ScalarValue::MonthInterval(right)) => left == right,
+        (
+            ScalarValue::MonthDayNanoInterval {
+                months: left_months,
+                days: left_days,
+                nanoseconds: left_nanos,
+            },
+            ScalarValue::MonthDayNanoInterval {
+                months: right_months,
+                days: right_days,
+                nanoseconds: right_nanos,
+            },
+        ) => (left_months, left_days, left_nanos) == (right_months, right_days, right_nanos),
         (ScalarValue::Utf8(left), ScalarValue::Utf8(right)) => left == right,
         _ => return None,
     })
@@ -546,6 +573,22 @@ fn compare(left: &ScalarValue, right: &ScalarValue) -> Option<Ordering> {
         (ScalarValue::MonthInterval(left), ScalarValue::MonthInterval(right)) => {
             left.partial_cmp(right)
         }
+        (
+            ScalarValue::MonthDayNanoInterval {
+                months: left_months,
+                days: left_days,
+                nanoseconds: left_nanos,
+            },
+            ScalarValue::MonthDayNanoInterval {
+                months: right_months,
+                days: right_days,
+                nanoseconds: right_nanos,
+            },
+        ) => (left_months, left_days, left_nanos).partial_cmp(&(
+            right_months,
+            right_days,
+            right_nanos,
+        )),
         (ScalarValue::Utf8(left), ScalarValue::Utf8(right)) => left.partial_cmp(right),
         _ => None,
     }

@@ -6,15 +6,17 @@ use std::{
 
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, DictionaryArray, Float16Array,
-        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        LargeBinaryArray, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array, new_null_array,
+        Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, DictionaryArray,
+        FixedSizeBinaryArray, FixedSizeBinaryBuilder, Float16Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray,
+        IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray, LargeStringArray,
+        StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
     },
     compute::cast,
     datatypes::{
-        ArrowDictionaryKeyType, DataType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type,
-        UInt16Type, UInt32Type, UInt64Type,
+        ArrowDictionaryKeyType, DataType, Int8Type, Int16Type, Int32Type, Int64Type,
+        IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, UInt8Type, UInt16Type,
+        UInt32Type, UInt64Type,
     },
 };
 
@@ -32,6 +34,9 @@ pub(crate) enum CellValue {
     Utf8(String),
     Binary(Vec<u8>),
     Decimal128(i128),
+    IntervalYearMonth(i32),
+    IntervalDayTime(i32, i32),
+    IntervalMonthDayNano(i32, i32, i64),
 }
 
 impl CellValue {
@@ -51,6 +56,12 @@ impl CellValue {
     }
 
     pub fn compare(&self, other: &Self) -> Result<Ordering> {
+        if let (Some(left), Some(right)) = (
+            interval_comparison_nanos(self),
+            interval_comparison_nanos(other),
+        ) {
+            return Ok(left.cmp(&right));
+        }
         match (self, other) {
             (Self::Boolean(left), Self::Boolean(right)) => Ok(left.cmp(right)),
             (Self::Int64(left), Self::Int64(right)) => Ok(left.cmp(right)),
@@ -71,6 +82,12 @@ impl CellValue {
 
 impl PartialEq for CellValue {
     fn eq(&self, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (
+            interval_comparison_nanos(self),
+            interval_comparison_nanos(other),
+        ) {
+            return left == right;
+        }
         match (self, other) {
             (Self::Null, Self::Null) => true,
             (Self::Boolean(left), Self::Boolean(right)) => left == right,
@@ -91,6 +108,12 @@ impl Eq for CellValue {}
 
 impl Hash for CellValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        if let Some(value) = interval_comparison_nanos(self) {
+            // All physical interval families share one SQL equality domain.
+            b"rustdb-interval".hash(state);
+            value.hash(state);
+            return;
+        }
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Null => {}
@@ -101,7 +124,28 @@ impl Hash for CellValue {
             Self::Utf8(value) => value.hash(state),
             Self::Binary(value) => value.hash(state),
             Self::Decimal128(value) => value.hash(state),
+            Self::IntervalYearMonth(_)
+            | Self::IntervalDayTime(_, _)
+            | Self::IntervalMonthDayNano(_, _, _) => unreachable!("interval hash returned early"),
         }
+    }
+}
+
+const NANOS_PER_DAY: i128 = 86_400_000_000_000;
+const NANOS_PER_MONTH: i128 = 30 * NANOS_PER_DAY;
+
+pub(crate) fn interval_comparison_nanos(value: &CellValue) -> Option<i128> {
+    match value {
+        CellValue::IntervalYearMonth(months) => Some(i128::from(*months) * NANOS_PER_MONTH),
+        CellValue::IntervalDayTime(days, millis) => {
+            Some(i128::from(*days) * NANOS_PER_DAY + i128::from(*millis) * 1_000_000)
+        }
+        CellValue::IntervalMonthDayNano(months, days, nanos) => Some(
+            i128::from(*months) * NANOS_PER_MONTH
+                + i128::from(*days) * NANOS_PER_DAY
+                + i128::from(*nanos),
+        ),
+        _ => None,
     }
 }
 
@@ -144,8 +188,25 @@ pub(crate) fn cell(array: &ArrayRef, row: usize) -> Result<CellValue> {
         DataType::LargeBinary => {
             CellValue::Binary(downcast::<LargeBinaryArray>(array)?.value(row).to_vec())
         }
+        DataType::FixedSizeBinary(_) => {
+            CellValue::Binary(downcast::<FixedSizeBinaryArray>(array)?.value(row).to_vec())
+        }
         DataType::Decimal128(_, _) => {
             CellValue::Decimal128(downcast::<Decimal128Array>(array)?.value(row))
+        }
+        DataType::Interval(IntervalUnit::YearMonth) => {
+            CellValue::IntervalYearMonth(downcast::<IntervalYearMonthArray>(array)?.value(row))
+        }
+        DataType::Interval(IntervalUnit::DayTime) => {
+            let (days, millis) =
+                IntervalDayTimeType::to_parts(downcast::<IntervalDayTimeArray>(array)?.value(row));
+            CellValue::IntervalDayTime(days, millis)
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(
+                downcast::<IntervalMonthDayNanoArray>(array)?.value(row),
+            );
+            CellValue::IntervalMonthDayNano(months, days, nanos)
         }
         DataType::Dictionary(key, _) => match key.as_ref() {
             DataType::Int8 => dictionary_cell::<Int8Type>(array, row)?,
@@ -180,6 +241,23 @@ fn dictionary_cell<K: ArrowDictionaryKeyType>(array: &ArrayRef, row: usize) -> R
 }
 
 pub(crate) fn canonicalize_sort_key(array: ArrayRef) -> Result<ArrayRef> {
+    if matches!(array.data_type(), DataType::Interval(_)) {
+        let values = (0..array.len())
+            .map(|row| {
+                if array.is_null(row) {
+                    return Ok(None);
+                }
+                interval_comparison_nanos(&cell(&array, row)?)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        Error::Internal("interval key did not decode as an interval".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Arc::new(
+            Decimal128Array::from(values).with_precision_and_scale(38, 0)?,
+        ));
+    }
     if !matches!(
         array.data_type(),
         DataType::Float16 | DataType::Float32 | DataType::Float64
@@ -195,6 +273,14 @@ pub(crate) fn canonicalize_sort_key(array: ArrayRef) -> Result<ArrayRef> {
         })
         .collect::<Result<Vec<_>>>()?;
     values_to_array(&values, array.data_type())
+}
+
+pub(crate) fn canonical_sort_key_type(data_type: &DataType) -> DataType {
+    if matches!(data_type, DataType::Interval(_)) {
+        DataType::Decimal128(38, 0)
+    } else {
+        data_type.clone()
+    }
 }
 
 pub(crate) fn values_to_array(values: &[CellValue], data_type: &DataType) -> Result<ArrayRef> {
@@ -275,6 +361,17 @@ pub(crate) fn values_to_array(values: &[CellValue], data_type: &DataType) -> Res
                 })
                 .collect::<Result<Vec<_>>>()?,
         )),
+        DataType::FixedSizeBinary(width) => {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), *width);
+            for value in values {
+                match value {
+                    CellValue::Null => builder.append_null(),
+                    CellValue::Binary(value) => builder.append_value(value)?,
+                    other => return Err(type_error(data_type, other)),
+                }
+            }
+            Arc::new(builder.finish())
+        }
         DataType::Decimal128(precision, scale) => {
             let array = Decimal128Array::from(
                 values
@@ -288,6 +385,42 @@ pub(crate) fn values_to_array(values: &[CellValue], data_type: &DataType) -> Res
             )
             .with_precision_and_scale(*precision, *scale)?;
             Arc::new(array)
+        }
+        DataType::Interval(IntervalUnit::YearMonth) => Arc::new(IntervalYearMonthArray::from(
+            values
+                .iter()
+                .map(|value| match value {
+                    CellValue::Null => Ok(None),
+                    CellValue::IntervalYearMonth(value) => Ok(Some(*value)),
+                    other => Err(type_error(data_type, other)),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        DataType::Interval(IntervalUnit::DayTime) => Arc::new(IntervalDayTimeArray::from(
+            values
+                .iter()
+                .map(|value| match value {
+                    CellValue::Null => Ok(None),
+                    CellValue::IntervalDayTime(days, millis) => {
+                        Ok(Some(IntervalDayTimeType::make_value(*days, *millis)))
+                    }
+                    other => Err(type_error(data_type, other)),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            Arc::new(IntervalMonthDayNanoArray::from(
+                values
+                    .iter()
+                    .map(|value| match value {
+                        CellValue::Null => Ok(None),
+                        CellValue::IntervalMonthDayNano(months, days, nanos) => Ok(Some(
+                            IntervalMonthDayNanoType::make_value(*months, *days, *nanos),
+                        )),
+                        other => Err(type_error(data_type, other)),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ))
         }
         other => {
             return Err(Error::Unsupported(format!(

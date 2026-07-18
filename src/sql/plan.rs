@@ -59,6 +59,11 @@ impl PlanSchema {
         self.qualifiers[index].as_deref()
     }
 
+    pub(crate) fn qualifier_matches(&self, index: usize, requested: &str) -> bool {
+        self.qualifier(index)
+            .is_some_and(|stored| crate::catalog_name::qualifier_matches(stored, requested))
+    }
+
     pub(crate) fn is_visible(&self, index: usize) -> bool {
         self.visible[index]
     }

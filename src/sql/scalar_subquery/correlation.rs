@@ -94,10 +94,27 @@ fn collect_outer_refs(plan: &LogicalPlan, output: &mut Vec<(u8, usize)>) {
             input, expressions, ..
         } => {
             for expression in expressions {
-                if let crate::sql::WindowFunction::Aggregate(aggregate) = &expression.function
-                    && let Some(argument) = &aggregate.expr
-                {
-                    argument.outer_references(output);
+                match &expression.function {
+                    crate::sql::WindowFunction::Aggregate(aggregate) => {
+                        if let Some(argument) = &aggregate.expr {
+                            argument.outer_references(output);
+                        }
+                    }
+                    crate::sql::WindowFunction::Lead { expr, default, .. }
+                    | crate::sql::WindowFunction::Lag { expr, default, .. } => {
+                        expr.outer_references(output);
+                        default.outer_references(output);
+                    }
+                    crate::sql::WindowFunction::FirstValue(expr)
+                    | crate::sql::WindowFunction::LastValue(expr) => {
+                        expr.outer_references(output);
+                    }
+                    crate::sql::WindowFunction::RowNumber
+                    | crate::sql::WindowFunction::Rank
+                    | crate::sql::WindowFunction::DenseRank
+                    | crate::sql::WindowFunction::Ntile(_)
+                    | crate::sql::WindowFunction::PercentRank
+                    | crate::sql::WindowFunction::CumeDist => {}
                 }
                 for partition in &expression.partition_by {
                     partition.outer_references(output);

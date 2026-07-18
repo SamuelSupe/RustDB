@@ -127,10 +127,27 @@ pub(super) fn remap_outer_plan(plan: &mut LogicalPlan, mapping: &[(usize, usize)
             input, expressions, ..
         } => {
             for expression in expressions {
-                if let crate::sql::WindowFunction::Aggregate(aggregate) = &mut expression.function
-                    && let Some(argument) = &mut aggregate.expr
-                {
-                    remap_outer_expr(argument, mapping)?;
+                match &mut expression.function {
+                    crate::sql::WindowFunction::Aggregate(aggregate) => {
+                        if let Some(argument) = &mut aggregate.expr {
+                            remap_outer_expr(argument, mapping)?;
+                        }
+                    }
+                    crate::sql::WindowFunction::Lead { expr, default, .. }
+                    | crate::sql::WindowFunction::Lag { expr, default, .. } => {
+                        remap_outer_expr(expr, mapping)?;
+                        remap_outer_expr(default, mapping)?;
+                    }
+                    crate::sql::WindowFunction::FirstValue(expr)
+                    | crate::sql::WindowFunction::LastValue(expr) => {
+                        remap_outer_expr(expr, mapping)?;
+                    }
+                    crate::sql::WindowFunction::RowNumber
+                    | crate::sql::WindowFunction::Rank
+                    | crate::sql::WindowFunction::DenseRank
+                    | crate::sql::WindowFunction::Ntile(_)
+                    | crate::sql::WindowFunction::PercentRank
+                    | crate::sql::WindowFunction::CumeDist => {}
                 }
                 for partition in &mut expression.partition_by {
                     remap_outer_expr(partition, mapping)?;

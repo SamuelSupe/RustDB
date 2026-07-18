@@ -1,15 +1,15 @@
 # RustDB v0.6-v0.7 Development Goals
 
-Status: v0.6 foundation implemented; v0.7 active
+Status: completed historical roadmap; superseded by v0.8
 Baseline date: 2026-07-15
 
-## Current delivery goal
+## Delivered goal
 
-The active delivery goal is `v0.7.0-alpha.1`. It preserves the v0.6 Native
+The delivered goal was `v0.7.0-alpha.1`. It preserves the v0.6 Native
 storage and reliability foundation while completing the vector execution,
 global scheduling, and memory-efficiency work below.
 
-The current release acceptance target is functionality-first: run all 43
+The release acceptance target was functionality-first: run all 43
 ClickBench queries once on ClickHouse's official one-million-row Parquet
 partition in a 4-CPU, 16-GiB OrbStack container. RustDB receives a 12-GiB
 engine budget. Every result is fully consumed and checksummed, and all terminal
@@ -29,7 +29,7 @@ The next two versions prioritize storage layout, cost-based planning, vectorized
 
 ## v0.7 functional acceptance contract
 
-The active v0.7 workload is one complete ClickBench pass:
+The delivered v0.7 workload was one complete ClickBench pass:
 
 - Use the official 43-query SQL file without dropping unsupported queries.
 - Use the official one-million-row Parquet partition for the routine functional

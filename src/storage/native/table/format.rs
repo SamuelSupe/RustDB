@@ -3,15 +3,23 @@ use serde::{Deserialize, Serialize};
 use super::{NativeSegment, SnapshotOperation};
 use crate::storage::native::manifest::TableReference;
 
-pub(super) const FORMAT_VERSION: u32 = 2;
-const LEGACY_FORMAT_VERSION: u32 = 1;
+pub(super) const FORMAT_VERSION: u32 = 3;
+const LEGACY_FORMAT_VERSION_V1: u32 = 1;
+const LEGACY_FORMAT_VERSION_V2: u32 = 2;
 pub(super) const SCHEMA_ENCODING: &str = "arrow-ipc-flatbuffer-hex-v1";
 
 pub(super) fn supported_format_version(version: u32) -> bool {
-    matches!(version, LEGACY_FORMAT_VERSION | FORMAT_VERSION)
+    matches!(
+        version,
+        LEGACY_FORMAT_VERSION_V1 | LEGACY_FORMAT_VERSION_V2 | FORMAT_VERSION
+    )
 }
 
 pub(super) fn supports_predicate_sidecars(version: u32) -> bool {
+    matches!(version, LEGACY_FORMAT_VERSION_V2 | FORMAT_VERSION)
+}
+
+pub(super) fn supports_delete_vectors(version: u32) -> bool {
     version == FORMAT_VERSION
 }
 
@@ -36,8 +44,16 @@ pub(super) struct TableManifest {
     pub(super) schema: StoredSchema,
     pub(super) source_bytes: u64,
     pub(super) row_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) deleted_row_count: u64,
     pub(super) segment_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) delete_vector_bytes: u64,
     pub(super) segments: Vec<NativeSegment>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Deserialize, Serialize)]

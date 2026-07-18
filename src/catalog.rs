@@ -1,6 +1,9 @@
 mod persistent;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use parking_lot::RwLock;
 
@@ -32,9 +35,15 @@ impl TableEntry {
 }
 
 #[derive(Clone, Default)]
+struct LocalCatalogState {
+    tables: HashMap<String, TableEntry>,
+    views: HashMap<String, String>,
+    hidden_persistent: HashSet<String>,
+}
+
+#[derive(Clone, Default)]
 pub struct Catalog {
-    tables: Arc<RwLock<HashMap<String, TableEntry>>>,
-    views: Arc<RwLock<HashMap<String, String>>>,
+    local: Arc<RwLock<LocalCatalogState>>,
     persistent: Option<PersistentCatalog>,
     pinned: Option<PersistentCatalogSnapshot>,
 }
@@ -53,14 +62,14 @@ impl Catalog {
     /// cannot observe a concurrent registration or view replacement.
     #[must_use]
     pub(crate) fn pin(&self) -> Self {
-        if self.pinned.is_some() {
-            return self.clone();
-        }
+        let local = self.local.read().clone();
         Self {
-            tables: Arc::new(RwLock::new(self.tables.read().clone())),
-            views: Arc::new(RwLock::new(self.views.read().clone())),
+            local: Arc::new(RwLock::new(local)),
             persistent: self.persistent.clone(),
-            pinned: self.persistent.as_ref().map(PersistentCatalog::snapshot),
+            pinned: self
+                .pinned
+                .clone()
+                .or_else(|| self.persistent.as_ref().map(PersistentCatalog::snapshot)),
         }
     }
 
@@ -71,37 +80,56 @@ impl Catalog {
 
     pub fn register(&self, entry: TableEntry) -> Result<()> {
         let key = normalize(entry.name());
-        let mut tables = self.tables.write();
-        let mut views = self.views.write();
-        tables.insert(key.clone(), entry);
-        views.remove(&key);
+        let mut local = self.local.write();
+        local.tables.insert(key.clone(), entry);
+        local.views.remove(&key);
+        local.hidden_persistent.remove(&key);
         Ok(())
     }
 
     pub fn unregister(&self, name: &str) -> Option<TableEntry> {
         let key = normalize(name);
-        let mut tables = self.tables.write();
-        let mut views = self.views.write();
-        let entry = tables.remove(&key);
-        views.remove(&key);
+        let mut local = self.local.write();
+        let entry = local.tables.remove(&key);
+        local.views.remove(&key);
         entry
     }
 
     pub fn table(&self, name: &str) -> Option<TableEntry> {
         let key = normalize(name);
-        self.tables.read().get(&key).cloned().or_else(|| {
+        let local = self.local.read();
+        local.tables.get(&key).cloned().or_else(|| {
+            if local.hidden_persistent.contains(&key) {
+                return None;
+            }
             self.persistent_snapshot()
                 .and_then(|snapshot| snapshot.table(&key))
         })
     }
 
     pub(crate) fn local_table(&self, name: &str) -> Option<TableEntry> {
-        self.tables.read().get(&normalize(name)).cloned()
+        self.local.read().tables.get(&normalize(name)).cloned()
     }
 
     pub(crate) fn persistent_table(&self, name: &str) -> Option<TableEntry> {
+        if self
+            .local
+            .read()
+            .hidden_persistent
+            .contains(&normalize(name))
+        {
+            return None;
+        }
         self.persistent_snapshot()
             .and_then(|snapshot| snapshot.table(&normalize(name)))
+    }
+
+    pub(crate) fn hide_persistent(&self, name: &str) {
+        let key = normalize(name);
+        let mut local = self.local.write();
+        local.tables.remove(&key);
+        local.views.remove(&key);
+        local.hidden_persistent.insert(key);
     }
 
     pub(crate) fn replace_provider(
@@ -111,8 +139,9 @@ impl Catalog {
         replacement: Arc<dyn TableProvider>,
     ) -> Result<()> {
         let key = normalize(name);
-        let mut tables = self.tables.write();
-        let entry = tables
+        let mut local = self.local.write();
+        let entry = local
+            .tables
             .get_mut(&key)
             .ok_or_else(|| crate::Error::Catalog(format!("table '{name}' does not exist")))?;
         if !Arc::ptr_eq(entry.provider(), expected) {
@@ -126,16 +155,18 @@ impl Catalog {
 
     pub fn table_names(&self) -> Vec<String> {
         let mut visible = HashMap::new();
+        let local = self.local.read();
         if let Some(snapshot) = self.persistent_snapshot() {
             visible.extend(
                 snapshot
                     .entries()
+                    .filter(|entry| !local.hidden_persistent.contains(&normalize(entry.name())))
                     .map(|entry| (normalize(entry.name()), entry.name().to_owned())),
             );
         }
         visible.extend(
-            self.tables
-                .read()
+            local
+                .tables
                 .values()
                 .map(|entry| (normalize(entry.name()), entry.name().to_owned())),
         );
@@ -151,10 +182,9 @@ impl Catalog {
         replace: bool,
     ) -> Result<()> {
         let key = normalize(entry.name());
-        let mut tables = self.tables.write();
-        let mut views = self.views.write();
-        let table_exists = tables.contains_key(&key);
-        let view_exists = views.contains_key(&key);
+        let mut local = self.local.write();
+        let table_exists = local.tables.contains_key(&key);
+        let view_exists = local.views.contains_key(&key);
         if table_exists && !view_exists {
             return Err(crate::Error::Catalog(format!(
                 "cannot replace table '{}' with a view",
@@ -167,25 +197,28 @@ impl Catalog {
                 entry.name()
             )));
         }
-        tables.insert(key.clone(), entry);
-        views.insert(key, sql.into());
+        local.tables.insert(key.clone(), entry);
+        local.views.insert(key, sql.into());
         Ok(())
     }
 
     pub fn drop_view(&self, name: &str) -> bool {
         let key = normalize(name);
-        let mut tables = self.tables.write();
-        let mut views = self.views.write();
-        if views.remove(&key).is_none() {
+        let mut local = self.local.write();
+        if local.views.remove(&key).is_none() {
             return false;
         }
-        tables.remove(&key);
+        local.tables.remove(&key);
         true
     }
 
     #[cfg(test)]
     pub fn is_view(&self, name: &str) -> bool {
-        self.views.read().contains_key(&normalize(name))
+        self.local.read().views.contains_key(&normalize(name))
+    }
+
+    pub(crate) fn is_local_view(&self, name: &str) -> bool {
+        self.local.read().views.contains_key(&normalize(name))
     }
 
     fn persistent_snapshot(&self) -> Option<PersistentCatalogSnapshot> {

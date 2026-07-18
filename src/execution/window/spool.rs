@@ -182,5 +182,6 @@ pub(super) fn aggregate_inputs(
 }
 
 pub(super) fn is_whole(expression: &WindowExpr) -> bool {
-    expression.frame.end == WindowFrameBound::UnboundedFollowing
+    expression.frame.start == WindowFrameBound::UnboundedPreceding
+        && expression.frame.end == WindowFrameBound::UnboundedFollowing
 }

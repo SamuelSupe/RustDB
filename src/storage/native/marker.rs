@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-use super::{DATABASE_FORMAT_VERSION, FORMAT_NAME, io};
+use super::{DATABASE_FORMAT_VERSION, FORMAT_NAME, LEGACY_DATABASE_FORMAT_VERSION, io};
 
 pub(super) const MAX_DATABASE_MARKER_BYTES: usize = 4 * 1024;
 
@@ -33,6 +33,26 @@ impl DatabaseMarker {
     pub(super) fn database_id(&self) -> &str {
         &self.database_id
     }
+
+    pub(super) fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub(super) fn uses_wal(&self) -> bool {
+        self.version == DATABASE_FORMAT_VERSION
+    }
+
+    pub(super) fn is_legacy(&self) -> bool {
+        self.version == LEGACY_DATABASE_FORMAT_VERSION
+    }
+
+    fn upgraded(&self) -> Self {
+        Self {
+            format: self.format.clone(),
+            version: DATABASE_FORMAT_VERSION,
+            database_id: self.database_id.clone(),
+        }
+    }
 }
 
 pub(super) fn read(path: &Path) -> Result<DatabaseMarker> {
@@ -45,6 +65,23 @@ pub(super) fn read(path: &Path) -> Result<DatabaseMarker> {
 }
 
 pub(super) fn write_new(path: &Path, marker: &DatabaseMarker) -> Result<()> {
+    let bytes = encode(path, marker)?;
+    io::atomic_create(path, &bytes)
+}
+
+pub(super) fn upgrade_legacy(path: &Path, transaction_id: &str) -> Result<()> {
+    let marker = read(path)?;
+    if !marker.is_legacy() {
+        return Err(Error::InvalidArgument(
+            "database marker is not a legacy v0.7 format".to_owned(),
+        ));
+    }
+    let upgraded = marker.upgraded();
+    let bytes = encode(path, &upgraded)?;
+    io::atomic_replace(path, &bytes, transaction_id)
+}
+
+fn encode(path: &Path, marker: &DatabaseMarker) -> Result<Vec<u8>> {
     let bytes = io::encode_json_bounded(
         path,
         marker,
@@ -53,7 +90,7 @@ pub(super) fn write_new(path: &Path, marker: &DatabaseMarker) -> Result<()> {
         true,
         true,
     )?;
-    io::atomic_create(path, &bytes)
+    Ok(bytes)
 }
 
 fn validate(path: &Path, marker: &DatabaseMarker) -> Result<()> {
@@ -63,12 +100,15 @@ fn validate(path: &Path, marker: &DatabaseMarker) -> Result<()> {
             format!("expected format '{FORMAT_NAME}', found '{}'", marker.format),
         ));
     }
-    if marker.version != DATABASE_FORMAT_VERSION {
+    if !matches!(
+        marker.version,
+        LEGACY_DATABASE_FORMAT_VERSION | DATABASE_FORMAT_VERSION
+    ) {
         return Err(Error::native_storage(
             path,
             format!(
-                "unsupported database format version {}; expected {DATABASE_FORMAT_VERSION}",
-                marker.version
+                "unsupported database format version {}; supported versions are {LEGACY_DATABASE_FORMAT_VERSION} and {DATABASE_FORMAT_VERSION}",
+                marker.version,
             ),
         ));
     }

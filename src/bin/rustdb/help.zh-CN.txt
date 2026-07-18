@@ -1,6 +1,6 @@
 RustDB - 查询本地磁盘和 S3/MinIO 上的 CSV、Parquet 与 Native 数据
 
-使用方法：rustdb [选项]
+使用方法：rustdb [选项] [命令]
 
 不指定 -c 或 -f 时启动交互终端。SQL 语句必须以分号结束。
 
@@ -10,6 +10,19 @@ RustDB - 查询本地磁盘和 S3/MinIO 上的 CSV、Parquet 与 Native 数据
       --format <table|csv|jsonl>      输出格式，默认 table
       --csv-null <文本>               CSV 输出中的 NULL 文本，默认空字段
       --metrics                       查询结束后输出执行指标
+
+Native 数据库：
+      --database <路径>               打开本地持久化 Native 数据库
+      --native-engine-limit <大小>    完整 Native 数据库目录硬配额
+      --native-default-table-limit <大小>
+                                      单张 Native 表的默认硬配额
+      --native-table-limit <表=大小>  单表硬配额，可重复；支持 schema.table
+  migrate <路径>                      显式迁移 v0.7 数据库，并保留安全备份
+  backup <数据库> <目标>              备份到本地目录或 s3:// 前缀
+  restore <备份> <新数据库>           从本地目录或 s3:// 前缀恢复
+
+v0.8 Native 数据库使用校验和 WAL 和快照隔离事务。SQL 支持 BEGIN、COMMIT、
+ROLLBACK；提交前必须消费完或丢弃事务内的所有流式结果。
 
 执行资源：
       --memory-limit <大小>           查询内存上限，例如 512MiB、2GiB
@@ -57,6 +70,14 @@ S3/MinIO：
 示例：
   rustdb -c "SELECT count(*) FROM read_parquet('/data/*.parquet')"
   rustdb -f query.sql --format csv --memory-limit 2GiB --threads 4
+  rustdb --database ./warehouse -c "BEGIN READ ONLY; SELECT count(*) FROM events; COMMIT"
+  rustdb --database ./warehouse --native-engine-limit 20GiB \
+    --native-default-table-limit 5GiB --native-table-limit events=10GiB \
+    -c "SELECT count(*) FROM events"
+  rustdb migrate ./warehouse
+  rustdb backup ./warehouse ./warehouse-backup
+  rustdb --s3-region us-east-1 backup ./warehouse s3://bucket/rustdb/snapshot
+  rustdb restore ./warehouse-backup ./warehouse-restored
   rustdb --s3-region us-east-1 -c \
     "SELECT * FROM read_parquet('s3://bucket/events/*.parquet') LIMIT 10"
 

@@ -79,8 +79,12 @@ fn direct_literal(expression: &BoundExpr) -> Option<PredicateValue> {
         | ScalarValue::Float64(_)
         | ScalarValue::DayInterval(_)
         | ScalarValue::MonthInterval(_)
+        | ScalarValue::MonthDayNanoInterval { .. }
         | ScalarValue::Utf8(_)
-        | ScalarValue::Binary(_) => None,
+        | ScalarValue::Binary(_)
+        | ScalarValue::Timestamp { .. }
+        | ScalarValue::Time { .. }
+        | ScalarValue::Uuid(_) => None,
     }
 }
 

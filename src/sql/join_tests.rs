@@ -12,6 +12,75 @@ use crate::{
 use super::{StatementPlan, plan_sql};
 
 #[test]
+fn resolves_schema_qualified_columns_and_wildcards_across_same_named_tables() {
+    let catalog = Catalog::default();
+    register_fields(
+        &catalog,
+        "analytics.events",
+        vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("metric", DataType::Int64, false),
+        ],
+    );
+    register_fields(
+        &catalog,
+        "sales.events",
+        vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ],
+    );
+    register_fields(
+        &catalog,
+        "events",
+        vec![Field::new("id", DataType::Int64, false)],
+    );
+
+    let StatementPlan::Query(plan) = plan_sql(
+        &catalog,
+        "SELECT analytics.events.*, sales.events.amount \
+         FROM analytics.events JOIN sales.events \
+         ON analytics.events.id = sales.events.id",
+    )
+    .unwrap() else {
+        panic!("expected query plan");
+    };
+    assert_eq!(plan.schema().arrow().fields().len(), 3);
+
+    let error = plan_sql(
+        &catalog,
+        "SELECT events.id FROM analytics.events JOIN sales.events \
+         ON analytics.events.id = sales.events.id",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("ambiguous"), "{error}");
+
+    assert!(
+        plan_sql(
+            &catalog,
+            "SELECT events.id FROM analytics.events WHERE events.id = 1",
+        )
+        .is_ok()
+    );
+    assert!(
+        plan_sql(
+            &catalog,
+            "SELECT a.id FROM analytics.events AS a WHERE a.id = 1",
+        )
+        .is_ok()
+    );
+    assert!(
+        plan_sql(
+            &catalog,
+            "SELECT analytics.events.id FROM analytics.events AS a"
+        )
+        .is_err()
+    );
+    assert!(plan_sql(&catalog, "SELECT main.events.id FROM events").is_ok());
+    assert!(plan_sql(&catalog, "SELECT main.events.* FROM events").is_ok());
+}
+
+#[test]
 fn using_preserves_side_types_and_selects_the_join_specific_merged_type() {
     let catalog = Catalog::default();
     register_schema(&catalog, "l", DataType::Int32);

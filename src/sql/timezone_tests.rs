@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, BooleanArray, TimestampMillisecondArray, TimestampSecondArray},
+    array::{Array, BooleanArray, StringArray, TimestampMillisecondArray, TimestampSecondArray},
     datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     record_batch::RecordBatch,
 };
@@ -76,30 +76,73 @@ async fn same_timezone_operations_preserve_zone_and_choose_finer_units() {
     assert_eq!(value(6), 1_712_674_800);
 }
 
-#[test]
-fn different_timezones_and_at_time_zone_are_rejected() {
+#[tokio::test]
+async fn zoned_comparison_literals_and_at_time_zone_use_iana_rules() {
     let catalog = timezone_catalog();
-    for (sql, expected) in [
-        (
-            "SELECT seconds = utc_millis FROM timezone_values",
-            "different timezones",
-        ),
-        (
-            "SELECT CASE WHEN true THEN seconds ELSE utc_millis END FROM timezone_values",
-            "incompatible types",
-        ),
-        (
-            "SELECT coalesce(seconds, utc_millis) FROM timezone_values",
-            "incompatible types",
-        ),
-        (
-            "SELECT seconds AT TIME ZONE 'UTC' FROM timezone_values",
-            "AT TIME ZONE is not supported",
-        ),
-    ] {
-        let error = plan_sql(&catalog, sql).unwrap_err().to_string();
-        assert!(error.contains(expected), "{sql}: {error}");
-    }
+    let batches = run(
+        &catalog,
+        "SELECT seconds = utc_millis, \
+         CAST(CASE WHEN true THEN seconds ELSE utc_millis END AS VARCHAR), \
+         CAST(TIMESTAMP '2024-03-10 01:30:00' AT TIME ZONE 'America/New_York' AS VARCHAR), \
+         CAST((TIMESTAMP '2024-03-10 01:30:00' AT TIME ZONE 'America/New_York') AT TIME ZONE 'UTC' AS VARCHAR), \
+         CAST(TIMESTAMPTZ '2024-03-10 01:30:00-05:00' AS VARCHAR), \
+         CAST(TIMESTAMPTZ '2024-03-10 01:30:00-05:00' AT TIME ZONE 'America/New_York' AS VARCHAR), \
+         CAST(TIMESTAMP '2024-11-03 01:30:00' AT TIME ZONE 'America/New_York' AS VARCHAR) \
+         FROM timezone_values",
+    )
+    .await;
+    let batch = &batches[0];
+    assert!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0)
+    );
+    let string = |column| {
+        batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_owned()
+    };
+    assert!(string(1).ends_with("+00:00"));
+    assert_eq!(string(2), "2024-03-10 01:30:00-05:00");
+    assert_eq!(string(3), "2024-03-10 06:30:00");
+    assert_eq!(string(4), "2024-03-10 06:30:00+00:00");
+    assert_eq!(string(5), "2024-03-10 01:30:00");
+    assert_eq!(string(6), "2024-11-03 01:30:00-05:00");
+
+    let plan = plan_sql(
+        &Catalog::default(),
+        "SELECT TIMESTAMP '2024-03-10 02:30:00' AT TIME ZONE 'America/New_York'",
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(1 << 20), temp.path()).unwrap();
+    let error = execute(plan, context)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("nonexistent local time"), "{error}");
+}
+
+async fn run(catalog: &Catalog, sql: &str) -> Vec<RecordBatch> {
+    let plan = plan_sql(catalog, sql).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(1 << 20), temp.path()).unwrap();
+    execute(plan, context)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap()
 }
 
 fn timezone_catalog() -> Catalog {

@@ -154,6 +154,16 @@ quota-accounted writer. Commit/load still rereads and verifies the completed
 file plus its Parquet footer and row count before Catalog visibility; the
 incremental digest removes only the earlier writer-side duplicate reread.
 
+`NativeStorageConfig` optionally applies hard engine and table quotas. A
+prepared snapshot is checked before its staging directory is published, and a
+transaction is checked again with all of its table writes aggregated before
+the durable WAL/Catalog boundary. The engine limit measures the complete
+Native root and reserves the next Catalog generation, WAL commit record, and
+`CURRENT` update. Table accounting deduplicates inherited directories and
+includes current, retired, staged, and published-but-uncommitted snapshots.
+These hard limits are independent of, and do not replace, the existing steady
+2x and write-peak 3x source-size governance.
+
 For a fixed multi-segment provider without LIMIT, scan planning concurrently
 preloads only the bounded prefix needed by the available I/O and compute lanes.
 The prefix is at most `min(file_count, io_concurrency, target_tasks)`. Footer
@@ -294,6 +304,15 @@ preserves an active directory even if its marker is older than the TTL; process
 exit releases the lock so a later Engine can reclaim the orphan. Unknown,
 unmarked, or invalidly marked directories are never treated as RustDB orphans.
 Valid legacy directories without `.rustdb-active` remain eligible for cleanup.
+
+Remote backup snapshots and restore downloads use separate strictly named
+`rustdb-remote-{backup|restore}-<uuid>` directories under the Spill root. Each
+directory is mode `0700` and has a mode-`0600`, versioned sibling owner marker
+whose content binds the operation kind and UUID; the live operation holds an
+exclusive lock on that marker. Engine startup, and remote-restore preflight,
+only reclaim an expired candidate after validating its name, directory type
+and permissions, marker type/permissions/content, and acquiring the lock.
+Unknown, forged, symlinked, fresh, or active paths are preserved.
 
 The configured limit is an engine reservation budget, not a process-RSS hard
 limit. Decoder credits and kernel workspace are conservative because exact

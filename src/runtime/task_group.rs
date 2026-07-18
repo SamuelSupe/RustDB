@@ -47,7 +47,7 @@ struct State {
     active: usize,
     first_failure: Option<TaskFailure>,
     reaper_started: bool,
-    reaper_cleanup: Option<ReaperCleanup>,
+    reaper_cleanups: Vec<ReaperCleanup>,
 }
 
 type ReaperCleanup = Box<dyn FnOnce() + Send + 'static>;
@@ -63,7 +63,23 @@ enum TaskFailure {
     InvalidArgument(String),
     Unsupported(String),
     ResourceExhausted(String),
+    NativeDiskQuotaExceeded {
+        path: PathBuf,
+        table: Option<String>,
+        current_bytes: u64,
+        added_bytes: u64,
+        peak_bytes: u64,
+        limit_bytes: u64,
+    },
     Catalog(String),
+    TransactionClosed {
+        transaction_id: String,
+        state: &'static str,
+    },
+    TransactionConflict {
+        transaction_id: String,
+        message: String,
+    },
     NativeStorage {
         path: PathBuf,
         message: String,
@@ -79,6 +95,10 @@ enum TaskFailure {
         generation: u64,
         message: String,
     },
+    CopyPostCommitFailure {
+        path: PathBuf,
+        message: String,
+    },
     Execution(String),
     Internal(String),
 }
@@ -92,7 +112,7 @@ impl TaskGroup {
                 active: 0,
                 first_failure: None,
                 reaper_started: false,
-                reaper_cleanup: None,
+                reaper_cleanups: Vec::new(),
             }),
             quiescent: Condvar::new(),
             notified: Notify::new(),
@@ -119,7 +139,35 @@ impl TaskGroup {
     where
         F: Future<Output = Result<()>> + Send + 'static,
     {
-        self.inner.start_task()?;
+        self.spawn_registered_on(handle, name, future, false)
+    }
+
+    /// Registers teardown created while a worker is unwinding. A closed group
+    /// accepts this only while another registered task is still active, so
+    /// cleanup cannot resurrect a query after it reached quiescence.
+    pub(crate) fn spawn_cleanup_on<F>(
+        &self,
+        handle: &Handle,
+        name: &'static str,
+        future: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.spawn_registered_on(handle, name, future, true)
+    }
+
+    fn spawn_registered_on<F>(
+        &self,
+        handle: &Handle,
+        name: &'static str,
+        future: F,
+        allow_during_unwind: bool,
+    ) -> Result<()>
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.inner.start_task(allow_during_unwind)?;
         let inner = Arc::clone(&self.inner);
         let active = ActiveTask {
             inner: Arc::clone(&inner),
@@ -193,7 +241,7 @@ impl TaskGroup {
     }
 
     /// Runs teardown away from `Drop`, after every registered task has
-    /// released its retained state. Only the first caller starts a reaper.
+    /// released its retained state. Multiple owners may enqueue cleanup.
     pub(crate) fn reap(&self, cleanup: impl FnOnce() + Send + 'static) {
         self.close();
         self.inner.queue_reaper(Box::new(cleanup));
@@ -237,9 +285,9 @@ impl ActiveTask {
 }
 
 impl Inner {
-    fn start_task(&self) -> Result<()> {
+    fn start_task(&self, allow_during_unwind: bool) -> Result<()> {
         let mut state = self.state.lock();
-        if !state.accepting {
+        if !state.accepting && !(allow_during_unwind && state.active != 0) {
             return Err(self.failure_locked(&state).unwrap_or(Error::Cancelled));
         }
         state.active = state.active.saturating_add(1);
@@ -297,15 +345,13 @@ impl Inner {
 
     fn queue_reaper(&self, cleanup: ReaperCleanup) {
         let mut state = self.state.lock();
-        if state.reaper_cleanup.is_none() {
-            state.reaper_cleanup = Some(cleanup);
-        }
+        state.reaper_cleanups.push(cleanup);
     }
 
     fn start_reaper(self: &Arc<Self>) {
         {
             let mut state = self.state.lock();
-            if state.reaper_started || state.reaper_cleanup.is_none() {
+            if state.reaper_started || state.reaper_cleanups.is_empty() {
                 return;
             }
             state.reaper_started = true;
@@ -324,33 +370,41 @@ impl Inner {
                 .spawn(move || worker_inner.run_reaper())
         };
         if let Err(error) = spawn {
-            let cleanup = {
+            let cleanups = {
                 let mut state = self.state.lock();
                 state.reaper_started = false;
-                (state.active == 0)
-                    .then(|| state.reaper_cleanup.take())
-                    .flatten()
+                if state.active == 0 {
+                    std::mem::take(&mut state.reaper_cleanups)
+                } else {
+                    Vec::new()
+                }
             };
             tracing::error!(%error, "failed to start query cleanup reaper");
             // Thread creation failure is exceptional. If no worker remains,
             // synchronous cleanup is the only leak-free fallback; otherwise
             // the last worker retries from `finish_task`.
-            if let Some(cleanup) = cleanup {
-                cleanup();
-            }
+            run_cleanups(cleanups);
         }
     }
 
     fn run_reaper(self: Arc<Self>) {
-        let cleanup = {
+        let cleanups = {
             let mut state = self.state.lock();
             while state.active != 0 {
                 self.quiescent.wait(&mut state);
             }
-            state.reaper_cleanup.take()
+            state.reaper_started = false;
+            std::mem::take(&mut state.reaper_cleanups)
         };
-        if let Some(cleanup) = cleanup {
-            cleanup();
+        run_cleanups(cleanups);
+        self.start_reaper();
+    }
+}
+
+fn run_cleanups(cleanups: Vec<ReaperCleanup>) {
+    for cleanup in cleanups {
+        if std::panic::catch_unwind(AssertUnwindSafe(cleanup)).is_err() {
+            tracing::error!("query cleanup callback panicked");
         }
     }
 }
@@ -362,7 +416,36 @@ impl TaskFailure {
             Error::InvalidArgument(message) => Self::InvalidArgument(message.clone()),
             Error::Unsupported(message) => Self::Unsupported(message.clone()),
             Error::ResourceExhausted(message) => Self::ResourceExhausted(message.clone()),
+            Error::NativeDiskQuotaExceeded {
+                path,
+                table,
+                current_bytes,
+                added_bytes,
+                peak_bytes,
+                limit_bytes,
+            } => Self::NativeDiskQuotaExceeded {
+                path: path.clone(),
+                table: table.clone(),
+                current_bytes: *current_bytes,
+                added_bytes: *added_bytes,
+                peak_bytes: *peak_bytes,
+                limit_bytes: *limit_bytes,
+            },
             Error::Catalog(message) => Self::Catalog(message.clone()),
+            Error::TransactionClosed {
+                transaction_id,
+                state,
+            } => Self::TransactionClosed {
+                transaction_id: transaction_id.clone(),
+                state,
+            },
+            Error::TransactionConflict {
+                transaction_id,
+                message,
+            } => Self::TransactionConflict {
+                transaction_id: transaction_id.clone(),
+                message: message.clone(),
+            },
             Error::NativeStorage { path, message } => Self::NativeStorage {
                 path: path.clone(),
                 message: message.clone(),
@@ -387,6 +470,10 @@ impl TaskFailure {
                 generation: *generation,
                 message: message.clone(),
             },
+            Error::CopyPostCommitFailure { path, message } => Self::CopyPostCommitFailure {
+                path: path.clone(),
+                message: message.clone(),
+            },
             Error::Execution(message) => Self::Execution(message.clone()),
             Error::Internal(message) => Self::Internal(message.clone()),
             // External error types are not Clone. Preserve their complete
@@ -405,7 +492,36 @@ impl TaskFailure {
             Self::InvalidArgument(message) => Error::InvalidArgument(message.clone()),
             Self::Unsupported(message) => Error::Unsupported(message.clone()),
             Self::ResourceExhausted(message) => Error::ResourceExhausted(message.clone()),
+            Self::NativeDiskQuotaExceeded {
+                path,
+                table,
+                current_bytes,
+                added_bytes,
+                peak_bytes,
+                limit_bytes,
+            } => Error::NativeDiskQuotaExceeded {
+                path: path.clone(),
+                table: table.clone(),
+                current_bytes: *current_bytes,
+                added_bytes: *added_bytes,
+                peak_bytes: *peak_bytes,
+                limit_bytes: *limit_bytes,
+            },
             Self::Catalog(message) => Error::Catalog(message.clone()),
+            Self::TransactionClosed {
+                transaction_id,
+                state,
+            } => Error::TransactionClosed {
+                transaction_id: transaction_id.clone(),
+                state,
+            },
+            Self::TransactionConflict {
+                transaction_id,
+                message,
+            } => Error::TransactionConflict {
+                transaction_id: transaction_id.clone(),
+                message: message.clone(),
+            },
             Self::NativeStorage { path, message } => Error::NativeStorage {
                 path: path.clone(),
                 message: message.clone(),
@@ -428,6 +544,10 @@ impl TaskFailure {
                 path: path.clone(),
                 transaction_id: transaction_id.clone(),
                 generation: *generation,
+                message: message.clone(),
+            },
+            Self::CopyPostCommitFailure { path, message } => Error::CopyPostCommitFailure {
+                path: path.clone(),
                 message: message.clone(),
             },
             Self::Execution(message) => Error::Execution(message.clone()),
@@ -711,7 +831,35 @@ mod tests {
 
         assert_eq!(cleaned.load(Ordering::Acquire), 1);
         assert!(!group.inner.state.lock().reaper_started);
-        assert!(group.inner.state.lock().reaper_cleanup.is_none());
+        assert!(group.inner.state.lock().reaper_cleanups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_reaper_cleanup_panic_does_not_skip_other_owners() {
+        let group = TaskGroup::new(QueryControl::new());
+        let release = Arc::new(Notify::new());
+        let worker_release = Arc::clone(&release);
+        group
+            .spawn("cleanup-panic-worker", async move {
+                worker_release.notified().await;
+                Ok(())
+            })
+            .unwrap();
+        group.reap(|| panic!("injected cleanup panic"));
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&cleaned);
+        group.reap(move || {
+            observed.fetch_add(1, Ordering::Release);
+        });
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cleaned.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a panicking cleanup must not skip later callbacks");
     }
 
     #[tokio::test]

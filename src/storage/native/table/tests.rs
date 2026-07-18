@@ -7,7 +7,9 @@ use arrow::{
 };
 use uuid::Uuid;
 
-use super::{NativeSegment, SnapshotOperation, TableSnapshot, layout, load, write_staged};
+use super::{
+    DeleteVector, NativeSegment, SnapshotOperation, TableSnapshot, layout, load, write_staged,
+};
 use crate::{Error, storage::native::segment::writer::SegmentWriter};
 
 #[test]
@@ -105,6 +107,63 @@ fn rejects_a_corrupt_segment_before_exposing_the_snapshot() {
         load(root.path(), &database_id, &snapshot.table_reference()).unwrap_err(),
         Error::NativeStorage { .. }
     ));
+}
+
+#[test]
+fn v3_snapshot_persists_visible_rows_and_a_versioned_delete_vector() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("tables")).unwrap();
+    let database_id = Uuid::new_v4().to_string();
+    let table_id = Uuid::new_v4().to_string();
+    let snapshot_id = Uuid::new_v4().to_string();
+    let segment_id = Uuid::new_v4().to_string();
+    let directory = layout::snapshot_directory(root.path(), &table_id, 1, &snapshot_id);
+    fs::create_dir_all(directory.join("segments")).unwrap();
+    fs::create_dir_all(directory.join("delete-vectors")).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+    )
+    .unwrap();
+    let path = directory
+        .join("segments")
+        .join(format!("{segment_id}.rdbseg"));
+    let mut writer = SegmentWriter::create_new(&path, Arc::clone(&schema)).unwrap();
+    writer.write_batch(&batch).unwrap();
+    let metadata = writer.finish().unwrap();
+    let source_bytes = metadata.bytes();
+    let vector = DeleteVector::from_offsets(3, [1]).unwrap();
+    let descriptor = vector
+        .write(
+            &layout::delete_vector_path(root.path(), &table_id, 1, &snapshot_id, &segment_id),
+            1,
+            &snapshot_id,
+            &super::super::disk_budget::DiskBudget::unlimited(),
+        )
+        .unwrap();
+    let segment =
+        NativeSegment::new(&segment_id, 1, &snapshot_id, metadata).with_delete_vector(descriptor);
+    let mut snapshot = TableSnapshot::new(
+        &database_id,
+        &table_id,
+        1,
+        &snapshot_id,
+        None,
+        SnapshotOperation::Import,
+        schema,
+        source_bytes,
+        vec![segment],
+    )
+    .unwrap();
+    write_staged(&directory, &mut snapshot).unwrap();
+
+    let loaded = load(root.path(), &database_id, &snapshot.table_reference()).unwrap();
+    assert_eq!(loaded.format_version(), 3);
+    assert_eq!(loaded.physical_row_count(), 3);
+    assert_eq!(loaded.deleted_row_count(), 1);
+    assert_eq!(loaded.row_count(), 2);
+    assert!(loaded.delete_vector_bytes() > 0);
 }
 
 #[test]

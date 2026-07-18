@@ -4,7 +4,7 @@ use arrow::datatypes::SchemaRef;
 
 use super::{
     CsvCompression, CsvHeader, CsvOptions, CsvScanConfig, EngineConfig, ExecutionConfig,
-    ParquetPruningMode, ParquetScanConfig, S3Config, SpillConfig,
+    NativeStorageConfig, ParquetPruningMode, ParquetScanConfig, S3Config, SpillConfig,
 };
 
 #[derive(Clone, Debug)]
@@ -146,6 +146,36 @@ impl EngineConfigBuilder {
     }
 
     #[must_use]
+    pub fn native_storage(mut self, native_storage: NativeStorageConfig) -> Self {
+        self.config.native_storage = native_storage;
+        self
+    }
+
+    #[must_use]
+    pub fn native_engine_limit_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.config.native_storage.engine_limit_bytes = bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn native_default_table_limit_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.config.native_storage.default_table_limit_bytes = bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn native_table_limit_bytes(mut self, name: impl Into<String>, bytes: u64) -> Self {
+        let name = name.into();
+        let normalized = NativeStorageConfig::canonical_table_name(&name)
+            .unwrap_or_else(|| name.to_ascii_lowercase());
+        self.config
+            .native_storage
+            .table_limit_bytes
+            .insert(normalized, bytes);
+        self
+    }
+
+    #[must_use]
     pub fn spill_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         let directory = directory.into();
         self.config.spill.directory = directory;
@@ -238,6 +268,9 @@ mod tests {
             .max_repartition_depth(3)
             .max_spill_write_amplification(Some(4.0))
             .runtime_filter_bytes(2 << 20)
+            .native_engine_limit_bytes(Some(64 << 20))
+            .native_default_table_limit_bytes(Some(32 << 20))
+            .native_table_limit_bytes("EVENTS", 16 << 20)
             .spill_directory("/tmp/rustdb-builder-spill")
             .build();
         assert_eq!(config.memory_limit, 128 << 20);
@@ -258,6 +291,15 @@ mod tests {
         assert_eq!(config.execution.max_repartition_depth, 3);
         assert_eq!(config.execution.max_spill_write_amplification, Some(4.0));
         assert_eq!(config.execution.runtime_filter_bytes, 2 << 20);
+        assert_eq!(config.native_storage.engine_limit_bytes, Some(64 << 20));
+        assert_eq!(
+            config.native_storage.default_table_limit_bytes,
+            Some(32 << 20)
+        );
+        assert_eq!(
+            config.native_storage.table_limit_bytes.get("events"),
+            Some(&(16 << 20))
+        );
         assert_eq!(
             config.spill.directory,
             PathBuf::from("/tmp/rustdb-builder-spill")

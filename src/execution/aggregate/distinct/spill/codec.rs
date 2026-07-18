@@ -204,6 +204,21 @@ fn encode_cell(value: &CellValue, output: &mut Vec<u8>) -> Result<()> {
             output.push(7);
             output.extend_from_slice(&value.to_le_bytes());
         }
+        CellValue::IntervalYearMonth(months) => {
+            output.push(8);
+            output.extend_from_slice(&months.to_le_bytes());
+        }
+        CellValue::IntervalDayTime(days, millis) => {
+            output.push(9);
+            output.extend_from_slice(&days.to_le_bytes());
+            output.extend_from_slice(&millis.to_le_bytes());
+        }
+        CellValue::IntervalMonthDayNano(months, days, nanos) => {
+            output.push(10);
+            output.extend_from_slice(&months.to_le_bytes());
+            output.extend_from_slice(&days.to_le_bytes());
+            output.extend_from_slice(&nanos.to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -225,6 +240,16 @@ fn decode_cell(cursor: &mut Cursor<'_>) -> Result<CellValue> {
         ),
         6 => CellValue::Binary(cursor.read_bytes()?.to_vec()),
         7 => CellValue::Decimal128(i128::from_le_bytes(cursor.read_array()?)),
+        8 => CellValue::IntervalYearMonth(i32::from_le_bytes(cursor.read_array()?)),
+        9 => CellValue::IntervalDayTime(
+            i32::from_le_bytes(cursor.read_array()?),
+            i32::from_le_bytes(cursor.read_array()?),
+        ),
+        10 => CellValue::IntervalMonthDayNano(
+            i32::from_le_bytes(cursor.read_array()?),
+            i32::from_le_bytes(cursor.read_array()?),
+            i64::from_le_bytes(cursor.read_array()?),
+        ),
         tag => return Err(corrupt(&format!("unknown value tag {tag}"))),
     })
 }

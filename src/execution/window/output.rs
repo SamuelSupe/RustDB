@@ -1,15 +1,11 @@
-use std::{mem::size_of, sync::Arc};
+mod chunk;
 
-use arrow::{
-    array::{ArrayRef, UInt64Array},
-    datatypes::SchemaRef,
-    record_batch::RecordBatch,
-};
+use std::sync::Arc;
+
+use arrow::{array::UInt64Array, datatypes::SchemaRef, record_batch::RecordBatch};
 
 use crate::runtime::{BatchEnvelope, MemoryBatchStream, QueryContext, boxed_memory_batch_stream};
-use crate::sql::{
-    AggregateFunction, WindowExpr, WindowFrameBound, WindowFrameUnits, WindowFunction,
-};
+use crate::sql::{WindowExpr, WindowFunction};
 use crate::{Error, Result};
 
 use super::super::{
@@ -18,14 +14,13 @@ use super::super::{
     value::{CellValue, cell, values_to_array},
 };
 use super::{
+    frame_aggregate, frame_index,
     keys::{evaluate_keys, row_key},
-    memory::{
-        array_value_payload_bytes, is_variable, original_slice_bytes, row_payload_bytes,
-        variable_output_bound,
-    },
-    sidecar,
+    memory::{array_value_payload_bytes, is_variable},
+    navigation, sidecar,
     spool::{CompletedPartition, aggregate_inputs, is_whole},
 };
+use chunk::{held_bytes, is_rows_prefix, plan as plan_chunk};
 
 pub(super) fn process(
     partition: CompletedPartition,
@@ -41,6 +36,28 @@ pub(super) fn process(
             &context,
             batch_size,
         )?;
+        let frame_index = frame_index::build(
+            &partition.file,
+            &expressions,
+            sidecar.as_ref(),
+            &context,
+            batch_size,
+            partition.rows,
+        )?;
+        let frame_aggregates = frame_aggregate::build(
+            &partition.file,
+            frame_index.as_ref(),
+            &expressions,
+            &context,
+            batch_size,
+            partition.rows,
+        )?;
+        let mut frame_aggregate_reader = frame_aggregates
+            .as_ref()
+            .map(|sidecar| context.spill.read_file(&sidecar.file))
+            .transpose()?;
+        let mut frame_aggregate_batch: Option<BatchEnvelope> = None;
+        let mut frame_aggregate_row = 0usize;
         let mut peer_reader = sidecar
             .as_ref()
             .map(|sidecar| context.spill.read_file(&sidecar.file))
@@ -48,6 +65,21 @@ pub(super) fn process(
         let mut peer_batch: Option<BatchEnvelope> = None;
         let mut peer_row = 0usize;
         let mut peer_remaining = 0u64;
+        let navigation = navigation::build(
+            &partition.file,
+            &expressions,
+            sidecar.as_ref(),
+            frame_index.as_ref(),
+            &context,
+            batch_size,
+            partition.rows,
+        )?;
+        let mut navigation_reader = navigation
+            .as_ref()
+            .map(|sidecar| context.spill.read_file(&sidecar.file))
+            .transpose()?;
+        let mut navigation_batch: Option<BatchEnvelope> = None;
+        let mut navigation_row = 0usize;
         let order_exprs = expressions[0]
             .order_by
             .iter()
@@ -116,6 +148,8 @@ pub(super) fn process(
                         &partition,
                         &state_memory,
                         peer_batch.as_ref(),
+                        frame_aggregate_batch.as_ref(),
+                        None,
                         None,
                     ),
                     "window replay expression workspace",
@@ -135,6 +169,51 @@ pub(super) fn process(
 
             while offset < replay.num_rows() {
                 context.check_cancelled()?;
+                if navigation.is_some()
+                    && navigation_batch
+                        .as_ref()
+                        .is_none_or(|batch| navigation_row >= batch.num_rows())
+                {
+                    drop(navigation_batch.take());
+                    navigation_batch = match navigation_reader.as_mut().and_then(Iterator::next) {
+                        Some(batch) => Some(BatchEnvelope::try_new(
+                            batch?,
+                            &context.memory,
+                            "window navigation sidecar input",
+                        )?),
+                        None => None,
+                    };
+                    navigation_row = 0;
+                    if navigation_batch.is_none() {
+                        Err(Error::Internal(
+                            "window navigation sidecar ended before partition input".into(),
+                        ))?;
+                    }
+                }
+                if frame_aggregates.is_some()
+                    && frame_aggregate_batch
+                        .as_ref()
+                        .is_none_or(|batch| frame_aggregate_row >= batch.num_rows())
+                {
+                    drop(frame_aggregate_batch.take());
+                    frame_aggregate_batch = match frame_aggregate_reader
+                        .as_mut()
+                        .and_then(Iterator::next)
+                    {
+                        Some(batch) => Some(BatchEnvelope::try_new(
+                            batch?,
+                            &context.memory,
+                            "window frame aggregate sidecar input",
+                        )?),
+                        None => None,
+                    };
+                    frame_aggregate_row = 0;
+                    if frame_aggregate_batch.is_none() {
+                        Err(Error::Internal(
+                            "window frame aggregate sidecar ended before partition input".into(),
+                        ))?;
+                    }
+                }
                 if let Some(sidecar_metadata) = sidecar.as_ref()
                     && peer_remaining == 0
                 {
@@ -219,11 +298,19 @@ pub(super) fn process(
                     &partition,
                     &state_memory,
                     peer_batch.as_ref(),
+                    frame_aggregate_batch.as_ref(),
+                    navigation_batch.as_ref(),
                     Some(&evaluation),
                 );
                 let mut rows = (replay.num_rows() - offset).min(batch_size.max(1));
                 if let Some(peer_rows) = peer_rows {
                     rows = rows.min(peer_rows);
+                }
+                if let Some(batch) = &navigation_batch {
+                    rows = rows.min(batch.num_rows() - navigation_row);
+                }
+                if let Some(batch) = &frame_aggregate_batch {
+                    rows = rows.min(batch.num_rows() - frame_aggregate_row);
                 }
                 let operation_limit = context.memory.operation_limit();
                 let plan = {
@@ -241,6 +328,12 @@ pub(super) fn process(
                             replay.batch(),
                             offset,
                             rows,
+                            navigation.as_ref(),
+                            navigation_batch.as_ref(),
+                            navigation_row,
+                            frame_aggregates.as_ref(),
+                            frame_aggregate_batch.as_ref(),
+                            frame_aggregate_row,
                         )?;
                         let required = held
                             .saturating_add(plan.state_growth)
@@ -334,12 +427,52 @@ pub(super) fn process(
                                     ))?;
                                 CellValue::Float64(peer_end as f64 / partition.rows as f64)
                             }
+                            WindowFunction::Lead { .. }
+                            | WindowFunction::Lag { .. }
+                            | WindowFunction::FirstValue(_)
+                            | WindowFunction::LastValue(_) => {
+                                let column = navigation
+                                    .as_ref()
+                                    .and_then(|sidecar| sidecar.expression_columns[index])
+                                    .ok_or_else(|| Error::Internal(
+                                        "window navigation result column is missing".into(),
+                                    ))?;
+                                cell(
+                                    navigation_batch
+                                        .as_ref()
+                                        .ok_or_else(|| Error::Internal(
+                                            "window navigation result batch is missing".into(),
+                                        ))?
+                                        .column(column),
+                                    navigation_row + row - offset,
+                                )?
+                            }
                             WindowFunction::Aggregate(_) if is_whole(expression) => partition
                                 .whole_values[index]
                                 .clone()
                                 .ok_or_else(|| Error::Internal(
                                     "whole-partition window aggregate has no finalized state".into(),
                                 ))?,
+                            WindowFunction::Aggregate(_)
+                                if frame_aggregates
+                                    .as_ref()
+                                    .and_then(|sidecar| sidecar.expression_columns[index])
+                                    .is_some() =>
+                            {
+                                let column = frame_aggregates
+                                    .as_ref()
+                                    .and_then(|sidecar| sidecar.expression_columns[index])
+                                    .expect("frame aggregate mapping checked");
+                                cell(
+                                    frame_aggregate_batch
+                                        .as_ref()
+                                        .ok_or_else(|| Error::Internal(
+                                            "window frame aggregate result batch is missing".into(),
+                                        ))?
+                                        .column(column),
+                                    frame_aggregate_row + row - offset,
+                                )?
+                            }
                             WindowFunction::Aggregate(aggregate)
                                 if is_rows_prefix(expression) =>
                             {
@@ -379,6 +512,12 @@ pub(super) fn process(
                     drop(values);
                     let output = RecordBatch::try_new(Arc::clone(&schema), columns)?;
                     offset += rows;
+                    if navigation_batch.is_some() {
+                        navigation_row += rows;
+                    }
+                    if frame_aggregate_batch.is_some() {
+                        frame_aggregate_row += rows;
+                    }
                     BatchEnvelope::from_reservation(output, workspace, "window output")?
                 };
                 // Yielding returns to the partition worker, which may block on
@@ -392,6 +531,10 @@ pub(super) fn process(
         drop(reader);
         drop(peer_reader);
         drop(peer_batch);
+        drop(navigation_reader);
+        drop(navigation_batch);
+        drop(frame_aggregate_reader);
+        drop(frame_aggregate_batch);
         if peer_remaining != 0 {
             Err(Error::Internal(
                 "window peer sidecar contains more rows than partition input".into(),
@@ -405,129 +548,18 @@ pub(super) fn process(
         if let Some(sidecar) = sidecar {
             context.spill.remove_file(&sidecar.file)?;
         }
+        if let Some(sidecar) = navigation {
+            context.spill.remove_file(&sidecar.file)?;
+        }
+        if let Some(sidecar) = frame_aggregates {
+            context.spill.remove_file(&sidecar.file)?;
+        }
+        if let Some(sidecar) = frame_index {
+            context.spill.remove_file(&sidecar.file)?;
+        }
         context.spill.remove_file(&partition.file)?;
         drop(partition);
     })
-}
-
-struct ChunkPlan {
-    workspace: usize,
-    state_growth: usize,
-    order_credit: usize,
-    retained_payload: Vec<usize>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn plan_chunk(
-    expressions: &[WindowExpr],
-    partition: &CompletedPartition,
-    inputs: &[Option<ArrayRef>],
-    order_keys: &[ArrayRef],
-    peer_values: &[Option<CellValue>],
-    retained_payload: &[usize],
-    previous_order_credit: usize,
-    batch: &RecordBatch,
-    offset: usize,
-    rows: usize,
-) -> Result<ChunkPlan> {
-    let order_credit = (offset..offset + rows)
-        .try_fold(previous_order_credit, |bytes, row| -> Result<usize> {
-            Ok(bytes.max(row_payload_bytes(order_keys, row)?))
-        })?;
-    let order_transient = (offset..offset + rows)
-        .try_fold(0usize, |bytes, row| -> Result<usize> {
-            Ok(bytes.max(row_payload_bytes(order_keys, row)?))
-        })?;
-    let mut next_retained = retained_payload.to_vec();
-    let mut update_transient = 0usize;
-    for (index, expression) in expressions.iter().enumerate() {
-        let WindowFunction::Aggregate(aggregate) = &expression.function else {
-            continue;
-        };
-        if !is_rows_prefix(expression)
-            || !matches!(
-                aggregate.function,
-                AggregateFunction::Min | AggregateFunction::Max
-            )
-            || !is_variable(&expression.data_type)
-        {
-            continue;
-        }
-        let Some(input) = inputs[index].as_ref() else {
-            continue;
-        };
-        let maximum = (offset..offset + rows).try_fold(0usize, |bytes, row| -> Result<usize> {
-            Ok(bytes.max(array_value_payload_bytes(input, row)?))
-        })?;
-        update_transient = update_transient.saturating_add(maximum);
-        next_retained[index] = next_retained[index].max(maximum);
-    }
-    let state_growth = order_credit
-        .saturating_sub(previous_order_credit)
-        .saturating_add(
-            next_retained
-                .iter()
-                .zip(retained_payload)
-                .fold(0usize, |bytes, (next, current)| {
-                    bytes.saturating_add(next.saturating_sub(*current))
-                }),
-        );
-    let mut workspace = original_slice_bytes(batch, offset, rows)
-        .saturating_add(order_transient)
-        .saturating_add(update_transient)
-        .saturating_add(expressions.len().saturating_mul(size_of::<ArrayRef>()))
-        .saturating_add(2048);
-    for (index, expression) in expressions.iter().enumerate() {
-        let whole_value = matches!(expression.function, WindowFunction::Aggregate(_))
-            .then(|| is_whole(expression))
-            .unwrap_or(false)
-            .then(|| partition.whole_values[index].as_ref())
-            .flatten();
-        let range_value = matches!(expression.function, WindowFunction::Aggregate(_))
-            .then(|| !is_whole(expression) && !is_rows_prefix(expression))
-            .unwrap_or(false)
-            .then(|| peer_values[index].as_ref())
-            .flatten();
-        let input = is_rows_prefix(expression)
-            .then(|| inputs[index].as_ref())
-            .flatten();
-        workspace = workspace.saturating_add(variable_output_bound(
-            expression,
-            whole_value,
-            range_value,
-            input,
-            next_retained[index],
-            offset,
-            rows,
-        )?);
-    }
-    Ok(ChunkPlan {
-        workspace,
-        state_growth,
-        order_credit,
-        retained_payload: next_retained,
-    })
-}
-
-fn held_bytes(
-    replay: &BatchEnvelope,
-    partition: &CompletedPartition,
-    state: &crate::runtime::MemoryReservation,
-    peer_batch: Option<&BatchEnvelope>,
-    evaluation: Option<&crate::runtime::MemoryReservation>,
-) -> usize {
-    replay
-        .memory_size()
-        .saturating_add(partition.retained_bytes())
-        .saturating_add(state.size())
-        .saturating_add(peer_batch.map(BatchEnvelope::memory_size).unwrap_or(0))
-        .saturating_add(evaluation.map_or(0, crate::runtime::MemoryReservation::size))
-}
-
-fn is_rows_prefix(expression: &WindowExpr) -> bool {
-    expression.frame.units == WindowFrameUnits::Rows
-        && expression.frame.end == WindowFrameBound::CurrentRow
-        && matches!(expression.function, WindowFunction::Aggregate(_))
 }
 
 fn ntile(row: u64, rows: u64, buckets: u64) -> Result<i64> {

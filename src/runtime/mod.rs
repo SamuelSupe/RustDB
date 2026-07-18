@@ -16,6 +16,7 @@ pub(crate) use batch::{
     estimate_array_bytes, estimate_schema_batch_bytes,
 };
 pub(crate) use compute::ComputeRuntime;
+pub(crate) use context::AsyncCleanupGuard;
 pub use context::QueryContext;
 pub use control::QueryControl;
 pub(crate) use global_scheduler::{GlobalComputePermit, GlobalComputeScheduler};

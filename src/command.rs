@@ -8,8 +8,8 @@ use arrow::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use sqlparser::ast::{
-    CreateTableOptions, DescribeAlias, ObjectName, ObjectNamePart, ObjectType,
-    ShowStatementOptions, Spanned, Statement,
+    CreateTableOptions, DescribeAlias, ObjectName, ObjectType, ShowStatementOptions, Spanned,
+    Statement, TransactionAccessMode as SqlAccessMode, TransactionIsolationLevel, TransactionMode,
 };
 
 use crate::datasource::{MetadataCache, ScanRequest, ScanTask, TableProvider, TableStatistics};
@@ -20,11 +20,35 @@ use crate::runtime::{
 use crate::sql::{LogicalPlan, StatementPlan};
 use crate::{Catalog, EngineConfig, Error, Result};
 
+#[path = "command/copy.rs"]
+mod copy;
+#[path = "command/maintenance.rs"]
+mod maintenance;
+#[path = "command/native_alter.rs"]
+mod native_alter;
+#[path = "command/native_delete.rs"]
+mod native_delete;
+#[path = "command/native_drop.rs"]
+mod native_drop;
+#[path = "command/native_schema.rs"]
+mod native_schema;
+#[path = "command/native_truncate.rs"]
+mod native_truncate;
+#[path = "command/native_update.rs"]
+mod native_update;
 #[path = "command/native_write.rs"]
 mod native_write;
 #[path = "command/source.rs"]
 mod source;
 
+pub(crate) use copy::{CopyCommand, CopyCsvOptions, CopyFormat, CopyToCommand};
+pub(crate) use maintenance::MaintenanceCommand;
+pub(crate) use native_alter::{NativeAlterCommand, NativeAlterOperation};
+pub(crate) use native_delete::NativeDeleteCommand;
+pub(crate) use native_drop::NativeDropTableCommand;
+pub(crate) use native_schema::NativeSchemaCommand;
+pub(crate) use native_truncate::NativeTruncateCommand;
+pub(crate) use native_update::NativeUpdateCommand;
 pub(crate) use native_write::{NativeWriteCommand, NativeWriteKind};
 
 pub(crate) enum ParsedStatement {
@@ -33,7 +57,13 @@ pub(crate) enum ParsedStatement {
 }
 
 pub(crate) enum SessionCommand {
+    BeginTransaction {
+        read_only: bool,
+    },
+    CommitTransaction,
+    RollbackTransaction,
     ShowTables,
+    ShowSchemas,
     Describe {
         name: String,
     },
@@ -45,14 +75,30 @@ pub(crate) enum SessionCommand {
         query: String,
         replace: bool,
     },
+    CreatePersistentView {
+        name: String,
+        query: String,
+        replace: bool,
+    },
     DropView {
         name: String,
         if_exists: bool,
     },
+    CopyTo(CopyToCommand),
+    Maintenance(MaintenanceCommand),
     NativeWrite(NativeWriteCommand),
+    NativeAlter(NativeAlterCommand),
+    NativeDelete(NativeDeleteCommand),
+    NativeDropTable(NativeDropTableCommand),
+    NativeSchema(NativeSchemaCommand),
+    NativeUpdate(NativeUpdateCommand),
+    NativeTruncate(NativeTruncateCommand),
 }
 
 pub(crate) fn parse(sql: &str) -> Result<ParsedStatement> {
+    if let Some(command) = maintenance::parse_custom(sql)? {
+        return Ok(ParsedStatement::Command(command));
+    }
     if let Some(command) = parse_refresh_table(sql)? {
         return Ok(ParsedStatement::Command(command));
     }
@@ -63,12 +109,112 @@ pub(crate) fn parse(sql: &str) -> Result<ParsedStatement> {
         ));
     }
     let statement = statements.remove(0);
+    if let Some(command) = copy::parse(&statement)? {
+        return Ok(ParsedStatement::Command(match command {
+            CopyCommand::From(command) => SessionCommand::NativeWrite(command),
+            CopyCommand::To(command) => SessionCommand::CopyTo(command),
+        }));
+    }
     if let Some(command) = native_write::parse(&statement, sql)? {
         return Ok(ParsedStatement::Command(SessionCommand::NativeWrite(
             command,
         )));
     }
+    if let Some(command) = native_alter::parse(&statement)? {
+        return Ok(ParsedStatement::Command(SessionCommand::NativeAlter(
+            command,
+        )));
+    }
+    if let Some(command) = native_delete::parse(&statement)? {
+        return Ok(ParsedStatement::Command(SessionCommand::NativeDelete(
+            command,
+        )));
+    }
+    if let Some(command) = native_drop::parse(&statement)? {
+        return Ok(ParsedStatement::Command(SessionCommand::NativeDropTable(
+            command,
+        )));
+    }
+    if let Some(command) = native_schema::parse(&statement)? {
+        return Ok(ParsedStatement::Command(SessionCommand::NativeSchema(
+            command,
+        )));
+    }
+    if let Some(command) = native_update::parse(&statement)? {
+        return Ok(ParsedStatement::Command(SessionCommand::NativeUpdate(
+            command,
+        )));
+    }
+    if let Some(command) = native_truncate::parse(&statement)? {
+        return Ok(ParsedStatement::Command(SessionCommand::NativeTruncate(
+            command,
+        )));
+    }
+    if let Some(command) = maintenance::parse_statement(&statement)? {
+        return Ok(ParsedStatement::Command(SessionCommand::Maintenance(
+            command,
+        )));
+    }
     let command = match &statement {
+        Statement::StartTransaction {
+            modes,
+            modifier,
+            statements,
+            exception,
+            has_end_keyword,
+            ..
+        } => {
+            if modifier.is_some()
+                || !statements.is_empty()
+                || exception.is_some()
+                || *has_end_keyword
+            {
+                return Err(Error::Unsupported(
+                    "procedural, chained, and modified BEGIN forms are not supported".into(),
+                ));
+            }
+            let mut access = None;
+            for mode in modes {
+                match mode {
+                    TransactionMode::AccessMode(mode) => {
+                        if access.replace(*mode).is_some() {
+                            return Err(Error::InvalidArgument(
+                                "transaction access mode was specified more than once".into(),
+                            ));
+                        }
+                    }
+                    TransactionMode::IsolationLevel(TransactionIsolationLevel::Snapshot) => {}
+                    TransactionMode::IsolationLevel(_) => {
+                        return Err(Error::Unsupported(
+                            "v0.8 transactions support SNAPSHOT isolation only".into(),
+                        ));
+                    }
+                }
+            }
+            Some(SessionCommand::BeginTransaction {
+                read_only: access == Some(SqlAccessMode::ReadOnly),
+            })
+        }
+        Statement::Commit {
+            chain,
+            end,
+            modifier,
+        } => {
+            if *chain || *end || modifier.is_some() {
+                return Err(Error::Unsupported(
+                    "chained and procedural COMMIT forms are not supported".into(),
+                ));
+            }
+            Some(SessionCommand::CommitTransaction)
+        }
+        Statement::Rollback { chain, savepoint } => {
+            if *chain || savepoint.is_some() {
+                return Err(Error::Unsupported(
+                    "ROLLBACK TO SAVEPOINT and chained rollback are not supported".into(),
+                ));
+            }
+            Some(SessionCommand::RollbackTransaction)
+        }
         Statement::ShowTables {
             terse,
             history,
@@ -90,6 +236,18 @@ pub(crate) fn parse(sql: &str) -> Result<ParsedStatement> {
             }
             Some(SessionCommand::ShowTables)
         }
+        Statement::ShowSchemas {
+            terse,
+            history,
+            show_options,
+        } => {
+            if *terse || *history || !plain_show_options(show_options) {
+                return Err(Error::Unsupported(
+                    "SHOW SCHEMAS modifiers are not supported".to_owned(),
+                ));
+            }
+            Some(SessionCommand::ShowSchemas)
+        }
         Statement::ExplainTable {
             describe_alias: DescribeAlias::Describe | DescribeAlias::Desc,
             hive_format,
@@ -106,11 +264,6 @@ pub(crate) fn parse(sql: &str) -> Result<ParsedStatement> {
             })
         }
         Statement::CreateView(view) => {
-            if !view.temporary {
-                return Err(Error::Unsupported(
-                    "only CREATE TEMP VIEW is supported".into(),
-                ));
-            }
             if view.or_alter
                 || view.materialized
                 || view.secure
@@ -129,12 +282,22 @@ pub(crate) fn parse(sql: &str) -> Result<ParsedStatement> {
                     "CREATE TEMP VIEW modifiers other than OR REPLACE are not supported".into(),
                 ));
             }
-            Some(SessionCommand::CreateTempView {
-                name: simple_name(&view.name, "view")?,
-                query: source::suffix_with_location(sql, view.query.span())
-                    .unwrap_or_else(|| view.query.to_string()),
-                replace: view.or_replace,
-            })
+            let command = if view.temporary {
+                SessionCommand::CreateTempView {
+                    name: simple_name(&view.name, "view")?,
+                    query: source::suffix_with_location(sql, view.query.span())
+                        .unwrap_or_else(|| view.query.to_string()),
+                    replace: view.or_replace,
+                }
+            } else {
+                SessionCommand::CreatePersistentView {
+                    name: simple_name(&view.name, "view")?,
+                    query: source::suffix_with_location(sql, view.query.span())
+                        .unwrap_or_else(|| view.query.to_string()),
+                    replace: view.or_replace,
+                }
+            };
+            Some(command)
         }
         Statement::Drop {
             object_type: ObjectType::View,
@@ -215,12 +378,7 @@ fn take_word(input: &str) -> Option<(&str, &str)> {
 }
 
 fn simple_name(name: &ObjectName, kind: &str) -> Result<String> {
-    let [ObjectNamePart::Identifier(identifier)] = name.0.as_slice() else {
-        return Err(Error::Unsupported(format!(
-            "qualified {kind} names are not supported"
-        )));
-    };
-    Ok(identifier.value.clone())
+    crate::catalog_name::object(name, kind)
 }
 
 fn plain_show_options(options: &ShowStatementOptions) -> bool {
@@ -237,6 +395,18 @@ pub(crate) fn show_tables(catalog: &Catalog) -> Result<RecordBatch> {
         .into_iter()
         .filter(|name| !name.starts_with("__rustdb_file_"));
     let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from_iter_values(names))],
+    )?)
+}
+
+pub(crate) fn show_schemas(names: impl IntoIterator<Item = String>) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "schema_name",
+        DataType::Utf8,
+        false,
+    )]));
     Ok(RecordBatch::try_new(
         schema,
         vec![Arc::new(StringArray::from_iter_values(names))],
@@ -294,7 +464,7 @@ pub(crate) fn status(message: &str) -> Result<RecordBatch> {
 pub(crate) struct ViewTable {
     name: String,
     query: String,
-    catalog: Catalog,
+    catalog: Option<Catalog>,
     config: EngineConfig,
     metadata_cache: MetadataCache,
     schema: SchemaRef,
@@ -313,9 +483,28 @@ impl ViewTable {
             schema: Arc::clone(plan.schema().arrow()),
             name,
             query,
-            catalog,
+            // A view must not share the mutable map that will subsequently
+            // contain the view itself; that would create an Arc cycle.
+            catalog: Some(catalog.pin()),
             config,
             metadata_cache,
+        }
+    }
+
+    pub(crate) fn persistent(
+        name: String,
+        query: String,
+        schema: SchemaRef,
+        config: EngineConfig,
+        metadata_cache: MetadataCache,
+    ) -> Self {
+        Self {
+            name,
+            query,
+            catalog: None,
+            config,
+            metadata_cache,
+            schema,
         }
     }
 
@@ -323,7 +512,13 @@ impl ViewTable {
         let catalog = context
             .as_ref()
             .and_then(|context| context.catalog_snapshot())
-            .unwrap_or_else(|| self.catalog.pin());
+            .or_else(|| self.catalog.as_ref().map(Catalog::pin))
+            .ok_or_else(|| {
+                Error::Internal(format!(
+                    "persistent view '{}' is missing its query catalog snapshot",
+                    self.name
+                ))
+            })?;
         let prepared = crate::table_function::prepare_with_cache_for_query(
             &catalog,
             &self.config,
@@ -346,7 +541,7 @@ impl ViewTable {
         };
         if plan.schema().arrow().as_ref() != self.schema.as_ref() {
             return Err(Error::Catalog(format!(
-                "temporary view '{}' changed schema after a dependency was replaced",
+                "view '{}' changed schema after a dependency was replaced",
                 self.name
             )));
         }
@@ -505,13 +700,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_refresh_table_and_rejects_qualified_names() {
+    fn parses_unqualified_and_schema_qualified_refresh_table() {
         assert!(matches!(
             parse("REFRESH TABLE dynamic_data;").unwrap(),
             ParsedStatement::Command(SessionCommand::RefreshTable { name })
                 if name == "dynamic_data"
         ));
-        assert!(parse("REFRESH TABLE catalog.dynamic_data").is_err());
+        assert!(matches!(
+            parse("REFRESH TABLE catalog.dynamic_data").unwrap(),
+            ParsedStatement::Command(SessionCommand::RefreshTable { name })
+                if name == "catalog.dynamic_data"
+        ));
     }
 
     #[test]

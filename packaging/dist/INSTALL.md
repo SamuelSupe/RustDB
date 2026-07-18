@@ -8,9 +8,9 @@ The adjacent `.sha256` file authenticates accidental corruption when obtained
 through a trusted channel:
 
 ```sh
-sha256sum -c rustdb-v0.7.0-alpha.1-linux-aarch64.tar.gz.sha256
+sha256sum -c rustdb-v0.8.0-alpha.1-linux-aarch64.tar.gz.sha256
 # macOS:
-shasum -a 256 rustdb-v0.7.0-alpha.1-macos-aarch64.tar.gz
+shasum -a 256 -c rustdb-v0.8.0-alpha.1-macos-aarch64.tar.gz.sha256
 ```
 
 After extraction, `SHA256SUMS` covers every installable payload.
@@ -18,8 +18,8 @@ After extraction, `SHA256SUMS` covers every installable payload.
 ## Install
 
 ```sh
-tar -xzf rustdb-v0.7.0-alpha.1-linux-aarch64.tar.gz
-cd rustdb-v0.7.0-alpha.1-linux-aarch64
+tar -xzf rustdb-v0.8.0-alpha.1-linux-aarch64.tar.gz
+cd rustdb-v0.8.0-alpha.1-linux-aarch64
 ./install.sh
 ```
 

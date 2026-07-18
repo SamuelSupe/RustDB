@@ -1,12 +1,12 @@
 # Migrating from v0.6 to v0.7 alpha
 
-`v0.7.0-alpha.1` is currently under development. It retains the v0.6 public
+`v0.7.0-alpha.1` was released on 2026-07-18. It retains the v0.6 public
 `Engine`, `Session`, Native storage, registration, prepared-statement, and
 streaming Arrow result APIs.
 
-The active release target is now a functionality-first, single ClickBench pass
+Its release target was a functionality-first, single ClickBench pass
 under a four-CPU/16-GiB container profile. Cross-engine timings later in this
-document are retained development history, not a current release gate or claim.
+document are retained development history, not a current v0.8 release gate or claim.
 The ClickBench compatibility slice adds `regexp_replace`/`regex_replace`,
 `to_timestamp_seconds`, checked integer-to-Date casts, and strict temporal
 literal comparison. These additions require no Rust API migration.

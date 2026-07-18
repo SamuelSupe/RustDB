@@ -43,3 +43,15 @@ pub(super) fn predicate_sidecar_path(
         .join("segments")
         .join(format!("{segment_id}.rdbpred"))
 }
+
+pub(super) fn delete_vector_path(
+    root: &Path,
+    table_id: &str,
+    owner_version: u64,
+    owner_snapshot_id: &str,
+    segment_id: &str,
+) -> PathBuf {
+    snapshot_directory(root, table_id, owner_version, owner_snapshot_id)
+        .join("delete-vectors")
+        .join(format!("{segment_id}.rdbdel"))
+}

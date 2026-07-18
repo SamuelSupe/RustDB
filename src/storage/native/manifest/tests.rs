@@ -51,6 +51,62 @@ fn stale_commit_does_not_change_current_generation() {
 }
 
 #[test]
+fn legacy_v1_manifest_objects_are_loaded_in_main_without_rekeying() {
+    #[derive(serde::Serialize)]
+    struct LegacyCatalog<'a> {
+        database_id: &'a str,
+        format_version: u32,
+        generation: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transaction_id: Option<&'a str>,
+        tables: &'a BTreeMap<String, TableReference>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        views: &'a BTreeMap<String, super::ViewReference>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        manifest: &'a LegacyCatalog<'a>,
+        sha256: &'a str,
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = NativeDatabase::open(directory.path().join("database")).unwrap();
+    let database_id = database_id(&database);
+    let path = database
+        .path()
+        .join("catalog/generations/00000000000000000000.json");
+    let tables = BTreeMap::from([("events".to_owned(), table_reference())]);
+    let views = BTreeMap::new();
+    let legacy = LegacyCatalog {
+        database_id: &database_id,
+        format_version: super::LEGACY_FORMAT_VERSION,
+        generation: 0,
+        transaction_id: None,
+        tables: &tables,
+        views: &views,
+    };
+    let checksum = super::io::json_sha256(
+        &path,
+        &legacy,
+        super::MAX_CATALOG_MANIFEST_BYTES,
+        "legacy catalog manifest",
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&Envelope {
+        manifest: &legacy,
+        sha256: &checksum,
+    })
+    .unwrap();
+    fs::write(&path, bytes).unwrap();
+
+    let loaded = load(database.path(), &database_id).unwrap();
+    assert!(loaded.schemas().contains("main"));
+    assert!(loaded.tables().contains_key("events"));
+    assert!(!loaded.tables().contains_key("main.events"));
+}
+
+#[test]
 fn immutable_generation_cannot_be_replaced_and_checksum_is_verified() {
     let directory = tempfile::tempdir().unwrap();
     let database = NativeDatabase::open(directory.path().join("database")).unwrap();
@@ -62,7 +118,10 @@ fn immutable_generation_cannot_be_replaced_and_checksum_is_verified() {
         database_id: database_id.clone(),
         format_version: super::FORMAT_VERSION,
         generation: 1,
+        transaction_id: None,
+        schemas: std::collections::BTreeSet::from(["main".to_owned()]),
         tables: BTreeMap::from([("other".to_owned(), table_reference())]),
+        views: BTreeMap::new(),
     };
     assert!(matches!(
         ensure_generation(database.path(), &conflicting).unwrap_err(),
@@ -93,7 +152,10 @@ fn recovery_removes_a_valid_unpublished_future_generation() {
         database_id: database_id.clone(),
         format_version: super::FORMAT_VERSION,
         generation: 1,
+        transaction_id: None,
+        schemas: std::collections::BTreeSet::from(["main".to_owned()]),
         tables: BTreeMap::new(),
+        views: BTreeMap::new(),
     };
     ensure_generation(database.path(), &future).unwrap();
     let path = database

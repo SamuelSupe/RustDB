@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, BooleanArray, Decimal128Array, Int64Array},
+    array::{Array, BooleanArray, Decimal128Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -127,6 +127,263 @@ async fn resolves_having_aliases() {
     )
     .await;
     assert_eq!(int64_pairs(&batches), vec![(1, 2)]);
+}
+
+#[tokio::test]
+async fn aggregate_filter_reuses_null_aware_aggregate_execution() {
+    let batches = run(
+        &grouped_catalog(),
+        "SELECT a, \
+         count(*) FILTER (WHERE b > 10), \
+         sum(b) FILTER (WHERE b > 10), \
+         count(DISTINCT x) FILTER (WHERE b >= 10) \
+         FROM grouped GROUP BY a ORDER BY a",
+    )
+    .await;
+    assert_eq!(int64_column(&batches, 0), vec![1, 2]);
+    assert_eq!(int64_column(&batches, 1), vec![1, 0]);
+    assert_eq!(optional_decimal_column(&batches, 2), vec![Some(20), None]);
+    assert_eq!(int64_column(&batches, 3), vec![2, 1]);
+
+    let error = plan_sql(
+        &grouped_catalog(),
+        "SELECT count(*) FILTER (WHERE b) FROM grouped",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("FILTER requires BOOLEAN"), "{error}");
+}
+
+#[tokio::test]
+async fn order_insensitive_aggregates_accept_and_validate_ordering_clauses() {
+    let batches = run(
+        &grouped_catalog(),
+        "SELECT sum(a ORDER BY b DESC), min(b) WITHIN GROUP (ORDER BY a) FROM grouped",
+    )
+    .await;
+    assert_eq!(decimal_column(&batches, 0), vec![4]);
+    assert_eq!(int64_column(&batches, 1), vec![10]);
+
+    let error = plan_sql(
+        &grouped_catalog(),
+        "SELECT sum(a ORDER BY missing) FROM grouped",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("missing"), "{error}");
+}
+
+#[tokio::test]
+async fn count_distinct_accepts_multiple_expressions() {
+    let catalog = nullable_tuple_catalog();
+    let batches = run(
+        &catalog,
+        "SELECT count(DISTINCT a, b), \
+         count(DISTINCT b, a), \
+         count(DISTINCT a, b) FILTER (WHERE b >= 10) \
+         FROM tuples",
+    )
+    .await;
+    assert_eq!(int64_column(&batches, 0), vec![3]);
+    assert_eq!(int64_column(&batches, 1), vec![3]);
+    assert_eq!(int64_column(&batches, 2), vec![3]);
+
+    let error = plan_sql(&catalog, "SELECT sum(DISTINCT a, b) FROM tuples")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("only for COUNT"), "{error}");
+}
+
+#[tokio::test]
+async fn grouping_sets_rollup_and_cube_expand_to_aggregate_branches() {
+    let catalog = grouped_catalog();
+    for grouping in ["GROUPING SETS ((a, b), (a), ())", "ROLLUP (a, b)"] {
+        let sql = format!(
+            "SELECT a, b, count(*) FROM grouped GROUP BY {grouping} \
+             ORDER BY a NULLS LAST, b NULLS LAST"
+        );
+        let batches = run(&catalog, &sql).await;
+        assert_eq!(
+            optional_int64_column(&batches, 0),
+            vec![Some(1), Some(1), Some(1), Some(2), Some(2), None],
+            "{grouping}"
+        );
+        assert_eq!(
+            optional_int64_column(&batches, 1),
+            vec![Some(10), Some(20), None, Some(10), None, None],
+            "{grouping}"
+        );
+        assert_eq!(int64_column(&batches, 2), vec![1, 1, 2, 1, 1, 3]);
+    }
+
+    let cube = run(
+        &catalog,
+        "SELECT a, b, count(*) FROM grouped GROUP BY CUBE (a, b) \
+         ORDER BY a NULLS LAST, b NULLS LAST",
+    )
+    .await;
+    assert_eq!(cube.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
+    assert_eq!(
+        optional_int64_column(&cube, 0),
+        vec![
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(2),
+            None,
+            None,
+            None
+        ]
+    );
+    assert_eq!(
+        optional_int64_column(&cube, 1),
+        vec![
+            Some(10),
+            Some(20),
+            None,
+            Some(10),
+            None,
+            Some(10),
+            Some(20),
+            None
+        ]
+    );
+    assert_eq!(int64_column(&cube, 2), vec![1, 1, 2, 1, 1, 2, 1, 3]);
+
+    let masks = run(
+        &catalog,
+        "SELECT a, b, grouping(a, b) AS gid, count(*) FROM grouped \
+         GROUP BY GROUPING SETS ((a, b), (a), ()) \
+         ORDER BY gid, a NULLS LAST, b NULLS LAST",
+    )
+    .await;
+    assert_eq!(int64_column(&masks, 2), vec![0, 0, 0, 1, 1, 3]);
+    assert_eq!(int64_column(&masks, 3), vec![1, 1, 1, 2, 1, 3]);
+}
+
+#[tokio::test]
+async fn grouping_sets_normalize_equivalent_ordinals_and_aliases() {
+    let catalog = grouped_catalog();
+    for grouping in ["GROUPING SETS ((1), (a))", "GROUPING SETS ((1), (k))"] {
+        let batches = run(
+            &catalog,
+            &format!("SELECT a AS k, count(*) FROM grouped GROUP BY {grouping} ORDER BY k"),
+        )
+        .await;
+        assert_eq!(int64_column(&batches, 0), vec![1, 1, 2, 2], "{grouping}");
+        assert_eq!(int64_column(&batches, 1), vec![2, 2, 1, 1], "{grouping}");
+    }
+}
+
+#[tokio::test]
+async fn interval_comparison_keys_use_one_sql_equality_domain() {
+    let scalar = run(
+        &Catalog::default(),
+        "SELECT \
+         INTERVAL '1' DAY = INTERVAL '24 hours', \
+         INTERVAL '1' MONTH = INTERVAL '30' DAY, \
+         INTERVAL '1' DAY < INTERVAL '25 hours'",
+    )
+    .await;
+    for column in scalar[0].columns() {
+        assert!(
+            column
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(0)
+        );
+    }
+
+    let grouped = run(
+        &Catalog::default(),
+        "SELECT count(*), count(DISTINCT i) \
+         FROM (VALUES (INTERVAL '1' DAY), (INTERVAL '24 hours')) AS v(i) \
+         GROUP BY i",
+    )
+    .await;
+    assert_eq!(int64_column(&grouped, 0), vec![2]);
+    assert_eq!(int64_column(&grouped, 1), vec![1]);
+
+    let joined = run(
+        &Catalog::default(),
+        "SELECT count(*) \
+         FROM (VALUES (INTERVAL '1' DAY)) AS l(i) \
+         JOIN (VALUES (INTERVAL '24 hours')) AS r(i) ON l.i = r.i",
+    )
+    .await;
+    assert_eq!(int64_column(&joined, 0), vec![1]);
+}
+
+#[tokio::test]
+async fn time_timestamp_precision_and_uuid_literals_cast_strictly() {
+    let batches = run(
+        &Catalog::default(),
+        "SELECT \
+         CAST(TIME '12:34:56.123456' AS VARCHAR), \
+         CAST(CAST('01:02:03.125' AS TIME(3)) AS VARCHAR), \
+         CAST(TIMESTAMP(3) '2024-02-29 12:34:56.1234' AS VARCHAR), \
+         CAST(TIMESTAMP(9) '2024-02-29 12:34:56.123456789' AS VARCHAR), \
+         CAST(UUID '550e8400-e29b-41d4-a716-446655440000' AS VARCHAR), \
+         CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID) = \
+           UUID '550e8400-e29b-41d4-a716-446655440000'",
+    )
+    .await;
+    assert_eq!(string_column(&batches, 0), vec!["12:34:56.123456"]);
+    assert_eq!(string_column(&batches, 1), vec!["01:02:03.125"]);
+    assert_eq!(string_column(&batches, 2), vec!["2024-02-29 12:34:56.123"]);
+    assert_eq!(
+        string_column(&batches, 3),
+        vec!["2024-02-29 12:34:56.123456789"]
+    );
+    assert_eq!(
+        string_column(&batches, 4),
+        vec!["550e8400-e29b-41d4-a716-446655440000"]
+    );
+    let equal = batches[0]
+        .column(5)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(equal.value(0));
+
+    let error = plan_sql(&Catalog::default(), "SELECT UUID 'not-a-uuid'")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("UUID literal"), "{error}");
+}
+
+#[tokio::test]
+async fn compound_intervals_cover_standard_ranges_and_mixed_units() {
+    let batches = run(
+        &Catalog::default(),
+        "SELECT \
+         TIMESTAMP '2024-01-01 00:00:00' \
+           + INTERVAL '1 02:03:04.5' DAY TO SECOND \
+           = TIMESTAMP '2024-01-02 02:03:04.5', \
+         DATE '2024-01-31' + INTERVAL '1-1' YEAR TO MONTH \
+           = DATE '2025-02-28', \
+         TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 day 2 hours' \
+           = TIMESTAMP '2024-01-02 02:00:00', \
+         TIMESTAMP '2024-01-01 00:00:00' \
+           + INTERVAL '2:03.5' MINUTE TO SECOND \
+           = TIMESTAMP '2024-01-01 00:02:03.5', \
+         CAST('2:03.5' AS INTERVAL) = INTERVAL '2:03.5' MINUTE TO SECOND",
+    )
+    .await;
+    for column in batches[0].columns() {
+        let values = column.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(values.value(0));
+    }
+
+    for sql in [
+        "SELECT INTERVAL '1 24:00' DAY TO MINUTE",
+        "SELECT INTERVAL '1-12' YEAR TO MONTH",
+        "SELECT INTERVAL '1:60' MINUTE TO SECOND",
+    ] {
+        assert!(plan_sql(&Catalog::default(), sql).is_err(), "{sql}");
+    }
 }
 
 #[tokio::test]
@@ -267,6 +524,40 @@ fn ordering_catalog() -> Catalog {
     )
 }
 
+fn nullable_tuple_catalog() -> Catalog {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(2),
+                None,
+                Some(2),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(10),
+                Some(20),
+                Some(10),
+                Some(10),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let catalog = Catalog::default();
+    catalog
+        .register(TableEntry::new("tuples", Arc::new(MemoryTable { batch })))
+        .unwrap();
+    catalog
+}
+
 fn table_catalog(name: &str, columns: Vec<(&str, Vec<i64>)>) -> Catalog {
     let schema = Arc::new(Schema::new(
         columns
@@ -325,6 +616,38 @@ fn optional_int64_column(batches: &[RecordBatch], column: usize) -> Vec<Option<i
                 .unwrap();
             (0..array.len())
                 .map(|row| (!array.is_null(row)).then(|| array.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn optional_decimal_column(batches: &[RecordBatch], column: usize) -> Vec<Option<i128>> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| (!array.is_null(row)).then(|| array.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn string_column(batches: &[RecordBatch], column: usize) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| array.value(row).to_owned())
                 .collect::<Vec<_>>()
         })
         .collect()

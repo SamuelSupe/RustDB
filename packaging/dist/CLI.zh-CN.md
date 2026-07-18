@@ -24,6 +24,63 @@ rustdb -f report.sql --format csv --csv-null '\N'
 输出格式支持 `table`、`csv`、`jsonl`。`--metrics` 会在流式结果消费完毕后，把执行
 指标写到 stderr。
 
+## Native 持久化数据库
+
+使用 `--database` 打开本地持久化数据库；不指定时仍使用临时 Engine：
+
+```sh
+rustdb --database ./warehouse -c \
+  "CREATE TABLE events AS SELECT * FROM read_parquet('/data/events/*.parquet')"
+
+rustdb --database ./warehouse -c \
+  "BEGIN READ ONLY; SELECT count(*) FROM events; COMMIT"
+```
+
+v0.8 Native 数据库使用带校验和的 WAL 和快照隔离事务。一个事务固定一份
+Catalog/数据快照；执行 `COMMIT` 前必须消费完或丢弃全部流式结果。mutation 结果
+必须消费到 EOS；若在 staged 后取消或放弃结果，整个事务会回滚，因为 v0.8 不提供
+语句级 savepoint。
+
+若 `COMMIT` 报告结果未知，不要重复提交；应重新打开数据库并检查恢复后的
+Catalog。post-commit failure 则明确表示 generation 已经持久化，同样不能重试。
+
+持久对象默认位于 `main` schema。可执行 `CREATE SCHEMA analytics` 并使用
+`analytics.events`；查询、DML、DDL、COPY 和维护命令采用同一限定名。
+`SHOW SCHEMAS` 与 `information_schema.schemata` 可查看命名空间。若 COPY 返回
+`CopyPostCommitFailure`，目标已经持久化，不应重试。若提示已有未完成的 staging
+文件或远端子对象，请检查并删除该未完成目标后再重试；RustDB 不会自动删除 crash
+残留。
+
+v0.7 数据库在显式迁移前只能只读打开：
+
+```sh
+rustdb migrate ./warehouse
+```
+
+迁移会先完整校验源数据库，并保留同级 `warehouse.v0.7-backup`；已存在的备份
+必须与当前源 catalog 快照完全一致。普通 open 不会静默升级格式。
+
+使用独立数据库命令创建或恢复经过校验的备份：
+
+```sh
+rustdb backup ./warehouse ./warehouse-backup
+rustdb restore ./warehouse-backup ./warehouse-restored
+
+rustdb --s3-region us-east-1 \
+  backup ./warehouse s3://analytics/rustdb/warehouse-2026-07-18
+rustdb --s3-region us-east-1 \
+  restore s3://analytics/rustdb/warehouse-2026-07-18 ./warehouse-restored
+```
+
+远端备份先上传不可变对象，最后发布 manifest。恢复会校验对象大小与哈希，并要求
+目标本地目录尚未存在。S3 endpoint、path-style、HTTP 与匿名参数和查询 Scan
+一致；Secret Key 仍只通过默认凭证链获取。
+
+嵌入式调用方放弃 backup future 后，Engine-owned worker 仍会继续到 manifest 发布
+成功或未完成对象清理结束。进程或主机崩溃应由 S3 未完成 multipart 生命周期策略
+兜底。若 manifest 前崩溃留下已完成对象，RustDB 会拒绝这个非空目标；检查并删除
+该专用前缀后再重试。
+
 ## 数据源
 
 ```sql
@@ -62,6 +119,11 @@ rustdb --s3-endpoint http://127.0.0.1:9000 \
 常用选项：
 
 - `--memory-limit 2GiB`：查询引擎内存预算；
+- `--database PATH`：本地持久化 Native 数据库目录；
+- `--native-engine-limit 20GiB`：完整 Native 数据库目录的硬配额；
+- `--native-default-table-limit 5GiB`：单张 Native 表的默认硬配额；
+- `--native-table-limit events=10GiB`：指定表覆盖值；可重复使用，非默认
+  schema 使用 `schema.table`；
 - `--threads 4`：计算线程数；
 - `--batch-size 8192`：Arrow 批次目标行数；
 - `--io-concurrency 16`：并发 Scan 任务数；
@@ -72,6 +134,8 @@ rustdb --s3-endpoint http://127.0.0.1:9000 \
 - `--runtime-filter-bytes 8MiB`：Join Runtime Filter 内存预算。
 
 大小单位支持 `B`、`KB`、`MB`、`GB`、`KiB`、`MiB`、`GiB`。
+Rust API 也可通过 `NativeStorageConfig` 设置这些配额。配额在每次打开时提供，
+不会写入数据库格式。
 
 ## 交互终端命令
 

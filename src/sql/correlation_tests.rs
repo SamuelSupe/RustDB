@@ -32,6 +32,29 @@ fn decorrelates_exists_and_cross_side_residual() {
 }
 
 #[test]
+fn rejects_outer_references_in_navigation_window_arguments() {
+    for sql in [
+        "SELECT (SELECT lead(o.value) OVER () FROM (SELECT 1 AS inner_value) i) \
+         FROM (SELECT 1 AS value) o",
+        "SELECT (SELECT lag(i.inner_value, 1, o.value) OVER () \
+         FROM (SELECT 1 AS inner_value) i) FROM (SELECT 1 AS value) o",
+        "SELECT (SELECT first_value(o.value) OVER () FROM (SELECT 1 AS inner_value) i) \
+         FROM (SELECT 1 AS value) o",
+        "SELECT (SELECT last_value(o.value) OVER () FROM (SELECT 1 AS inner_value) i) \
+         FROM (SELECT 1 AS value) o",
+    ] {
+        let error = plan_sql(&Catalog::default(), sql).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{sql}: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("window functions in a correlated subquery"),
+            "{sql}: {error}"
+        );
+    }
+}
+
+#[test]
 fn keeps_exists_in_an_expression_as_mark_join() {
     let plan = explain(
         "SELECT d.value, \

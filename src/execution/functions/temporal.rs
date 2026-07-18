@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        Array, ArrayRef, Date32Array, Int32Array, Int64Array, StringArray,
-        TimestampMicrosecondArray,
+        Array, ArrayRef, Date32Array, Int32Array, Int64Array, StringArray, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     },
     compute::{
         cast,
@@ -14,8 +16,9 @@ use arrow::{
 
 use crate::sql::DateTimePart;
 use crate::sql::temporal::{
-    date32_to_timestamp, format_date32, format_timestamp_microsecond, parse_date32,
-    parse_timestamp_microsecond, timestamp_to_date32, truncate_date, truncate_timestamp,
+    date32_to_timestamp, format_date32, format_time, format_timestamp, parse_date32,
+    parse_time_at_precision, parse_timestamp_at_precision, timestamp_to_date32, truncate_date,
+    truncate_timestamp,
 };
 use crate::{Error, Result};
 
@@ -150,18 +153,71 @@ pub(super) fn string_to_date(array: &ArrayRef) -> Result<ArrayRef> {
     Ok(Arc::new(Date32Array::from(output)))
 }
 
-pub(super) fn string_to_timestamp(array: &ArrayRef) -> Result<ArrayRef> {
+pub(super) fn string_to_timestamp(array: &ArrayRef, target: &DataType) -> Result<ArrayRef> {
     let values = downcast::<StringArray>(array, "Utf8")?;
+    let DataType::Timestamp(unit, timezone) = target else {
+        return Err(Error::Internal(format!(
+            "string_to_timestamp target is {target}"
+        )));
+    };
+    if timezone.is_some() {
+        return Err(Error::Unsupported(
+            "timezone-aware string CAST is not supported yet".into(),
+        ));
+    }
+    let precision = precision(*unit);
     let output = (0..values.len())
         .map(|row| {
             values
                 .is_valid(row)
-                .then(|| parse_timestamp_microsecond(values.value(row)))
+                .then(|| parse_timestamp_at_precision(values.value(row), precision).map(|v| v.0))
                 .transpose()
                 .map_err(|error| cast_error(error, row, "TIMESTAMP"))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Arc::new(TimestampMicrosecondArray::from(output)))
+    Ok(match unit {
+        TimeUnit::Second => Arc::new(TimestampSecondArray::from(output)) as ArrayRef,
+        TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(output)),
+        TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(output)),
+        TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(output)),
+    })
+}
+
+pub(super) fn string_to_time(array: &ArrayRef, target: &DataType) -> Result<ArrayRef> {
+    let values = downcast::<StringArray>(array, "Utf8")?;
+    let unit = match target {
+        DataType::Time32(unit) | DataType::Time64(unit) => *unit,
+        _ => {
+            return Err(Error::Internal(format!(
+                "string_to_time target is {target}"
+            )));
+        }
+    };
+    let output = (0..values.len())
+        .map(|row| {
+            values
+                .is_valid(row)
+                .then(|| parse_time_at_precision(values.value(row), precision(unit)).map(|v| v.0))
+                .transpose()
+                .map_err(|error| cast_error(error, row, "TIME"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(match unit {
+        TimeUnit::Second => Arc::new(Time32SecondArray::from(
+            output
+                .into_iter()
+                .map(|value| value.map(|value| value as i32))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+        TimeUnit::Millisecond => Arc::new(Time32MillisecondArray::from(
+            output
+                .into_iter()
+                .map(|value| value.map(|value| value as i32))
+                .collect::<Vec<_>>(),
+        )),
+        TimeUnit::Microsecond => Arc::new(Time64MicrosecondArray::from(output)),
+        TimeUnit::Nanosecond => Arc::new(Time64NanosecondArray::from(output)),
+    })
 }
 
 pub(super) fn date_to_string(array: &ArrayRef) -> Result<ArrayRef> {
@@ -174,12 +230,55 @@ pub(super) fn date_to_string(array: &ArrayRef) -> Result<ArrayRef> {
 }
 
 pub(super) fn timestamp_to_string(array: &ArrayRef) -> Result<ArrayRef> {
-    let values = timestamp_microseconds(array)?;
-    Ok(string_array((0..values.len()).map(|row| {
-        values
-            .is_valid(row)
-            .then(|| format_timestamp_microsecond(values.value(row)))
-    })))
+    let DataType::Timestamp(unit, _) = array.data_type() else {
+        return Err(Error::Internal(
+            "timestamp_to_string received a non-timestamp".into(),
+        ));
+    };
+    let values = (0..array.len())
+        .map(|row| {
+            if array.is_null(row) {
+                return Ok(None);
+            }
+            let super::super::value::CellValue::Int64(value) =
+                super::super::value::cell(array, row)?
+            else {
+                return Err(Error::Internal("TIMESTAMP cell is not Int64".into()));
+            };
+            Ok(Some(format_timestamp(value, *unit)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(string_array(values))
+}
+
+pub(super) fn time_to_string(array: &ArrayRef) -> Result<ArrayRef> {
+    let unit = match array.data_type() {
+        DataType::Time32(unit) | DataType::Time64(unit) => *unit,
+        other => return Err(Error::Internal(format!("time_to_string received {other}"))),
+    };
+    let values = (0..array.len())
+        .map(|row| {
+            if array.is_null(row) {
+                return Ok(None);
+            }
+            let super::super::value::CellValue::Int64(value) =
+                super::super::value::cell(array, row)?
+            else {
+                return Err(Error::Internal("TIME cell is not Int64".into()));
+            };
+            format_time(value, unit).map(Some)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(string_array(values))
+}
+
+fn precision(unit: TimeUnit) -> u64 {
+    match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 3,
+        TimeUnit::Microsecond => 6,
+        TimeUnit::Nanosecond => 9,
+    }
 }
 
 pub(super) fn date_to_timestamp(array: &ArrayRef) -> Result<ArrayRef> {

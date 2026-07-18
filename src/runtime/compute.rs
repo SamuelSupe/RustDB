@@ -46,6 +46,23 @@ impl ComputeRuntime {
         })
     }
 
+    /// Detaches engine-owned housekeeping from the caller's future.
+    ///
+    /// The spawned future must retain the Engine that owns this runtime when
+    /// it needs to survive the last external Engine handle being dropped.
+    pub(crate) fn spawn_background<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let task = self
+            .runtime
+            .as_ref()
+            .expect("compute runtime is available until Engine drop")
+            .handle()
+            .spawn(future);
+        drop(task);
+    }
+
     /// Drives a lazy physical stream on the fixed-size engine runtime. The
     /// bounded channel applies backpressure when an embedded caller is slow.
     pub(crate) fn pipe(
@@ -66,10 +83,18 @@ impl ComputeRuntime {
             .tasks
             .spawn_on(handle, "query-producer", async move {
                 loop {
+                    let next = input.next();
+                    tokio::pin!(next);
                     let item = tokio::select! {
                         biased;
-                        item = input.next() => item,
-                        _ = producer_context.control.cancelled() => return Ok(()),
+                        item = &mut next => item,
+                        _ = producer_context.control.cancelled() => {
+                            if producer_context.has_protected_async_cleanup() {
+                                next.await
+                            } else {
+                                return Ok(());
+                            }
+                        },
                     };
                     let Some(item) = item else { break };
                     let terminal = item.is_err();
@@ -270,6 +295,34 @@ mod tests {
         .expect("query reaper must clean after the producer stops");
         assert!(!directory.exists());
         assert_eq!(cleanup_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_protected_async_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = Arc::new(QueryContext::new(MemoryPool::new(1 << 20), temp.path()).unwrap());
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_context = Arc::clone(&context);
+        let cleanup_finished = Arc::clone(&cleaned);
+        let input = boxed_memory_batch_stream(async_stream::stream! {
+            let _guard = cleanup_context.protect_async_cleanup();
+            cleanup_context.control.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cleanup_finished.store(true, Ordering::Release);
+            yield Err(Error::Cancelled);
+        });
+        let runtime = ComputeRuntime::new(1).unwrap();
+        let output = runtime.pipe(input, Arc::clone(&context));
+        drop(output);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cleaned.load(Ordering::Acquire) || context.tasks.active_tasks() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("protected query cleanup must finish before TaskGroup quiescence");
+        assert!(!context.has_protected_async_cleanup());
     }
 
     #[tokio::test]

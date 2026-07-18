@@ -1,7 +1,8 @@
 use arrow::array::{
-    Array, BinaryArray, Date32Array, Decimal128Array, Int64Array, TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int64Array,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 use futures::TryStreamExt;
 
 use super::ParameterValue;
@@ -181,6 +182,127 @@ async fn preserves_binary_decimal_temporal_and_typed_null_values() {
     );
     assert_eq!(batch.column(4).data_type(), &DataType::Binary);
     assert!(batch.column(4).is_null(0));
+}
+
+#[tokio::test]
+async fn binds_v08_time_uuid_and_interval_parameter_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = Engine::new(
+        EngineConfig::builder()
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )
+    .unwrap()
+    .session();
+    let statement = session
+        .prepare(
+            "SELECT \
+             ? = TIME(9) '12:34:56.123456789', \
+             ? = TIMESTAMPTZ(9) '2024-03-10 06:30:00.123456789+00:00', \
+             ? = UUID '550e8400-e29b-41d4-a716-446655440000', \
+             ? = INTERVAL '1 month 2 days 3.5 seconds'",
+        )
+        .unwrap();
+    let time = 45_296_123_456_789_i64;
+    let timestamp = 1_710_052_200_123_456_789_i64;
+    let uuid = *uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+        .unwrap()
+        .as_bytes();
+    let batches = statement
+        .execute(&[
+            ParameterValue::Time {
+                value: time,
+                unit: TimeUnit::Nanosecond,
+            },
+            ParameterValue::Timestamp {
+                value: timestamp,
+                unit: TimeUnit::Nanosecond,
+                timezone: Some("UTC".into()),
+            },
+            ParameterValue::Uuid(uuid),
+            ParameterValue::MonthDayNanoInterval {
+                months: 1,
+                days: 2,
+                nanoseconds: 3_500_000_000,
+            },
+        ])
+        .await
+        .unwrap()
+        .into_stream()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    for column in batches[0].columns() {
+        assert!(
+            column
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(0)
+        );
+    }
+}
+
+#[tokio::test]
+async fn preserves_prepared_timestamp_timezone_metadata_and_typed_nulls() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = Engine::new(
+        EngineConfig::builder()
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )
+    .unwrap()
+    .session();
+    let statement = session.prepare("SELECT ?, ?").unwrap();
+    let zone = "America/New_York";
+    let value = 1_710_052_200_123_456_789_i64;
+    let batches = statement
+        .execute(&[
+            ParameterValue::Timestamp {
+                value,
+                unit: TimeUnit::Nanosecond,
+                timezone: Some(zone.into()),
+            },
+            ParameterValue::Null(DataType::Timestamp(TimeUnit::Nanosecond, Some(zone.into()))),
+        ])
+        .await
+        .unwrap()
+        .into_stream()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let batch = &batches[0];
+    assert_eq!(
+        batch.column(0).data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some(zone.into()))
+    );
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap()
+            .value(0),
+        value
+    );
+    assert_eq!(batch.column(1).data_type(), batch.column(0).data_type());
+    assert!(batch.column(1).is_null(0));
+
+    let error = match statement
+        .execute(&[
+            ParameterValue::Timestamp {
+                value,
+                unit: TimeUnit::Nanosecond,
+                timezone: Some("not/a-zone".into()),
+            },
+            ParameterValue::Null(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        ])
+        .await
+    {
+        Ok(_) => panic!("invalid timezone parameter unexpectedly executed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unknown IANA timezone"));
 }
 
 #[test]

@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use arrow::datatypes::{DataType, SchemaRef};
 use uuid::Uuid;
@@ -20,6 +23,9 @@ pub(crate) enum NativeWriteMode {
     Create,
     Replace,
     Append,
+    Delete,
+    Update,
+    Truncate,
 }
 
 pub(crate) struct NativeWritePlan {
@@ -64,6 +70,72 @@ pub(super) fn plan(
     source_schema: SchemaRef,
     new_source_bytes: u64,
 ) -> Result<NativeWritePlan> {
+    let state = database.state.lock();
+    if state.catalog.generation() != expected_generation {
+        return Err(Error::Catalog(format!(
+            "catalog generation changed: expected {expected_generation}, found {}",
+            state.catalog.generation()
+        )));
+    }
+    plan_with_existing(
+        database,
+        &state,
+        name,
+        mode,
+        expected_generation,
+        state
+            .tables
+            .get(&name.to_ascii_lowercase())
+            .map(Arc::as_ref),
+        source_schema,
+        new_source_bytes,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_from_snapshot(
+    database: &NativeDatabase,
+    name: &str,
+    mode: NativeWriteMode,
+    expected_generation: u64,
+    existing: Option<Arc<super::table::TableSnapshot>>,
+    schemas: &BTreeSet<String>,
+    source_schema: SchemaRef,
+    new_source_bytes: u64,
+) -> Result<NativeWritePlan> {
+    let state = database.state.lock();
+    if expected_generation > state.catalog.generation() {
+        return Err(Error::Catalog(format!(
+            "transaction snapshot generation {expected_generation} is ahead of catalog generation {}",
+            state.catalog.generation()
+        )));
+    }
+    plan_with_existing(
+        database,
+        &state,
+        name,
+        mode,
+        expected_generation,
+        existing.as_deref(),
+        source_schema,
+        new_source_bytes,
+        Some(schemas),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_with_existing(
+    database: &NativeDatabase,
+    state: &super::NativeState,
+    name: &str,
+    mode: NativeWriteMode,
+    expected_generation: u64,
+    existing: Option<&super::table::TableSnapshot>,
+    source_schema: SchemaRef,
+    new_source_bytes: u64,
+    transaction_schemas: Option<&BTreeSet<String>>,
+) -> Result<NativeWritePlan> {
     let normalized = name.to_ascii_lowercase();
     if normalized.is_empty()
         || normalized != name
@@ -75,14 +147,11 @@ pub(super) fn plan(
         )));
     }
     validate_schema(&source_schema)?;
-    let state = database.state.lock();
-    if state.catalog.generation() != expected_generation {
+    if transaction_schemas.is_none() && state.views.contains_key(&normalized) {
         return Err(Error::Catalog(format!(
-            "catalog generation changed: expected {expected_generation}, found {}",
-            state.catalog.generation()
+            "cannot replace view '{name}' with a table"
         )));
     }
-    let existing = state.tables.get(&normalized);
     let (
         table_id,
         version,
@@ -98,7 +167,13 @@ pub(super) fn plan(
         (NativeWriteMode::Create, Some(_)) => {
             return Err(Error::Catalog(format!("table '{name}' already exists")));
         }
-        (NativeWriteMode::Append, None) => {
+        (
+            NativeWriteMode::Append
+            | NativeWriteMode::Delete
+            | NativeWriteMode::Update
+            | NativeWriteMode::Truncate,
+            None,
+        ) => {
             return Err(Error::Catalog(format!(
                 "native table '{name}' does not exist"
             )));
@@ -127,13 +202,32 @@ pub(super) fn plan(
             0,
             Vec::new(),
         ),
-        (NativeWriteMode::Append, Some(snapshot)) => {
+        (NativeWriteMode::Truncate, Some(snapshot)) => (
+            snapshot.table_id().to_owned(),
+            next_version(snapshot.version())?,
+            Some(snapshot.table_reference()),
+            SnapshotOperation::Truncate,
+            snapshot.schema(),
+            0,
+            snapshot.source_bytes(),
+            snapshot.storage_bytes(),
+            0,
+            Vec::new(),
+        ),
+        (
+            NativeWriteMode::Append | NativeWriteMode::Delete | NativeWriteMode::Update,
+            Some(snapshot),
+        ) => {
             validate_append_schema(&source_schema, &snapshot.schema())?;
             (
                 snapshot.table_id().to_owned(),
                 next_version(snapshot.version())?,
                 Some(snapshot.table_reference()),
-                SnapshotOperation::Append,
+                match mode {
+                    NativeWriteMode::Delete => SnapshotOperation::Delete,
+                    NativeWriteMode::Update => SnapshotOperation::Update,
+                    _ => SnapshotOperation::Append,
+                },
                 snapshot.schema(),
                 snapshot.source_bytes(),
                 0,
@@ -144,24 +238,30 @@ pub(super) fn plan(
         }
     };
     let snapshot_id = Uuid::new_v4().to_string();
-    manifest::validate_planned_update(
-        database.path(),
-        &state.catalog,
-        &normalized,
-        TableReference::new(
-            table_id.clone(),
-            version,
-            snapshot_id.clone(),
-            "0".repeat(64),
-        ),
-    )?;
-    let retired_source_bytes = super::retired_source_bytes(&state, &table_id)?;
+    let reference = TableReference::new(
+        table_id.clone(),
+        version,
+        snapshot_id.clone(),
+        "0".repeat(64),
+    );
+    if let Some(schemas) = transaction_schemas {
+        manifest::validate_planned_transaction_update(
+            database.path(),
+            &state.catalog,
+            schemas,
+            &normalized,
+            reference,
+        )?;
+    } else {
+        manifest::validate_planned_update(database.path(), &state.catalog, &normalized, reference)?;
+    }
+    let retired_source_bytes = super::retired_source_bytes(state, &table_id)?;
     let retained_old_source_bytes = retained_old_source_bytes
         .checked_add(retired_source_bytes)
         .ok_or_else(|| {
             Error::ResourceExhausted("retired native source byte count overflow".to_owned())
         })?;
-    let retired_storage_bytes = super::retired_storage_bytes(database.path(), &state, &table_id)?;
+    let retired_storage_bytes = super::retired_storage_bytes(database.path(), state, &table_id)?;
     let retained_old_storage_bytes = retained_old_storage_bytes
         .checked_add(retired_storage_bytes)
         .ok_or_else(|| {
@@ -307,8 +407,11 @@ fn supported_type(data_type: &DataType) -> bool {
             | DataType::LargeBinary
             | DataType::Date32
             | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
             | DataType::Timestamp(_, _)
             | DataType::Interval(_)
+            | DataType::FixedSizeBinary(16)
     )
 }
 

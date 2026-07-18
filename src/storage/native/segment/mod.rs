@@ -1,8 +1,11 @@
+pub(crate) mod encoding;
 mod fingerprint;
 mod metadata;
 #[cfg(test)]
 pub(in crate::storage::native) mod predicate_file_writer;
 pub(crate) mod predicate_sidecar;
+#[allow(dead_code)]
+pub(crate) mod row_id;
 mod staging_file;
 pub(crate) mod writer;
 

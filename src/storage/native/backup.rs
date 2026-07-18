@@ -192,6 +192,10 @@ fn copy_snapshot(database: &NativeDatabase, destination: &Path) -> Result<()> {
 
     native_io::create_private_dir_all(&destination.join("tables"))?;
     native_io::create_private_dir_all(&destination.join("staging"))?;
+    // A backup contains one already-published catalog generation, so it starts
+    // with a fresh WAL instead of copying source transactions that are no
+    // longer needed to recover that snapshot.
+    native_io::create_private_dir_all(&destination.join("wal"))?;
     for snapshot in state.tables.values() {
         copy_table_snapshot(database.path(), destination, snapshot)?;
     }
@@ -206,6 +210,7 @@ fn copy_table_snapshot(
     for source in snapshot.reachable_directories(source_root) {
         let target = translated_path(source_root, target_root, &source)?;
         native_io::create_private_dir_all(&target.join("segments"))?;
+        native_io::create_private_dir_all(&target.join("delete-vectors"))?;
         copy_file(
             &source.join(".rustdb-snapshot"),
             &target.join(".rustdb-snapshot"),
@@ -221,6 +226,10 @@ fn copy_table_snapshot(
         copy_file(&source, &target)?;
     }
     for source in snapshot.predicate_sidecar_paths(source_root) {
+        let target = translated_path(source_root, target_root, &source)?;
+        copy_file(&source, &target)?;
+    }
+    for source in snapshot.delete_vector_paths(source_root) {
         let target = translated_path(source_root, target_root, &source)?;
         copy_file(&source, &target)?;
     }

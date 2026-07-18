@@ -21,6 +21,7 @@ use super::{
     relation::{CteScope, alias_plan, cte_name},
 };
 
+mod grouping_sets;
 mod join;
 mod select;
 mod set_ops;

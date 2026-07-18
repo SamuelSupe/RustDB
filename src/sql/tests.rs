@@ -3,7 +3,8 @@ use std::sync::Arc;
 use arrow::{
     array::{
         Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
-        TimestampMicrosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
@@ -96,14 +97,9 @@ fn binds_supported_distinct_aggregates_and_rejects_unsupported_shapes() {
     };
     let explain = plan.explain();
     assert!(explain.contains("distinct=count:3,dedup:tagged_full_key"));
+    assert!(plan_sql(&Catalog::default(), "SELECT count(DISTINCT 1, 2)").is_ok());
 
-    for sql in [
-        "SELECT count(DISTINCT *)",
-        "SELECT count(DISTINCT 1, 2)",
-        "SELECT sum(DISTINCT *)",
-        "SELECT sum(1 ORDER BY 1)",
-        "SELECT count(1) FILTER (WHERE TRUE)",
-    ] {
+    for sql in ["SELECT count(DISTINCT *)", "SELECT sum(DISTINCT *)"] {
         assert!(plan_sql(&Catalog::default(), sql).is_err(), "{sql}");
     }
 }
@@ -177,7 +173,7 @@ async fn executes_year_month_and_day_date_intervals() {
 }
 
 #[tokio::test]
-async fn timestamp_typed_literals_honor_microsecond_precision() {
+async fn timestamp_typed_literals_honor_declared_precision() {
     let batches = run("SELECT TIMESTAMP(0) '2024-02-29 12:34:56.999999', \
                 TIMESTAMP(3) '2024-02-29 12:34:56.123999', \
                 TIMESTAMP(6) '1969-12-31 23:59:59.123456', \
@@ -185,39 +181,63 @@ async fn timestamp_typed_literals_honor_microsecond_precision() {
                 TIMESTAMP(3) '1969-12-31 23:59:59.8765'")
     .await;
     let batch = &batches[0];
-    let values = (0..5)
-        .map(|column| {
+    assert!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .is_some()
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap()
+            .value(0)
+            % 1_000,
+        124
+    );
+    assert_eq!(
+        batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .value(0),
+        -876_544
+    );
+    for (column, expected) in [(3, -877), (4, -124)] {
+        assert_eq!(
             batch
                 .column(column)
                 .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
+                .downcast_ref::<TimestampMillisecondArray>()
                 .unwrap()
-                .value(0)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(values[0] % 1_000_000, 0);
-    assert_eq!(values[1] % 1_000_000, 124_000);
-    assert_eq!(values[2], -876_544);
-    assert_eq!(values[3], -877_000);
-    assert_eq!(values[4], -124_000);
+                .value(0),
+            expected
+        );
+    }
 
-    let error = plan_sql(
-        &Catalog::default(),
-        "SELECT TIMESTAMP(7) '2024-02-29 12:34:56.1234567'",
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("precision above 6"), "{error}");
-
-    let error = plan_sql(
-        &Catalog::default(),
-        "SELECT CAST('2024-02-29 12:34:56.123456' AS TIMESTAMP(3))",
-    )
-    .unwrap_err()
-    .to_string();
+    let batches = run("SELECT TIMESTAMP(7) '2024-02-29 12:34:56.1234567'").await;
     assert!(
-        error.contains("precision-qualified TIMESTAMP casts"),
-        "{error}"
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .is_some()
+    );
+
+    let batches = run("SELECT CAST('2024-02-29 12:34:56.123456' AS TIMESTAMP(3))").await;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap()
+            .value(0)
+            % 1_000,
+        123
     );
 }
 

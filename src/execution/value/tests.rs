@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use arrow::{
     array::{
@@ -105,5 +109,23 @@ fn returns_null_for_every_temporal_family() {
 
     for array in arrays {
         assert_eq!(cell(&array, 0).unwrap(), CellValue::Null);
+    }
+}
+
+#[test]
+fn equivalent_interval_families_share_equality_order_and_hash() {
+    let day = CellValue::IntervalDayTime(1, 0);
+    let hours = CellValue::IntervalMonthDayNano(0, 0, 86_400_000_000_000);
+    let month = CellValue::IntervalYearMonth(1);
+    let days = CellValue::IntervalMonthDayNano(0, 30, 0);
+
+    for (left, right) in [(day, hours), (month, days)] {
+        assert_eq!(left, right);
+        assert!(left.compare(&right).unwrap().is_eq());
+        let mut left_hash = DefaultHasher::new();
+        left.hash(&mut left_hash);
+        let mut right_hash = DefaultHasher::new();
+        right.hash(&mut right_hash);
+        assert_eq!(left_hash.finish(), right_hash.finish());
     }
 }

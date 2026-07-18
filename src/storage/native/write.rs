@@ -72,6 +72,13 @@ impl StagedSnapshot {
             .join(format!("{segment_id}.rdbseg"))
     }
 
+    #[allow(dead_code)]
+    pub(in crate::storage::native) fn delete_vector_path(&self, segment_id: &str) -> PathBuf {
+        self.snapshot
+            .join("delete-vectors")
+            .join(format!("{segment_id}.rdbdel"))
+    }
+
     #[cfg(test)]
     pub(crate) fn predicate_sidecar_path(&self, segment_id: &str) -> PathBuf {
         self.snapshot
@@ -80,6 +87,7 @@ impl StagedSnapshot {
     }
 
     pub(crate) fn publish(mut self, destination: &Path) -> Result<()> {
+        let transaction_id = self.marker.transaction_id.clone();
         let parent = destination
             .parent()
             .ok_or_else(|| Error::native_storage(destination, "snapshot has no parent"))?;
@@ -92,8 +100,23 @@ impl StagedSnapshot {
         }
         fs::rename(&self.snapshot, destination)
             .map_err(|error| Error::io(Some(destination.to_path_buf()), error))?;
-        io::sync_dir(parent)?;
-        self.remove_transaction_root()?;
+        io::sync_dir(parent).map_err(|error| {
+            Error::commit_outcome_unknown(
+                destination,
+                &transaction_id,
+                format!(
+                    "native snapshot was renamed into place but directory durability is unknown; reopen the engine: {error}"
+                ),
+            )
+        })?;
+        self.remove_transaction_root().map_err(|error| {
+            Error::native_storage(
+                destination,
+                format!(
+                    "native snapshot was published but staging cleanup failed; reopen the engine: {error}"
+                ),
+            )
+        })?;
         self.active = false;
         Ok(())
     }

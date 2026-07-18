@@ -34,6 +34,7 @@ const WRITE_BATCH_ROWS: usize = 8 * 1024;
 pub(crate) struct SegmentWriter {
     path: PathBuf,
     schema: SchemaRef,
+    physical_schema_fingerprint: String,
     schema_fingerprint: String,
     rows: u64,
     writer: ArrowWriter<Sha256Writer<QuotaFile>>,
@@ -55,28 +56,32 @@ impl SegmentWriter {
         memory: Option<&MemoryPool>,
     ) -> Result<Self> {
         let predicate_sidecar = PredicateSidecarCollector::new(&schema, memory);
-        let mut writer = Self::create_new_inner(path, schema, budget)?;
+        let logical_schema = Arc::clone(&schema);
+        let mut writer = Self::create_new_inner(path, schema, logical_schema, budget)?;
         writer.predicate_sidecar = Some(predicate_sidecar);
         Ok(writer)
     }
 
     pub(in crate::storage::native) fn create_new_without_predicate_sidecar(
         path: impl AsRef<Path>,
-        schema: SchemaRef,
+        physical_schema: SchemaRef,
+        logical_schema: SchemaRef,
         budget: DiskBudget,
     ) -> Result<Self> {
-        Self::create_new_inner(path, schema, budget)
+        Self::create_new_inner(path, physical_schema, logical_schema, budget)
     }
 
     fn create_new_inner(
         path: impl AsRef<Path>,
         schema: SchemaRef,
+        logical_schema: SchemaRef,
         budget: DiskBudget,
     ) -> Result<Self> {
         let path = path.as_ref();
         require_segment_path(path)?;
 
-        let fingerprint = schema_fingerprint(&schema);
+        let physical_schema_fingerprint = schema_fingerprint(&schema);
+        let fingerprint = schema_fingerprint(&logical_schema);
         let file = Sha256Writer::new(QuotaFile::new(open_private(path)?, budget.clone()));
         let writer = ArrowWriter::try_new(
             file,
@@ -99,6 +104,7 @@ impl SegmentWriter {
         Ok(Self {
             path: path.to_path_buf(),
             schema,
+            physical_schema_fingerprint,
             schema_fingerprint: fingerprint,
             rows: 0,
             writer,
@@ -113,7 +119,7 @@ impl SegmentWriter {
                 &self.path,
                 format!(
                     "record batch schema mismatch: expected {}, found {}",
-                    self.schema_fingerprint,
+                    self.physical_schema_fingerprint,
                     schema_fingerprint(batch.schema().as_ref())
                 ),
             ));

@@ -84,7 +84,7 @@ fn encode_staged(directory: &Path, snapshot: &TableSnapshot) -> Result<EncodedSt
     schema::validate_encoded_size(&manifest_path, schema_bytes.len())?;
     let manifest = TableManifest {
         database_id: snapshot.database_id.clone(),
-        format_version: super::format::FORMAT_VERSION,
+        format_version: snapshot.format_version(),
         table_id: snapshot.table_id.clone(),
         version: snapshot.version,
         snapshot_id: snapshot.snapshot_id.clone(),
@@ -97,7 +97,9 @@ fn encode_staged(directory: &Path, snapshot: &TableSnapshot) -> Result<EncodedSt
         },
         source_bytes: snapshot.source_bytes,
         row_count: snapshot.row_count,
+        deleted_row_count: snapshot.deleted_row_count,
         segment_bytes: snapshot.segment_bytes,
+        delete_vector_bytes: snapshot.delete_vector_bytes,
         segments: snapshot.segments.to_vec(),
     };
     let checksum = io::json_sha256(
@@ -198,8 +200,24 @@ pub(in crate::storage::native) fn load(
             "legacy table manifest declares a predicate sidecar",
         ));
     }
+    if !super::format::supports_delete_vectors(manifest.format_version)
+        && manifest
+            .segments
+            .iter()
+            .any(|segment| segment.delete_vector().is_some())
+    {
+        return Err(Error::native_storage(
+            &path,
+            "legacy table manifest declares a delete vector",
+        ));
+    }
+    let physical_row_count = manifest
+        .row_count
+        .checked_add(manifest.deleted_row_count)
+        .ok_or_else(|| Error::native_storage(&path, "table physical row count overflow"))?;
     let schema = schema::decode(&path, &manifest.schema.ipc_hex, &manifest.schema.sha256)?;
     let mut snapshot = TableSnapshot {
+        format_version: manifest.format_version,
         database_id: manifest.database_id,
         table_id: manifest.table_id,
         version: manifest.version,
@@ -209,8 +227,11 @@ pub(in crate::storage::native) fn load(
         schema,
         schema_fingerprint: manifest.schema.sha256,
         source_bytes: manifest.source_bytes,
+        physical_row_count,
         row_count: manifest.row_count,
+        deleted_row_count: manifest.deleted_row_count,
         segment_bytes: manifest.segment_bytes,
+        delete_vector_bytes: manifest.delete_vector_bytes,
         storage_bytes: 0,
         segments: manifest.segments.into(),
         verified_segment_fingerprints: Vec::new().into(),

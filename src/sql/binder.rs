@@ -6,7 +6,7 @@ use sqlparser::ast::{BinaryOperator, CastKind, Expr, Ident, UnaryOperator};
 use crate::{Error, Result};
 
 use super::functions::bind_scalar_expr_with;
-use super::{BinaryOp, BoundExpr, ExprKind, PlanSchema, ScalarValue, UnaryOp};
+use super::{BinaryOp, BoundExpr, ExprKind, PlanSchema, ScalarFunction, ScalarValue, UnaryOp};
 use super::{
     coercion::{
         cast, cast_if_needed, coerce_arithmetic, coerce_comparison, common_case_type, is_numeric,
@@ -55,12 +55,14 @@ pub(super) fn bind_expr_scoped(
     }
     match expr {
         Expr::Identifier(ident) => bind_scoped_column(None, ident, schema, outer),
-        Expr::CompoundIdentifier(idents) if idents.len() >= 2 => bind_scoped_column(
-            Some(&idents[idents.len() - 2].value),
-            &idents[idents.len() - 1],
-            schema,
-            outer,
-        ),
+        Expr::CompoundIdentifier(idents) if idents.len() >= 2 => {
+            let qualifier = idents[..idents.len() - 1]
+                .iter()
+                .map(|ident| ident.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            bind_scoped_column(Some(&qualifier), &idents[idents.len() - 1], schema, outer)
+        }
         Expr::Value(value) => bind_value(&value.value),
         Expr::TypedString(value) => bind_typed_string(value),
         Expr::Interval(interval) => bind_interval(interval),
@@ -199,10 +201,10 @@ pub(super) fn bind_expr_scoped(
             "scalar function {} is not supported",
             function.name
         ))),
-        Expr::AtTimeZone { .. } => Err(Error::Unsupported(
-            "AT TIME ZONE is not supported; RustDB does not apply an implicit session timezone"
-                .into(),
-        )),
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => bind_at_time_zone(timestamp, time_zone, schema, outer),
         Expr::Subquery(_)
         | Expr::Exists { .. }
         | Expr::InSubquery { .. }
@@ -214,6 +216,40 @@ pub(super) fn bind_expr_scoped(
             "expression `{other}` is not supported"
         ))),
     }
+}
+
+fn bind_at_time_zone(
+    timestamp: &Expr,
+    time_zone: &Expr,
+    schema: &PlanSchema,
+    outer: Option<&PlanSchema>,
+) -> Result<BoundExpr> {
+    let timestamp = bind_expr_scoped(timestamp, schema, outer)?;
+    let DataType::Timestamp(unit, source_zone) = &timestamp.data_type else {
+        return Err(Error::InvalidArgument(format!(
+            "AT TIME ZONE requires TIMESTAMP, got {}",
+            timestamp.data_type
+        )));
+    };
+    let zone = bind_expr_scoped(time_zone, schema, outer)?;
+    let ExprKind::Literal(ScalarValue::Utf8(zone)) = zone.kind else {
+        return Err(Error::InvalidArgument(
+            "AT TIME ZONE requires a constant IANA timezone string".into(),
+        ));
+    };
+    let timezone = zone.parse::<chrono_tz::Tz>().map_err(|_| {
+        Error::InvalidArgument(format!("AT TIME ZONE has unknown IANA timezone '{zone}'"))
+    })?;
+    let attach = source_zone.is_none();
+    let data_type = DataType::Timestamp(*unit, attach.then(|| timezone.to_string().into()));
+    Ok(BoundExpr {
+        display_name: format!("{} AT TIME ZONE '{timezone}'", timestamp.display_name),
+        kind: ExprKind::ScalarFunction {
+            function: ScalarFunction::AtTimeZone { timezone, attach },
+            args: vec![timestamp],
+        },
+        data_type,
+    })
 }
 
 fn bind_in_list(
@@ -315,9 +351,7 @@ fn find_column(
             continue;
         }
         if let Some(qualifier) = qualifier
-            && !schema
-                .qualifier(index)
-                .is_some_and(|value| value.eq_ignore_ascii_case(qualifier))
+            && !schema.qualifier_matches(index, qualifier)
         {
             continue;
         }

@@ -57,6 +57,7 @@ fn initialize_and_publish(
     marker: &Marker,
 ) -> Result<()> {
     io::create_private_dir_all(&initializing.join("snapshot").join("segments"))?;
+    io::create_private_dir_all(&initializing.join("snapshot").join("delete-vectors"))?;
     let marker_path = initializing.join(TRANSACTION_MARKER);
     let bytes = io::encode_json_bounded(
         &marker_path,

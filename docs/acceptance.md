@@ -5,9 +5,36 @@ resource-heavy performance work as separate gates. This prevents every
 platform job from downloading or generating the same analytical dataset while
 still requiring one real S3-compatible integration run.
 
-## Active v0.7 release gate
+## Active v0.8 release gate
 
-The v0.7 release decision is functionality-first and supersedes comparative
+v0.8 is reliability-first. Run one focused pass through OrbStack:
+
+```sh
+scripts/ci/orbstack.sh v08
+```
+
+This gate covers all four standalone and transaction commit durability
+boundaries, WAL/staging cleanup, migration retry after each publication
+boundary, deterministic snapshot-isolation conflicts, persistent schema
+namespaces and qualified objects, engine/table hard quotas including concurrent
+publication, DML/transactional DDL, mutation-result cancellation/abandonment,
+COPY and maintenance, Native type reopen, the advanced SQL/time slice, and one
+local/MinIO COPY plus backup/restore round trip. It also verifies COPY encoder
+and multipart memory leases plus conservative TTL reclamation of owned remote
+backup/restore crash directories. It does not
+run comparative performance, repeated soak, ClickBench, TPC-H, or dedicated
+low-memory Spill suites. Formatting and all-target compilation remain separate
+cheap checks during development.
+
+The durable-boundary cases also assert the public terminal classification:
+definite pre-commit failure is rolled back, unreconciled WAL publication is
+indeterminate, and post-Catalog failure is committed. Remote COPY and backup
+abandonment must quiesce their multipart/object cleanup before the relevant
+TaskGroup or Engine-owned worker is released.
+
+## Historical v0.7 release gate
+
+The v0.7 release decision was functionality-first and superseded comparative
 performance gates elsewhere in this historical document. Run the 43 official
 ClickBench queries once on the official 1M Parquet partition:
 
@@ -23,7 +50,7 @@ timing requirement, or 100M download requirement. The optional full dataset
 profile is `CLICKBENCH_PROFILE=full`.
 
 The TPC-H differential, old fixed-hardware measurements, and low-memory suites
-below remain useful regression tools, but they are not blocking v0.7 unless a
+below remain useful regression tools, but they are not blocking v0.8 unless a
 focused correctness issue explicitly calls for them.
 
 ## Local quality gate

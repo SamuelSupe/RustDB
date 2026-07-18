@@ -18,14 +18,19 @@ use crate::{
     sql::StatementPlan,
 };
 
+mod copy;
 mod csv_lifecycle;
 mod join_aggregate;
+mod maintenance;
 mod memory_snapshot;
 mod native;
 mod native_backup;
 mod native_gc;
 mod native_integrity;
 mod native_parquet;
+mod native_quota;
+mod native_schema;
+mod native_types;
 
 #[test]
 fn rejects_zero_sized_batches() {
@@ -758,6 +763,45 @@ async fn refresh_table_atomically_replaces_the_registered_csv_schema() {
     collect(session.execute("REFRESH TABLE dynamic_csv").await.unwrap()).await;
     let described = collect(session.execute("DESCRIBE dynamic_csv").await.unwrap()).await;
     assert_eq!(described[0].num_rows(), 3);
+}
+
+#[tokio::test]
+async fn refresh_table_canonicalizes_the_default_schema_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("parts");
+    std::fs::create_dir(&data).unwrap();
+    let first = data.join("a.csv");
+    std::fs::write(&first, "id\n1\n").unwrap();
+    let session = Engine::new(
+        EngineConfig::builder()
+            .spill_directory(directory.path().join("spill"))
+            .build(),
+    )
+    .unwrap()
+    .session();
+
+    session
+        .register_csv(
+            "main.events",
+            [format!("{}/*.csv", data.display())],
+            CsvOptions {
+                header: CsvHeader::Present,
+                ..CsvOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    std::fs::remove_file(first).unwrap();
+    std::fs::write(data.join("b.csv"), "id,label\n2,two\n").unwrap();
+    let schema = session.refresh_table("main.events").await.unwrap();
+    assert_eq!(schema.fields().len(), 2);
+
+    let error = session.refresh_table("analytics.events").await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Catalog(message) if message.contains("analytics.events")),
+        "qualified refresh fell back to the default schema: {error}"
+    );
 }
 
 #[tokio::test]

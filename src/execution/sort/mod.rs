@@ -24,7 +24,7 @@ use crate::sql::SortExpr;
 use crate::{Error, Result};
 
 use super::expr::evaluate;
-use super::value::canonicalize_sort_key;
+use super::value::{canonical_sort_key_type, canonicalize_sort_key};
 use merge::{MemoryRun, MergeIterator, MergeRun};
 use run::{RunCleanup, compact_pending_runs, compact_runs, sort_batches, spill_run};
 
@@ -346,7 +346,7 @@ fn make_converter(expressions: &[SortExpr]) -> Result<RowConverter> {
         .iter()
         .map(|expression| {
             SortField::new_with_options(
-                expression.expr.data_type.clone(),
+                canonical_sort_key_type(&expression.expr.data_type),
                 SortOptions {
                     descending: expression.descending,
                     nulls_first: expression.nulls_first,

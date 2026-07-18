@@ -10,7 +10,7 @@ use std::{
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_stream::stream;
 use futures::StreamExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -18,17 +18,49 @@ use crate::{
     Result, TableEntry,
     catalog::PersistentCatalog,
     command::{ParsedStatement, SessionCommand, ViewTable},
-    datasource::{MetadataCache, NativeSegmentTable, RegisteredCsvTable, RegisteredParquetTable},
+    datasource::{
+        MetadataCache, NativeSegmentTable, NativeSystemTable, RegisteredCsvTable,
+        RegisteredParquetTable, SystemTableKind,
+    },
     runtime::{
         ComputeRuntime, GlobalComputeScheduler, MemoryPool, QueryContext, QueryControl,
         RecordBatchStream, SpillIoPool, SpillManager, SpillQuotaPool, boxed_record_batch_stream,
         scavenge_orphans,
     },
     sql::{LogicalPlan, StatementPlan},
-    storage::NativeDatabase,
+    storage::{NativeDatabase, RemoteTempDir, RemoteTempKind, scavenge_remote_temp_orphans},
 };
 
 pub use memory_snapshot::EngineMemorySnapshot;
+pub use transaction::{
+    CommitInfo, Transaction, TransactionAccessMode, TransactionOptions,
+    TransactionPreparedStatement,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationInfo {
+    from_version: u32,
+    to_version: u32,
+    backup_path: Option<std::path::PathBuf>,
+}
+
+impl MigrationInfo {
+    pub fn from_version(&self) -> u32 {
+        self.from_version
+    }
+
+    pub fn to_version(&self) -> u32 {
+        self.to_version
+    }
+
+    pub fn backup_path(&self) -> Option<&Path> {
+        self.backup_path.as_deref()
+    }
+
+    pub fn migrated(&self) -> bool {
+        self.from_version != self.to_version
+    }
+}
 
 #[derive(Clone)]
 pub struct Engine {
@@ -46,12 +78,21 @@ struct EngineInner {
     spill_io: SpillIoPool,
     database: Option<Arc<NativeDatabase>>,
     persistent_catalog: PersistentCatalog,
+    transactions: transaction_manager::TransactionManager,
     native_commit: parking_lot::Mutex<()>,
-    native_write_admission: Arc<Semaphore>,
     native_poisoned: AtomicBool,
 }
 
 impl Engine {
+    pub fn migrate(path: impl AsRef<Path>) -> Result<MigrationInfo> {
+        let migration = NativeDatabase::migrate(path)?;
+        Ok(MigrationInfo {
+            from_version: migration.from_version,
+            to_version: migration.to_version,
+            backup_path: migration.backup_path,
+        })
+    }
+
     pub fn new(config: EngineConfig) -> Result<Self> {
         validate_config(&config)?;
         Self::from_validated_config(config, None)
@@ -59,7 +100,7 @@ impl Engine {
 
     pub fn open(path: impl AsRef<Path>, config: EngineConfig) -> Result<Self> {
         validate_config(&config)?;
-        let database = NativeDatabase::open(path)?;
+        let database = NativeDatabase::open_with_storage(path, config.native_storage.clone())?;
         Self::from_validated_config(config, Some(database))
     }
 
@@ -83,6 +124,7 @@ impl Engine {
         std::fs::create_dir_all(&config.spill.directory)
             .map_err(|error| Error::io(Some(config.spill.directory.clone()), error))?;
         scavenge_orphans(&config.spill.directory, config.spill.orphan_ttl)?;
+        scavenge_remote_temp_orphans(&config.spill.directory, config.spill.orphan_ttl)?;
         let memory = MemoryPool::named_root("engine", config.memory_limit);
         SpillManager::protect_io_headroom(&memory, config.spill.io_threads)?;
         let admission = Arc::new(Semaphore::new(config.max_concurrent_queries));
@@ -103,6 +145,16 @@ impl Engine {
                         );
                         TableEntry::new(name, Arc::new(provider))
                     })
+                    .chain(database.view_definitions().into_iter().map(|(name, view)| {
+                        let provider = ViewTable::persistent(
+                            name.clone(),
+                            view.sql().to_owned(),
+                            view.schema(),
+                            config.clone(),
+                            metadata_cache.clone(),
+                        );
+                        TableEntry::new(name, Arc::new(provider))
+                    }))
                     .collect::<Vec<_>>();
                 PersistentCatalog::new(database.catalog_generation(), entries)?
             }
@@ -110,6 +162,7 @@ impl Engine {
         };
         let spill_quota = SpillQuotaPool::new(config.spill.clone())?;
         let spill_io = SpillIoPool::new(config.spill.io_threads)?;
+        let transactions = transaction_manager::TransactionManager::default();
         Ok(Self {
             inner: Arc::new(EngineInner {
                 config,
@@ -122,8 +175,8 @@ impl Engine {
                 spill_io,
                 database,
                 persistent_catalog,
+                transactions,
                 native_commit: parking_lot::Mutex::new(()),
-                native_write_admission: Arc::new(Semaphore::new(1)),
                 native_poisoned: AtomicBool::new(false),
             }),
         })
@@ -151,10 +204,124 @@ impl Engine {
         database.backup_to(destination.as_ref())
     }
 
+    /// Creates a consistent local-directory or S3/MinIO Native backup.
+    ///
+    /// An S3 location is an object prefix. Its manifest is published only
+    /// after every immutable backup object has completed and passed hashing.
+    pub async fn backup_to_location(&self, location: &str) -> Result<()> {
+        if !location.starts_with("s3://") {
+            return self.backup_to(local_location_path(location)?);
+        }
+        let temporary =
+            RemoteTempDir::create(&self.inner.config.spill.directory, RemoteTempKind::Backup)?;
+        let snapshot = temporary.path().join("snapshot");
+        if let Err(error) = self.backup_to(&snapshot) {
+            return temporary.finish(Err(error));
+        }
+        let location = location.to_owned();
+        let s3 = self.inner.config.s3.clone();
+        self.run_owned_remote_backup(async move {
+            let result = crate::storage::upload_remote_backup(&snapshot, &location, &s3).await;
+            temporary.finish(result)
+        })
+        .await
+    }
+
+    /// Runs a remote backup to completion even when its caller abandons the
+    /// public async future. The retained Engine keeps the runtime alive; the
+    /// storage worker either publishes the manifest or performs its own
+    /// multipart/object cleanup before returning.
+    async fn run_owned_remote_backup<F>(&self, future: F) -> Result<()>
+    where
+        F: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let engine_keepalive = self.clone();
+        self.inner.compute.spawn_background(async move {
+            let _engine_keepalive = engine_keepalive;
+            let result = future.await;
+            if let Err(result) = sender.send(result)
+                && let Err(error) = result
+            {
+                tracing::error!(%error, "abandoned remote backup reached a terminal error");
+            }
+        });
+        receiver.await.map_err(|_| {
+            Error::Internal("engine-owned remote backup worker stopped unexpectedly".to_owned())
+        })?
+    }
+
+    /// Restores a local-directory or S3/MinIO backup into a new Native path.
+    pub async fn restore_from_location(
+        backup: &str,
+        destination: impl AsRef<Path>,
+        config: EngineConfig,
+    ) -> Result<Self> {
+        validate_config(&config)?;
+        if !backup.starts_with("s3://") {
+            return Self::restore_from(local_location_path(backup)?, destination, config);
+        }
+        std::fs::create_dir_all(&config.spill.directory)
+            .map_err(|error| Error::io(Some(config.spill.directory.clone()), error))?;
+        scavenge_remote_temp_orphans(&config.spill.directory, config.spill.orphan_ttl)?;
+        let backup = backup.to_owned();
+        let destination = destination.as_ref().to_owned();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let _worker = tokio::spawn(async move {
+            let result = async {
+                let downloaded = crate::storage::download_remote_backup(
+                    &backup,
+                    &config.spill.directory,
+                    &config.s3,
+                )
+                .await?;
+                let restored = Self::restore_from(downloaded.snapshot(), destination, config);
+                downloaded.finish(restored)
+            }
+            .await;
+            if let Err(result) = sender.send(result)
+                && let Err(error) = result
+            {
+                tracing::error!(%error, "abandoned remote restore reached a terminal error");
+            }
+        });
+        receiver.await.map_err(|_| {
+            Error::Internal("owned remote restore worker stopped unexpectedly".to_owned())
+        })?
+    }
+
     pub fn session(&self) -> Session {
+        let catalog = Catalog::with_persistent(self.inner.persistent_catalog.clone());
+        if let Some(database) = self.inner.database.as_ref() {
+            for (name, kind) in [
+                (
+                    "information_schema.schemata",
+                    SystemTableKind::InformationSchemata,
+                ),
+                (
+                    "information_schema.tables",
+                    SystemTableKind::InformationTables,
+                ),
+                (
+                    "information_schema.columns",
+                    SystemTableKind::InformationColumns,
+                ),
+                ("rustdb_system.tables", SystemTableKind::NativeTables),
+                ("rustdb_system.wal", SystemTableKind::Wal),
+            ] {
+                catalog
+                    .register(TableEntry::new(
+                        name,
+                        Arc::new(NativeSystemTable::new(Arc::clone(database), kind)),
+                    ))
+                    .expect("system table registration is infallible");
+            }
+        }
         Session {
             engine: self.clone(),
-            catalog: Catalog::with_persistent(self.inner.persistent_catalog.clone()),
+            catalog,
+            sql_transaction: Arc::new(AsyncMutex::new(None)),
+            native_transaction: None,
         }
     }
 
@@ -172,6 +339,16 @@ impl Engine {
             snapshot.queued_waiters,
             snapshot.waiting_queries,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transaction_counts_for_test(&self) -> (usize, usize) {
+        self.inner.transactions.counts()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn oldest_transaction_snapshot_generation(&self) -> Option<u64> {
+        self.inner.transactions.oldest_snapshot_generation()
     }
 
     fn drain_native_retired(&self) -> Result<()> {
@@ -197,6 +374,8 @@ impl Engine {
 pub struct Session {
     engine: Engine,
     catalog: Catalog,
+    sql_transaction: Arc<AsyncMutex<Option<Transaction>>>,
+    native_transaction: Option<Arc<transaction::TransactionWorkspace>>,
 }
 
 impl Session {
@@ -213,8 +392,33 @@ impl Session {
             .collect()
     }
 
+    fn schema_names(&self) -> Vec<String> {
+        match self.native_transaction.as_ref() {
+            Some(transaction) => transaction.schema_names(),
+            None => self
+                .engine
+                .inner
+                .database
+                .as_ref()
+                .map(|database| database.schema_names())
+                .unwrap_or_else(|| vec![crate::catalog_name::DEFAULT_SCHEMA.to_owned()]),
+        }
+    }
+
+    fn ensure_schema_for(&self, name: &str) -> Result<()> {
+        let schema = crate::catalog_name::schema_of(name);
+        if self.schema_names().iter().any(|name| name == schema) {
+            return Ok(());
+        }
+        Err(Error::Catalog(format!("schema '{schema}' does not exist")))
+    }
+
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
         PreparedStatement::new(self.clone(), sql)
+    }
+
+    pub fn begin_transaction(&self, options: TransactionOptions) -> Result<Transaction> {
+        Transaction::begin(self, options)
     }
 
     pub async fn register_parquet<I, S>(
@@ -227,6 +431,8 @@ impl Session {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let name = crate::catalog_name::local(&name.into(), "registered table")?;
+        self.ensure_schema_for(&name)?;
         let locations = normalize_locations(locations);
         let provider = RegisteredParquetTable::try_new(
             locations,
@@ -249,6 +455,8 @@ impl Session {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let name = crate::catalog_name::local(&name.into(), "registered table")?;
+        self.ensure_schema_for(&name)?;
         let locations = normalize_locations(locations);
         let provider =
             RegisteredCsvTable::try_new(locations, options, &self.engine.inner.config).await?;
@@ -257,9 +465,10 @@ impl Session {
     }
 
     pub async fn refresh_table(&self, name: &str) -> Result<SchemaRef> {
+        let name = crate::catalog_name::local(name, "registered table")?;
         let entry = self
             .catalog
-            .table(name)
+            .table(&name)
             .ok_or_else(|| Error::Catalog(format!("table '{name}' does not exist")))?;
         let replacement = entry.provider().refreshed().await?.ok_or_else(|| {
             Error::Catalog(format!(
@@ -268,19 +477,48 @@ impl Session {
         })?;
         let schema = replacement.schema();
         self.catalog
-            .replace_provider(name, entry.provider(), replacement)?;
+            .replace_provider(&name, entry.provider(), replacement)?;
         Ok(schema)
     }
 
     pub async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        let admission_started = Instant::now();
-        let permit = self.acquire_query_permit().await?;
-        let admission_wait = admission_started.elapsed();
         let parse_started = Instant::now();
         let parsed = crate::command::parse(sql);
         let parse_time = parse_started.elapsed();
+        let parsed = parsed?;
 
-        match parsed? {
+        if is_transaction_control(&parsed) {
+            let ParsedStatement::Command(command) = parsed else {
+                unreachable!("transaction control is always a command")
+            };
+            return self.execute_transaction_control(command, parse_time).await;
+        }
+
+        let transaction = self.sql_transaction.lock().await;
+        if let Some(transaction) = transaction.as_ref() {
+            return transaction.execute(sql).await;
+        }
+        drop(transaction);
+
+        self.execute_parsed(parsed, parse_time).await
+    }
+
+    pub(super) async fn execute_direct(&self, sql: &str) -> Result<QueryResult> {
+        let parse_started = Instant::now();
+        let parsed = crate::command::parse(sql)?;
+        self.execute_parsed(parsed, parse_started.elapsed()).await
+    }
+
+    async fn execute_parsed(
+        &self,
+        parsed: ParsedStatement,
+        parse_time: Duration,
+    ) -> Result<QueryResult> {
+        let admission_started = Instant::now();
+        let permit = self.acquire_query_permit().await?;
+        let admission_wait = admission_started.elapsed();
+
+        match parsed {
             ParsedStatement::Command(command) => {
                 self.execute_command(command, permit, admission_wait, parse_time)
                     .await
@@ -327,6 +565,18 @@ impl Session {
     }
 
     pub(crate) async fn execute_prepared(
+        &self,
+        statement: sqlparser::ast::Statement,
+    ) -> Result<QueryResult> {
+        let transaction = self.sql_transaction.lock().await;
+        if let Some(transaction) = transaction.as_ref() {
+            return transaction.execute_statement(statement).await;
+        }
+        drop(transaction);
+        self.execute_prepared_direct(statement).await
+    }
+
+    pub(super) async fn execute_prepared_direct(
         &self,
         statement: sqlparser::ast::Statement,
     ) -> Result<QueryResult> {
@@ -379,13 +629,83 @@ impl Session {
                 .execute_native_write(command, permit, admission_wait, parse_time)
                 .await;
         }
+        if let SessionCommand::CopyTo(command) = command {
+            return self
+                .execute_copy_to(command, permit, admission_wait, parse_time)
+                .await;
+        }
+        if let SessionCommand::Maintenance(command) = command {
+            return self
+                .execute_maintenance(command, permit, admission_wait, parse_time)
+                .await;
+        }
+        if let SessionCommand::NativeAlter(command) = command {
+            return self
+                .execute_native_alter(command, permit, admission_wait, parse_time)
+                .await;
+        }
+        if let SessionCommand::CreatePersistentView {
+            name,
+            query,
+            replace,
+        } = command
+        {
+            return self
+                .execute_persistent_view_create(
+                    name,
+                    query,
+                    replace,
+                    permit,
+                    admission_wait,
+                    parse_time,
+                )
+                .await;
+        }
+        if let SessionCommand::DropView { name, if_exists } = command {
+            return self
+                .execute_view_drop(name, if_exists, permit, admission_wait, parse_time)
+                .await;
+        }
+        if let SessionCommand::NativeDelete(command) = command {
+            return self
+                .execute_native_delete(command, permit, admission_wait, parse_time)
+                .await;
+        }
+        if let SessionCommand::NativeDropTable(command) = command {
+            return self
+                .execute_native_drop_table(command, permit, admission_wait, parse_time)
+                .await;
+        }
+        if let SessionCommand::NativeUpdate(command) = command {
+            return self
+                .execute_native_update(command, permit, admission_wait, parse_time)
+                .await;
+        }
+        if let SessionCommand::NativeTruncate(command) = command {
+            return self
+                .execute_native_truncate(command, permit, admission_wait, parse_time)
+                .await;
+        }
+        if let SessionCommand::NativeSchema(command) = command {
+            return self
+                .execute_native_schema(command, permit, admission_wait, parse_time)
+                .await;
+        }
         let context = self.query_context()?;
         context.metrics.record_query_admission_wait(admission_wait);
         context.metrics.record_sql_parse_time(parse_time);
         let batch = async {
             match command {
-                SessionCommand::ShowTables => crate::command::show_tables(&self.catalog),
-                SessionCommand::Describe { name } => crate::command::describe(&self.catalog, &name),
+                SessionCommand::BeginTransaction { .. }
+                | SessionCommand::CommitTransaction
+                | SessionCommand::RollbackTransaction => {
+                    unreachable!("transaction control bypasses query admission")
+                }
+                SessionCommand::ShowTables => crate::command::show_tables(&self.pin_catalog()?),
+                SessionCommand::ShowSchemas => crate::command::show_schemas(self.schema_names()),
+                SessionCommand::Describe { name } => {
+                    crate::command::describe(&self.pin_catalog()?, &name)
+                }
                 SessionCommand::RefreshTable { name } => {
                     self.refresh_table(&name).await?;
                     crate::command::status("REFRESH TABLE")
@@ -395,6 +715,7 @@ impl Session {
                     query,
                     replace,
                 } => {
+                    self.ensure_schema_for(&name)?;
                     let plan = self
                         .prepare_view_plan(&query, Some(Arc::clone(&context)))
                         .await?;
@@ -410,13 +731,31 @@ impl Session {
                         .register_view(TableEntry::new(name, provider), query, replace)?;
                     crate::command::status("CREATE VIEW")
                 }
-                SessionCommand::DropView { name, if_exists } => {
-                    if !self.catalog.drop_view(&name) && !if_exists {
-                        return Err(Error::Catalog(format!("view '{name}' does not exist")));
-                    }
-                    crate::command::status("DROP VIEW")
+                SessionCommand::CreatePersistentView { .. } => {
+                    unreachable!("handled before command dispatch")
+                }
+                SessionCommand::DropView { .. } => unreachable!("handled before command dispatch"),
+                SessionCommand::CopyTo(_) => unreachable!("handled before command dispatch"),
+                SessionCommand::Maintenance(_) => {
+                    unreachable!("handled before command dispatch")
                 }
                 SessionCommand::NativeWrite(_) => unreachable!("handled before command dispatch"),
+                SessionCommand::NativeAlter(_) => unreachable!("handled before command dispatch"),
+                SessionCommand::NativeDelete(_) => {
+                    unreachable!("handled before command dispatch")
+                }
+                SessionCommand::NativeDropTable(_) => {
+                    unreachable!("handled before command dispatch")
+                }
+                SessionCommand::NativeUpdate(_) => {
+                    unreachable!("handled before command dispatch")
+                }
+                SessionCommand::NativeTruncate(_) => {
+                    unreachable!("handled before command dispatch")
+                }
+                SessionCommand::NativeSchema(_) => {
+                    unreachable!("handled before command dispatch")
+                }
             }
         }
         .await;
@@ -425,6 +764,86 @@ impl Session {
             Err(error) => return Err(context.error_with_cleanup(error)),
         };
         self.batch_result(batch, permit, context)
+    }
+
+    async fn execute_transaction_control(
+        &self,
+        command: SessionCommand,
+        parse_time: Duration,
+    ) -> Result<QueryResult> {
+        let context = self.query_context()?;
+        context.metrics.record_sql_parse_time(parse_time);
+        let batch = match command {
+            SessionCommand::BeginTransaction { read_only } => {
+                let mut active = self.sql_transaction.lock().await;
+                if active.is_some() {
+                    return Err(context.error_with_cleanup(Error::InvalidArgument(
+                        "a transaction is already active for this session".to_owned(),
+                    )));
+                }
+                let options = if read_only {
+                    TransactionOptions::read_only()
+                } else {
+                    TransactionOptions::read_write()
+                };
+                *active = Some(
+                    Transaction::begin(self, options)
+                        .map_err(|error| context.error_with_cleanup(error))?,
+                );
+                crate::command::status("BEGIN")
+            }
+            SessionCommand::CommitTransaction => {
+                let mut active = self.sql_transaction.lock().await;
+                let transaction = active.as_mut().ok_or_else(|| {
+                    context.error_with_cleanup(Error::InvalidArgument(
+                        "no transaction is active".to_owned(),
+                    ))
+                })?;
+                let outcome = transaction.commit();
+                if let Err(Error::NativeCommitPostCommitFailure {
+                    path,
+                    transaction_id,
+                    generation,
+                    ..
+                }) = &outcome
+                {
+                    context.mark_native_commit(path.clone(), transaction_id.clone(), *generation);
+                }
+                if outcome.is_err() && !transaction.is_active() {
+                    active.take();
+                }
+                let commit = outcome.map_err(|error| {
+                    let error = context.error_with_cleanup(error);
+                    context.error_after_durable_outcome(error)
+                })?;
+                if let Some(generation) = commit.committed_generation()
+                    && let Some(database) = self.engine.inner.database.as_ref()
+                {
+                    context.mark_native_commit(
+                        database.path().to_path_buf(),
+                        commit.transaction_id().to_string(),
+                        generation,
+                    );
+                }
+                active.take();
+                crate::command::status("COMMIT")
+            }
+            SessionCommand::RollbackTransaction => {
+                let mut active = self.sql_transaction.lock().await;
+                let transaction = active.as_mut().ok_or_else(|| {
+                    context.error_with_cleanup(Error::InvalidArgument(
+                        "no transaction is active".to_owned(),
+                    ))
+                })?;
+                transaction
+                    .rollback()
+                    .map_err(|error| context.error_with_cleanup(error))?;
+                active.take();
+                crate::command::status("ROLLBACK")
+            }
+            _ => unreachable!("non-transaction command entered transaction control"),
+        }?;
+        self.batch_result_without_admission(batch, context)
     }
 
     async fn prepare_view_plan(
@@ -450,7 +869,7 @@ impl Session {
         sql: &str,
         context: Option<Arc<QueryContext>>,
     ) -> Result<StatementPlan> {
-        let catalog = self.catalog.pin();
+        let catalog = self.pin_catalog()?;
         if let Some(context) = context.as_ref() {
             context.set_catalog_snapshot(catalog.clone())?;
         }
@@ -520,7 +939,7 @@ impl Session {
         statement: sqlparser::ast::Statement,
         context: Option<Arc<QueryContext>>,
     ) -> Result<StatementPlan> {
-        let catalog = self.catalog.pin();
+        let catalog = self.pin_catalog()?;
         if let Some(context) = context.as_ref() {
             context.set_catalog_snapshot(catalog.clone())?;
         }
@@ -585,6 +1004,22 @@ impl Session {
         ))
     }
 
+    fn batch_result_without_admission(
+        &self,
+        batch: RecordBatch,
+        context: Arc<QueryContext>,
+    ) -> Result<QueryResult> {
+        let schema = batch.schema();
+        let stream = boxed_record_batch_stream(futures::stream::once(async move { Ok(batch) }));
+        Ok(query_result_inner(
+            schema,
+            stream,
+            context,
+            None,
+            self.engine.clone(),
+        ))
+    }
+
     fn query_context(&self) -> Result<Arc<QueryContext>> {
         let query_id = Uuid::new_v4();
         let query_memory = self.engine.inner.memory.child(
@@ -608,6 +1043,24 @@ impl Session {
         context.configure_compute_lanes(self.engine.inner.config.compute_threads);
         Ok(context)
     }
+
+    pub(super) fn pin_catalog(&self) -> Result<Catalog> {
+        match self.native_transaction.as_ref() {
+            Some(transaction) => transaction.pin_catalog(&self.catalog),
+            None => Ok(self.catalog.pin()),
+        }
+    }
+}
+
+fn is_transaction_control(parsed: &ParsedStatement) -> bool {
+    matches!(
+        parsed,
+        ParsedStatement::Command(
+            SessionCommand::BeginTransaction { .. }
+                | SessionCommand::CommitTransaction
+                | SessionCommand::RollbackTransaction
+        )
+    )
 }
 
 fn query_result(
@@ -615,6 +1068,16 @@ fn query_result(
     stream: RecordBatchStream,
     context: Arc<QueryContext>,
     permit: OwnedSemaphorePermit,
+    engine: Engine,
+) -> QueryResult {
+    query_result_inner(schema, stream, context, Some(permit), engine)
+}
+
+fn query_result_inner(
+    schema: SchemaRef,
+    stream: RecordBatchStream,
+    context: Arc<QueryContext>,
+    permit: Option<OwnedSemaphorePermit>,
     engine: Engine,
 ) -> QueryResult {
     let stream = instrument_output(stream, Arc::clone(&context), permit, engine);
@@ -677,7 +1140,7 @@ impl QueryResult {
 fn instrument_output(
     mut input: RecordBatchStream,
     context: Arc<QueryContext>,
-    permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
     engine: Engine,
 ) -> RecordBatchStream {
     boxed_record_batch_stream(stream! {
@@ -688,7 +1151,7 @@ fn instrument_output(
         while let Some(item) = input.next().await {
             match item {
                 Ok(batch) => {
-                    if !context.native_commit_is_durable()
+                    if !context.durable_outcome_is_committed()
                         && let Err(error) = context.check_cancelled()
                     {
                         context.metrics.finish();
@@ -718,17 +1181,27 @@ fn instrument_output(
                     // than waiting for QueryContext::drop().
                     let mut error = context.error_with_cleanup_after_tasks(error).await;
                     context.release_catalog_snapshot();
+                    let mut native_cleanup_failed = false;
                     if let Err(cleanup) = _engine_keepalive.drain_native_retired() {
+                        native_cleanup_failed = true;
                         error = Error::Execution(format!(
                             "{error}; additionally failed to clean retired native snapshots: {cleanup}"
                         ));
                     }
-                    if context.native_commit_is_durable() {
-                        _engine_keepalive
-                            .inner
-                            .native_poisoned
-                            .store(true, Ordering::Release);
-                        error = context.error_after_native_commit(error);
+                    if context.durable_outcome_is_committed() {
+                        // Result delivery can be cancelled after the catalog
+                        // commit is already durable. That outcome must be
+                        // reported as committed without poisoning an otherwise
+                        // healthy engine. Only a native cleanup failure here
+                        // requires reopen; commit/install failures poison at
+                        // their source before reaching this wrapper.
+                        if native_cleanup_failed {
+                            _engine_keepalive
+                                .inner
+                                .native_poisoned
+                                .store(true, Ordering::Release);
+                        }
+                        error = context.error_after_durable_outcome(error);
                     }
                     yield Err(error);
                     return;
@@ -738,29 +1211,33 @@ fn instrument_output(
         context.metrics.finish();
         if let Err(mut error) = context.cleanup_spill_after_tasks().await {
             context.release_catalog_snapshot();
+            let mut native_cleanup_failed = false;
             if let Err(cleanup) = _engine_keepalive.drain_native_retired() {
+                native_cleanup_failed = true;
                 error = Error::Execution(format!(
                     "{error}; additionally failed to clean retired native snapshots: {cleanup}"
                 ));
             }
-            if context.native_commit_is_durable() {
-                _engine_keepalive
-                    .inner
-                    .native_poisoned
-                    .store(true, Ordering::Release);
-                error = context.error_after_native_commit(error);
+            if context.durable_outcome_is_committed() {
+                if native_cleanup_failed {
+                    _engine_keepalive
+                        .inner
+                        .native_poisoned
+                        .store(true, Ordering::Release);
+                }
+                error = context.error_after_durable_outcome(error);
             }
             yield Err(error);
             return;
         }
         context.release_catalog_snapshot();
         if let Err(error) = _engine_keepalive.drain_native_retired() {
-            if context.native_commit_is_durable() {
+            if context.durable_outcome_is_committed() {
                 _engine_keepalive
                     .inner
                     .native_poisoned
                     .store(true, Ordering::Release);
-                yield Err(context.error_after_native_commit(error));
+                yield Err(context.error_after_durable_outcome(error));
             } else {
                 yield Err(error);
             }
@@ -774,6 +1251,26 @@ where
     S: Into<String>,
 {
     locations.into_iter().map(Into::into).collect()
+}
+
+fn local_location_path(location: &str) -> Result<std::path::PathBuf> {
+    if !location.starts_with("file://") {
+        return Ok(std::path::PathBuf::from(location));
+    }
+    let url = url::Url::parse(location)
+        .map_err(|error| Error::InvalidArgument(format!("invalid file URI: {error}")))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::InvalidArgument(
+            "file URI must not contain user information".to_owned(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(Error::InvalidArgument(
+            "file URI must not contain a query or fragment".to_owned(),
+        ));
+    }
+    url.to_file_path()
+        .map_err(|()| Error::InvalidArgument("file URI is not a local path".to_owned()))
 }
 
 fn validate_config(config: &EngineConfig) -> Result<()> {
@@ -808,6 +1305,7 @@ fn validate_config(config: &EngineConfig) -> Result<()> {
     config.csv_scan.validate()?;
     config.execution.validate()?;
     config.spill.validate()?;
+    config.native_storage.validate()?;
     ensure_directory_parent(&config.spill.directory)
 }
 
@@ -824,8 +1322,34 @@ fn ensure_directory_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests;
 
+#[path = "engine/copy.rs"]
+mod copy;
+#[path = "engine/copy_sink.rs"]
+mod copy_sink;
+#[path = "engine/maintenance.rs"]
+mod maintenance;
 #[path = "engine/memory_snapshot.rs"]
 mod memory_snapshot;
 
+#[path = "engine/native_alter.rs"]
+mod native_alter;
+#[path = "engine/native_delete.rs"]
+mod native_delete;
+#[path = "engine/native_drop.rs"]
+mod native_drop;
+#[path = "engine/native_matches.rs"]
+mod native_matches;
+#[path = "engine/native_schema.rs"]
+mod native_schema;
+#[path = "engine/native_truncate.rs"]
+mod native_truncate;
+#[path = "engine/native_update.rs"]
+mod native_update;
+#[path = "engine/native_view.rs"]
+mod native_view;
 #[path = "engine/native_write.rs"]
 mod native_write;
+#[path = "engine/transaction.rs"]
+mod transaction;
+#[path = "engine/transaction_manager.rs"]
+mod transaction_manager;

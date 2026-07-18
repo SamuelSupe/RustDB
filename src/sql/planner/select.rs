@@ -19,7 +19,7 @@ use super::super::{
     window,
 };
 use super::{
-    Planner,
+    Planner, grouping_sets,
     join::{JoinBinding, apply_using_projection, bind_join_constraint},
     last_name_part, object_name,
 };
@@ -47,19 +47,20 @@ impl Planner<'_> {
         let mut selection = select.selection.clone();
         let mut having = select.having.clone();
         let mut qualify = select.qualify.clone();
-        let mut group_ast = match &select.group_by {
-            GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => {
-                expressions.clone()
-            }
-            GroupByExpr::Expressions(_, _) | GroupByExpr::All(_) => {
-                return Err(Error::Unsupported(
-                    "GROUP BY modifiers and GROUP BY ALL are not supported".into(),
-                ));
-            }
+        let expanded_grouping = grouping_sets::expand(&select.group_by)?;
+        let (mut group_ast, mut grouping_plan) = match expanded_grouping {
+            Some(expanded) => (expanded.universe, Some(expanded.sets)),
+            None => match &select.group_by {
+                GroupByExpr::Expressions(expressions, _) => (expressions.clone(), None),
+                GroupByExpr::All(_) => unreachable!("GROUP BY ALL was rejected by expansion"),
+            },
         };
         let mut plan = self.plan_from(&select.from, ctes)?;
         projection = expand_wildcards(&projection, plan.schema())?;
         resolve_group_by(&mut group_ast, &projection, plan.schema())?;
+        if let Some(sets) = grouping_plan.as_mut() {
+            grouping_sets::normalize_resolved(&mut group_ast, sets)?;
+        }
         if let Some(predicate) = &mut having {
             rewrite_projection_aliases(predicate, &projection, "HAVING")?;
         }
@@ -87,13 +88,14 @@ impl Planner<'_> {
                 .cloned()
                 .map(SelectItem::UnnamedExpr),
         );
-        let aggregate_query = is_aggregate_query(
-            &group_ast,
-            &projection,
-            having.as_ref(),
-            qualify.as_ref(),
-            &select.named_window,
-        );
+        let aggregate_query = grouping_plan.is_some()
+            || is_aggregate_query(
+                &group_ast,
+                &projection,
+                having.as_ref(),
+                qualify.as_ref(),
+                &select.named_window,
+            );
 
         if let Some(predicate) = &mut selection {
             plan = self.plan_where(plan, predicate, outer, ctes)?;
@@ -161,6 +163,11 @@ impl Planner<'_> {
             _ => false,
         }) || qualify.as_ref().is_some_and(window::contains_window);
         if has_windows || qualify.is_some() {
+            if grouping_plan.is_some() {
+                return Err(Error::Unsupported(
+                    "window functions over grouping sets are not supported yet".into(),
+                ));
+            }
             let plan = window::plan_window_projection(
                 plan,
                 &group_ast,
@@ -175,14 +182,18 @@ impl Planner<'_> {
         }
 
         if aggregate_query {
-            let plan = plan_aggregate_projection(
-                plan,
-                &group_ast,
-                &projection,
-                having.as_ref(),
-                outer,
-                &hidden_groups,
-            )?;
+            let plan = if let Some(sets) = grouping_plan.as_deref() {
+                grouping_sets::plan(plan, &group_ast, sets, &projection, having.as_ref(), outer)?
+            } else {
+                plan_aggregate_projection(
+                    plan,
+                    &group_ast,
+                    &projection,
+                    having.as_ref(),
+                    outer,
+                    &hidden_groups,
+                )?
+            };
             Ok(if distinct { plan_distinct(plan) } else { plan })
         } else {
             let plan = self.plan_projection(plan, &projection, outer)?;
@@ -340,12 +351,15 @@ impl Planner<'_> {
                         "table functions are not supported".into(),
                     ));
                 }
-                let table_name = object_name(name);
-                let qualifier = alias
-                    .as_ref()
-                    .map(|alias| alias.name.value.clone())
-                    .unwrap_or_else(|| last_name_part(&table_name).to_owned());
-                if let Some(plan) = ctes.get(&cte_name(last_name_part(&table_name))) {
+                let display_name = object_name(name);
+                let table_name = crate::catalog_name::object(name, "table")?;
+                if name.0.len() == 1
+                    && let Some(plan) = ctes.get(&cte_name(last_name_part(&display_name)))
+                {
+                    let qualifier = alias
+                        .as_ref()
+                        .map(|alias| alias.name.value.clone())
+                        .unwrap_or_else(|| last_name_part(&display_name).to_owned());
                     return alias_plan(
                         plan.clone(),
                         Some(&qualifier),
@@ -355,13 +369,19 @@ impl Planner<'_> {
                             .unwrap_or(&[]),
                     );
                 }
-                let entry = self
-                    .catalog
-                    .table(&table_name)
-                    .or_else(|| self.catalog.table(last_name_part(&table_name)))
-                    .ok_or_else(|| {
-                        Error::Catalog(format!("table '{table_name}' does not exist"))
-                    })?;
+                let qualifier = alias
+                    .as_ref()
+                    .map(|alias| alias.name.value.clone())
+                    .unwrap_or_else(|| {
+                        if table_name.contains('.') {
+                            table_name.clone()
+                        } else {
+                            format!("{}.{}", crate::catalog_name::DEFAULT_SCHEMA, table_name)
+                        }
+                    });
+                let entry = self.catalog.table(&table_name).ok_or_else(|| {
+                    Error::Catalog(format!("table '{display_name}' does not exist"))
+                })?;
                 let provider = Arc::clone(entry.provider());
                 let schema = provider.schema();
                 let statistics = provider.statistics();
@@ -370,7 +390,7 @@ impl Planner<'_> {
                     vec![Some(qualifier.clone()); provider.schema().fields().len()],
                 );
                 let plan = LogicalPlan::Scan {
-                    table_name,
+                    table_name: display_name,
                     provider,
                     statistics,
                     projection: None,
@@ -491,20 +511,17 @@ fn expand_wildcards(items: &[SelectItem], schema: &PlanSchema) -> Result<Vec<Sel
                     .map(|index| SelectItem::UnnamedExpr(column_expr(schema, index))),
             ),
             SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _) => {
-                let qualifier = object_name(name);
+                let display_name = object_name(name);
+                let qualifier = wildcard_qualifier(name)?;
                 let start = output.len();
                 output.extend(
                     (0..schema.arrow().fields().len())
-                        .filter(|index| {
-                            schema.qualifier(*index).is_some_and(|value| {
-                                value.eq_ignore_ascii_case(last_name_part(&qualifier))
-                            })
-                        })
+                        .filter(|index| schema.qualifier_matches(*index, &qualifier))
                         .map(|index| SelectItem::UnnamedExpr(column_expr(schema, index))),
                 );
                 if output.len() == start {
                     return Err(Error::Catalog(format!(
-                        "relation '{qualifier}' does not exist"
+                        "relation '{display_name}' does not exist"
                     )));
                 }
             }
@@ -522,7 +539,13 @@ fn expand_wildcards(items: &[SelectItem], schema: &PlanSchema) -> Result<Vec<Sel
 fn column_expr(schema: &PlanSchema, index: usize) -> Expr {
     let column = Ident::new(schema.arrow().field(index).name());
     match schema.qualifier(index) {
-        Some(qualifier) => Expr::CompoundIdentifier(vec![Ident::new(qualifier), column]),
+        Some(qualifier) => Expr::CompoundIdentifier(
+            qualifier
+                .split('.')
+                .map(Ident::new)
+                .chain(std::iter::once(column))
+                .collect(),
+        ),
         None => Expr::Identifier(column),
     }
 }
@@ -570,7 +593,8 @@ fn bind_qualified_wildcard(
     schema: &PlanSchema,
     output: &mut Vec<BoundExpr>,
 ) -> Result<()> {
-    let qualifier = object_name(name);
+    let display_name = object_name(name);
+    let qualifier = wildcard_qualifier(name)?;
     let start = output.len();
     output.extend(
         schema
@@ -578,21 +602,27 @@ fn bind_qualified_wildcard(
             .fields()
             .iter()
             .enumerate()
-            .filter(|(index, _)| {
-                schema
-                    .qualifier(*index)
-                    .is_some_and(|value| value.eq_ignore_ascii_case(last_name_part(&qualifier)))
-            })
+            .filter(|(index, _)| schema.qualifier_matches(*index, &qualifier))
             .map(|(index, field)| {
                 BoundExpr::column(index, field.data_type().clone(), field.name())
             }),
     );
     if output.len() == start {
         return Err(Error::Catalog(format!(
-            "relation '{qualifier}' does not exist"
+            "relation '{display_name}' does not exist"
         )));
     }
     Ok(())
+}
+
+fn wildcard_qualifier(name: &sqlparser::ast::ObjectName) -> Result<String> {
+    if let [part] = name.0.as_slice() {
+        return part
+            .as_ident()
+            .map(|ident| ident.value.clone())
+            .ok_or_else(|| Error::Unsupported("relation aliases must be identifiers".into()));
+    }
+    crate::catalog_name::qualifier(name, "relation")
 }
 
 fn plan_distinct(input: LogicalPlan) -> LogicalPlan {

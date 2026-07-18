@@ -30,6 +30,7 @@ impl PersistentCatalog {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.current.read().generation()
     }

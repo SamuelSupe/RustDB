@@ -74,6 +74,9 @@ pub(super) fn bind_scalar_expr_with<F>(expr: &Expr, bind_arg: &mut F) -> Option<
 where
     F: FnMut(&Expr) -> Result<BoundExpr>,
 {
+    if let Some(bound) = super::parameter_literal::bind_with(expr, bind_arg) {
+        return Some(bound);
+    }
     match expr {
         Expr::Function(function) if lookup(&function.name.to_string()).is_some() => {
             Some(bind_function_with(function, bind_arg))
@@ -270,6 +273,16 @@ fn make_function(
         ScalarFunction::DatePart(_) | ScalarFunction::DateTrunc(_) => {
             return Err(Error::Internal(
                 "date functions must be bound through their specialized signature".into(),
+            ));
+        }
+        ScalarFunction::DistinctTuple => {
+            return Err(Error::Internal(
+                "DISTINCT tuple is an internal aggregate expression".into(),
+            ));
+        }
+        ScalarFunction::AtTimeZone { .. } => {
+            return Err(Error::Internal(
+                "AT TIME ZONE must be bound through its specialized expression".into(),
             ));
         }
     };

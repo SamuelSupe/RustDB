@@ -14,9 +14,13 @@ use super::{
     TableProvider, TableSourceIdentity, TableStatistics, provider::next_provider_id,
 };
 
+mod delete_vectors;
+mod encoding;
 mod predicate_sidecar;
 mod verification_cache;
 
+use delete_vectors::DeleteAwareParquetTable;
+use encoding::NativeEncodedTable;
 pub(super) use predicate_sidecar::{
     NativePredicateSidecar, SidecarProjectionCandidate, SidecarProjectionExecution,
 };
@@ -50,9 +54,12 @@ impl NativeSegmentTable {
                     .expect("native database path was validated as UTF-8")
             })
             .collect::<Vec<_>>();
+        let total_byte_size = snapshot
+            .segment_bytes()
+            .checked_add(snapshot.delete_vector_bytes());
         let statistics = TableStatistics {
             row_count: Some(snapshot.row_count()),
-            total_byte_size: Some(snapshot.segment_bytes()),
+            total_byte_size,
             file_count: locations.len(),
         };
         let verification_cache = VerificationCache::new(&snapshot);
@@ -180,16 +187,35 @@ impl NativeSegmentTable {
         &self,
         files: Vec<ObjectSource>,
         sidecars: Vec<Option<NativePredicateSidecar>>,
+        delete_vectors: Option<(
+            Vec<Option<crate::storage::NativeDeleteVector>>,
+            crate::runtime::MemoryReservation,
+        )>,
     ) -> Result<Arc<dyn TableProvider>> {
+        let logical_schema = self.snapshot.schema();
+        let physical_schema = crate::storage::native_segment_physical_schema(&logical_schema);
+        if let Some((delete_vectors, reservation)) = delete_vectors {
+            let provider: Arc<dyn TableProvider> = Arc::new(DeleteAwareParquetTable::try_new(
+                files,
+                sidecars,
+                delete_vectors,
+                physical_schema,
+                self.statistics.clone(),
+                &self.config,
+                self.metadata_cache.clone(),
+                reservation,
+            )?);
+            return NativeEncodedTable::wrap(provider, logical_schema);
+        }
         let table = ParquetTable::from_fixed_files_with_predicate_sidecars(
             files,
             sidecars,
-            self.snapshot.schema(),
+            physical_schema,
             self.statistics.clone(),
             &self.config,
             self.metadata_cache.clone(),
         )?;
-        Ok(Arc::new(table))
+        NativeEncodedTable::wrap(Arc::new(table), logical_schema)
     }
 
     fn validate_delegation(
@@ -245,14 +271,21 @@ impl TableProvider for NativeSegmentTable {
 
     fn explain_scan(&self) -> Option<String> {
         Some(format!(
-            "format=native-parquet version={} segments={} morsel=row_group_chunk(max=4) root={}",
+            "format=native-parquet manifest=v{} table_version={} segments={} deleted_rows={} morsel=row_group_chunk(max=4) root={}",
+            self.snapshot.format_version(),
             self.snapshot.version(),
             self.locations.len(),
+            self.snapshot.deleted_row_count(),
             self.root.display()
         ))
     }
 
     fn supports_exact_filter(&self, predicate: &ScanPredicate) -> bool {
+        if self.snapshot.deleted_row_count() != 0
+            || crate::storage::native_segment_encoding_required(&self.snapshot.schema())
+        {
+            return false;
+        }
         let schema = self.snapshot.schema();
         super::exact_filter::supported(predicate, schema.as_ref(), schema.as_ref())
     }
@@ -287,7 +320,64 @@ impl TableProvider for NativeSegmentTable {
             .record_native_verification_time(verification_started.elapsed());
         verified?;
         context.check_cancelled()?;
-        let provider = self.fixed_provider(files, sidecars)?;
+        let delete_vectors = if self.snapshot.deleted_row_count() == 0 {
+            None
+        } else {
+            let bytes = usize::try_from(self.snapshot.delete_vector_bytes()).map_err(|_| {
+                Error::ResourceExhausted(
+                    "native delete-vector bytes do not fit in query memory".to_owned(),
+                )
+            })?;
+            let mut reservation = context
+                .reserve_memory(bytes.max(1), "native delete vectors")
+                .await?;
+            let root = Arc::clone(&self.root);
+            let snapshot = Arc::clone(&self.snapshot);
+            let vectors = context
+                .spill
+                .run_query_io(move |control| {
+                    control.check_cancelled()?;
+                    snapshot.load_delete_vectors(&root)
+                })
+                .await?;
+            let retained = vectors
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(crate::storage::NativeDeleteVector::memory_size)
+                .sum::<usize>()
+                .max(1);
+            reservation.try_resize(retained)?;
+            let mut by_path = self
+                .snapshot
+                .segment_paths(&self.root)
+                .into_iter()
+                .zip(vectors)
+                .collect::<HashMap<_, _>>();
+            let aligned = files
+                .iter()
+                .map(|file| {
+                    let path = file.local_path().ok_or_else(|| {
+                        Error::Internal(format!(
+                            "Native segment did not resolve to a local path: {}",
+                            file.uri()
+                        ))
+                    })?;
+                    by_path.remove(path).ok_or_else(|| {
+                        Error::Internal(format!(
+                            "Native delete-vector binding is missing for {}",
+                            path.display()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !by_path.is_empty() {
+                return Err(Error::Internal(
+                    "Native delete-vector bindings contain an unexpected segment".to_owned(),
+                ));
+            }
+            Some((aligned, reservation))
+        };
+        let provider = self.fixed_provider(files, sidecars, delete_vectors)?;
         context.cache_prepared_provider(self.id, provider)
     }
 

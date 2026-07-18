@@ -3,8 +3,9 @@
 [简体中文](README.zh-CN.md)
 
 This archive contains the standalone `rustdb` command for querying local and
-S3-compatible CSV and Parquet data. The engine is single-node and embedded in
-the command; no server process is required.
+S3-compatible CSV/Parquet data and managing a persistent local Native OLAP
+database. The engine is single-node and embedded in the command; no server
+process is required.
 
 ## Quick start
 
@@ -13,6 +14,7 @@ Run from the extracted directory:
 ```sh
 ./bin/rustdb --version
 ./bin/rustdb -c "SELECT count(*) FROM read_parquet('/data/*.parquet')"
+./bin/rustdb --database ./warehouse -c "CREATE TABLE events AS SELECT * FROM read_parquet('/data/events.parquet')"
 ```
 
 Or install it:

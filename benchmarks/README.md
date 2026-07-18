@@ -2,7 +2,7 @@
 
 ## ClickBench functionality pass
 
-The active v0.7 acceptance workload is one complete 43-query ClickBench pass
+The historical v0.7 acceptance workload was one complete 43-query ClickBench pass
 on the official 1M Parquet partition with a 4-CPU/16-GiB OrbStack container. It
 does not compare RustDB with another engine and does not repeat measurements. See
 [`clickbench/README.md`](clickbench/README.md) for the resource contract and
@@ -39,7 +39,7 @@ entry. Do not compare a warm run from one engine with a cold run from another.
 ## Legacy differential tooling
 
 The comparison-oriented runners below are retained for historical regression
-investigation, but they are not part of the active v0.7 release target.
+investigation, but they are not part of the active v0.8 release target.
 
 ## DuckDB correctness checksum
 

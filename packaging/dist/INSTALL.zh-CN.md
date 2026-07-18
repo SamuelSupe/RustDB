@@ -7,9 +7,9 @@
 从可信渠道获取文件后，可用相邻的 `.sha256` 检查意外损坏：
 
 ```sh
-sha256sum -c rustdb-v0.7.0-alpha.1-linux-aarch64.tar.gz.sha256
+sha256sum -c rustdb-v0.8.0-alpha.1-linux-aarch64.tar.gz.sha256
 # macOS：
-shasum -a 256 rustdb-v0.7.0-alpha.1-macos-aarch64.tar.gz
+shasum -a 256 -c rustdb-v0.8.0-alpha.1-macos-aarch64.tar.gz.sha256
 ```
 
 解压后的 `SHA256SUMS` 覆盖所有可安装文件。
@@ -17,8 +17,8 @@ shasum -a 256 rustdb-v0.7.0-alpha.1-macos-aarch64.tar.gz
 ## 安装
 
 ```sh
-tar -xzf rustdb-v0.7.0-alpha.1-linux-aarch64.tar.gz
-cd rustdb-v0.7.0-alpha.1-linux-aarch64
+tar -xzf rustdb-v0.8.0-alpha.1-linux-aarch64.tar.gz
+cd rustdb-v0.8.0-alpha.1-linux-aarch64
 ./install.sh
 ```
 

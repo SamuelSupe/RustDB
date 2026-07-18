@@ -14,9 +14,11 @@ use crate::sql::{
 
 mod multiset;
 mod types;
+mod values;
 
 use multiset::plan_multiset_operation;
 use types::{common_set_type, is_nested, supports_distinct_key};
+use values::plan_values;
 
 impl Planner<'_> {
     pub(super) fn plan_set_expr(
@@ -38,9 +40,7 @@ impl Planner<'_> {
                 let right = self.plan_set_expr(right, ctes, outer)?;
                 plan_set_operation(left, right, *op, *set_quantifier)
             }
-            SetExpr::Values(_) => Err(Error::Unsupported(
-                "VALUES query bodies are not supported".into(),
-            )),
+            SetExpr::Values(values) => plan_values(values),
             SetExpr::Table(_) => Err(Error::Unsupported(
                 "TABLE query bodies are not supported".into(),
             )),

@@ -63,6 +63,61 @@ async fn executes_default_range_rows_and_whole_partition_frames() {
 }
 
 #[tokio::test]
+async fn executes_navigation_functions_and_bounded_rows_frames() {
+    let batches = run(
+        "SELECT g, v, \
+         lead(v) OVER (PARTITION BY g ORDER BY v) AS next_v, \
+         lag(v, 2, -1) OVER (PARTITION BY g ORDER BY v) AS lag_two, \
+         lead(v, 99, v * 10) OVER (PARTITION BY g ORDER BY v) AS far_default, \
+         first_value(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS frame_first, \
+         last_value(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS frame_last, \
+         first_value(v) OVER (PARTITION BY g ORDER BY v) AS peer_first, \
+         last_value(v) OVER (PARTITION BY g ORDER BY v) AS peer_last \
+         FROM events ORDER BY g, v, row_number() OVER (PARTITION BY g ORDER BY v)",
+    )
+    .await;
+    assert_eq!(
+        nullable_ints(&batches, 2),
+        vec![Some(1), Some(2), None, None]
+    );
+    assert_eq!(ints(&batches, 3), vec![-1, -1, 1, -1]);
+    assert_eq!(ints(&batches, 4), vec![10, 10, 20, 50]);
+    assert_eq!(ints(&batches, 5), vec![1, 1, 1, 5]);
+    assert_eq!(ints(&batches, 6), vec![1, 2, 2, 5]);
+    assert_eq!(ints(&batches, 7), vec![1, 1, 1, 5]);
+    assert_eq!(ints(&batches, 8), vec![1, 1, 2, 5]);
+}
+
+#[tokio::test]
+async fn executes_bounded_rows_range_and_groups_frames() {
+    let batches = run("SELECT v, \
+         sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), \
+         sum(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW), \
+         sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+         first_value(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING), \
+         last_value(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+         FROM events ORDER BY v, row_number() OVER (ORDER BY v)")
+    .await;
+    assert_eq!(ints(&batches, 0), vec![1, 1, 2, 5]);
+    assert_eq!(decimals(&batches, 1), vec![2, 4, 8, 7]);
+    assert_eq!(decimals(&batches, 2), vec![2, 2, 4, 5]);
+    assert_eq!(decimals(&batches, 3), vec![2, 2, 4, 7]);
+    assert_eq!(ints(&batches, 4), vec![1, 1, 1, 2]);
+    assert_eq!(ints(&batches, 5), vec![2, 2, 5, 5]);
+}
+
+#[tokio::test]
+async fn executes_peer_only_range_frames_without_a_single_order_key() {
+    let batches = run("SELECT g, v, \
+         sum(v) OVER (RANGE BETWEEN CURRENT ROW AND CURRENT ROW) AS no_order, \
+         sum(v) OVER (ORDER BY g, v RANGE BETWEEN CURRENT ROW AND CURRENT ROW) AS two_keys \
+         FROM events ORDER BY g, v, row_number() OVER (PARTITION BY g ORDER BY v)")
+    .await;
+    assert_eq!(decimals(&batches, 2), vec![9, 9, 9, 9]);
+    assert_eq!(decimals(&batches, 3), vec![2, 2, 2, 5]);
+}
+
+#[tokio::test]
 async fn resolves_named_windows_qualify_and_aggregate_results() {
     let batches = run("SELECT g, sum(v) AS total, rank() OVER w AS r \
          FROM events GROUP BY g \
@@ -523,8 +578,8 @@ fn rejects_window_contexts_and_unsupported_frames() {
         "SELECT v FROM events WHERE row_number() OVER () = 1",
         "SELECT v FROM events GROUP BY row_number() OVER ()",
         "SELECT v FROM events HAVING row_number() OVER () = 1",
-        "SELECT sum(v) OVER (ORDER BY v ROWS 1 PRECEDING) FROM events",
-        "SELECT sum(v) OVER (ORDER BY v GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM events",
+        "SELECT sum(v) OVER (ORDER BY v, g RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM events",
+        "SELECT sum(v) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM events",
         "SELECT count(DISTINCT v) OVER () FROM events",
         "SELECT row_number() OVER (ORDER BY rank() OVER ()) FROM events",
         "SELECT ntile(0) OVER () FROM events",
@@ -577,6 +632,22 @@ fn ints(batches: &[RecordBatch], column: usize) -> Vec<i64> {
                 .values()
                 .iter()
                 .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn nullable_ints(batches: &[RecordBatch], column: usize) -> Vec<Option<i64>> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..values.len())
+                .map(|row| (!values.is_null(row)).then(|| values.value(row)))
                 .collect::<Vec<_>>()
         })
         .collect()

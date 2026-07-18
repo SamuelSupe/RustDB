@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path, s
 
 use crate::{Error, Result};
 
-use super::{INIT_FILE, MARKER_FILE, io, manifest, marker, table};
+use super::{INIT_FILE, MARKER_FILE, io, manifest, marker, table, view::NativeView};
 
 pub(super) fn recover_initialization_temps(
     root: &Path,
@@ -58,6 +58,21 @@ pub(super) fn load_tables(
             table::load(root, database_id, reference)
                 .map(Arc::new)
                 .map(|snapshot| (name.clone(), snapshot))
+        })
+        .collect()
+}
+
+pub(super) fn load_views(
+    root: &Path,
+    catalog: &manifest::CatalogState,
+) -> Result<BTreeMap<String, Arc<NativeView>>> {
+    catalog
+        .views()
+        .iter()
+        .map(|(name, reference)| {
+            NativeView::load(root, reference)
+                .map(Arc::new)
+                .map(|view| (name.clone(), view))
         })
         .collect()
 }
@@ -144,6 +159,9 @@ pub(super) fn open_existing(root: &Path, marker_path: &Path, init_path: &Path) -
     io::require_directory(&root.join("catalog").join("generations"))?;
     io::require_directory(&root.join("tables"))?;
     io::require_directory(&root.join("staging"))?;
+    if marker.uses_wal() {
+        io::require_directory(&root.join("wal"))?;
+    }
     manifest::validate_current(root, marker.database_id())?;
 
     if init_path.exists() {
@@ -163,6 +181,7 @@ pub(super) fn finish_initialization(root: &Path, marker: &marker::DatabaseMarker
     io::create_private_dir_all(&root.join("catalog").join("generations"))?;
     io::create_private_dir_all(&root.join("tables"))?;
     io::create_private_dir_all(&root.join("staging"))?;
+    io::create_private_dir_all(&root.join("wal"))?;
     io::sync_dir(root)?;
 
     manifest::ensure_initial(root, marker.database_id())?;

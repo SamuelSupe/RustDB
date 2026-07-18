@@ -5,11 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use glob::{MatchOptions, Pattern, glob};
 use object_store::{
     GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, local::LocalFileSystem, path::Path,
 };
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{Error, Result, S3Config, runtime::QueryContext, storage::LocalFileIdentity};
@@ -301,26 +302,15 @@ impl LocationResolver {
         objects: &mut SourceList,
         context: Option<&QueryContext>,
     ) -> Result<()> {
-        let url = Url::parse(location).map_err(|error| {
-            Error::InvalidArgument(format!("invalid S3 URI {location}: {error}"))
-        })?;
-        let bucket = url
-            .host_str()
-            .filter(|bucket| !bucket.is_empty())
-            .ok_or_else(|| Error::InvalidArgument(format!("S3 URI has no bucket: {location}")))?;
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(Error::InvalidArgument(format!(
-                "S3 URI must not contain query or fragment: {location}"
-            )));
-        }
+        let url = super::s3_uri::S3Uri::parse(location)?;
+        let bucket = url.bucket();
 
-        let path = Path::from_url_path(url.path().trim_start_matches('/')).map_err(|error| {
-            Error::InvalidArgument(format!("invalid S3 key in {location}: {error}"))
-        })?;
+        let path = Path::from_url_path(url.path().trim_start_matches('/'))
+            .map_err(|error| Error::InvalidArgument(format!("invalid S3 key: {error}")))?;
         if path.as_ref().is_empty() {
-            return Err(Error::InvalidArgument(format!(
-                "S3 URI must include an object key or pattern: {location}"
-            )));
+            return Err(Error::InvalidArgument(
+                "S3 URI must include an object key or pattern".to_owned(),
+            ));
         }
 
         let store = match stores.get(bucket) {
@@ -333,15 +323,14 @@ impl LocationResolver {
         };
 
         if has_glob(path.as_ref()) {
-            let pattern = Pattern::new(path.as_ref()).map_err(|error| {
-                Error::InvalidArgument(format!("invalid S3 glob {location}: {error}"))
-            })?;
+            let pattern = Pattern::new(path.as_ref())
+                .map_err(|error| Error::InvalidArgument(format!("invalid S3 glob: {error}")))?;
             let prefix = literal_prefix(path.as_ref());
             let prefix = if prefix.is_empty() {
                 None
             } else {
                 Some(Path::parse(prefix).map_err(|error| {
-                    Error::InvalidArgument(format!("invalid S3 prefix in {location}: {error}"))
+                    Error::InvalidArgument(format!("invalid S3 prefix: {error}"))
                 })?)
             };
             let mut listing = store.list(prefix.as_ref()).try_filter(|meta| {
@@ -364,30 +353,15 @@ impl LocationResolver {
                 objects.push(ObjectSource::new(uri, Arc::clone(&store), meta, true, None))?;
             }
         } else {
-            let head = store.head(&path);
-            let meta = match context {
-                Some(context) => {
-                    context.check_cancelled()?;
-                    context.metrics.add_s3_requests(1);
-                    tokio::select! {
-                        _ = context.control.cancelled() => Err(Error::Cancelled),
-                        result = head => result.map_err(Error::from),
-                    }?
-                }
-                None => head.await?,
-            };
-            objects.push(ObjectSource::new(
-                location.to_owned(),
-                Arc::clone(&store),
-                meta,
-                true,
-                None,
-            ))?;
+            let source =
+                resolve_concrete_s3_source(bucket, location, &path, Arc::clone(&store), context)
+                    .await?;
+            objects.push(source)?;
         }
         Ok(())
     }
 
-    fn build_s3_store(&self, bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+    pub(crate) fn build_s3_store(&self, bucket: &str) -> Result<Arc<dyn ObjectStore>> {
         let mut builder = builder_from_env(self.s3.endpoint.as_deref(), self.s3.allow_http)?
             .with_bucket_name(bucket)
             .with_allow_http(self.s3.allow_http);
@@ -407,6 +381,188 @@ impl LocationResolver {
 
         Ok(Arc::new(builder.build()?))
     }
+}
+
+async fn resolve_concrete_s3_source(
+    bucket: &str,
+    uri: &str,
+    path: &Path,
+    store: Arc<dyn ObjectStore>,
+    context: Option<&QueryContext>,
+) -> Result<ObjectSource> {
+    let manifest = copy_manifest_path(path)?;
+    if let Some(context) = context {
+        context.check_cancelled()?;
+        context.metrics.add_s3_requests(2);
+    }
+    let heads = async { tokio::join!(store.head(path), store.head(&manifest)) };
+    let (exact, manifest_head) = match context {
+        Some(context) => tokio::select! {
+            _ = context.control.cancelled() => return Err(Error::Cancelled),
+            result = heads => result,
+        },
+        None => heads.await,
+    };
+    match (exact, manifest_head) {
+        (Ok(_), Ok(_)) => Err(Error::InvalidArgument(
+            "ambiguous S3 source: both the exact object and its COPY manifest exist".to_owned(),
+        )),
+        (Ok(meta), Err(object_store::Error::NotFound { .. })) => {
+            Ok(ObjectSource::new(uri.to_owned(), store, meta, true, None))
+        }
+        (Err(object_store::Error::NotFound { .. }), Ok(_)) => {
+            resolve_copy_manifest(bucket, path, store, context).await
+        }
+        (
+            Err(error @ object_store::Error::NotFound { .. }),
+            Err(object_store::Error::NotFound { .. }),
+        ) => Err(error.into()),
+        (Err(error), _) | (_, Err(error)) => Err(error.into()),
+    }
+}
+
+fn copy_manifest_path(prefix: &Path) -> Result<Path> {
+    Path::parse(format!(
+        "{}/{}",
+        prefix.as_ref(),
+        super::copy_manifest::FILE_NAME
+    ))
+    .map_err(|error| Error::InvalidArgument(format!("invalid COPY manifest key: {error}")))
+}
+
+async fn resolve_copy_manifest(
+    bucket: &str,
+    prefix: &Path,
+    store: Arc<dyn ObjectStore>,
+    context: Option<&QueryContext>,
+) -> Result<ObjectSource> {
+    let manifest = copy_manifest_path(prefix)?;
+    if let Some(context) = context {
+        context.check_cancelled()?;
+        context.metrics.add_s3_requests(1);
+    }
+    let response = match context {
+        Some(context) => tokio::select! {
+            _ = context.control.cancelled() => return Err(Error::Cancelled),
+            result = store.get(&manifest) => result?,
+        },
+        None => store.get(&manifest).await?,
+    };
+    if response.meta.size > super::copy_manifest::MAX_BYTES as u64 {
+        return Err(Error::ResourceExhausted(format!(
+            "COPY manifest s3://{bucket}/{manifest} exceeds {} bytes",
+            super::copy_manifest::MAX_BYTES
+        )));
+    }
+    let bytes = match context {
+        Some(context) => tokio::select! {
+            _ = context.control.cancelled() => return Err(Error::Cancelled),
+            result = response.bytes() => result?,
+        },
+        None => response.bytes().await?,
+    };
+    let entry = super::copy_manifest::decode(FsPath::new(manifest.as_ref()), &bytes)?;
+    let expected_prefix = format!("{}/", prefix.as_ref());
+    if !entry.object.starts_with(&expected_prefix) {
+        return Err(Error::Execution(format!(
+            "COPY manifest s3://{bucket}/{manifest} references an object outside its prefix"
+        )));
+    }
+    let data = Path::parse(&entry.object)
+        .map_err(|error| Error::Execution(format!("invalid COPY data object: {error}")))?;
+    if let Some(context) = context {
+        context.check_cancelled()?;
+        context.metrics.add_s3_requests(1);
+    }
+    let meta = match context {
+        Some(context) => tokio::select! {
+            _ = context.control.cancelled() => return Err(Error::Cancelled),
+            result = store.head(&data) => result?,
+        },
+        None => store.head(&data).await?,
+    };
+    if meta.size != entry.bytes {
+        return Err(Error::Execution(format!(
+            "COPY data object s3://{bucket}/{data} has size {}, manifest expected {}",
+            meta.size, entry.bytes
+        )));
+    }
+    let data_uri = format!("s3://{bucket}/{data}");
+    if entry.e_tag.is_some() || entry.version.is_some() {
+        let e_tag_changed = entry
+            .e_tag
+            .as_deref()
+            .is_some_and(|expected| meta.e_tag.as_deref() != Some(expected));
+        let version_changed = entry
+            .version
+            .as_deref()
+            .is_some_and(|expected| meta.version.as_deref() != Some(expected));
+        if e_tag_changed || version_changed {
+            return Err(Error::Execution(format!(
+                "COPY data object {data_uri} no longer has the identity recorded by its manifest"
+            )));
+        }
+    } else {
+        verify_legacy_copy_checksum(&data_uri, &data, &store, &meta, &entry.sha256, context)
+            .await?;
+    }
+    Ok(ObjectSource::new(data_uri, store, meta, true, None))
+}
+
+async fn verify_legacy_copy_checksum(
+    uri: &str,
+    data: &Path,
+    store: &Arc<dyn ObjectStore>,
+    meta: &object_store::ObjectMeta,
+    expected_sha256: &str,
+    context: Option<&QueryContext>,
+) -> Result<()> {
+    if let Some(context) = context {
+        context.check_cancelled()?;
+        context.metrics.add_s3_requests(1);
+    }
+    let options = GetOptions {
+        if_match: meta.e_tag.clone(),
+        version: meta.version.clone(),
+        ..GetOptions::default()
+    };
+    let response = match context {
+        Some(context) => tokio::select! {
+            _ = context.control.cancelled() => return Err(Error::Cancelled),
+            result = store.get_opts(data, options) => result?,
+        },
+        None => store.get_opts(data, options).await?,
+    };
+    ObjectSnapshot::from(meta).validate_get_response(uri, &response.meta)?;
+    let mut stream = response.into_stream();
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    loop {
+        let next = match context {
+            Some(context) => tokio::select! {
+                _ = context.control.cancelled() => return Err(Error::Cancelled),
+                result = stream.next() => result,
+            },
+            None => stream.next().await,
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk?;
+        let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        bytes = bytes.checked_add(len).ok_or_else(|| {
+            Error::ResourceExhausted("COPY checksum byte count overflowed u64".to_owned())
+        })?;
+        if let Some(context) = context {
+            context.metrics.add_s3_bytes_transferred(len);
+        }
+        digest.update(&chunk);
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if bytes != meta.size || !actual.eq_ignore_ascii_case(expected_sha256) {
+        return Err(Error::Execution(format!(
+            "COPY data object {uri} failed checksum validation"
+        )));
+    }
+    Ok(())
 }
 
 async fn resolve_local(
@@ -454,12 +610,20 @@ async fn resolve_local(
 
 fn local_pattern(location: &str) -> Result<PathBuf> {
     if location.starts_with("file://") {
-        let url = Url::parse(location).map_err(|error| {
-            Error::InvalidArgument(format!("invalid file URI {location}: {error}"))
-        })?;
-        url.to_file_path().map_err(|()| {
-            Error::InvalidArgument(format!("file URI is not a local path: {location}"))
-        })
+        let url = Url::parse(location)
+            .map_err(|_| Error::InvalidArgument("invalid file URI".to_owned()))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(Error::InvalidArgument(
+                "file URI must not contain user information".to_owned(),
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(Error::InvalidArgument(
+                "file URI must not contain a query or fragment".to_owned(),
+            ));
+        }
+        url.to_file_path()
+            .map_err(|()| Error::InvalidArgument("file URI is not a local path".to_owned()))
     } else {
         let path = FsPath::new(location);
         if path.is_absolute() {

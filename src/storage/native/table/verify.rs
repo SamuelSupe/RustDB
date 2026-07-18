@@ -31,9 +31,15 @@ pub(super) fn snapshot(snapshot: &TableSnapshot, path: &Path) -> Result<()> {
     }
     match (snapshot.operation(), snapshot.parent()) {
         (super::SnapshotOperation::Import, None) if snapshot.version() == 1 => {}
-        (super::SnapshotOperation::Append | super::SnapshotOperation::Replace, Some(parent))
-            if parent.table_id() == snapshot.table_id()
-                && parent.version().checked_add(1) == Some(snapshot.version()) =>
+        (
+            super::SnapshotOperation::Append
+            | super::SnapshotOperation::Replace
+            | super::SnapshotOperation::Delete
+            | super::SnapshotOperation::Update
+            | super::SnapshotOperation::Truncate,
+            Some(parent),
+        ) if parent.table_id() == snapshot.table_id()
+            && parent.version().checked_add(1) == Some(snapshot.version()) =>
         {
             parent.validate(path, "parent")?;
         }
@@ -44,17 +50,32 @@ pub(super) fn snapshot(snapshot: &TableSnapshot, path: &Path) -> Result<()> {
             ));
         }
     }
-    let rows = checked_sum(
+    let physical_rows = checked_sum(
         path,
         snapshot.segments().iter().map(NativeSegment::rows),
-        "row count",
+        "physical row count",
     )?;
+    let deleted_rows = checked_sum(
+        path,
+        snapshot
+            .segments()
+            .iter()
+            .filter_map(|segment| segment.delete_vector().map(|vector| vector.deleted_rows())),
+        "deleted row count",
+    )?;
+    let visible_rows = physical_rows
+        .checked_sub(deleted_rows)
+        .ok_or_else(|| Error::native_storage(path, "deleted rows exceed physical rows"))?;
     let bytes = checked_sum(
         path,
         snapshot.segments().iter().map(NativeSegment::bytes),
         "segment bytes",
     )?;
-    if rows != snapshot.row_count() || bytes != snapshot.segment_bytes() {
+    if physical_rows != snapshot.physical_row_count()
+        || visible_rows != snapshot.row_count()
+        || deleted_rows != snapshot.deleted_row_count()
+        || bytes != snapshot.segment_bytes()
+    {
         return Err(Error::native_storage(
             path,
             "snapshot totals do not match its segment list",
@@ -68,8 +89,23 @@ pub(super) fn snapshot(snapshot: &TableSnapshot, path: &Path) -> Result<()> {
             .filter_map(|segment| segment.predicate_sidecar().map(|sidecar| sidecar.bytes())),
         "predicate sidecar bytes",
     )?;
+    let delete_vector_bytes = checked_sum(
+        path,
+        snapshot
+            .segments()
+            .iter()
+            .filter_map(|segment| segment.delete_vector().map(|vector| vector.bytes())),
+        "delete vector bytes",
+    )?;
+    if delete_vector_bytes != snapshot.delete_vector_bytes() {
+        return Err(Error::native_storage(
+            path,
+            "snapshot delete vector bytes do not match its segment list",
+        ));
+    }
     let managed_bytes = bytes
         .checked_add(sidecar_bytes)
+        .and_then(|bytes| bytes.checked_add(delete_vector_bytes))
         .ok_or_else(|| Error::native_storage(path, "snapshot managed data byte count overflow"))?;
     let limit = super::super::write_plan::storage_limit(snapshot.source_bytes(), 2, "final")?;
     if managed_bytes > limit {
@@ -109,23 +145,24 @@ pub(super) fn segment_owners_cancelable(
     check_cancelled: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     let mut owners = HashSet::new();
-    for segment in snapshot.segments() {
-        if !owners.insert((segment.owner_version(), segment.owner_snapshot_id())) {
+    for (version, snapshot_id) in snapshot.segments().iter().flat_map(|segment| {
+        std::iter::once((segment.owner_version(), segment.owner_snapshot_id())).chain(
+            segment
+                .delete_vector()
+                .map(|vector| (vector.owner_version(), vector.owner_snapshot_id())),
+        )
+    }) {
+        if !owners.insert((version, snapshot_id)) {
             continue;
         }
         check_cancelled()?;
-        let directory = layout::snapshot_directory(
-            root,
-            snapshot.table_id(),
-            segment.owner_version(),
-            segment.owner_snapshot_id(),
-        );
+        let directory = layout::snapshot_directory(root, snapshot.table_id(), version, snapshot_id);
         super::super::io::require_directory(&directory)?;
         let marker = super::persistence::read_marker(&directory)?;
         if marker.database_id != snapshot.database_id()
             || marker.table_id != snapshot.table_id()
-            || marker.version != segment.owner_version()
-            || marker.snapshot_id != segment.owner_snapshot_id()
+            || marker.version != version
+            || marker.snapshot_id != snapshot_id
         {
             return Err(Error::native_storage(
                 directory,
@@ -158,7 +195,13 @@ pub(super) fn segment_fingerprints_cancelable(
             check_cancelled()?;
             let (path, metadata) = segment_metadata(root, snapshot, segment)?;
             let sidecar = predicate_sidecar_metadata(root, snapshot, segment)?;
-            Ok(managed_file_fingerprint(&path, &metadata, sidecar.as_ref()))
+            let delete_vector = delete_vector_metadata(root, snapshot, segment)?;
+            Ok(managed_file_fingerprint(
+                &path,
+                &metadata,
+                sidecar.as_ref(),
+                delete_vector.as_ref(),
+            ))
         })
         .collect()
 }
@@ -189,8 +232,10 @@ fn verify_segment_file(
     check_cancelled()?;
     let (path, metadata) = segment_metadata(root, snapshot, segment)?;
     let sidecar = predicate_sidecar_metadata(root, snapshot, segment)?;
+    let delete_vector = delete_vector_metadata(root, snapshot, segment)?;
     let before_segment = file_fingerprint(&path, &metadata);
-    let before = managed_file_fingerprint(&path, &metadata, sidecar.as_ref());
+    let before =
+        managed_file_fingerprint(&path, &metadata, sidecar.as_ref(), delete_vector.as_ref());
     if sha256_file(&path, check_cancelled)? != segment.sha256() {
         return Err(Error::native_storage(
             &path,
@@ -207,6 +252,18 @@ fn verify_segment_file(
                 "native predicate sidecar checksum mismatch",
             ));
         }
+    }
+    if let Some((delete_path, _)) = &delete_vector {
+        let descriptor = segment
+            .delete_vector()
+            .expect("delete vector metadata requires a descriptor");
+        if sha256_file(delete_path, check_cancelled)? != descriptor.sha256() {
+            return Err(Error::native_storage(
+                delete_path,
+                "native delete vector checksum mismatch",
+            ));
+        }
+        super::DeleteVector::read(delete_path, descriptor)?;
     }
 
     let file = File::open(&path).map_err(|error| Error::io(Some(path.clone()), error))?;
@@ -245,7 +302,13 @@ fn verify_segment_file(
     check_cancelled()?;
     let (_, after_metadata) = segment_metadata(root, snapshot, segment)?;
     let after_sidecar = predicate_sidecar_metadata(root, snapshot, segment)?;
-    let after = managed_file_fingerprint(&path, &after_metadata, after_sidecar.as_ref());
+    let after_delete_vector = delete_vector_metadata(root, snapshot, segment)?;
+    let after = managed_file_fingerprint(
+        &path,
+        &after_metadata,
+        after_sidecar.as_ref(),
+        after_delete_vector.as_ref(),
+    );
     if before != after {
         return Err(Error::native_storage(
             &path,
@@ -324,6 +387,38 @@ fn predicate_sidecar_metadata(
     Ok(Some((path, metadata)))
 }
 
+fn delete_vector_metadata(
+    root: &Path,
+    snapshot: &TableSnapshot,
+    segment: &NativeSegment,
+) -> Result<Option<(std::path::PathBuf, fs::Metadata)>> {
+    let Some(descriptor) = segment.delete_vector() else {
+        return Ok(None);
+    };
+    let path = layout::delete_vector_path(
+        root,
+        snapshot.table_id(),
+        descriptor.owner_version(),
+        descriptor.owner_snapshot_id(),
+        segment.segment_id(),
+    );
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|error| Error::io(Some(path.clone()), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::native_storage(
+            &path,
+            "native delete vector is not a regular file",
+        ));
+    }
+    if metadata.len() != descriptor.bytes() {
+        return Err(Error::native_storage(
+            &path,
+            "native delete vector byte size mismatch",
+        ));
+    }
+    Ok(Some((path, metadata)))
+}
+
 fn file_fingerprint(_path: &Path, metadata: &fs::Metadata) -> Option<String> {
     LocalFileIdentity::from_metadata(metadata).map(|identity| identity.to_string())
 }
@@ -332,12 +427,20 @@ fn managed_file_fingerprint(
     segment_path: &Path,
     segment_metadata: &fs::Metadata,
     sidecar: Option<&(std::path::PathBuf, fs::Metadata)>,
+    delete_vector: Option<&(std::path::PathBuf, fs::Metadata)>,
 ) -> Option<String> {
     let segment = file_fingerprint(segment_path, segment_metadata)?;
-    match sidecar {
+    let segment = match sidecar {
         Some((path, metadata)) => {
             let sidecar = file_fingerprint(path, metadata)?;
             Some(format!("{segment}|{sidecar}"))
+        }
+        None => Some(segment),
+    }?;
+    match delete_vector {
+        Some((path, metadata)) => {
+            let vector = file_fingerprint(path, metadata)?;
+            Some(format!("{segment}|{vector}"))
         }
         None => Some(segment),
     }
@@ -366,6 +469,34 @@ fn segment_descriptor(
     }
     if let Some(sidecar) = segment.predicate_sidecar() {
         predicate_sidecar_descriptor(snapshot, segment, sidecar, path)?;
+    }
+    if let Some(vector) = segment.delete_vector() {
+        delete_vector_descriptor(snapshot, segment, vector, path)?;
+    }
+    Ok(())
+}
+
+fn delete_vector_descriptor(
+    snapshot: &TableSnapshot,
+    segment: &NativeSegment,
+    vector: &super::delete_vector::DeleteVectorDescriptor,
+    path: &Path,
+) -> Result<()> {
+    let owner_id = Uuid::parse_str(vector.owner_snapshot_id());
+    if owner_id.is_err()
+        || vector.format_version() != super::delete_vector::FORMAT_VERSION
+        || vector.owner_version() == 0
+        || vector.owner_version() > snapshot.version()
+        || vector.row_count() != segment.rows()
+        || vector.deleted_rows() == 0
+        || vector.deleted_rows() > vector.row_count()
+        || vector.bytes() < 28
+        || !valid_sha256(vector.sha256())
+    {
+        return Err(Error::native_storage(
+            path,
+            "invalid native delete vector descriptor",
+        ));
     }
     Ok(())
 }

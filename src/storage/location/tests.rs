@@ -3,13 +3,17 @@ use std::{fs, sync::Arc};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{fs::FileTimes, time::Duration};
 
-use object_store::ObjectStoreExt;
+use bytes::Bytes;
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory, path::Path as ObjectPath,
+};
 use tempfile::tempdir;
 
-use super::{LocationResolver, ObjectSnapshot, literal_prefix};
+use super::{LocationResolver, ObjectSnapshot, literal_prefix, resolve_concrete_s3_source};
 use crate::{
     S3Config,
     runtime::{MemoryPool, QueryContext},
+    storage::CopyManifestEntry,
 };
 
 #[tokio::test]
@@ -154,6 +158,26 @@ async fn rejects_file_lists_that_exceed_the_metadata_cap() {
     assert!(error.to_string().contains("file metadata limit"));
 }
 
+#[tokio::test]
+async fn file_source_uri_rejects_secrets_without_echoing_them() {
+    for (uri, secret) in [
+        (
+            "file://alice:password-secret@localhost/tmp/input.csv",
+            "password-secret",
+        ),
+        ("file:///tmp/input.csv?token=query-secret", "query-secret"),
+        ("file:///tmp/input.csv#fragment-secret", "fragment-secret"),
+    ] {
+        let error = LocationResolver::new(S3Config::default())
+            .resolve(&[uri.to_owned()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(secret), "{error}");
+        assert!(!error.contains(uri), "{error}");
+    }
+}
+
 #[test]
 fn extracts_listing_prefix_before_glob_segment() {
     assert_eq!(
@@ -161,4 +185,95 @@ fn extracts_listing_prefix_before_glob_segment() {
         "events/year=2026"
     );
     assert_eq!(literal_prefix("*.parquet"), "");
+}
+
+#[tokio::test]
+async fn rejects_ambiguous_exact_object_and_copy_manifest() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = ObjectPath::from("exports/result");
+    let manifest = ObjectPath::from("exports/result/_rustdb_manifest.json");
+    store
+        .put(&path, PutPayload::from(Bytes::from_static(b"exact")))
+        .await
+        .unwrap();
+    store
+        .put(&manifest, PutPayload::from(Bytes::from_static(b"manifest")))
+        .await
+        .unwrap();
+
+    let error =
+        resolve_concrete_s3_source("bucket", "s3://bucket/exports/result", &path, store, None)
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("ambiguous S3 source"));
+}
+
+#[tokio::test]
+async fn copy_manifest_rejects_a_same_size_replacement() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let prefix = ObjectPath::from("exports/result");
+    let data = ObjectPath::from("exports/result/part.csv");
+    let manifest = ObjectPath::from("exports/result/_rustdb_manifest.json");
+    let identity = store
+        .put(&data, PutPayload::from(Bytes::from_static(b"old\n")))
+        .await
+        .unwrap();
+    let payload = crate::storage::encode_copy_manifest(&CopyManifestEntry {
+        format: "csv".to_owned(),
+        object: data.to_string(),
+        bytes: 4,
+        sha256: "a".repeat(64),
+        e_tag: identity.e_tag,
+        version: identity.version,
+    })
+    .unwrap();
+    store
+        .put(&manifest, PutPayload::from(Bytes::from(payload)))
+        .await
+        .unwrap();
+    store
+        .put(&data, PutPayload::from(Bytes::from_static(b"new\n")))
+        .await
+        .unwrap();
+
+    let error =
+        resolve_concrete_s3_source("bucket", "s3://bucket/exports/result", &prefix, store, None)
+            .await
+            .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("identity recorded by its manifest")
+    );
+}
+
+#[tokio::test]
+async fn legacy_copy_manifest_verifies_the_data_checksum() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let prefix = ObjectPath::from("exports/legacy");
+    let data = ObjectPath::from("exports/legacy/part.csv");
+    let manifest = ObjectPath::from("exports/legacy/_rustdb_manifest.json");
+    store
+        .put(&data, PutPayload::from(Bytes::from_static(b"new\n")))
+        .await
+        .unwrap();
+    let payload = crate::storage::copy_manifest::encode_legacy(&CopyManifestEntry {
+        format: "csv".to_owned(),
+        object: data.to_string(),
+        bytes: 4,
+        sha256: "0".repeat(64),
+        e_tag: None,
+        version: None,
+    })
+    .unwrap();
+    store
+        .put(&manifest, PutPayload::from(Bytes::from(payload)))
+        .await
+        .unwrap();
+
+    let error =
+        resolve_concrete_s3_source("bucket", "s3://bucket/exports/legacy", &prefix, store, None)
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("failed checksum validation"));
 }

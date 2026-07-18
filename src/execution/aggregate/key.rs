@@ -101,12 +101,12 @@ impl GroupKeyEncoder {
         if groups.is_empty() {
             return Self::Empty;
         }
-        // Arrow rows intentionally total-order signed zero and NaN payloads,
-        // while SQL grouping uses CellValue's normalized float equality.
+        // Arrow rows intentionally distinguish signed zero, NaN payloads, and
+        // structural interval fields, while SQL grouping normalizes all three.
         if groups.iter().any(|group| {
             matches!(
                 group.data_type,
-                DataType::Float16 | DataType::Float32 | DataType::Float64
+                DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Interval(_)
             )
         }) {
             return Self::Cells;

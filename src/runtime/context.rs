@@ -45,7 +45,9 @@ pub struct QueryContext {
     object_snapshots_sealed: AtomicBool,
     view_plans: RwLock<HashMap<String, LogicalPlan>>,
     prepared_providers: RwLock<HashMap<u64, Arc<dyn TableProvider>>>,
-    durable_native_commit: Mutex<Option<DurableNativeCommit>>,
+    durable_outcome: Mutex<Option<DurableOutcome>>,
+    protected_async_cleanup: Arc<AtomicUsize>,
+    transaction_mutation_applied: AtomicBool,
     native_cleanup: NativeCleanup,
 }
 
@@ -204,7 +206,9 @@ impl QueryContext {
             object_snapshots_sealed: AtomicBool::new(false),
             view_plans: RwLock::new(HashMap::new()),
             prepared_providers: RwLock::new(HashMap::new()),
-            durable_native_commit: Mutex::new(None),
+            durable_outcome: Mutex::new(None),
+            protected_async_cleanup: Arc::new(AtomicUsize::new(0)),
+            transaction_mutation_applied: AtomicBool::new(false),
             native_cleanup: NativeCleanup::default(),
         }
     }
@@ -228,32 +232,70 @@ impl QueryContext {
         transaction_id: String,
         generation: u64,
     ) {
-        *self.durable_native_commit.lock() = Some(DurableNativeCommit {
+        *self.durable_outcome.lock() = Some(DurableOutcome::NativeCommit(DurableNativeCommit {
             path,
             transaction_id,
             generation,
-        });
+        }));
+    }
+
+    pub(crate) fn mark_copy_commit(&self, path: PathBuf) {
+        *self.durable_outcome.lock() = Some(DurableOutcome::Copy { path });
+    }
+
+    /// Keeps the query producer from dropping an in-flight future that owns
+    /// asynchronous cleanup state. The protected future must still observe
+    /// query cancellation and return after finishing or rolling back its I/O.
+    pub(crate) fn protect_async_cleanup(&self) -> AsyncCleanupGuard {
+        self.protected_async_cleanup.fetch_add(1, Ordering::AcqRel);
+        AsyncCleanupGuard {
+            active: Arc::clone(&self.protected_async_cleanup),
+        }
+    }
+
+    pub(crate) fn has_protected_async_cleanup(&self) -> bool {
+        self.protected_async_cleanup.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn mark_transaction_mutation_applied(&self) {
+        self.transaction_mutation_applied
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn transaction_mutation_was_applied(&self) -> bool {
+        self.transaction_mutation_applied.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_native_database_cleanup(&self, database: Weak<NativeDatabase>) {
         *self.native_cleanup.database.lock() = Some(database);
     }
 
-    pub(crate) fn native_commit_is_durable(&self) -> bool {
-        self.durable_native_commit.lock().is_some()
+    pub(crate) fn durable_outcome_is_committed(&self) -> bool {
+        self.durable_outcome.lock().is_some()
     }
 
-    pub(crate) fn error_after_native_commit(&self, error: Error) -> Error {
-        if matches!(error, Error::NativeCommitPostCommitFailure { .. }) {
-            return error;
-        }
-        let commit = self.durable_native_commit.lock();
-        match commit.as_ref() {
-            Some(commit) => Error::native_commit_post_commit_failure(
+    pub(crate) fn error_after_durable_outcome(&self, error: Error) -> Error {
+        let outcome = self.durable_outcome.lock();
+        match outcome.as_ref() {
+            Some(DurableOutcome::NativeCommit(_))
+                if matches!(error, Error::NativeCommitPostCommitFailure { .. }) =>
+            {
+                error
+            }
+            Some(DurableOutcome::Copy { .. })
+                if matches!(error, Error::CopyPostCommitFailure { .. }) =>
+            {
+                error
+            }
+            Some(DurableOutcome::NativeCommit(commit)) => Error::native_commit_post_commit_failure(
                 &commit.path,
                 &commit.transaction_id,
                 commit.generation,
-                format!("{error}; do not retry the write before reopening the engine"),
+                format!("{error}; the native write is durable, do not retry it"),
+            ),
+            Some(DurableOutcome::Copy { path }) => Error::copy_post_commit_failure(
+                path,
+                format!("{error}; the COPY output is durable, do not retry it"),
             ),
             None => error,
         }
@@ -644,6 +686,22 @@ struct DurableNativeCommit {
     path: PathBuf,
     transaction_id: String,
     generation: u64,
+}
+
+enum DurableOutcome {
+    NativeCommit(DurableNativeCommit),
+    Copy { path: PathBuf },
+}
+
+pub(crate) struct AsyncCleanupGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for AsyncCleanupGuard {
+    fn drop(&mut self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "async cleanup guard underflow");
+    }
 }
 
 #[derive(Default)]

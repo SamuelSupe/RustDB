@@ -1,5 +1,8 @@
+mod frame_aggregate;
+mod frame_index;
 mod keys;
 mod memory;
+mod navigation;
 mod output;
 mod sidecar;
 mod spool;

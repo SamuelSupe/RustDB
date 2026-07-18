@@ -127,6 +127,34 @@ async fn executes_distinct_null_semantics_and_query_level_limit() {
         rows("WITH set_rows AS (SELECT 1 AS n UNION ALL SELECT 2) SELECT n FROM set_rows").await,
         2
     );
+    assert_eq!(
+        rows("SELECT TIME(3) '12:00:00.125' UNION SELECT TIME(9) '12:00:00.125'").await,
+        1
+    );
+    assert_eq!(
+        rows("SELECT UUID '550e8400-e29b-41d4-a716-446655440000' INTERSECT SELECT UUID '550e8400-e29b-41d4-a716-446655440000'").await,
+        1
+    );
+    assert_eq!(
+        rows("SELECT INTERVAL '1' DAY EXCEPT SELECT INTERVAL '2' DAY").await,
+        1
+    );
+    assert_eq!(
+        rows("SELECT INTERVAL '1' DAY UNION SELECT INTERVAL '1' MONTH").await,
+        2
+    );
+    assert_eq!(
+        rows("SELECT INTERVAL '1' DAY UNION SELECT INTERVAL '24 hours'").await,
+        1
+    );
+    assert_eq!(
+        rows(
+            "SELECT TIMESTAMP '2024-01-01 00:00:00' AT TIME ZONE 'America/New_York' \
+             UNION SELECT TIMESTAMP '2024-01-01 05:00:00' AT TIME ZONE 'UTC'"
+        )
+        .await,
+        1
+    );
 
     let batches =
         run("SELECT 3 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY n LIMIT 1 OFFSET 1")

@@ -304,6 +304,8 @@ fn parse_factor(factor: &TableFactor) -> Result<Option<FileSpec>> {
                 match name.as_str() {
                     "header" => options.header = csv_header(value)?,
                     "delimiter" => options.delimiter = delimiter(value)?,
+                    "quote" => options.quote = csv_byte(value, "quote")?,
+                    "escape" => options.escape = Some(csv_byte(value, "escape")?),
                     "sample_size" => options.sample_size = positive_usize(value, "sample_size")?,
                     "compression" => options.compression = csv_compression(value)?,
                     _ => return Err(unknown_argument(kind, &name)),
@@ -497,12 +499,16 @@ fn csv_header(argument: &FunctionArgExpr) -> Result<CsvHeader> {
 }
 
 fn delimiter(argument: &FunctionArgExpr) -> Result<u8> {
-    let delimiter = literal_string(argument, "delimiter")?;
-    let bytes = delimiter.as_bytes();
+    csv_byte(argument, "delimiter")
+}
+
+fn csv_byte(argument: &FunctionArgExpr, name: &str) -> Result<u8> {
+    let value = literal_string(argument, name)?;
+    let bytes = value.as_bytes();
     if bytes.len() != 1 || !bytes[0].is_ascii() {
-        return Err(Error::InvalidArgument(
-            "CSV delimiter must be exactly one ASCII byte".to_owned(),
-        ));
+        return Err(Error::InvalidArgument(format!(
+            "CSV {name} must be exactly one ASCII byte"
+        )));
     }
     Ok(bytes[0])
 }

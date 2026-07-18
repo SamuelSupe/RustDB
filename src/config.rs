@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -185,6 +186,113 @@ impl Default for SpillConfig {
     }
 }
 
+/// Hard limits for persistent Native storage.
+///
+/// The engine limit covers the complete database directory and commit
+/// publication headroom. Table limits cover physical snapshots owned by the
+/// logical table, including retained versions.
+///
+/// Limits are process configuration: they are applied by `Engine::open` and
+/// are not persisted in the database directory.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct NativeStorageConfig {
+    pub engine_limit_bytes: Option<u64>,
+    pub default_table_limit_bytes: Option<u64>,
+    pub table_limit_bytes: BTreeMap<String, u64>,
+}
+
+impl NativeStorageConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_optional_limit("native_storage.engine_limit_bytes", self.engine_limit_bytes)?;
+        validate_optional_limit(
+            "native_storage.default_table_limit_bytes",
+            self.default_table_limit_bytes,
+        )?;
+        if let (Some(engine), Some(table)) =
+            (self.engine_limit_bytes, self.default_table_limit_bytes)
+            && table > engine
+        {
+            return Err(Error::InvalidArgument(format!(
+                "native_storage.default_table_limit_bytes ({table}) must not exceed native_storage.engine_limit_bytes ({engine})"
+            )));
+        }
+        let mut canonical_names = std::collections::BTreeSet::new();
+        for (name, &limit) in &self.table_limit_bytes {
+            let canonical = Self::canonical_table_name(name);
+            if name.is_empty()
+                || name.len() > 255
+                || *name != name.to_ascii_lowercase()
+                || canonical.is_none()
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "native_storage.table_limit_bytes key '{name}' must be a normalized table or schema.table name of at most 255 UTF-8 bytes"
+                )));
+            }
+            if !canonical_names.insert(canonical.expect("validated canonical name")) {
+                return Err(Error::InvalidArgument(format!(
+                    "native_storage.table_limit_bytes key '{name}' duplicates another default-schema table limit"
+                )));
+            }
+            if limit == 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "native_storage.table_limit_bytes['{name}'] must be greater than zero"
+                )));
+            }
+            if let Some(engine) = self.engine_limit_bytes
+                && limit > engine
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "native_storage.table_limit_bytes['{name}'] ({limit}) must not exceed native_storage.engine_limit_bytes ({engine})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn table_limit(&self, name: &str) -> Option<u64> {
+        let canonical = Self::canonical_table_name(name)?;
+        self.table_limit_bytes
+            .get(&canonical)
+            .or_else(|| {
+                (!canonical.contains('.'))
+                    .then(|| self.table_limit_bytes.get(&format!("main.{canonical}")))
+                    .flatten()
+            })
+            .copied()
+            .or(self.default_table_limit_bytes)
+    }
+
+    pub(crate) fn canonical_table_name(name: &str) -> Option<String> {
+        let normalized = name.to_ascii_lowercase();
+        let parts = normalized.split('.').collect::<Vec<_>>();
+        match parts.as_slice() {
+            [table] if !table.is_empty() && !table.contains('\0') => Some((*table).to_owned()),
+            ["main", table] if !table.is_empty() && !table.contains('\0') => {
+                Some((*table).to_owned())
+            }
+            [schema, table]
+                if !schema.is_empty()
+                    && !table.is_empty()
+                    && !schema.contains('\0')
+                    && !table.contains('\0') =>
+            {
+                Some(format!("{schema}.{table}"))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn validate_optional_limit(name: &str, value: Option<u64>) -> Result<()> {
+    if matches!(value, Some(0)) {
+        return Err(Error::InvalidArgument(format!(
+            "{name} must be greater than zero when configured"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct EngineConfig {
@@ -199,6 +307,7 @@ pub struct EngineConfig {
     pub execution: ExecutionConfig,
     pub s3: S3Config,
     pub spill: SpillConfig,
+    pub native_storage: NativeStorageConfig,
 }
 
 impl Default for EngineConfig {
@@ -224,6 +333,7 @@ impl Default for EngineConfig {
             execution: ExecutionConfig::default(),
             s3: S3Config::default(),
             spill,
+            native_storage: NativeStorageConfig::default(),
         }
     }
 }
@@ -333,11 +443,11 @@ impl ParquetOptions {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
     use super::{
-        CsvScanConfig, ExecutionConfig, ParquetPruningMode, ParquetScanConfig, S3Config,
-        SpillConfig,
+        CsvScanConfig, ExecutionConfig, NativeStorageConfig, ParquetPruningMode, ParquetScanConfig,
+        S3Config, SpillConfig,
     };
     use crate::Error;
 
@@ -451,6 +561,32 @@ mod tests {
         ];
 
         for config in cases {
+            assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
+        }
+    }
+
+    #[test]
+    fn native_storage_validation_rejects_zero_and_incoherent_limits() {
+        for config in [
+            NativeStorageConfig {
+                engine_limit_bytes: Some(0),
+                ..NativeStorageConfig::default()
+            },
+            NativeStorageConfig {
+                engine_limit_bytes: Some(10),
+                default_table_limit_bytes: Some(11),
+                ..NativeStorageConfig::default()
+            },
+            NativeStorageConfig {
+                table_limit_bytes: BTreeMap::from([("Events".to_owned(), 1)]),
+                ..NativeStorageConfig::default()
+            },
+            NativeStorageConfig {
+                engine_limit_bytes: Some(10),
+                table_limit_bytes: BTreeMap::from([("events".to_owned(), 11)]),
+                ..NativeStorageConfig::default()
+            },
+        ] {
             assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
         }
     }

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result};
 
 use super::{
-    CATALOG_GENERATION_BUDGET_PER_TABLE_BYTES, CatalogState, FORMAT_VERSION,
+    CATALOG_GENERATION_BUDGET_PER_TABLE_BYTES, CatalogState, FORMAT_VERSION, LEGACY_FORMAT_VERSION,
     MAX_CATALOG_MANIFEST_BYTES, MAX_CURRENT_BYTES,
 };
 use crate::storage::native::io;
@@ -49,6 +49,12 @@ pub(super) fn validate_generation_size(root: &Path, state: &CatalogState) -> Res
     encode_generation(&path, state).map(|_| ())
 }
 
+pub(super) fn encoded_generation_size(root: &Path, state: &CatalogState) -> Result<u64> {
+    let path = generation_path(root, state.generation);
+    u64::try_from(encode_generation(&path, state)?.len())
+        .map_err(|_| Error::ResourceExhausted("catalog generation size overflowed".to_owned()))
+}
+
 fn encode_generation(path: &Path, state: &CatalogState) -> Result<Vec<u8>> {
     let max_bytes = generation_budget(state)?;
     let sha256 = io::json_sha256(path, state, max_bytes, "catalog manifest")?;
@@ -67,11 +73,26 @@ fn encode_generation(path: &Path, state: &CatalogState) -> Result<Vec<u8>> {
 }
 
 fn generation_budget(state: &CatalogState) -> Result<usize> {
-    state
+    let object_budget = state
         .tables
         .len()
+        .saturating_add(state.views.len())
+        .saturating_add(state.schemas.len())
         .max(1)
         .checked_mul(CATALOG_GENERATION_BUDGET_PER_TABLE_BYTES)
+        .ok_or_else(|| Error::ResourceExhausted("catalog byte budget overflow".to_owned()))?;
+    let view_payload_budget = state.views.values().try_fold(0_usize, |bytes, view| {
+        let escaped_sql =
+            view.sql.len().checked_mul(6).ok_or_else(|| {
+                Error::ResourceExhausted("view SQL byte budget overflow".to_owned())
+            })?;
+        bytes
+            .checked_add(escaped_sql)
+            .and_then(|bytes| bytes.checked_add(view.schema_ipc_hex.len()))
+            .ok_or_else(|| Error::ResourceExhausted("view payload byte budget overflow".to_owned()))
+    })?;
+    object_budget
+        .checked_add(view_payload_budget)
         .map(|bytes| bytes.min(MAX_CATALOG_MANIFEST_BYTES))
         .ok_or_else(|| Error::ResourceExhausted("catalog byte budget overflow".to_owned()))
 }
@@ -95,16 +116,19 @@ pub(super) fn read_generation(root: &Path, generation: u64) -> Result<CatalogSta
             "catalog manifest checksum mismatch",
         ));
     }
-    if envelope.manifest.format_version != FORMAT_VERSION {
+    if !matches!(
+        envelope.manifest.format_version,
+        LEGACY_FORMAT_VERSION | FORMAT_VERSION
+    ) {
         return Err(Error::native_storage(
             &path,
             format!(
-                "unsupported catalog format version {}; expected {FORMAT_VERSION}",
-                envelope.manifest.format_version
+                "unsupported catalog format version {}; supported versions are {LEGACY_FORMAT_VERSION} and {FORMAT_VERSION}",
+                envelope.manifest.format_version,
             ),
         ));
     }
-    Ok(envelope.manifest)
+    Ok(super::normalize_legacy(envelope.manifest))
 }
 
 pub(super) fn write_current(root: &Path, generation: u64) -> Result<()> {

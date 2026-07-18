@@ -1,4 +1,4 @@
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 
 pub(super) fn supports_distinct_key(data_type: &DataType) -> bool {
     matches!(
@@ -23,7 +23,11 @@ pub(super) fn supports_distinct_key(data_type: &DataType) -> bool {
             | DataType::LargeBinary
             | DataType::Date32
             | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
             | DataType::Timestamp(_, _)
+            | DataType::Interval(_)
+            | DataType::FixedSizeBinary(16)
     )
 }
 
@@ -81,17 +85,30 @@ pub(super) fn common_set_type(
         | (DataType::Timestamp(unit, None), DataType::Date32) => {
             Ok(DataType::Timestamp(*unit, None))
         }
+        (
+            DataType::Time32(left_unit) | DataType::Time64(left_unit),
+            DataType::Time32(right_unit) | DataType::Time64(right_unit),
+        ) => Ok(time_type(finer_time_unit(*left_unit, *right_unit))),
+        (DataType::Interval(_), DataType::Interval(_)) => {
+            Ok(DataType::Interval(IntervalUnit::MonthDayNano))
+        }
         (DataType::Timestamp(left_unit, left_tz), DataType::Timestamp(right_unit, right_tz))
-            if left_tz == right_tz =>
+            if left_tz.is_some() == right_tz.is_some() =>
         {
+            let timezone = match (left_tz, right_tz) {
+                (Some(left), Some(right)) if left == right => Some(left.clone()),
+                (Some(_), Some(_)) => Some("UTC".into()),
+                (None, None) => None,
+                _ => unreachable!("timezone presence was checked"),
+            };
             Ok(DataType::Timestamp(
                 finer_time_unit(*left_unit, *right_unit),
-                left_tz.clone(),
+                timezone,
             ))
         }
-        (DataType::Timestamp(_, left_tz), DataType::Timestamp(_, right_tz)) => Err(format!(
-            "timestamp timezones differ ({left_tz:?} versus {right_tz:?})"
-        )),
+        (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => {
+            Err("cannot align TIMESTAMP WITH TIME ZONE with TIMESTAMP WITHOUT TIME ZONE".into())
+        }
         _ => Err("no lossless common type exists".into()),
     }
 }
@@ -216,6 +233,13 @@ fn finer_time_unit(left: TimeUnit, right: TimeUnit) -> TimeUnit {
     }
 }
 
+fn time_type(unit: TimeUnit) -> DataType {
+    match unit {
+        TimeUnit::Second | TimeUnit::Millisecond => DataType::Time32(unit),
+        TimeUnit::Microsecond | TimeUnit::Nanosecond => DataType::Time64(unit),
+    }
+}
+
 fn time_unit_rank(unit: TimeUnit) -> u8 {
     match unit {
         TimeUnit::Second => 0,
@@ -257,6 +281,37 @@ mod tests {
             .unwrap(),
             DataType::Timestamp(TimeUnit::Microsecond, None)
         );
+        assert_eq!(
+            common_set_type(
+                &DataType::Time32(TimeUnit::Millisecond),
+                &DataType::Time64(TimeUnit::Nanosecond),
+            )
+            .unwrap(),
+            DataType::Time64(TimeUnit::Nanosecond)
+        );
+        assert_eq!(
+            common_set_type(
+                &DataType::Timestamp(TimeUnit::Millisecond, Some("America/New_York".into()),),
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            )
+            .unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            common_set_type(
+                &DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth),
+                &DataType::Interval(arrow::datatypes::IntervalUnit::DayTime),
+            )
+            .unwrap(),
+            DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+        );
+        for data_type in [
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::FixedSizeBinary(16),
+            DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+        ] {
+            assert!(supports_distinct_key(&data_type));
+        }
     }
 
     #[test]

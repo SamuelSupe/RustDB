@@ -7,9 +7,10 @@ use crate::{Error, Result};
 
 use super::{
     NativeDatabase, StagedSnapshot,
+    active_wal::ActiveWal,
     disk_budget::DiskBudget,
     segment::writer::SegmentWriter,
-    table::{self, NativeSegment, TableSnapshot},
+    table::{self, DeleteVector, NativeSegment, TableSnapshot},
     write_plan::{CATALOG_HEADROOM_BYTES, NativeWritePlan, storage_limit},
 };
 
@@ -25,6 +26,8 @@ struct OpenSegment {
 }
 
 pub(crate) struct NativeTableWriter {
+    wal: Arc<super::wal::Wal>,
+    wal_owner: Option<ActiveWal>,
     staging: Option<StagedSnapshot>,
     plan: Option<NativeWritePlan>,
     current: Option<OpenSegment>,
@@ -34,27 +37,55 @@ pub(crate) struct NativeTableWriter {
 }
 
 pub(crate) struct PreparedSnapshot {
+    pub(super) wal: Arc<super::wal::Wal>,
+    pub(super) wal_owner: ActiveWal,
     pub(super) staging: StagedSnapshot,
     pub(super) snapshot: TableSnapshot,
     pub(super) name: String,
-    pub(super) expected_generation: u64,
 }
 
 impl PreparedSnapshot {
-    pub(crate) fn expected_generation(&self) -> u64 {
-        self.expected_generation
+    pub(crate) fn abort(mut self) -> Result<()> {
+        abort_owned_transaction(self.staging, &mut self.wal_owner)
     }
 
-    pub(crate) fn abort(self) -> Result<()> {
-        self.staging.abort()
+    pub(in crate::storage::native) fn quota_directories(
+        &self,
+        root: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        let own = self.snapshot.final_directory(root);
+        self.snapshot
+            .reachable_directories(root)
+            .into_iter()
+            .map(|directory| {
+                if directory == own {
+                    self.staging.snapshot_directory().to_path_buf()
+                } else {
+                    directory
+                }
+            })
+            .collect()
     }
 }
 
 impl NativeTableWriter {
     pub(super) fn begin(database: &NativeDatabase, plan: NativeWritePlan) -> Result<Self> {
         let staging = StagedSnapshot::begin(database.path(), database.database_id())?;
+        let wal = database.wal()?;
+        if let Err(error) = wal.begin(staging.transaction_id(), plan.expected_generation) {
+            return match staging.abort() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(Error::native_storage(
+                    database.path(),
+                    format!("{error}; native staging cleanup failed: {cleanup}"),
+                )),
+            };
+        }
         let disk_budget = DiskBudget::new(plan.new_snapshot_limit);
+        let wal_owner = ActiveWal::new(Arc::clone(&wal), staging.transaction_id());
         Ok(Self {
+            wal,
+            wal_owner: Some(wal_owner),
             staging: Some(staging),
             plan: Some(plan),
             current: None,
@@ -120,9 +151,42 @@ impl NativeTableWriter {
             self.current = Some(self.open_segment()?);
         }
         self.logical_input_bytes = logical_input_bytes;
+        let encoded = super::segment::encoding::encode(&normalized, &self.schema())?;
         let current = self.current.as_mut().expect("segment was opened");
-        current.writer.write_batch(&normalized)?;
+        current.writer.write_batch(&encoded)?;
         current.input_bytes = current.input_bytes.saturating_add(input_bytes);
+        Ok(())
+    }
+
+    pub(crate) fn write_delete_vector(
+        &mut self,
+        segment_id: &str,
+        vector: &DeleteVector,
+    ) -> Result<()> {
+        let plan = self.plan.as_mut().expect("writer plan exists");
+        let segment = plan
+            .inherited_segments
+            .iter_mut()
+            .find(|segment| segment.segment_id() == segment_id)
+            .ok_or_else(|| {
+                Error::Internal(format!(
+                    "native UPDATE segment '{segment_id}' is absent from its write plan"
+                ))
+            })?;
+        if vector.row_count() != segment.rows() {
+            return Err(Error::Internal(format!(
+                "native UPDATE vector for segment '{segment_id}' covers {} rows, expected {}",
+                vector.row_count(),
+                segment.rows()
+            )));
+        }
+        let path = self
+            .staging
+            .as_ref()
+            .expect("writer staging exists")
+            .delete_vector_path(segment_id);
+        let descriptor = vector.write(&path, plan.version, &plan.snapshot_id, &self.disk_budget)?;
+        *segment = segment.clone().with_delete_vector(descriptor);
         Ok(())
     }
 
@@ -164,13 +228,14 @@ impl NativeTableWriter {
             Ok(snapshot) => snapshot,
             Err(error) => return self.abort_with(error),
         };
+        let mut wal_owner = self.wal_owner.take().expect("writer WAL owner exists");
         let staging = self.staging.take().expect("writer staging exists");
         if let Err(error) = table::write_staged_with_budget(
             staging.snapshot_directory(),
             &mut snapshot,
             &self.disk_budget,
         ) {
-            return abort_staging(staging, error);
+            return abort_staging(staging, &mut wal_owner, error);
         }
         if let Err(error) = check_limits(
             &plan,
@@ -178,32 +243,35 @@ impl NativeTableWriter {
             self.disk_budget.used(),
             source_bytes,
         ) {
-            return abort_staging(staging, error);
+            return abort_staging(staging, &mut wal_owner, error);
         }
         Ok(PreparedSnapshot {
+            wal: Arc::clone(&self.wal),
+            wal_owner,
             staging,
             snapshot,
             name: plan.name,
-            expected_generation: plan.expected_generation,
         })
     }
 
     pub(crate) fn abort(mut self) -> Result<()> {
         self.current.take();
         self.plan.take();
-        match self.staging.take() {
-            Some(staging) => staging.abort(),
-            None => Ok(()),
-        }
+        let Some(staging) = self.staging.take() else {
+            return Ok(());
+        };
+        let mut wal_owner = self.wal_owner.take().expect("writer WAL owner exists");
+        abort_owned_transaction(staging, &mut wal_owner)
     }
 
     fn abort_with<T>(mut self, error: Error) -> Result<T> {
         self.current.take();
         self.plan.take();
-        match self.staging.take() {
-            Some(staging) => abort_staging(staging, error),
-            None => Err(error),
-        }
+        let Some(staging) = self.staging.take() else {
+            return Err(error);
+        };
+        let mut wal_owner = self.wal_owner.take().expect("writer WAL owner exists");
+        abort_staging(staging, &mut wal_owner, error)
     }
 
     fn open_segment(&self) -> Result<OpenSegment> {
@@ -212,6 +280,7 @@ impl NativeTableWriter {
         Ok(OpenSegment {
             writer: SegmentWriter::create_new_without_predicate_sidecar(
                 staging.segment_path(&id),
+                super::segment::encoding::physical_schema(&self.schema()),
                 self.schema(),
                 self.disk_budget.clone(),
             )?,
@@ -241,9 +310,9 @@ impl NativeTableWriter {
     }
 }
 
-fn abort_staging<T>(staging: StagedSnapshot, error: Error) -> Result<T> {
+fn abort_staging<T>(staging: StagedSnapshot, wal_owner: &mut ActiveWal, error: Error) -> Result<T> {
     let path = staging.path().to_owned();
-    match staging.abort() {
+    match abort_owned_transaction(staging, wal_owner) {
         Ok(()) => Err(error),
         Err(cleanup) => Err(Error::native_storage(
             path,
@@ -252,7 +321,24 @@ fn abort_staging<T>(staging: StagedSnapshot, error: Error) -> Result<T> {
     }
 }
 
-fn check_limits(
+pub(super) fn abort_owned_transaction(
+    staging: StagedSnapshot,
+    wal_owner: &mut ActiveWal,
+) -> Result<()> {
+    let path = staging.path().to_owned();
+    let staging_result = staging.abort();
+    let wal_result = wal_owner.abort();
+    match (staging_result, wal_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(staging), Err(wal)) => Err(Error::native_storage(
+            path,
+            format!("staging cleanup failed: {staging}; WAL abort also failed: {wal}"),
+        )),
+    }
+}
+
+pub(super) fn check_limits(
     plan: &NativeWritePlan,
     new_source_bytes: u64,
     new_snapshot_bytes: u64,

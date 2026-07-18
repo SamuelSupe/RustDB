@@ -16,10 +16,25 @@ pub enum ScalarValue {
     },
     Date32(i32),
     TimestampMicrosecond(i64),
+    Timestamp {
+        value: i64,
+        unit: TimeUnit,
+        timezone: Option<String>,
+    },
+    Time {
+        value: i64,
+        unit: TimeUnit,
+    },
     DayInterval(i32),
     MonthInterval(i32),
+    MonthDayNanoInterval {
+        months: i32,
+        days: i32,
+        nanoseconds: i64,
+    },
     Utf8(String),
     Binary(Vec<u8>),
+    Uuid([u8; 16]),
 }
 
 impl ScalarValue {
@@ -35,10 +50,19 @@ impl ScalarValue {
             } => DataType::Decimal128(*precision, *scale),
             Self::Date32(_) => DataType::Date32,
             Self::TimestampMicrosecond(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
+            Self::Timestamp { unit, timezone, .. } => {
+                DataType::Timestamp(*unit, timezone.clone().map(Into::into))
+            }
+            Self::Time { unit, .. } => match unit {
+                TimeUnit::Second | TimeUnit::Millisecond => DataType::Time32(*unit),
+                TimeUnit::Microsecond | TimeUnit::Nanosecond => DataType::Time64(*unit),
+            },
             Self::DayInterval(_) => DataType::Interval(IntervalUnit::DayTime),
             Self::MonthInterval(_) => DataType::Interval(IntervalUnit::YearMonth),
+            Self::MonthDayNanoInterval { .. } => DataType::Interval(IntervalUnit::MonthDayNano),
             Self::Utf8(_) => DataType::Utf8,
             Self::Binary(_) => DataType::Binary,
+            Self::Uuid(_) => DataType::FixedSizeBinary(16),
         }
     }
 }
@@ -58,8 +82,26 @@ impl fmt::Display for ScalarValue {
             Self::TimestampMicrosecond(value) => {
                 write!(formatter, "TIMESTAMP_MICROSECOND({value})")
             }
+            Self::Timestamp {
+                value,
+                unit,
+                timezone,
+            } => write!(
+                formatter,
+                "TIMESTAMP_{unit:?}({value}, {})",
+                timezone.as_deref().unwrap_or("naive")
+            ),
+            Self::Time { value, unit } => write!(formatter, "TIME_{unit:?}({value})"),
             Self::DayInterval(value) => write!(formatter, "INTERVAL '{value}' DAY"),
             Self::MonthInterval(value) => write!(formatter, "INTERVAL '{value}' MONTH"),
+            Self::MonthDayNanoInterval {
+                months,
+                days,
+                nanoseconds,
+            } => write!(
+                formatter,
+                "INTERVAL_MONTH_DAY_NANO({months}, {days}, {nanoseconds})"
+            ),
             Self::Utf8(value) => write!(formatter, "'{value}'"),
             Self::Binary(value) => {
                 formatter.write_str("X'")?;
@@ -68,6 +110,7 @@ impl fmt::Display for ScalarValue {
                 }
                 formatter.write_str("'")
             }
+            Self::Uuid(value) => formatter.write_str(&uuid::Uuid::from_bytes(*value).to_string()),
         }
     }
 }
@@ -409,6 +452,12 @@ pub enum ScalarFunction {
     DatePart(DateTimePart),
     DateTrunc(DateTimePart),
     ToTimestampSeconds,
+    AtTimeZone {
+        timezone: chrono_tz::Tz,
+        attach: bool,
+    },
+    /// Internal NULL-aware Arrow row encoding for multi-expression DISTINCT.
+    DistinctTuple,
 }
 
 impl fmt::Display for ScalarFunction {
@@ -416,6 +465,11 @@ impl fmt::Display for ScalarFunction {
         match self {
             Self::DatePart(part) => write!(formatter, "date_part[{part}]"),
             Self::DateTrunc(part) => write!(formatter, "date_trunc[{part}]"),
+            Self::AtTimeZone { timezone, attach } => write!(
+                formatter,
+                "at_time_zone[{timezone},{}]",
+                if *attach { "attach" } else { "detach" }
+            ),
             other => formatter.write_str(match other {
                 Self::Substring => "substring",
                 Self::Length => "length",
@@ -437,7 +491,8 @@ impl fmt::Display for ScalarFunction {
                 Self::Floor => "floor",
                 Self::Round => "round",
                 Self::ToTimestampSeconds => "to_timestamp_seconds",
-                Self::DatePart(_) | Self::DateTrunc(_) => unreachable!(),
+                Self::DistinctTuple => "__distinct_tuple",
+                Self::DatePart(_) | Self::DateTrunc(_) | Self::AtTimeZone { .. } => unreachable!(),
             }),
         }
     }

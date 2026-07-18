@@ -2,10 +2,13 @@ use std::{cmp::Ordering, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array,
-        Int64Array, IntervalDayTimeArray, IntervalYearMonthArray, NullArray, StringArray,
-        UInt64Array,
-        types::{IntervalDayTimeType, IntervalYearMonthType},
+        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+        FixedSizeBinaryBuilder, Float64Array, Int64Array, IntervalDayTimeArray,
+        IntervalMonthDayNanoArray, IntervalYearMonthArray, NullArray, StringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt64Array,
+        types::{IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType},
     },
     compute::{
         filter_record_batch,
@@ -417,6 +420,20 @@ fn evaluate_binary(op: BinaryOp, left: ArrayRef, right: ArrayRef) -> Result<Arra
     {
         return Ok(Arc::new(compare_decimals(op, &left, &right)?));
     }
+    if matches!(left.data_type(), arrow::datatypes::DataType::Interval(_))
+        && matches!(right.data_type(), arrow::datatypes::DataType::Interval(_))
+        && matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        )
+    {
+        return Ok(Arc::new(compare_intervals(op, &left, &right)?));
+    }
     let result: ArrayRef = match op {
         BinaryOp::Eq => Arc::new(cmp::eq(&left, &right)?),
         BinaryOp::NotEq => Arc::new(cmp::neq(&left, &right)?),
@@ -436,6 +453,34 @@ fn evaluate_binary(op: BinaryOp, left: ArrayRef, right: ArrayRef) -> Result<Arra
         BinaryOp::Modulo => numeric::rem(&left, &right)?,
     };
     Ok(result)
+}
+
+fn compare_intervals(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Result<BooleanArray> {
+    if left.len() != right.len() {
+        return Err(Error::Internal(
+            "INTERVAL comparison operands have different lengths".into(),
+        ));
+    }
+    Ok(BooleanArray::from_iter(
+        (0..left.len())
+            .map(|row| {
+                if left.is_null(row) || right.is_null(row) {
+                    return Ok(None);
+                }
+                let ordering =
+                    super::value::cell(left, row)?.compare(&super::value::cell(right, row)?)?;
+                Ok(Some(match op {
+                    BinaryOp::Eq => ordering.is_eq(),
+                    BinaryOp::NotEq => !ordering.is_eq(),
+                    BinaryOp::Lt => ordering.is_lt(),
+                    BinaryOp::LtEq => !ordering.is_gt(),
+                    BinaryOp::Gt => ordering.is_gt(),
+                    BinaryOp::GtEq => !ordering.is_lt(),
+                    _ => unreachable!("caller only passes comparison operators"),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
 fn compare_decimals(op: BinaryOp, left: &ArrayRef, right: &ArrayRef) -> Result<BooleanArray> {
@@ -591,6 +636,54 @@ fn literal_array(value: &ScalarValue, len: usize) -> Result<ArrayRef> {
             ScalarValue::TimestampMicrosecond(value) => {
                 super::functions::timestamp_literal(*value, len)
             }
+            ScalarValue::Timestamp {
+                value,
+                unit,
+                timezone,
+            } => match unit {
+                arrow::datatypes::TimeUnit::Second => Arc::new(
+                    TimestampSecondArray::from(vec![Some(*value); len])
+                        .with_timezone_opt(timezone.clone()),
+                ),
+                arrow::datatypes::TimeUnit::Millisecond => Arc::new(
+                    TimestampMillisecondArray::from(vec![Some(*value); len])
+                        .with_timezone_opt(timezone.clone()),
+                ),
+                arrow::datatypes::TimeUnit::Microsecond => Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(*value); len])
+                        .with_timezone_opt(timezone.clone()),
+                ),
+                arrow::datatypes::TimeUnit::Nanosecond => Arc::new(
+                    TimestampNanosecondArray::from(vec![Some(*value); len])
+                        .with_timezone_opt(timezone.clone()),
+                ),
+            },
+            ScalarValue::Time { value, unit } => match unit {
+                arrow::datatypes::TimeUnit::Second => Arc::new(Time32SecondArray::from(vec![
+                    Some(
+                        i32::try_from(*value).map_err(|_| {
+                            Error::Execution("TIME(second) literal is out of range".into())
+                        })?
+                    );
+                    len
+                ])),
+                arrow::datatypes::TimeUnit::Millisecond => {
+                    Arc::new(Time32MillisecondArray::from(vec![
+                        Some(
+                            i32::try_from(*value).map_err(|_| {
+                                Error::Execution("TIME(millisecond) literal is out of range".into())
+                            })?
+                        );
+                        len
+                    ]))
+                }
+                arrow::datatypes::TimeUnit::Microsecond => {
+                    Arc::new(Time64MicrosecondArray::from(vec![Some(*value); len]))
+                }
+                arrow::datatypes::TimeUnit::Nanosecond => {
+                    Arc::new(Time64NanosecondArray::from(vec![Some(*value); len]))
+                }
+            },
             ScalarValue::DayInterval(days) => Arc::new(IntervalDayTimeArray::from(vec![
                 Some(
                     IntervalDayTimeType::make_value(*days, 0)
@@ -603,12 +696,29 @@ fn literal_array(value: &ScalarValue, len: usize) -> Result<ArrayRef> {
                 );
                 len
             ])),
+            ScalarValue::MonthDayNanoInterval {
+                months,
+                days,
+                nanoseconds,
+            } => Arc::new(IntervalMonthDayNanoArray::from(vec![
+                Some(
+                    IntervalMonthDayNanoType::make_value(*months, *days, *nanoseconds,)
+                );
+                len
+            ])),
             ScalarValue::Utf8(value) => Arc::new(StringArray::from_iter_values(
                 std::iter::repeat_n(value.as_str(), len),
             )),
             ScalarValue::Binary(value) => Arc::new(BinaryArray::from_iter_values(
                 std::iter::repeat_n(value.as_slice(), len),
             )),
+            ScalarValue::Uuid(value) => {
+                let mut builder = FixedSizeBinaryBuilder::with_capacity(len, 16);
+                for _ in 0..len {
+                    builder.append_value(value)?;
+                }
+                Arc::new(builder.finish())
+            }
         };
     Ok(array)
 }

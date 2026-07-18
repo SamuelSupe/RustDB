@@ -1,11 +1,24 @@
+use std::sync::Arc;
+
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
-use sqlparser::ast::{DataType as SqlDataType, ExactNumberInfo, TimezoneInfo};
+use sqlparser::ast::{DataType as SqlDataType, ExactNumberInfo, IntervalFields, TimezoneInfo};
 
 use crate::{Error, Result};
 
 use super::{BinaryOp, BoundExpr, ExprKind, ScalarValue};
 
 pub(super) fn cast(expr: BoundExpr, data_type: &SqlDataType) -> Result<BoundExpr> {
+    if let (
+        ExprKind::Literal(ScalarValue::Utf8(value)),
+        SqlDataType::Interval { fields, precision },
+    ) = (&expr.kind, data_type)
+    {
+        return Ok(BoundExpr::literal(super::interval::parse_cast_interval(
+            value,
+            fields.as_ref(),
+            *precision,
+        )?));
+    }
     let target = arrow_type(data_type)?;
     validate_temporal_cast(&expr.data_type, &target)?;
     let display_name = format!("CAST({} AS {data_type})", expr.display_name);
@@ -83,6 +96,13 @@ pub(super) fn coerce_comparison(
             cast_if_needed(right, &DataType::Utf8),
         ));
     }
+    if is_interval(&left.data_type) && is_interval(&right.data_type) {
+        let target = DataType::Interval(IntervalUnit::MonthDayNano);
+        return Ok((
+            cast_if_needed(left, &target),
+            cast_if_needed(right, &target),
+        ));
+    }
     if left.data_type == DataType::Date32 && is_utf8_literal(&right) {
         return Ok((left, cast_if_needed(right, &DataType::Date32)));
     }
@@ -114,13 +134,13 @@ pub(super) fn coerce_comparison(
         DataType::Timestamp(right_unit, right_zone),
     ) = (&left.data_type, &right.data_type)
     {
-        if left_zone != right_zone {
-            return Err(Error::InvalidArgument(format!(
-                "cannot compare TIMESTAMP values with different timezones ({left_zone:?} and {right_zone:?})"
-            )));
+        if left_zone.is_some() != right_zone.is_some() {
+            return Err(Error::InvalidArgument(
+                "cannot compare TIMESTAMP WITH TIME ZONE to TIMESTAMP WITHOUT TIME ZONE".into(),
+            ));
         }
         let unit = finer_time_unit(*left_unit, *right_unit);
-        let target = DataType::Timestamp(unit, left_zone.clone());
+        let target = DataType::Timestamp(unit, common_timezone(left_zone, right_zone));
         return Ok((
             cast_if_needed(left, &target),
             cast_if_needed(right, &target),
@@ -139,40 +159,36 @@ pub(super) fn coerce_arithmetic(
 ) -> Result<(BoundExpr, BoundExpr, DataType)> {
     let day_interval = DataType::Interval(IntervalUnit::DayTime);
     let month_interval = DataType::Interval(IntervalUnit::YearMonth);
+    let compound_interval = DataType::Interval(IntervalUnit::MonthDayNano);
     if matches!(&left.data_type, DataType::Timestamp(_, _))
-        && matches!(
-            &right.data_type,
-            DataType::Interval(IntervalUnit::DayTime | IntervalUnit::YearMonth)
-        )
+        && is_interval(&right.data_type)
         && matches!(op, BinaryOp::Add | BinaryOp::Subtract)
     {
         let output = left.data_type.clone();
         return Ok((left, right, output));
     }
-    if matches!(
-        &left.data_type,
-        DataType::Interval(IntervalUnit::DayTime | IntervalUnit::YearMonth)
-    ) && matches!(&right.data_type, DataType::Timestamp(_, _))
+    if is_interval(&left.data_type)
+        && matches!(&right.data_type, DataType::Timestamp(_, _))
         && op == BinaryOp::Add
     {
         let output = right.data_type.clone();
         return Ok((left, right, output));
     }
     if left.data_type == DataType::Date32
-        && matches!(
-            &right.data_type,
-            DataType::Interval(IntervalUnit::DayTime | IntervalUnit::YearMonth)
-        )
+        && is_interval(&right.data_type)
         && matches!(op, BinaryOp::Add | BinaryOp::Subtract)
     {
+        if right.data_type == compound_interval {
+            let timestamp = DataType::Timestamp(TimeUnit::Microsecond, None);
+            return Ok((cast_if_needed(left, &timestamp), right, timestamp));
+        }
         return Ok((left, right, DataType::Date32));
     }
-    if matches!(
-        &left.data_type,
-        DataType::Interval(IntervalUnit::DayTime | IntervalUnit::YearMonth)
-    ) && right.data_type == DataType::Date32
-        && op == BinaryOp::Add
-    {
+    if is_interval(&left.data_type) && right.data_type == DataType::Date32 && op == BinaryOp::Add {
+        if left.data_type == compound_interval {
+            let timestamp = DataType::Timestamp(TimeUnit::Microsecond, None);
+            return Ok((left, cast_if_needed(right, &timestamp), timestamp));
+        }
         return Ok((left, right, DataType::Date32));
     }
     if left.data_type == day_interval
@@ -186,6 +202,16 @@ pub(super) fn coerce_arithmetic(
         && matches!(op, BinaryOp::Add | BinaryOp::Subtract)
     {
         return Ok((left, right, month_interval));
+    }
+    if is_interval(&left.data_type)
+        && is_interval(&right.data_type)
+        && matches!(op, BinaryOp::Add | BinaryOp::Subtract)
+    {
+        return Ok((
+            cast_if_needed(left, &compound_interval),
+            cast_if_needed(right, &compound_interval),
+            compound_interval,
+        ));
     }
     if is_decimal(&left.data_type) || is_decimal(&right.data_type) {
         // DuckDB's `/` operator always produces floating-point output, also
@@ -257,6 +283,9 @@ pub(super) fn common_case_type(left: &DataType, right: &DataType) -> Result<Data
     if is_string(left) && is_string(right) {
         return Ok(DataType::Utf8);
     }
+    if is_interval(left) && is_interval(right) {
+        return Ok(DataType::Interval(IntervalUnit::MonthDayNano));
+    }
     if left == &DataType::Date32
         && let DataType::Timestamp(unit, None) = right
     {
@@ -269,16 +298,24 @@ pub(super) fn common_case_type(left: &DataType, right: &DataType) -> Result<Data
     }
     if let (DataType::Timestamp(left_unit, left_zone), DataType::Timestamp(right_unit, right_zone)) =
         (left, right)
-        && left_zone == right_zone
+        && left_zone.is_some() == right_zone.is_some()
     {
         return Ok(DataType::Timestamp(
             finer_time_unit(*left_unit, *right_unit),
-            left_zone.clone(),
+            common_timezone(left_zone, right_zone),
         ));
     }
     Err(Error::InvalidArgument(format!(
         "CASE branches have incompatible types {left} and {right}"
     )))
+}
+
+fn common_timezone(left: &Option<Arc<str>>, right: &Option<Arc<str>>) -> Option<Arc<str>> {
+    match (left, right) {
+        (Some(left), Some(right)) if left == right => Some(Arc::clone(left)),
+        (Some(_), Some(_)) => Some("UTC".into()),
+        _ => None,
+    }
 }
 
 pub(super) fn is_numeric(data_type: &DataType) -> bool {
@@ -351,44 +388,44 @@ fn arrow_type(data_type: &SqlDataType) -> Result<DataType> {
         | SqlDataType::MediumBlob
         | SqlDataType::LongBlob
         | SqlDataType::Bytes(_) => DataType::Binary,
+        SqlDataType::Uuid => DataType::FixedSizeBinary(16),
         SqlDataType::Date | SqlDataType::Date32 => DataType::Date32,
+        SqlDataType::Time(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            let unit = temporal_unit(precision.unwrap_or(6), "TIME")?;
+            match unit {
+                TimeUnit::Second | TimeUnit::Millisecond => DataType::Time32(unit),
+                TimeUnit::Microsecond | TimeUnit::Nanosecond => DataType::Time64(unit),
+            }
+        }
+        SqlDataType::Time(_, _) => {
+            return Err(Error::Unsupported(
+                "TIME WITH TIME ZONE cast targets are not supported".into(),
+            ));
+        }
         SqlDataType::Timestamp(precision, timezone) => {
-            if precision.is_some_and(|precision| precision > 6) {
-                return Err(Error::InvalidArgument(
-                    "TIMESTAMP precision above 6 cannot be represented by the microsecond engine type"
-                        .into(),
-                ));
-            }
-            if precision.is_some_and(|precision| precision < 6) {
-                return Err(Error::Unsupported(
-                    "precision-qualified TIMESTAMP casts below microseconds are not supported; use TIMESTAMP or TIMESTAMP(6)"
-                        .into(),
-                ));
-            }
+            let unit = temporal_unit(precision.unwrap_or(6), "TIMESTAMP")?;
             let timezone = match timezone {
                 TimezoneInfo::None | TimezoneInfo::WithoutTimeZone => None,
-                _ => {
-                    return Err(Error::Unsupported(
-                        "timezone-aware TIMESTAMP cast targets are not supported".into(),
-                    ));
-                }
+                TimezoneInfo::WithTimeZone | TimezoneInfo::Tz => Some("UTC".into()),
             };
-            DataType::Timestamp(TimeUnit::Microsecond, timezone)
+            DataType::Timestamp(unit, timezone)
         }
         SqlDataType::TimestampNtz(precision) => {
-            if precision.is_some_and(|precision| precision > 6) {
+            DataType::Timestamp(temporal_unit(precision.unwrap_or(6), "TIMESTAMP")?, None)
+        }
+        SqlDataType::Interval { fields, precision } => {
+            if precision.is_some_and(|precision| precision > 9) {
                 return Err(Error::InvalidArgument(
-                    "TIMESTAMP precision above 6 cannot be represented by the microsecond engine type"
-                        .into(),
+                    "INTERVAL precision above 9 is not supported".into(),
                 ));
             }
-            if precision.is_some_and(|precision| precision < 6) {
-                return Err(Error::Unsupported(
-                    "precision-qualified TIMESTAMP casts below microseconds are not supported; use TIMESTAMP or TIMESTAMP(6)"
-                        .into(),
-                ));
+            match fields {
+                Some(
+                    IntervalFields::Year | IntervalFields::Month | IntervalFields::YearToMonth,
+                ) => DataType::Interval(IntervalUnit::YearMonth),
+                Some(IntervalFields::Day) => DataType::Interval(IntervalUnit::DayTime),
+                _ => DataType::Interval(IntervalUnit::MonthDayNano),
             }
-            DataType::Timestamp(TimeUnit::Microsecond, None)
         }
         other => {
             return Err(Error::Unsupported(format!(
@@ -397,6 +434,18 @@ fn arrow_type(data_type: &SqlDataType) -> Result<DataType> {
         }
     };
     Ok(output)
+}
+
+fn temporal_unit(precision: u64, kind: &str) -> Result<TimeUnit> {
+    match precision {
+        0 => Ok(TimeUnit::Second),
+        1..=3 => Ok(TimeUnit::Millisecond),
+        4..=6 => Ok(TimeUnit::Microsecond),
+        7..=9 => Ok(TimeUnit::Nanosecond),
+        _ => Err(Error::InvalidArgument(format!(
+            "{kind} precision above 9 is not supported"
+        ))),
+    }
 }
 
 fn decimal_type(info: &ExactNumberInfo) -> Result<DataType> {
@@ -568,8 +617,43 @@ fn is_utf8_literal(expr: &BoundExpr) -> bool {
 }
 
 fn validate_temporal_cast(source: &DataType, target: &DataType) -> Result<()> {
-    let source_temporal = matches!(source, DataType::Date32 | DataType::Timestamp(_, _));
-    let target_temporal = matches!(target, DataType::Date32 | DataType::Timestamp(_, _));
+    let source_uuid = source == &DataType::FixedSizeBinary(16);
+    let target_uuid = target == &DataType::FixedSizeBinary(16);
+    if source_uuid || target_uuid {
+        return if source == &DataType::Null
+            || matches!(source, DataType::Utf8 | DataType::LargeUtf8) && target_uuid
+            || source_uuid && matches!(target, DataType::Utf8 | DataType::LargeUtf8)
+            || source_uuid && target_uuid
+        {
+            Ok(())
+        } else {
+            Err(Error::InvalidArgument(format!(
+                "strict UUID CAST does not support {source} to {target}"
+            )))
+        };
+    }
+    if is_interval(source) || is_interval(target) {
+        return if source == &DataType::Null
+            || source == target
+            || is_interval(source) && target == &DataType::Interval(IntervalUnit::MonthDayNano)
+            || is_string(source) && is_interval(target)
+            || is_interval(source) && is_string(target)
+        {
+            Ok(())
+        } else {
+            Err(Error::InvalidArgument(format!(
+                "strict INTERVAL CAST does not support {source} to {target}"
+            )))
+        };
+    }
+    let source_temporal = matches!(
+        source,
+        DataType::Date32 | DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
+    );
+    let target_temporal = matches!(
+        target,
+        DataType::Date32 | DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
+    );
     if !source_temporal && !target_temporal {
         return Ok(());
     }
@@ -584,17 +668,33 @@ fn validate_temporal_cast(source: &DataType, target: &DataType) -> Result<()> {
         (DataType::Utf8 | DataType::LargeUtf8, DataType::Date32)
             | (
                 DataType::Utf8 | DataType::LargeUtf8,
-                DataType::Timestamp(_, None)
+                DataType::Timestamp(_, _)
             )
             | (DataType::Date32, DataType::Utf8 | DataType::LargeUtf8)
             | (DataType::Date32, DataType::Timestamp(_, None))
             | (DataType::Date32, DataType::Date32)
             | (
-                DataType::Timestamp(_, None),
+                DataType::Timestamp(_, _),
                 DataType::Utf8 | DataType::LargeUtf8
             )
             | (DataType::Timestamp(_, None), DataType::Date32)
             | (DataType::Timestamp(_, None), DataType::Timestamp(_, None))
+            | (
+                DataType::Timestamp(_, Some(_)),
+                DataType::Timestamp(_, Some(_))
+            )
+            | (
+                DataType::Utf8 | DataType::LargeUtf8,
+                DataType::Time32(_) | DataType::Time64(_)
+            )
+            | (
+                DataType::Time32(_) | DataType::Time64(_),
+                DataType::Utf8 | DataType::LargeUtf8
+            )
+            | (
+                DataType::Time32(_) | DataType::Time64(_),
+                DataType::Time32(_) | DataType::Time64(_)
+            )
     );
     if supported {
         Ok(())
@@ -620,6 +720,10 @@ fn is_float(data_type: &DataType) -> bool {
         data_type,
         DataType::Float16 | DataType::Float32 | DataType::Float64
     )
+}
+
+fn is_interval(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Interval(_))
 }
 
 fn is_unsigned(data_type: &DataType) -> bool {

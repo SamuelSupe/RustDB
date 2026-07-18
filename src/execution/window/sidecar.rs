@@ -26,6 +26,7 @@ use super::{
 pub(super) struct RangeSidecar {
     pub(super) file: SpillFile,
     pub(super) expression_columns: Vec<Option<usize>>,
+    pub(super) groups: u64,
 }
 
 pub(super) fn build(
@@ -39,9 +40,11 @@ pub(super) fn build(
         .enumerate()
         .filter_map(|(index, expression)| is_range_aggregate(expression).then_some(index))
         .collect::<Vec<_>>();
-    let needs_peer_lengths = expressions
-        .iter()
-        .any(|expression| matches!(expression.function, WindowFunction::CumeDist));
+    let needs_peer_lengths = expressions.iter().any(|expression| {
+        matches!(expression.function, WindowFunction::CumeDist)
+            || expression.frame.units == WindowFrameUnits::Groups
+            || expression.frame.units == WindowFrameUnits::Range
+    });
     if range_indices.is_empty() && !needs_peer_lengths {
         return Ok(None);
     }
@@ -111,6 +114,7 @@ pub(super) fn build(
     let mut current_key: Option<Vec<CellValue>> = None;
     let mut current_key_payload = 0usize;
     let mut peer_len = 0u64;
+    let mut groups = 0u64;
     let mut summaries = SummaryBuffer::new(range_indices.len(), capacity);
     let mut retained_payload = vec![0usize; expressions.len()];
 
@@ -144,6 +148,9 @@ pub(super) fn build(
                     &mut writer,
                     &schema,
                 )?;
+                groups = groups.checked_add(1).ok_or_else(|| {
+                    Error::Execution("window peer group count overflowed UINT64".into())
+                })?;
                 peer_len = 0;
             }
             let previous_key = current_key.replace(key);
@@ -206,6 +213,9 @@ pub(super) fn build(
             &mut writer,
             &schema,
         )?;
+        groups = groups
+            .checked_add(1)
+            .ok_or_else(|| Error::Execution("window peer group count overflowed UINT64".into()))?;
     }
     let released = summaries.flush(&mut writer, &schema, expressions, &range_indices)?;
     memory.shrink(released);
@@ -222,6 +232,7 @@ pub(super) fn build(
     Ok(Some(RangeSidecar {
         file,
         expression_columns,
+        groups,
     }))
 }
 

@@ -133,7 +133,7 @@ pub(super) fn pull(plan: LogicalPlan) -> Result<Pulled> {
             schema,
         } => {
             let child = pull(*input)?;
-            if !child.correlations.is_empty() {
+            if !child.correlations.is_empty() || expressions.iter().any(window_contains_outer_ref) {
                 return Err(Error::Unsupported(
                     "window functions in a correlated subquery are not supported".into(),
                 ));
@@ -237,6 +237,36 @@ pub(super) fn pull(plan: LogicalPlan) -> Result<Pulled> {
             "nested DependentJoin reached correlation-key extraction".into(),
         )),
     }
+}
+
+fn window_contains_outer_ref(expression: &crate::sql::WindowExpr) -> bool {
+    let function = match &expression.function {
+        crate::sql::WindowFunction::Aggregate(aggregate) => aggregate
+            .expr
+            .as_ref()
+            .is_some_and(BoundExpr::contains_outer_ref),
+        crate::sql::WindowFunction::Lead { expr, default, .. }
+        | crate::sql::WindowFunction::Lag { expr, default, .. } => {
+            expr.contains_outer_ref() || default.contains_outer_ref()
+        }
+        crate::sql::WindowFunction::FirstValue(expr)
+        | crate::sql::WindowFunction::LastValue(expr) => expr.contains_outer_ref(),
+        crate::sql::WindowFunction::RowNumber
+        | crate::sql::WindowFunction::Rank
+        | crate::sql::WindowFunction::DenseRank
+        | crate::sql::WindowFunction::Ntile(_)
+        | crate::sql::WindowFunction::PercentRank
+        | crate::sql::WindowFunction::CumeDist => false,
+    };
+    function
+        || expression
+            .partition_by
+            .iter()
+            .any(BoundExpr::contains_outer_ref)
+        || expression
+            .order_by
+            .iter()
+            .any(|order| order.expr.contains_outer_ref())
 }
 
 fn pull_filter(

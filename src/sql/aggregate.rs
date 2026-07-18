@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
-    CastKind, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    Ident, SelectItem, UnaryOperator,
+    CastKind, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentClause, FunctionArguments, Ident, SelectItem, UnaryOperator,
 };
 
 use crate::{Error, Result};
@@ -50,6 +50,31 @@ pub(super) fn plan_aggregate_projection(
         .iter()
         .map(|expr| bind_expr_scoped(expr, input.schema(), outer))
         .collect::<Result<Vec<_>>>()?;
+    plan_bound_aggregate_projection(input, group_ast, group_exprs, items, having)
+}
+
+pub(super) fn plan_aggregate_projection_with_groups(
+    input: LogicalPlan,
+    group_ast: &[Expr],
+    group_exprs: Vec<BoundExpr>,
+    items: &[SelectItem],
+    having: Option<&Expr>,
+) -> Result<LogicalPlan> {
+    if deferred::has_attachments(&input) {
+        return Err(Error::Unsupported(
+            "correlated subqueries with grouping sets are not supported yet".into(),
+        ));
+    }
+    plan_bound_aggregate_projection(input, group_ast, group_exprs, items, having)
+}
+
+fn plan_bound_aggregate_projection(
+    input: LogicalPlan,
+    group_ast: &[Expr],
+    group_exprs: Vec<BoundExpr>,
+    items: &[SelectItem],
+    having: Option<&Expr>,
+) -> Result<LogicalPlan> {
     let mut aggregate_exprs = Vec::new();
     let mut output_exprs = Vec::with_capacity(items.len());
     for item in items {
@@ -434,13 +459,9 @@ fn defer_result_columns(
 }
 
 pub(super) fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result<AggregateExpr> {
-    if function.over.is_some()
-        || function.filter.is_some()
-        || !function.within_group.is_empty()
-        || !matches!(&function.parameters, FunctionArguments::None)
-    {
+    if function.over.is_some() || !matches!(&function.parameters, FunctionArguments::None) {
         return Err(Error::Unsupported(
-            "aggregate modifiers, FILTER, and window OVER clauses are not supported".into(),
+            "aggregate parameters and window OVER clauses are not supported".into(),
         ));
     }
     let aggregate = aggregate_function(function).ok_or_else(|| {
@@ -452,13 +473,11 @@ pub(super) fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result
             function.name
         )));
     };
-    if !arguments.clauses.is_empty() {
-        return Err(Error::Unsupported(
-            "ordered aggregate arguments are not supported".into(),
-        ));
-    }
+    bind_ordering(function, arguments, &mut |expression| {
+        bind_expr(expression, schema)
+    })?;
     let requested_distinct = arguments.duplicate_treatment == Some(DuplicateTreatment::Distinct);
-    let expr = match arguments.args.as_slice() {
+    let mut expr = match arguments.args.as_slice() {
         [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => Some(bind_expr(expr, schema)?),
         [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
             if aggregate == AggregateFunction::Count && !requested_distinct =>
@@ -466,6 +485,33 @@ pub(super) fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result
             None
         }
         [] if aggregate == AggregateFunction::Count && !requested_distinct => None,
+        values if requested_distinct && values.len() > 1 => {
+            if aggregate != AggregateFunction::Count {
+                return Err(Error::InvalidArgument(format!(
+                    "aggregate {} supports multiple DISTINCT expressions only for COUNT",
+                    function.name
+                )));
+            }
+            let args = values
+                .iter()
+                .map(|argument| match argument {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => {
+                        bind_expr(expression, schema)
+                    }
+                    _ => Err(Error::InvalidArgument(
+                        "COUNT(DISTINCT ...) requires expression arguments".into(),
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(BoundExpr {
+                kind: ExprKind::ScalarFunction {
+                    function: super::ScalarFunction::DistinctTuple,
+                    args,
+                },
+                data_type: DataType::Binary,
+                display_name: "DISTINCT tuple".into(),
+            })
+        }
         _ => {
             return Err(Error::InvalidArgument(format!(
                 "aggregate {} expects one expression (or * for count)",
@@ -473,6 +519,19 @@ pub(super) fn bind_aggregate(function: &Function, schema: &PlanSchema) -> Result
             )));
         }
     };
+    if let Some(filter) = function.filter.as_deref() {
+        let filter = bind_expr(filter, schema)?;
+        ensure_boolean(&filter).map_err(|_| {
+            Error::InvalidArgument(format!(
+                "aggregate FILTER requires BOOLEAN, got {}",
+                filter.data_type
+            ))
+        })?;
+        let value = expr
+            .take()
+            .unwrap_or_else(|| BoundExpr::literal(ScalarValue::Int64(1)));
+        expr = Some(make_case(None, vec![(filter, value)], None)?);
+    }
     if matches!(aggregate, AggregateFunction::Sum | AggregateFunction::Avg)
         && !expr
             .as_ref()
@@ -532,14 +591,10 @@ pub(super) fn bind_window_aggregate(
     function: &Function,
     bind: &mut impl FnMut(&Expr) -> Result<BoundExpr>,
 ) -> Result<AggregateExpr> {
-    if function.filter.is_some()
-        || function.null_treatment.is_some()
-        || !function.within_group.is_empty()
-        || !matches!(&function.parameters, FunctionArguments::None)
+    if function.null_treatment.is_some() || !matches!(&function.parameters, FunctionArguments::None)
     {
         return Err(Error::Unsupported(
-            "window aggregate FILTER, ordered arguments, parameters, and NULL treatment are not supported"
-                .into(),
+            "window aggregate parameters and NULL treatment are not supported".into(),
         ));
     }
     let aggregate = aggregate_function(function).ok_or_else(|| {
@@ -554,14 +609,13 @@ pub(super) fn bind_window_aggregate(
             function.name
         )));
     };
-    if !arguments.clauses.is_empty()
-        || arguments.duplicate_treatment == Some(DuplicateTreatment::Distinct)
-    {
+    bind_ordering(function, arguments, bind)?;
+    if arguments.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
         return Err(Error::Unsupported(
-            "DISTINCT and ordered window aggregates are not supported".into(),
+            "DISTINCT window aggregates are not supported".into(),
         ));
     }
-    let expr = match arguments.args.as_slice() {
+    let mut expr = match arguments.args.as_slice() {
         [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => Some(bind(expr)?),
         [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
             if aggregate == AggregateFunction::Count =>
@@ -576,6 +630,19 @@ pub(super) fn bind_window_aggregate(
             )));
         }
     };
+    if let Some(filter) = function.filter.as_deref() {
+        let filter = bind(filter)?;
+        ensure_boolean(&filter).map_err(|_| {
+            Error::InvalidArgument(format!(
+                "window aggregate FILTER requires BOOLEAN, got {}",
+                filter.data_type
+            ))
+        })?;
+        let value = expr
+            .take()
+            .unwrap_or_else(|| BoundExpr::literal(ScalarValue::Int64(1)));
+        expr = Some(make_case(None, vec![(filter, value)], None)?);
+    }
     if matches!(aggregate, AggregateFunction::Sum | AggregateFunction::Avg)
         && !expr
             .as_ref()
@@ -594,6 +661,52 @@ pub(super) fn bind_window_aggregate(
         data_type,
         display_name: function.to_string(),
     })
+}
+
+fn bind_ordering(
+    function: &Function,
+    arguments: &sqlparser::ast::FunctionArgumentList,
+    bind: &mut impl FnMut(&Expr) -> Result<BoundExpr>,
+) -> Result<()> {
+    let mut argument_order = false;
+    for clause in &arguments.clauses {
+        let FunctionArgumentClause::OrderBy(order_by) = clause else {
+            return Err(Error::Unsupported(format!(
+                "aggregate {} does not support argument clause {clause}",
+                function.name
+            )));
+        };
+        if argument_order {
+            return Err(Error::InvalidArgument(format!(
+                "aggregate {} has more than one ORDER BY clause",
+                function.name
+            )));
+        }
+        argument_order = true;
+        bind_order_expressions(order_by, bind)?;
+    }
+    if argument_order && !function.within_group.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "aggregate {} cannot combine argument ORDER BY with WITHIN GROUP",
+            function.name
+        )));
+    }
+    bind_order_expressions(&function.within_group, bind)
+}
+
+fn bind_order_expressions(
+    order_by: &[sqlparser::ast::OrderByExpr],
+    bind: &mut impl FnMut(&Expr) -> Result<BoundExpr>,
+) -> Result<()> {
+    for order in order_by {
+        if order.with_fill.is_some() {
+            return Err(Error::Unsupported(
+                "aggregate ORDER BY WITH FILL is not supported".into(),
+            ));
+        }
+        bind(&order.expr)?;
+    }
+    Ok(())
 }
 
 fn aggregate_schema(groups: &[BoundExpr], aggregates: &[AggregateExpr]) -> PlanSchema {

@@ -1,11 +1,13 @@
 use sqlparser::ast::{
-    DataType as SqlDataType, DateTimeField, Expr, Interval, TimezoneInfo, TypedString,
-    UnaryOperator, Value,
+    DataType as SqlDataType, Expr, Interval, TimezoneInfo, TypedString, UnaryOperator, Value,
 };
 
 use crate::{Error, Result};
 
-use super::temporal::{parse_date32, parse_timestamp_microsecond};
+use super::temporal::{
+    parse_date32, parse_time_at_precision, parse_timestamp_at_precision,
+    parse_timestamptz_at_precision,
+};
 use super::{BoundExpr, ScalarValue};
 
 pub(super) fn bind_value(value: &Value) -> Result<BoundExpr> {
@@ -70,12 +72,42 @@ pub(super) fn bind_typed_string(value: &TypedString) -> Result<BoundExpr> {
             parse_date32(literal)?,
         ))),
         SqlDataType::Timestamp(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
-        | SqlDataType::TimestampNtz(precision) => Ok(BoundExpr::literal(
-            ScalarValue::TimestampMicrosecond(timestamp_with_precision(literal, precision)?),
+        | SqlDataType::TimestampNtz(precision) => {
+            let precision = precision.unwrap_or(6);
+            let (value, unit) = parse_timestamp_at_precision(literal, precision)?;
+            Ok(BoundExpr::literal(
+                if unit == arrow::datatypes::TimeUnit::Microsecond {
+                    ScalarValue::TimestampMicrosecond(value)
+                } else {
+                    ScalarValue::Timestamp {
+                        value,
+                        unit,
+                        timezone: None,
+                    }
+                },
+            ))
+        }
+        SqlDataType::Time(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            let (value, unit) = parse_time_at_precision(literal, precision.unwrap_or(6))?;
+            Ok(BoundExpr::literal(ScalarValue::Time { value, unit }))
+        }
+        SqlDataType::Time(_, _) => Err(Error::Unsupported(
+            "TIME WITH TIME ZONE is not supported".into(),
         )),
-        SqlDataType::Timestamp(_, _) => Err(Error::Unsupported(
-            "timezone-aware TIMESTAMP literals are not supported".into(),
-        )),
+        SqlDataType::Uuid => {
+            let value = uuid::Uuid::parse_str(literal).map_err(|error| {
+                Error::InvalidArgument(format!("UUID literal '{literal}' is invalid: {error}"))
+            })?;
+            Ok(BoundExpr::literal(ScalarValue::Uuid(*value.as_bytes())))
+        }
+        SqlDataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+            let (value, unit) = parse_timestamptz_at_precision(literal, precision.unwrap_or(6))?;
+            Ok(BoundExpr::literal(ScalarValue::Timestamp {
+                value,
+                unit,
+                timezone: Some("UTC".into()),
+            }))
+        }
         _ => Err(Error::Unsupported(format!(
             "typed literal {} is not supported",
             value.data_type
@@ -83,52 +115,15 @@ pub(super) fn bind_typed_string(value: &TypedString) -> Result<BoundExpr> {
     }
 }
 
-fn timestamp_with_precision(literal: &str, precision: Option<u64>) -> Result<i64> {
-    let precision = precision.unwrap_or(6);
-    if precision > 6 {
-        return Err(Error::InvalidArgument(
-            "TIMESTAMP precision above 6 cannot be represented by the microsecond engine type"
-                .into(),
-        ));
-    }
-    let value = parse_timestamp_microsecond(literal)?;
-    let factor = 10_i128.pow(6 - u32::try_from(precision).expect("precision is at most six"));
-    let magnitude = i128::from(value).abs();
-    let rounded = (magnitude + factor / 2) / factor * factor;
-    let rounded = if value.is_negative() {
-        -rounded
-    } else {
-        rounded
-    };
-    i64::try_from(rounded)
-        .map_err(|_| Error::InvalidArgument("TIMESTAMP literal is out of range".into()))
-}
-
 pub(super) fn bind_interval(interval: &Interval) -> Result<BoundExpr> {
-    if interval.last_field.is_some()
-        || interval.leading_precision.is_some()
-        || interval.fractional_seconds_precision.is_some()
-    {
-        return Err(Error::Unsupported(
-            "interval ranges and precision qualifiers are not supported".into(),
-        ));
-    }
     let raw = interval_value(interval.value.as_ref())?;
-    let value = match interval.leading_field.as_ref() {
-        Some(DateTimeField::Day) => ScalarValue::DayInterval(parse_integer(&raw, "day")?),
-        Some(DateTimeField::Month) => ScalarValue::MonthInterval(parse_integer(&raw, "month")?),
-        Some(DateTimeField::Year) => ScalarValue::MonthInterval(
-            parse_integer(&raw, "year")?
-                .checked_mul(12)
-                .ok_or_else(|| Error::InvalidArgument("year INTERVAL is out of range".into()))?,
-        ),
-        Some(field) => {
-            return Err(Error::Unsupported(format!(
-                "INTERVAL {field} is not supported; expected YEAR, MONTH, or DAY"
-            )));
-        }
-        None => parse_interval_suffix(&raw)?,
-    };
+    let value = super::interval::parse_interval(
+        &raw,
+        interval.leading_field.as_ref(),
+        interval.last_field.as_ref(),
+        interval.leading_precision,
+        interval.fractional_seconds_precision,
+    )?;
     Ok(BoundExpr::literal(value))
 }
 
@@ -202,37 +197,6 @@ fn interval_value(expr: &Expr) -> Result<String> {
         } => Ok(format!("-{}", interval_value(expr)?)),
         _ => Err(Error::InvalidArgument(
             "INTERVAL value must be a constant integer".into(),
-        )),
-    }
-}
-
-fn parse_integer(value: &str, unit: &str) -> Result<i32> {
-    value.trim().parse().map_err(|_| {
-        Error::InvalidArgument(format!(
-            "{unit} INTERVAL value '{value}' is not a 32-bit integer"
-        ))
-    })
-}
-
-fn parse_interval_suffix(value: &str) -> Result<ScalarValue> {
-    let mut parts = value.split_whitespace();
-    let number = parts.next().unwrap_or_default();
-    let unit = parts.next().unwrap_or_default();
-    if parts.next().is_some() {
-        return Err(Error::Unsupported(
-            "an unqualified INTERVAL must use '<integer> year|month|day'".into(),
-        ));
-    }
-    match unit.to_ascii_lowercase().as_str() {
-        "day" | "days" => Ok(ScalarValue::DayInterval(parse_integer(number, "day")?)),
-        "month" | "months" => Ok(ScalarValue::MonthInterval(parse_integer(number, "month")?)),
-        "year" | "years" => Ok(ScalarValue::MonthInterval(
-            parse_integer(number, "year")?
-                .checked_mul(12)
-                .ok_or_else(|| Error::InvalidArgument("year INTERVAL is out of range".into()))?,
-        )),
-        _ => Err(Error::Unsupported(
-            "an unqualified INTERVAL must use '<integer> year|month|day'".into(),
         )),
     }
 }
