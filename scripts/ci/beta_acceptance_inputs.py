@@ -167,7 +167,7 @@ def preflight(args: argparse.Namespace) -> int:
             args.workspace.resolve()
             / "benchmarks"
             / "clickbench"
-            / "functional-oracle-v1.json",
+            / "functional-oracle-v2.json",
         )
         result["preflight_complete"] = True
         atomic_json(output / "inputs.json", result)

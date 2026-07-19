@@ -32,7 +32,12 @@ CLICKBENCH = {
         "fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d",
     ),
 }
-CLICKBENCH_QUERY_SHA256 = "a7d6673357348ee9680443216b6f26f30d1dce9f313b419d38502417b2c2a219"
+CLICKBENCH_CANONICAL_QUERY_SHA256 = (
+    "a7d6673357348ee9680443216b6f26f30d1dce9f313b419d38502417b2c2a219"
+)
+CLICKBENCH_FUNCTIONAL_QUERY_SHA256 = (
+    "5386a67950894eb01803dc4f216a0bda61bb219940f8b783a3c648f0c4f76749"
+)
 
 
 def absolute_path(value: str, label: str, kind: str) -> Path:
@@ -217,19 +222,27 @@ def clickbench_fixture(root: Path, profile: str, oracle_path: Path) -> dict[str,
     if profile not in CLICKBENCH:
         raise ValueError("Beta acceptance requires the SHA-256-pinned functional profile")
     name, expected_bytes, expected_source_etag, expected_sha256 = CLICKBENCH[profile]
-    query = root / "queries.sql"
+    canonical_query = root / "queries.sql"
+    query = CLICKBENCH_DIR / "queries-rustdb.sql"
     data = root / name
-    if not query.is_file() or not data.is_file():
+    if not canonical_query.is_file() or not query.is_file() or not data.is_file():
         raise ValueError(f"ClickBench input must contain queries.sql and {name}")
     if data.stat().st_size != expected_bytes:
         raise ValueError(
             f"ClickBench {name} has {data.stat().st_size} bytes; expected {expected_bytes}"
         )
     query_sha256 = sha256(query)
+    canonical_query_sha256 = sha256(canonical_query)
     data_sha256 = sha256(data)
-    if query_sha256 != CLICKBENCH_QUERY_SHA256:
+    if canonical_query_sha256 != CLICKBENCH_CANONICAL_QUERY_SHA256:
         raise ValueError(
-            f"ClickBench queries.sql SHA-256 is {query_sha256}; expected {CLICKBENCH_QUERY_SHA256}"
+            "canonical ClickBench queries.sql SHA-256 is "
+            f"{canonical_query_sha256}; expected {CLICKBENCH_CANONICAL_QUERY_SHA256}"
+        )
+    if query_sha256 != CLICKBENCH_FUNCTIONAL_QUERY_SHA256:
+        raise ValueError(
+            "ClickBench functional query SHA-256 is "
+            f"{query_sha256}; expected {CLICKBENCH_FUNCTIONAL_QUERY_SHA256}"
         )
     if data_sha256 != expected_sha256:
         raise ValueError(
@@ -241,6 +254,7 @@ def clickbench_fixture(root: Path, profile: str, oracle_path: Path) -> dict[str,
         profile=profile,
         mode="execute",
         query_sha256=query_sha256,
+        canonical_query_sha256=canonical_query_sha256,
         dataset_sha256=data_sha256,
     )
     return {
@@ -250,7 +264,14 @@ def clickbench_fixture(root: Path, profile: str, oracle_path: Path) -> dict[str,
             "path": str(query),
             "bytes": query.stat().st_size,
             "sha256": query_sha256,
-            "expected_sha256": CLICKBENCH_QUERY_SHA256,
+            "expected_sha256": CLICKBENCH_FUNCTIONAL_QUERY_SHA256,
+            "identity_verified": True,
+        },
+        "canonical_query": {
+            "path": str(canonical_query),
+            "bytes": canonical_query.stat().st_size,
+            "sha256": canonical_query_sha256,
+            "expected_sha256": CLICKBENCH_CANONICAL_QUERY_SHA256,
             "identity_verified": True,
         },
         "data": {
@@ -269,6 +290,7 @@ def clickbench_fixture(root: Path, profile: str, oracle_path: Path) -> dict[str,
             "query_count": oracle["query_count"],
             "checksum_algorithm": oracle["checksum_algorithm"],
             "query_sha256": oracle["query_sha256"],
+            "canonical_query_sha256": oracle["canonical_query_sha256"],
             "dataset_sha256": oracle["dataset_sha256"],
             "results": oracle["results"],
         },

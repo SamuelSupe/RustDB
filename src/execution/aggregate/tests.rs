@@ -503,6 +503,25 @@ fn unsigned_sum_widens_past_u64() {
     assert_eq!(merged, expected);
 }
 
+#[test]
+fn unsigned_average_is_exact_across_parallel_partials() {
+    let expression = aggregate_expr(AggregateFunction::Avg, DataType::UInt64);
+    let values = [
+        CellValue::UInt64(u64::MAX),
+        CellValue::UInt64(1_948_194_877_894_919_561),
+        CellValue::UInt64(610_074),
+    ];
+    let direct = finished_state(&expression, values.clone()).unwrap();
+    let merged =
+        merge_partial_states(&expression, [values[..1].to_vec(), values[1..].to_vec()]).unwrap();
+
+    assert_eq!(merged, direct);
+    assert_eq!(
+        partial_schema(&[], &[expression]).field(0).data_type(),
+        &DataType::Binary
+    );
+}
+
 fn finished_state(
     expression: &AggregateExpr,
     values: impl IntoIterator<Item = CellValue>,

@@ -23,8 +23,8 @@ OUTPUT=$(python3 -B "$INPUT_HELPER" create-output \
 STEPS_FILE="$OUTPUT/steps.jsonl"
 
 finish() {
-  local status finalize_status failed_step
   local exit_code=$?
+  local status finalize_status failed_step
   trap - EXIT
   trap '' INT TERM
   if [[ $exit_code -eq 0 ]]; then

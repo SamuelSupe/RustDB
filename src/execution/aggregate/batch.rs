@@ -68,8 +68,14 @@ fn update_one(
             required(array, aggregate)?,
             "decimal sum overflowed i128",
         ),
-        AggregateState::Avg { sum, count } => {
-            update_average(sum, count, required(array, aggregate)?)
+        AggregateState::AvgSigned { sum, count } => {
+            update_signed_average(sum, count, required(array, aggregate)?)
+        }
+        AggregateState::AvgUnsigned { sum, count } => {
+            update_unsigned_average(sum, count, required(array, aggregate)?)
+        }
+        AggregateState::AvgFloat { sum, count } => {
+            update_float_average(sum, count, required(array, aggregate)?)
         }
         AggregateState::AvgDecimal { sum, count, .. } => {
             update_decimal_average(sum, count, required(array, aggregate)?)
@@ -160,11 +166,13 @@ fn update_decimal(
     Ok(())
 }
 
-fn update_average(sum: &mut f64, count: &mut u64, array: &ArrayRef) -> Result<()> {
+fn update_signed_average(sum: &mut i128, count: &mut u64, array: &ArrayRef) -> Result<()> {
     macro_rules! add {
         ($ty:ty) => {{
             for value in downcast::<$ty>(array)?.iter().flatten() {
-                *sum += value as f64;
+                *sum = sum
+                    .checked_add(i128::from(value))
+                    .ok_or_else(|| Error::Execution("signed average sum overflow".into()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::Execution("average count overflow".into()))?;
@@ -177,13 +185,49 @@ fn update_average(sum: &mut f64, count: &mut u64, array: &ArrayRef) -> Result<()
         DataType::Int16 => add!(Int16Array),
         DataType::Int32 => add!(Int32Array),
         DataType::Int64 => add!(Int64Array),
+        other => type_error("signed AVG", other),
+    }
+}
+
+fn update_unsigned_average(sum: &mut u128, count: &mut u64, array: &ArrayRef) -> Result<()> {
+    macro_rules! add {
+        ($ty:ty) => {{
+            for value in downcast::<$ty>(array)?.iter().flatten() {
+                *sum = sum
+                    .checked_add(u128::from(value))
+                    .ok_or_else(|| Error::Execution("unsigned average sum overflow".into()))?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Execution("average count overflow".into()))?;
+            }
+            Ok(())
+        }};
+    }
+    match array.data_type() {
         DataType::UInt8 => add!(UInt8Array),
         DataType::UInt16 => add!(UInt16Array),
         DataType::UInt32 => add!(UInt32Array),
         DataType::UInt64 => add!(UInt64Array),
+        other => type_error("unsigned AVG", other),
+    }
+}
+
+fn update_float_average(sum: &mut f64, count: &mut u64, array: &ArrayRef) -> Result<()> {
+    macro_rules! add {
+        ($ty:ty) => {{
+            for value in downcast::<$ty>(array)?.iter().flatten() {
+                *sum += value as f64;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Execution("average count overflow".into()))?;
+            }
+            Ok(())
+        }};
+    }
+    match array.data_type() {
         DataType::Float32 => add!(Float32Array),
         DataType::Float64 => add!(Float64Array),
-        other => type_error("AVG", other),
+        other => type_error("floating AVG", other),
     }
 }
 

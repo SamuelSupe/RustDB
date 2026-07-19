@@ -7,6 +7,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+from beta_acceptance_clickbench import (
+    REPORT_COUNT as CLICKBENCH_REPORT_COUNT,
+    validate_raw_reports,
+    validate_resource_contract,
+)
 from beta_acceptance_common import command, read_json, sha256
 
 
@@ -203,18 +208,21 @@ def clickbench_summary(
         value.get("complete") is not True
         or value.get("mode") != "execute"
         or value.get("binary_as_string") is not True
-        or value.get("query_count") != 43
-        or value.get("passed") != 43
+        or value.get("query_count") != CLICKBENCH_REPORT_COUNT
+        or value.get("passed") != CLICKBENCH_REPORT_COUNT
         or value.get("failed") != 0
     ):
         raise ValueError("ClickBench did not pass all 43 queries")
     results = value.get("results")
-    if not isinstance(results, list) or len(results) != 43:
+    if not isinstance(results, list) or len(results) != CLICKBENCH_REPORT_COUNT:
         raise ValueError("ClickBench manifest has the wrong result count")
     expected = inputs["clickbench"]
     expected_oracle = expected["oracle"]
     expected_results = expected_oracle.get("results")
-    if not isinstance(expected_results, list) or len(expected_results) != 43:
+    if (
+        not isinstance(expected_results, list)
+        or len(expected_results) != CLICKBENCH_REPORT_COUNT
+    ):
         raise ValueError("ClickBench preflight oracle has the wrong result count")
     for number, (result, oracle_result) in enumerate(
         zip(results, expected_results), start=1
@@ -241,9 +249,13 @@ def clickbench_summary(
             raise ValueError(f"ClickBench query {number} differs from its typed oracle")
     dataset = value.get("dataset", {})
     queries = value.get("queries", {})
+    canonical_queries = value.get("canonical_queries", {})
     oracle = value.get("oracle", {})
     if (
         dataset.get("profile") != expected["profile"]
+        or expected["data"].get("identity_verified") is not True
+        or expected["query"].get("identity_verified") is not True
+        or expected["canonical_query"].get("identity_verified") is not True
         or dataset.get("bytes") != expected["data"]["bytes"]
         or dataset.get("sha256") != expected["data"]["sha256"]
         or dataset.get("expected_sha256") != expected["data"]["expected_sha256"]
@@ -253,6 +265,11 @@ def clickbench_summary(
         or queries.get("sha256") != expected["query"]["sha256"]
         or queries.get("expected_sha256") != expected["query"]["expected_sha256"]
         or queries.get("identity_verified") is not True
+        or canonical_queries.get("sha256")
+        != expected["canonical_query"]["sha256"]
+        or canonical_queries.get("expected_sha256")
+        != expected["canonical_query"]["expected_sha256"]
+        or canonical_queries.get("identity_verified") is not True
         or oracle.get("schema") != expected_oracle["schema"]
         or oracle.get("profile") != expected_oracle["profile"]
         or oracle.get("mode") != expected_oracle["mode"]
@@ -264,17 +281,26 @@ def clickbench_summary(
         or oracle.get("checksum_algorithm")
         != expected_oracle["checksum_algorithm"]
         or oracle.get("query_sha256") != expected["query"]["sha256"]
+        or oracle.get("canonical_query_sha256")
+        != expected["canonical_query"]["sha256"]
         or oracle.get("dataset_sha256") != expected["data"]["sha256"]
     ):
         raise ValueError("ClickBench used a different fixture or oracle")
     resource = value.get("resource_contract", {})
-    if (
-        resource.get("engine_threads") != 4
-        or resource.get("engine_memory_limit_bytes") != 4 * 1024**3
-    ):
-        raise ValueError("ClickBench used a different CPU or engine-memory profile")
-    if value.get("build", {}).get("id") != commit:
+    validate_resource_contract(resource)
+    build = value.get("build", {})
+    if build.get("id") != commit:
         raise ValueError("ClickBench build is not bound to the accepted commit")
+    binary_sha256 = build.get("binary_sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", binary_sha256 or ""):
+        raise ValueError("ClickBench build has an invalid binary SHA-256")
+    raw_summary = validate_raw_reports(
+        path,
+        results,
+        commit,
+        binary_sha256,
+        expected_oracle["checksum_algorithm"],
+    )
     acceptance = value.get("acceptance_summary", {})
     required_true = (
         "all_terminal_query_reservations_zero",
@@ -283,6 +309,13 @@ def clickbench_summary(
     )
     if not all(acceptance.get(field) is True for field in required_true):
         raise ValueError("ClickBench left reservations or Spill state behind")
+    peak_fields = (
+        "max_peak_engine_reservation_bytes",
+        "max_process_peak_rss_bytes",
+        "max_peak_active_lanes",
+    )
+    if any(acceptance.get(field) != raw_summary[field] for field in peak_fields):
+        raise ValueError("ClickBench acceptance summary differs from its raw reports")
     return {
         "path": str(path),
         "manifest_sha256": sha256(path),
@@ -290,12 +323,16 @@ def clickbench_summary(
         "dataset_bytes": dataset["bytes"],
         "dataset_sha256": dataset["sha256"],
         "query_sha256": queries["sha256"],
+        "canonical_query_sha256": canonical_queries["sha256"],
         "oracle_sha256": oracle["sha256"],
         "checksum_algorithm": oracle["checksum_algorithm"],
-        "oracle_matches": 43,
+        "oracle_matches": CLICKBENCH_REPORT_COUNT,
         "identity_verified": True,
-        "passed": 43,
+        "passed": CLICKBENCH_REPORT_COUNT,
         "failed": 0,
+        "build_id": commit,
+        "binary_sha256": binary_sha256,
+        "validated_raw_reports": raw_summary["validated_raw_reports"],
         "resource_contract": resource,
         "acceptance_summary": acceptance,
     }

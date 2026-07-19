@@ -48,8 +48,20 @@ the tag-specific outcome belongs in the
 6. **Acceptance:** one complete OrbStack run on a 4-core/16-GiB-class machine,
    followed by an explicit equivalent local/MinIO CSV-or-Parquet workload with
    2-GiB and 4-GiB engine limits, at least 100 GiB / 10,000 files or objects,
-   eight concurrent clients, and one preloaded ClickBench pass. beta.1 records
-   a functional baseline and makes no cross-engine performance claim.
+   eight concurrent clients, and one preloaded ClickBench pass. ClickBench is
+   fixed to four CPUs, a 12-GiB container limit, a 4-GiB engine budget, batch
+   8192, and I/O concurrency 16. Canonical official queries remain the pinned
+   source/full profile; functional acceptance runs a versioned deterministic
+   derivative with complete tie-breakers and binds both SHA-256 identities.
+   beta.1 records a functional baseline and makes no cross-engine performance
+   claim. A digest-pinned `clickhouse-local` rowset is used only for correctness
+   oracle generation and review, not during release acceptance.
+
+   中文：ClickBench 只运行一遍，固定使用 4 CPU、12 GiB 容器上限、4 GiB Engine
+   上限、batch 8192 和 I/O 并发 16。官方规范查询继续作为固定的来源/full profile；
+   功能验收执行带完整 tie-breaker 的版本化确定性派生查询，并同时绑定两份 SHA-256。
+   按 digest 固定的 `clickhouse-local` 行集只用于生成和复核正确性 oracle，不进入发行
+   验收，也不用于性能比较。
 
 ## Deliberate limits
 

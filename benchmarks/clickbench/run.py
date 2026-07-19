@@ -49,6 +49,7 @@ def arguments() -> argparse.Namespace:
         description="Run one functional ClickBench pass with RustDB"
     )
     parser.add_argument("--queries", type=Path, required=True)
+    parser.add_argument("--canonical-queries", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--oracle", type=Path)
     parser.add_argument(
@@ -56,6 +57,7 @@ def arguments() -> argparse.Namespace:
     )
     parser.add_argument("--data-etag", dest="expected_source_etag")
     parser.add_argument("--expected-query-sha256", type=sha256_value)
+    parser.add_argument("--expected-canonical-query-sha256", type=sha256_value)
     parser.add_argument("--expected-data-sha256", type=sha256_value)
     parser.add_argument("--expected-oracle-sha256", type=sha256_value)
     parser.add_argument(
@@ -296,6 +298,11 @@ def main() -> int:
         args.expected_query_sha256,
         "ClickBench query file",
     )
+    canonical_query_identity = identity_facts(
+        args.canonical_queries,
+        args.expected_canonical_query_sha256,
+        "canonical ClickBench query file",
+    )
     data_identity = identity_facts(
         args.data,
         args.expected_data_sha256,
@@ -318,6 +325,7 @@ def main() -> int:
             profile=args.dataset_profile,
             mode=args.mode,
             query_sha256=query_identity["sha256"],
+            canonical_query_sha256=canonical_query_identity["sha256"],
             dataset_sha256=data_identity["sha256"],
         )
     args.output.mkdir(parents=True, exist_ok=False)
@@ -336,6 +344,10 @@ def main() -> int:
             "path": str(args.queries),
         }
         | query_identity,
+        "canonical_queries": {
+            "path": str(args.canonical_queries),
+        }
+        | canonical_query_identity,
         "dataset": {
             "profile": args.dataset_profile,
             "path": str(args.data),
@@ -351,6 +363,7 @@ def main() -> int:
                 "query_count": oracle["query_count"],
                 "checksum_algorithm": oracle["checksum_algorithm"],
                 "query_sha256": oracle["query_sha256"],
+                "canonical_query_sha256": oracle["canonical_query_sha256"],
                 "dataset_sha256": oracle["dataset_sha256"],
             }
             | oracle_identity

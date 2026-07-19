@@ -223,15 +223,20 @@ scripts/ci/beta_acceptance.sh
 本地与 MinIO 必须是等价数据：2/4 GiB、8 客户端的四次运行必须得到同一 checksum。
 门禁会重新核对本地文件的 size/mtime 清单，并在 MinIO 运行前后列出对象，要求每个
 URI、size、ETag 都与 manifest 一致；每条查询还必须发现 manifest 中的精确文件数。
-ClickBench 目录必须预先放好 `queries.sql` 及
-SHA-256 固定的 functional 数据文件。门禁只运行一次 `scripts/ci/orbstack.sh all`、四次
-外部数据路径和一次 ClickBench，并把 commit、主机/profile、规范化输入清单、命令、
+ClickBench 目录必须预先放好 SHA-256 固定的 functional 数据文件和规范 `queries.sql`；
+仓库提供实际执行所用的版本化确定性派生查询。门禁同时绑定两份查询的身份，并以
+4 CPU、12 GiB 容器上限、4 GiB Engine 上限、batch 8192、I/O 并发 16 运行一次
+ClickBench。门禁只运行一次 `scripts/ci/orbstack.sh all`、四次外部数据路径和一次
+ClickBench，并把 commit、主机/profile、规范化输入清单、命令、
 日志、runner build ID、资源摘要和结果写入 `<输出>/evidence.json`。失败或中断也会生成
 failed 证据，且该目录不可复用。不重复运行专用低内存 Spill 压力测试。
 
 100 GiB 的 `count(*)` 路径负责发现、快照、元数据、并发和内存记账；functional
 ClickBench 则通过固定的 43 组行数与 typed checksum oracle 验证真实 Parquet 数据页和
-结果正确性。两部分都不构成跨引擎性能声明。
+结果正确性。官方规范查询保持不变，继续作为来源和 full profile；确定性派生版本只在
+规范查询的有界结果未完整规定并列顺序时补充完整 tie-breaker。正确性 oracle 的生成和
+复核只使用一个由 digest 固定的 `clickhouse-local` 镜像产生的行集；发行门禁不会启动
+ClickHouse，也不比较任何跨引擎性能。
 
 annotated release tag 必须绑定已验收 commit：
 

@@ -72,7 +72,15 @@ pub(in crate::execution) enum AggregateState {
     },
     Min(Option<CellValue>),
     Max(Option<CellValue>),
-    Avg {
+    AvgSigned {
+        sum: i128,
+        count: u64,
+    },
+    AvgUnsigned {
+        sum: u128,
+        count: u64,
+    },
+    AvgFloat {
         sum: f64,
         count: u64,
     },
@@ -114,12 +122,18 @@ impl AggregateState {
             AggregateFunction::Max => Self::Max(None),
             AggregateFunction::Avg => {
                 match expression.expr.as_ref().map(|input| &input.data_type) {
+                    Some(DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) => {
+                        Self::AvgSigned { sum: 0, count: 0 }
+                    }
+                    Some(
+                        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64,
+                    ) => Self::AvgUnsigned { sum: 0, count: 0 },
                     Some(DataType::Decimal128(_, scale)) => Self::AvgDecimal {
                         sum: 0,
                         count: 0,
                         scale: *scale,
                     },
-                    _ => Self::Avg { sum: 0.0, count: 0 },
+                    _ => Self::AvgFloat { sum: 0.0, count: 0 },
                 }
             }
         }
@@ -184,7 +198,33 @@ impl AggregateState {
             },
             Self::Min(current) => update_extreme(current, value, false)?,
             Self::Max(current) => update_extreme(current, value, true)?,
-            Self::Avg { sum, count } => {
+            Self::AvgSigned { sum, count } => {
+                if let Some(value) = value.filter(|value| !value.is_null()) {
+                    let CellValue::Int64(value) = value else {
+                        return Err(unexpected_value(expression, &value));
+                    };
+                    *sum = sum
+                        .checked_add(i128::from(value))
+                        .ok_or_else(|| Error::Execution("signed average sum overflow".into()))?;
+                    *count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Execution("average count overflow".into()))?;
+                }
+            }
+            Self::AvgUnsigned { sum, count } => {
+                if let Some(value) = value.filter(|value| !value.is_null()) {
+                    let CellValue::UInt64(value) = value else {
+                        return Err(unexpected_value(expression, &value));
+                    };
+                    *sum = sum
+                        .checked_add(u128::from(value))
+                        .ok_or_else(|| Error::Execution("unsigned average sum overflow".into()))?;
+                    *count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Execution("average count overflow".into()))?;
+                }
+            }
+            Self::AvgFloat { sum, count } => {
                 if let Some(value) = value.filter(|value| !value.is_null()) {
                     *sum += value.as_f64()?;
                     *count = count
@@ -262,11 +302,16 @@ impl AggregateState {
                 value, precision, ..
             } => decimal_value(*value, *precision, "sum"),
             Self::Min(value) | Self::Max(value) => Ok(value.clone().unwrap_or(CellValue::Null)),
-            Self::Avg { sum, count: 0 } => {
-                let _ = sum;
-                Ok(CellValue::Null)
-            }
-            Self::Avg { sum, count } => Ok(CellValue::Float64(*sum / *count as f64)),
+            Self::AvgSigned { count: 0, .. }
+            | Self::AvgUnsigned { count: 0, .. }
+            | Self::AvgFloat { count: 0, .. } => Ok(CellValue::Null),
+            Self::AvgSigned { sum, count } => Ok(CellValue::Float64(super::average::signed_ratio(
+                *sum, *count,
+            ))),
+            Self::AvgUnsigned { sum, count } => Ok(CellValue::Float64(
+                super::average::unsigned_ratio(*sum, *count),
+            )),
+            Self::AvgFloat { sum, count } => Ok(CellValue::Float64(*sum / *count as f64)),
             Self::AvgDecimal { count: 0, .. } => Ok(CellValue::Null),
             Self::AvgDecimal { sum, count, scale } => Ok(CellValue::Float64(
                 (*sum as f64 / *count as f64) * 10_f64.powi(-i32::from(*scale)),
@@ -276,7 +321,13 @@ impl AggregateState {
 
     pub(super) fn partial_values(&self) -> Result<Vec<CellValue>> {
         match self {
-            Self::Avg { sum, count } => {
+            Self::AvgSigned { sum, count } => {
+                Ok(vec![encode_i128(*sum), CellValue::UInt64(*count)])
+            }
+            Self::AvgUnsigned { sum, count } => {
+                Ok(vec![encode_u128(*sum), CellValue::UInt64(*count)])
+            }
+            Self::AvgFloat { sum, count } => {
                 Ok(vec![CellValue::Float64(*sum), CellValue::UInt64(*count)])
             }
             Self::AvgDecimal { sum, count, .. } => {
@@ -304,6 +355,8 @@ impl AggregateState {
             Self::SumSigned { .. }
             | Self::SumUnsigned { .. }
             | Self::SumDecimal { .. }
+            | Self::AvgSigned { .. }
+            | Self::AvgUnsigned { .. }
             | Self::AvgDecimal { .. } => 16,
             _ => 0,
         }
@@ -327,7 +380,37 @@ impl AggregateState {
                     Error::Execution("count overflowed INT64 while merging spill partitions".into())
                 })?;
             }
-            Self::Avg { sum, count } => {
+            Self::AvgSigned { sum, count } => {
+                let partial_sum = cell(batch.column(*column), row)?;
+                let partial_count = cell(batch.column(*column + 1), row)?;
+                *column += 2;
+                let partial_sum = decode_i128(expression, partial_sum)?;
+                let CellValue::UInt64(partial_count) = partial_count else {
+                    return Err(unexpected_value(expression, &partial_count));
+                };
+                *sum = sum.checked_add(partial_sum).ok_or_else(|| {
+                    Error::Execution("signed average overflow while merging partials".into())
+                })?;
+                *count = count.checked_add(partial_count).ok_or_else(|| {
+                    Error::Execution("average count overflow while merging partials".into())
+                })?;
+            }
+            Self::AvgUnsigned { sum, count } => {
+                let partial_sum = cell(batch.column(*column), row)?;
+                let partial_count = cell(batch.column(*column + 1), row)?;
+                *column += 2;
+                let partial_sum = decode_u128(expression, partial_sum)?;
+                let CellValue::UInt64(partial_count) = partial_count else {
+                    return Err(unexpected_value(expression, &partial_count));
+                };
+                *sum = sum.checked_add(partial_sum).ok_or_else(|| {
+                    Error::Execution("unsigned average overflow while merging partials".into())
+                })?;
+                *count = count.checked_add(partial_count).ok_or_else(|| {
+                    Error::Execution("average count overflow while merging partials".into())
+                })?;
+            }
+            Self::AvgFloat { sum, count } => {
                 let partial_sum = cell(batch.column(*column), row)?;
                 let partial_count = cell(batch.column(*column + 1), row)?;
                 *column += 2;

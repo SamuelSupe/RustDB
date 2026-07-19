@@ -1,0 +1,506 @@
+{
+  "canonical_query_sha256": "a7d6673357348ee9680443216b6f26f30d1dce9f313b419d38502417b2c2a219",
+  "checksum_algorithm": "rustdb-typed-multiset-sha256-v1",
+  "dataset_sha256": "fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d",
+  "mode": "execute",
+  "profile": "functional",
+  "query_count": 43,
+  "query_sha256": "5386a67950894eb01803dc4f216a0bda61bb219940f8b783a3c648f0c4f76749",
+  "reference": {
+    "engine": {
+      "image": "clickhouse/clickhouse-server@sha256:f40cd6034fb8c54dce6a85338750fbad79f387e2705e1991a85f2e7086b5b9ea",
+      "image_digest": "sha256:f40cd6034fb8c54dce6a85338750fbad79f387e2705e1991a85f2e7086b5b9ea",
+      "name": "ClickHouse clickhouse-local",
+      "version": "ClickHouse local version 25.8.28.1 (official build)."
+    },
+    "manifest_sha256": "7e7cdbe989679c4e0c3e6fb2d75326fb110440cd46213283c9f7836c0b3ceb95",
+    "q04_exact_ratio": {
+      "denominator": 1000000,
+      "expected_f64_bits": "0x43bb0960eb622986",
+      "numerator": "1948194877894919561610074"
+    },
+    "q24_event_time_watch_id_duplicate_groups": 0,
+    "rustdb_binary_sha256": "7f282c1251f63efb6dd4025937d74746873502ce2aaff33e253324e4afc0ee33",
+    "rustdb_candidate_manifest_sha256": "a4fc03810ba5194874fc167c2b1e9f28da616c4f7d6f569eff21ab6f734b035a",
+    "semantic_checksum_algorithm": "rustdb-clickbench-semantic-json-sha256-v1",
+    "semantic_results": [
+      {
+        "query": 1,
+        "reference_semantic_checksum": "48bae75439675ce814a4e27d6ec2dce12f2318e17cd0bb0c74350486f9f4c129",
+        "rows": 1,
+        "rustdb_semantic_checksum": "48bae75439675ce814a4e27d6ec2dce12f2318e17cd0bb0c74350486f9f4c129"
+      },
+      {
+        "query": 2,
+        "reference_semantic_checksum": "52337cf8297d659d0a9717675904a0fff7109ced8beba4fe4ee715d3c3e091f7",
+        "rows": 1,
+        "rustdb_semantic_checksum": "52337cf8297d659d0a9717675904a0fff7109ced8beba4fe4ee715d3c3e091f7"
+      },
+      {
+        "query": 3,
+        "reference_semantic_checksum": "285658120fac41f3eea34d04cb9f71d05d5391df7ffb7665b277c99f4703aef2",
+        "rows": 1,
+        "rustdb_semantic_checksum": "285658120fac41f3eea34d04cb9f71d05d5391df7ffb7665b277c99f4703aef2"
+      },
+      {
+        "query": 4,
+        "reference_semantic_checksum": "fedf9a760bf749b43abda5eb7a1ebd363145fa8c8e91f31094ee49ea0b1fbe07",
+        "rows": 1,
+        "rustdb_semantic_checksum": "fedf9a760bf749b43abda5eb7a1ebd363145fa8c8e91f31094ee49ea0b1fbe07"
+      },
+      {
+        "query": 5,
+        "reference_semantic_checksum": "d2cf6450a8514c3d97f6d7a07ded9d099800f3093b9be4f7475cda22ccf3abf7",
+        "rows": 1,
+        "rustdb_semantic_checksum": "d2cf6450a8514c3d97f6d7a07ded9d099800f3093b9be4f7475cda22ccf3abf7"
+      },
+      {
+        "query": 6,
+        "reference_semantic_checksum": "608fd11b49ff60c72c417fa22494a90677a93bcc6e3e31d48bc4adc6110bfd2a",
+        "rows": 1,
+        "rustdb_semantic_checksum": "608fd11b49ff60c72c417fa22494a90677a93bcc6e3e31d48bc4adc6110bfd2a"
+      },
+      {
+        "query": 7,
+        "reference_semantic_checksum": "0edb25c4e53999722bbaaeba9753b0a08f7ab0e2450f97ccb41851b8e72f062e",
+        "rows": 1,
+        "rustdb_semantic_checksum": "0edb25c4e53999722bbaaeba9753b0a08f7ab0e2450f97ccb41851b8e72f062e"
+      },
+      {
+        "query": 8,
+        "reference_semantic_checksum": "6fd9ce0b985f5deb9fe5ef8d6f5997fe510fec656339ce5092d084feb681a75d",
+        "rows": 5,
+        "rustdb_semantic_checksum": "6fd9ce0b985f5deb9fe5ef8d6f5997fe510fec656339ce5092d084feb681a75d"
+      },
+      {
+        "query": 9,
+        "reference_semantic_checksum": "223a0f0f4556f0f108ac81ecfced34af462fa5f1291b40729c00cd61de7d813f",
+        "rows": 10,
+        "rustdb_semantic_checksum": "223a0f0f4556f0f108ac81ecfced34af462fa5f1291b40729c00cd61de7d813f"
+      },
+      {
+        "query": 10,
+        "reference_semantic_checksum": "e62b38d6ae7cfacfbc7fbfb7f1f1dc7f72800230ec9623b3373c72b27505d05c",
+        "rows": 10,
+        "rustdb_semantic_checksum": "e62b38d6ae7cfacfbc7fbfb7f1f1dc7f72800230ec9623b3373c72b27505d05c"
+      },
+      {
+        "query": 11,
+        "reference_semantic_checksum": "4e0480e3b1d758e40d88f80545bdd37099094a17de695bc3dbf5b49f9d460772",
+        "rows": 10,
+        "rustdb_semantic_checksum": "4e0480e3b1d758e40d88f80545bdd37099094a17de695bc3dbf5b49f9d460772"
+      },
+      {
+        "query": 12,
+        "reference_semantic_checksum": "259ddc6cbf6f2701f9945128dadd76cb6d7bace090f93ccae17038159778db8f",
+        "rows": 10,
+        "rustdb_semantic_checksum": "259ddc6cbf6f2701f9945128dadd76cb6d7bace090f93ccae17038159778db8f"
+      },
+      {
+        "query": 13,
+        "reference_semantic_checksum": "499b9e2bdd8d0b8989e84b47e4cbef4cd6b276959609b898893aee7a0dcfe4c0",
+        "rows": 10,
+        "rustdb_semantic_checksum": "499b9e2bdd8d0b8989e84b47e4cbef4cd6b276959609b898893aee7a0dcfe4c0"
+      },
+      {
+        "query": 14,
+        "reference_semantic_checksum": "9a91dc43f9575474fbc032ddfc548fd0c9ee88edf412afcb8ac3e31038aea104",
+        "rows": 10,
+        "rustdb_semantic_checksum": "9a91dc43f9575474fbc032ddfc548fd0c9ee88edf412afcb8ac3e31038aea104"
+      },
+      {
+        "query": 15,
+        "reference_semantic_checksum": "128a4e452e1538cad6b799156a7ea7819166f38a853492dcb19d3734cf79c98b",
+        "rows": 10,
+        "rustdb_semantic_checksum": "128a4e452e1538cad6b799156a7ea7819166f38a853492dcb19d3734cf79c98b"
+      },
+      {
+        "query": 16,
+        "reference_semantic_checksum": "95711bd0b75a1e1eb4e988910de13f97abe40466808ae8dcbf91062e9e9561cc",
+        "rows": 10,
+        "rustdb_semantic_checksum": "95711bd0b75a1e1eb4e988910de13f97abe40466808ae8dcbf91062e9e9561cc"
+      },
+      {
+        "query": 17,
+        "reference_semantic_checksum": "0761783883a0fa4c840836994d3fb852518ba33cfdd01a2d98972606744acce2",
+        "rows": 10,
+        "rustdb_semantic_checksum": "0761783883a0fa4c840836994d3fb852518ba33cfdd01a2d98972606744acce2"
+      },
+      {
+        "query": 18,
+        "reference_semantic_checksum": "3e5b7e24e1532ec1724938c09aa6181b59626f2fcdf44cffe55460843cb970fd",
+        "rows": 10,
+        "rustdb_semantic_checksum": "3e5b7e24e1532ec1724938c09aa6181b59626f2fcdf44cffe55460843cb970fd"
+      },
+      {
+        "query": 19,
+        "reference_semantic_checksum": "d7ffdf9d5e8bf7f2c95ed45e6883633613a6ea34979e533229d34caff84a0163",
+        "rows": 10,
+        "rustdb_semantic_checksum": "d7ffdf9d5e8bf7f2c95ed45e6883633613a6ea34979e533229d34caff84a0163"
+      },
+      {
+        "query": 20,
+        "reference_semantic_checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "rows": 0,
+        "rustdb_semantic_checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "query": 21,
+        "reference_semantic_checksum": "32c756f98bf4ff676948380df5f8eba3b4487a2eedfd13f9d2ebbb66286b5323",
+        "rows": 1,
+        "rustdb_semantic_checksum": "32c756f98bf4ff676948380df5f8eba3b4487a2eedfd13f9d2ebbb66286b5323"
+      },
+      {
+        "query": 22,
+        "reference_semantic_checksum": "d44210393a0fd1fe71bafc1859b5f5e01933933a2e00a4f1911849982f2d1a3d",
+        "rows": 1,
+        "rustdb_semantic_checksum": "d44210393a0fd1fe71bafc1859b5f5e01933933a2e00a4f1911849982f2d1a3d"
+      },
+      {
+        "query": 23,
+        "reference_semantic_checksum": "b4e273c32867baaa61e5060dafaa937757b8ebf934962ef239b11bfd39d37971",
+        "rows": 10,
+        "rustdb_semantic_checksum": "b4e273c32867baaa61e5060dafaa937757b8ebf934962ef239b11bfd39d37971"
+      },
+      {
+        "query": 24,
+        "reference_semantic_checksum": "0ebb7383bc62748f0c81ebbb5e67b5c6b3c3708f5f381a6dc20d4b486508c8be",
+        "rows": 10,
+        "rustdb_semantic_checksum": "0ebb7383bc62748f0c81ebbb5e67b5c6b3c3708f5f381a6dc20d4b486508c8be"
+      },
+      {
+        "query": 25,
+        "reference_semantic_checksum": "af81b358847ba7d04fadd5d39912ec2a90bd70e3c3420191d0776348dddc093f",
+        "rows": 10,
+        "rustdb_semantic_checksum": "af81b358847ba7d04fadd5d39912ec2a90bd70e3c3420191d0776348dddc093f"
+      },
+      {
+        "query": 26,
+        "reference_semantic_checksum": "6b93a6e20a225b2ded21e53295fc3efe5d3d22cd057ae2826f541ea52422d1d5",
+        "rows": 10,
+        "rustdb_semantic_checksum": "6b93a6e20a225b2ded21e53295fc3efe5d3d22cd057ae2826f541ea52422d1d5"
+      },
+      {
+        "query": 27,
+        "reference_semantic_checksum": "1b94cec62da3cc9d41c90a1125f5d99cc8de3200a15d09d84783ea3ad398f5d5",
+        "rows": 10,
+        "rustdb_semantic_checksum": "1b94cec62da3cc9d41c90a1125f5d99cc8de3200a15d09d84783ea3ad398f5d5"
+      },
+      {
+        "query": 28,
+        "reference_semantic_checksum": "9fd44b17163dfccedd3bffcd3e793152356ef3ff8c5b84d58022a05caa42453c",
+        "rows": 2,
+        "rustdb_semantic_checksum": "9fd44b17163dfccedd3bffcd3e793152356ef3ff8c5b84d58022a05caa42453c"
+      },
+      {
+        "query": 29,
+        "reference_semantic_checksum": "988f89d1ad1f5581fb7a7964b5337c63f73303b02001a23ac915591208572746",
+        "rows": 2,
+        "rustdb_semantic_checksum": "988f89d1ad1f5581fb7a7964b5337c63f73303b02001a23ac915591208572746"
+      },
+      {
+        "query": 30,
+        "reference_semantic_checksum": "e7b5cb0b50ebf4a5baef9d66fa65229b6af9845110a9471ba904e76c658df9cb",
+        "rows": 1,
+        "rustdb_semantic_checksum": "e7b5cb0b50ebf4a5baef9d66fa65229b6af9845110a9471ba904e76c658df9cb"
+      },
+      {
+        "query": 31,
+        "reference_semantic_checksum": "80a0701b44d2fb9b8fe12e6ef8109fa4e0aa95cd6e4ddf035d82f6357293c604",
+        "rows": 10,
+        "rustdb_semantic_checksum": "797dc401aaf679487b6fa654099f0eeb552b6d71e7d58f0724df3d881072df5d"
+      },
+      {
+        "query": 32,
+        "reference_semantic_checksum": "be6a591b855227591a1bdfc6f73a0848f852b760f39342c1b7ee3a26405d8997",
+        "rows": 10,
+        "rustdb_semantic_checksum": "1e94fab4766ffccd3a14ffdb6c7fb89eda28c95d8a474b58b94578d78bc3f67b"
+      },
+      {
+        "query": 33,
+        "reference_semantic_checksum": "52ed79f88acfb37a3c8948c5a6631497eb9b4356a4a7fe2524bbd8f2eb6b828c",
+        "rows": 10,
+        "rustdb_semantic_checksum": "a16708be1743d05de7b79a3aa606ef8371d35c87b63ddd9bdd94ad5a1bf16025"
+      },
+      {
+        "query": 34,
+        "reference_semantic_checksum": "fa39f6f66c88559490e4f5488c44176c512d8111555f7e84f276080cc57d854c",
+        "rows": 10,
+        "rustdb_semantic_checksum": "fa39f6f66c88559490e4f5488c44176c512d8111555f7e84f276080cc57d854c"
+      },
+      {
+        "query": 35,
+        "reference_semantic_checksum": "eca52231c6e10eb1d32dec3282e201237cfa0b666752c411f99f3305f2d48b1f",
+        "rows": 10,
+        "rustdb_semantic_checksum": "eca52231c6e10eb1d32dec3282e201237cfa0b666752c411f99f3305f2d48b1f"
+      },
+      {
+        "query": 36,
+        "reference_semantic_checksum": "0352ff699d3f77087ca651b2c4dca98880aadd5079fd9168e705b4805b602041",
+        "rows": 10,
+        "rustdb_semantic_checksum": "0352ff699d3f77087ca651b2c4dca98880aadd5079fd9168e705b4805b602041"
+      },
+      {
+        "query": 37,
+        "reference_semantic_checksum": "c559588cd17b64e85c03d28faff727e66dbfe9dc69d7d57ce1a5e799e815c044",
+        "rows": 10,
+        "rustdb_semantic_checksum": "c559588cd17b64e85c03d28faff727e66dbfe9dc69d7d57ce1a5e799e815c044"
+      },
+      {
+        "query": 38,
+        "reference_semantic_checksum": "802fd61419911f0b9faa8a9d3c47dedbff7795ffd7099831df88d5c75870256f",
+        "rows": 10,
+        "rustdb_semantic_checksum": "802fd61419911f0b9faa8a9d3c47dedbff7795ffd7099831df88d5c75870256f"
+      },
+      {
+        "query": 39,
+        "reference_semantic_checksum": "cec3c7a13b30f6e862805ce9a7b58ce2a88840f7c93a813b9ac37c8506969fa6",
+        "rows": 10,
+        "rustdb_semantic_checksum": "cec3c7a13b30f6e862805ce9a7b58ce2a88840f7c93a813b9ac37c8506969fa6"
+      },
+      {
+        "query": 40,
+        "reference_semantic_checksum": "a4de4ce4859f06d122e6788c71548834287084926cb79774674f825c3f8d3741",
+        "rows": 10,
+        "rustdb_semantic_checksum": "a4de4ce4859f06d122e6788c71548834287084926cb79774674f825c3f8d3741"
+      },
+      {
+        "query": 41,
+        "reference_semantic_checksum": "2b716b94a23193f700d34e14b260f7fcd2da0396665fac3de2590b265a5555a6",
+        "rows": 10,
+        "rustdb_semantic_checksum": "2b716b94a23193f700d34e14b260f7fcd2da0396665fac3de2590b265a5555a6"
+      },
+      {
+        "query": 42,
+        "reference_semantic_checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "rows": 0,
+        "rustdb_semantic_checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "query": 43,
+        "reference_semantic_checksum": "30998b8df9539d548fb9e486fabd5046d804a7e39f3020624ac912c1a3b35f57",
+        "rows": 10,
+        "rustdb_semantic_checksum": "af31f0e39016e59466d14559f1dfd1c046cbcbc62acf3a3a025e0364a3c5ebbf"
+      }
+    ],
+    "verified_queries": 43
+  },
+  "results": [
+    {
+      "checksum": "a6a2220945f9bdae01f47aa061fabcd187d462a3465e1f2056ff5656c952c55c",
+      "query": 1,
+      "rows": 1
+    },
+    {
+      "checksum": "02704b513948a68ec29236f818d171c8f610ea244d95426831b631eb0e76bce6",
+      "query": 2,
+      "rows": 1
+    },
+    {
+      "checksum": "1e6025916fb5a9ddebd61f23399f0eaebec7fc8142485ed363411e6b29c442c5",
+      "query": 3,
+      "rows": 1
+    },
+    {
+      "checksum": "6358e1a450a1a1046d8ee59297666cbb51ccec3cf1974e196c14b2cd29d1e3f2",
+      "query": 4,
+      "rows": 1
+    },
+    {
+      "checksum": "213bf23a96e6459295c1266e8bf5019ed4d25cb24de479bf2afb49bdf5f9cbea",
+      "query": 5,
+      "rows": 1
+    },
+    {
+      "checksum": "617f98d653ddef71f725e86d4b5c7f04a76277f5e8195e672d934de7098309dc",
+      "query": 6,
+      "rows": 1
+    },
+    {
+      "checksum": "e6674eeb00fb844b8bce37658c59e2335031f34541852b8d8d8a144441cfc74f",
+      "query": 7,
+      "rows": 1
+    },
+    {
+      "checksum": "ece6309ccedf53ae8820371175b0c9f5b7868e35c00a7a11c8f45e3771146532",
+      "query": 8,
+      "rows": 5
+    },
+    {
+      "checksum": "3f2e5a009a6f98bdc36917c02cbb04f5cfef1b39d5fd538ad59d3f8709071909",
+      "query": 9,
+      "rows": 10
+    },
+    {
+      "checksum": "b9a00ed8e68f65aaae4faca3d88d061a324fb8862aa487e8d7d3a80717788c07",
+      "query": 10,
+      "rows": 10
+    },
+    {
+      "checksum": "06778035ade2b179b5bc9286ca4d571c2d8cdef3e89f2df5b37c9ffaf9d1650c",
+      "query": 11,
+      "rows": 10
+    },
+    {
+      "checksum": "094a7ffbf80e66447d449e1cb65160b563d41f986b1ca551489a3c548e37f1e6",
+      "query": 12,
+      "rows": 10
+    },
+    {
+      "checksum": "2f5a5fec193e9d142784e942f8e2114d4dd811c9575c2f0390e8c523320201e4",
+      "query": 13,
+      "rows": 10
+    },
+    {
+      "checksum": "518d488486dd21f5307c91f307b1e69037f64bf3de9d8abc0b70286dc94d3ac2",
+      "query": 14,
+      "rows": 10
+    },
+    {
+      "checksum": "3314f4399afea6395aee0853533bed15745eb30e8e0022b1ceb6505e2f015c5e",
+      "query": 15,
+      "rows": 10
+    },
+    {
+      "checksum": "11e99bcd4c69b809626c06ee32d9180f5c6600f33ac5b90a4cd2161094f8860c",
+      "query": 16,
+      "rows": 10
+    },
+    {
+      "checksum": "c5223fc782a11c109b23b7b571e2b6b9a01f3d117b2d31b9ece5ed00fa70e875",
+      "query": 17,
+      "rows": 10
+    },
+    {
+      "checksum": "3cea7a9c36133e81bfbe6eabe210185fd32b597a910a7e4d3433b425b2bd6fc9",
+      "query": 18,
+      "rows": 10
+    },
+    {
+      "checksum": "bf19b43c765b6c46ec60f106af1f7f543203c54bc280c7b5f5713d975b2fc7d1",
+      "query": 19,
+      "rows": 10
+    },
+    {
+      "checksum": "563cdd7167f513489094920d3f6a79d3390a101afd624cab86c0574ceb427608",
+      "query": 20,
+      "rows": 0
+    },
+    {
+      "checksum": "c850dd28af9b4bab030ed95cc0b17f54c96cadcd215d3ead79de859758f09a30",
+      "query": 21,
+      "rows": 1
+    },
+    {
+      "checksum": "b91fa58aebbda1b073f6114acc774e14179023de469e6844840a9c2f3944aea3",
+      "query": 22,
+      "rows": 1
+    },
+    {
+      "checksum": "04438b4f8b8dcdf6eb9be7a080804084b3328868c0655831fc55efd941809998",
+      "query": 23,
+      "rows": 10
+    },
+    {
+      "checksum": "07d2a1c4582242ee09b5f7f290a63adfceeb7bd985c897b4919e021b743060b6",
+      "query": 24,
+      "rows": 10
+    },
+    {
+      "checksum": "cc6f2912f5786e8fb800feaddd6ee3d7178f6f9c732b8d4797ed4102ad45096a",
+      "query": 25,
+      "rows": 10
+    },
+    {
+      "checksum": "7be741b27cc4f63d3f162586e64fb1c2cdea16b1b9a27e0cdc30b2f1e4d83814",
+      "query": 26,
+      "rows": 10
+    },
+    {
+      "checksum": "df347d3de4cbc342194d7f087f5979c6c4099a5a827f3252b8a6ca125ce23716",
+      "query": 27,
+      "rows": 10
+    },
+    {
+      "checksum": "6793cd341ced9dbd70ad7489dfaad8b6d9dacc99e65045751ae1bb75962ef2c6",
+      "query": 28,
+      "rows": 2
+    },
+    {
+      "checksum": "604f1b0844f7b574250fafaaf0d5964f16447533bd2d3e78187a5a4c0cd8e5bd",
+      "query": 29,
+      "rows": 2
+    },
+    {
+      "checksum": "cc06652355501928011cb94e99c78dcdc80cafe00d9e03c4c0cccd045e7b99e7",
+      "query": 30,
+      "rows": 1
+    },
+    {
+      "checksum": "f205d669c0bf2ed343de1ebac3fc1d625cc50541a20a73bd0636c874131f2fc6",
+      "query": 31,
+      "rows": 10
+    },
+    {
+      "checksum": "d3afa3e607f252c2faf4cf322657a76454f2cb110bb9b843faa0d2cc0f292864",
+      "query": 32,
+      "rows": 10
+    },
+    {
+      "checksum": "0f19d48f4233338bf3208d4bd4af506268eb516c1d253bb0331f2c508f66b801",
+      "query": 33,
+      "rows": 10
+    },
+    {
+      "checksum": "3541fb74e8739865cb9b5b7eea0aead76377a31ba47b3c59337f3e71f056b8b4",
+      "query": 34,
+      "rows": 10
+    },
+    {
+      "checksum": "cbd3ba79c4eb9cdce7587abab82d85c68ab63f5a96737f2069ef034f9905b287",
+      "query": 35,
+      "rows": 10
+    },
+    {
+      "checksum": "9962387c968d762f2f84937d80ab907174426cb242fc5c1517ab5c35b6c765ac",
+      "query": 36,
+      "rows": 10
+    },
+    {
+      "checksum": "253d1b62f7cb8c5c6c3064b92cbd1606142463b2111308177447b0b279c0cdfe",
+      "query": 37,
+      "rows": 10
+    },
+    {
+      "checksum": "4e162bd8823576935e7d6bdf604b4e442497addcb663e6341626a4abbe0ac96f",
+      "query": 38,
+      "rows": 10
+    },
+    {
+      "checksum": "4cf3049abecdcd5447fd13a99c7a343e5cf39235ec1cd88a415802c2e645d9de",
+      "query": 39,
+      "rows": 10
+    },
+    {
+      "checksum": "fbe3bcd1fcbb99afe364b2aaec2c74a682c26a9de2c83078ef6ee5ce97426bd7",
+      "query": 40,
+      "rows": 10
+    },
+    {
+      "checksum": "e97d12cbc8268f9f267f253fc0032bcb0ee4412d70e397b7b769d07cc4b3d80b",
+      "query": 41,
+      "rows": 10
+    },
+    {
+      "checksum": "fdf76f80db5bf4b23a5583a88677810ea8f032bf90401b51651f0e6a636b3e33",
+      "query": 42,
+      "rows": 0
+    },
+    {
+      "checksum": "7001bacd0e39d45794482f27f366e280aa48fb3eb265f71d9bbd6108d9afae87",
+      "query": 43,
+      "rows": 10
+    }
+  ],
+  "schema": "rustdb-clickbench-functional-oracle-v2"
+}

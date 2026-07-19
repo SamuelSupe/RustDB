@@ -363,9 +363,13 @@ The full execution model is documented in [architecture.md](docs/architecture.md
 
 - The Beta contract requires one complete OrbStack release run plus an explicit
   100-GiB/10,000-object equivalent local/MinIO CSV-or-Parquet workload at 2/4
-  GiB and eight-client concurrency, followed by one ClickBench pass. The gate
-  writes commit-bound `evidence.json`; publication is blocked until an annotated
-  tag binds that accepted commit. See the
+  GiB and eight-client concurrency, followed by one deterministic ClickBench
+  pass with four CPUs, a 12-GiB container limit, a 4-GiB engine budget, batch
+  8192, and I/O concurrency 16. The canonical official queries remain pinned as
+  the source/full profile; functional acceptance uses a versioned derivative
+  with complete tie-breakers. The gate writes commit-bound `evidence.json`;
+  publication is blocked until an annotated tag binds that accepted commit.
+  See the
   [Beta roadmap](docs/roadmap-v1-beta.md) and
   [operator guide](docs/operator-guide.md).
 - TPC-H Q1-Q22 query coverage is retained in [`benchmarks/tpch`](benchmarks/tpch).

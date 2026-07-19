@@ -33,7 +33,11 @@ SQL (`SELECT count(*)` over the complete fixture), derives the expected file
 count from the normalized manifest, revalidates the local size/mtime inventory,
 and checks the live MinIO URI/size/ETag inventory before and after execution.
 The large-file query intentionally exercises discovery, snapshot, metadata,
-concurrency, and memory accounting; the pinned ClickBench oracle supplies
+concurrency, and memory accounting. ClickBench runs once with four CPUs, a
+12-GiB container limit, a 4-GiB engine budget, batch 8192, and I/O concurrency
+16. Its pinned canonical query file remains the source/full-profile workload;
+functional acceptance executes a versioned derivative with complete
+tie-breakers and binds both SHA-256 identities. The pinned oracle supplies
 data-page and result-correctness coverage. No fixture is downloaded implicitly.
 The four external runs must produce the same checksum and finish without active
 tasks, reservations, or Spill artifacts. The evidence directory is outside the
@@ -41,7 +45,10 @@ repository and is finalized on success, failure, or interruption.
 
 This is a functional and resource-accounting baseline. It is deliberately one
 run, not a repeated timing, soak, dedicated low-memory Spill, or cross-engine
-performance gate. Details and exact environment variables are in
+performance gate. Oracle generation and review use exactly one rowset from a
+digest-pinned `clickhouse-local` image; ClickHouse is not executed by this
+release gate and no timing comparison is made. Details and exact environment
+variables are in
 [`roadmap-v1-beta.md`](roadmap-v1-beta.md) and the bilingual operator guides.
 
 ## Historical v0.9 release gate

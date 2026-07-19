@@ -11,6 +11,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from beta_acceptance_clickbench import (
+    BATCH_SIZE as CLICKBENCH_BATCH_SIZE,
+    CONTAINER_CPUS as CLICKBENCH_CONTAINER_CPUS,
+    CONTAINER_MEMORY_BYTES as CLICKBENCH_CONTAINER_MEMORY_BYTES,
+    ENGINE_MEMORY_BYTES as CLICKBENCH_ENGINE_MEMORY_BYTES,
+    ENGINE_THREADS as CLICKBENCH_ENGINE_THREADS,
+    IO_CONCURRENCY as CLICKBENCH_IO_CONCURRENCY,
+    METADATA_CACHE_BYTES as CLICKBENCH_METADATA_CACHE_BYTES,
+    REPORT_COUNT as CLICKBENCH_REPORT_COUNT,
+)
 from beta_acceptance_common import atomic_json, read_json
 from beta_acceptance_local import SCHEMA as LOCAL_VERIFICATION_SCHEMA
 from beta_acceptance_minio import SCHEMA as MINIO_VERIFICATION_SCHEMA
@@ -147,8 +157,16 @@ def execution_contract() -> dict[str, Any]:
         "clickbench": {
             "runner": "benchmarks/clickbench/run.sh",
             "offline": True,
-            "threads": 4,
-            "engine_memory_limit_bytes": 4 * 1024**3,
+            "container_cpus": CLICKBENCH_CONTAINER_CPUS,
+            "container_memory_bytes": CLICKBENCH_CONTAINER_MEMORY_BYTES,
+            "threads": CLICKBENCH_ENGINE_THREADS,
+            "engine_memory_limit_bytes": CLICKBENCH_ENGINE_MEMORY_BYTES,
+            "batch_size": CLICKBENCH_BATCH_SIZE,
+            "io_concurrency": CLICKBENCH_IO_CONCURRENCY,
+            "metadata_cache_bytes": CLICKBENCH_METADATA_CACHE_BYTES,
+            "raw_reports": CLICKBENCH_REPORT_COUNT,
+            "build_id": "accepted_commit",
+            "binary_sha256_required": True,
             "passes": 1,
         },
     }

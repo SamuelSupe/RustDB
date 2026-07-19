@@ -3,20 +3,22 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 DATA_DIR=${CLICKBENCH_DATA_DIR:-"$ROOT/data/clickbench"}
-QUERY_FILE="$DATA_DIR/queries.sql"
-ORACLE_FILE="$ROOT/benchmarks/clickbench/functional-oracle-v1.json"
+CANONICAL_QUERY_FILE="$DATA_DIR/queries.sql"
+FUNCTIONAL_QUERY_FILE="$ROOT/benchmarks/clickbench/queries-rustdb.sql"
+ORACLE_FILE="$ROOT/benchmarks/clickbench/functional-oracle-v2.json"
 TARGET_DIR=${CLICKBENCH_TARGET_DIR:-/private/tmp/rustdb-clickbench-target}
 RESULT_ROOT=${CLICKBENCH_RESULT_ROOT:-"$ROOT/benchmarks/results/clickbench"}
 RUN_NAME=${CLICKBENCH_RUN_NAME:-"$(date -u +%Y%m%dT%H%M%SZ)"}
 OUTPUT="$RESULT_ROOT/$RUN_NAME"
 QUERY_URL=${CLICKBENCH_QUERY_URL:-https://raw.githubusercontent.com/ClickHouse/ClickBench/main/clickhouse/queries.sql}
-CONTAINER_MEMORY=${CLICKBENCH_CONTAINER_MEMORY:-16g}
-ENGINE_MEMORY_BYTES=${CLICKBENCH_ENGINE_MEMORY_BYTES:-12884901888}
+CONTAINER_MEMORY=${CLICKBENCH_CONTAINER_MEMORY:-}
+ENGINE_MEMORY_BYTES=${CLICKBENCH_ENGINE_MEMORY_BYTES:-}
 QUERY_TIMEOUT_SECONDS=${CLICKBENCH_QUERY_TIMEOUT_SECONDS:-3600}
 PROFILE=${CLICKBENCH_PROFILE:-functional}
 OFFLINE=${CLICKBENCH_OFFLINE:-0}
-EXPECTED_QUERY_SHA256=a7d6673357348ee9680443216b6f26f30d1dce9f313b419d38502417b2c2a219
-EXPECTED_ORACLE_SHA256=3040ce083db2647e6efef0a185b0b7772f4a5722898e0f351b8a1f8e46ac43b7
+EXPECTED_CANONICAL_QUERY_SHA256=a7d6673357348ee9680443216b6f26f30d1dce9f313b419d38502417b2c2a219
+EXPECTED_FUNCTIONAL_QUERY_SHA256=5386a67950894eb01803dc4f216a0bda61bb219940f8b783a3c648f0c4f76749
+EXPECTED_ORACLE_SHA256=1e431a93f6942b50682178e7f21e8b81ab87e02c3a4e7247842e6ef296c354e5
 
 case "$OFFLINE" in
   0|1) ;;
@@ -28,6 +30,11 @@ esac
 
 case "$PROFILE" in
   functional)
+    CONTAINER_MEMORY=${CONTAINER_MEMORY:-12g}
+    ENGINE_MEMORY_BYTES=${ENGINE_MEMORY_BYTES:-4294967296}
+    QUERY_FILE="$FUNCTIONAL_QUERY_FILE"
+    CONTAINER_QUERY_FILE=/workspace/benchmarks/clickbench/queries-rustdb.sql
+    EXPECTED_QUERY_SHA256=$EXPECTED_FUNCTIONAL_QUERY_SHA256
     DATA_NAME=hits-1m.parquet
     DEFAULT_DATA_URL=https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
     DEFAULT_DATA_BYTES=122446530
@@ -35,11 +42,16 @@ case "$PROFILE" in
     DEFAULT_DATA_SHA256=fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d
     DATA_ADAPTER=(--binary-as-string)
     ORACLE_ARGS=(
-      --oracle /workspace/benchmarks/clickbench/functional-oracle-v1.json
+      --oracle /workspace/benchmarks/clickbench/functional-oracle-v2.json
       --expected-oracle-sha256 "$EXPECTED_ORACLE_SHA256"
     )
     ;;
   full)
+    CONTAINER_MEMORY=${CONTAINER_MEMORY:-16g}
+    ENGINE_MEMORY_BYTES=${ENGINE_MEMORY_BYTES:-12884901888}
+    QUERY_FILE="$CANONICAL_QUERY_FILE"
+    CONTAINER_QUERY_FILE=/data/queries.sql
+    EXPECTED_QUERY_SHA256=$EXPECTED_CANONICAL_QUERY_SHA256
     DATA_NAME=hits-100m.parquet
     DEFAULT_DATA_URL=https://datasets.clickhouse.com/hits_compatible/hits.parquet
     DEFAULT_DATA_BYTES=14779976446
@@ -78,17 +90,22 @@ sha256() {
 }
 
 mkdir -p "$DATA_DIR" "$TARGET_DIR" "$RESULT_ROOT"
-if [[ ! -f "$QUERY_FILE" ]]; then
+if [[ ! -f "$CANONICAL_QUERY_FILE" ]]; then
   if [[ $OFFLINE = 1 ]]; then
-    echo "ClickBench offline mode requires an existing query file: $QUERY_FILE" >&2
+    echo "ClickBench offline mode requires an existing query file: $CANONICAL_QUERY_FILE" >&2
     exit 1
   fi
-  curl --fail --location --output "$QUERY_FILE.part" "$QUERY_URL"
-  mv "$QUERY_FILE.part" "$QUERY_FILE"
+  curl --fail --location --output "$CANONICAL_QUERY_FILE.part" "$QUERY_URL"
+  mv "$CANONICAL_QUERY_FILE.part" "$CANONICAL_QUERY_FILE"
+fi
+ACTUAL_CANONICAL_QUERY_SHA256=$(sha256 "$CANONICAL_QUERY_FILE")
+if [[ $ACTUAL_CANONICAL_QUERY_SHA256 != "$EXPECTED_CANONICAL_QUERY_SHA256" ]]; then
+  echo "canonical ClickBench queries.sql SHA-256 is $ACTUAL_CANONICAL_QUERY_SHA256, expected $EXPECTED_CANONICAL_QUERY_SHA256" >&2
+  exit 1
 fi
 ACTUAL_QUERY_SHA256=$(sha256 "$QUERY_FILE")
 if [[ $ACTUAL_QUERY_SHA256 != "$EXPECTED_QUERY_SHA256" ]]; then
-  echo "ClickBench queries.sql SHA-256 is $ACTUAL_QUERY_SHA256, expected $EXPECTED_QUERY_SHA256" >&2
+  echo "ClickBench execution query SHA-256 is $ACTUAL_QUERY_SHA256, expected $EXPECTED_QUERY_SHA256" >&2
   exit 1
 fi
 if [[ $PROFILE = functional ]]; then
@@ -169,11 +186,13 @@ docker run --rm --cpus 4 --memory "$CONTAINER_MEMORY" \
   --volume "$RESULT_ROOT:/results" \
   rustdb-dev:1.97 \
   python3 -B /workspace/benchmarks/clickbench/run.py \
-    --queries /data/queries.sql \
+    --queries "$CONTAINER_QUERY_FILE" \
+    --canonical-queries /data/queries.sql \
     --data "/data/$DATA_NAME" \
     --dataset-profile "$PROFILE" \
     --data-etag "$EXPECTED_DATA_ETAG" \
     --expected-query-sha256 "$EXPECTED_QUERY_SHA256" \
+    --expected-canonical-query-sha256 "$EXPECTED_CANONICAL_QUERY_SHA256" \
     --output "/results/$RUN_NAME" \
     --binary /clickbench-target/release/rustdb-bench \
     --threads 4 \

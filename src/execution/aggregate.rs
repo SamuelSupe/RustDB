@@ -19,6 +19,7 @@ use super::{
 };
 
 mod admission;
+mod average;
 mod batch;
 mod dense_dictionary;
 mod distinct;
@@ -872,7 +873,17 @@ pub(super) fn partial_schema(groups: &[BoundExpr], aggregates: &[AggregateExpr])
             fields.push(Field::new(
                 format!("__agg_{index}_sum"),
                 match expression.expr.as_ref().map(|input| &input.data_type) {
-                    Some(DataType::Decimal128(_, _)) => DataType::Binary,
+                    Some(
+                        DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64
+                        | DataType::Decimal128(_, _),
+                    ) => DataType::Binary,
                     _ => DataType::Float64,
                 },
                 false,

@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "rustdb-clickbench-functional-oracle-v1"
+SCHEMA = "rustdb-clickbench-functional-oracle-v2"
 CHECKSUM_ALGORITHM = "rustdb-typed-multiset-sha256-v1"
-PINNED_SHA256 = "3040ce083db2647e6efef0a185b0b7772f4a5722898e0f351b8a1f8e46ac43b7"
+PINNED_SHA256 = "1e431a93f6942b50682178e7f21e8b81ab87e02c3a4e7247842e6ef296c354e5"
 EXPECTED_QUERIES = 43
+REFERENCE_IMAGE_DIGEST = (
+    "sha256:f40cd6034fb8c54dce6a85338750fbad79f387e2705e1991a85f2e7086b5b9ea"
+)
 
 
 def file_sha256(path: Path) -> str:
@@ -31,6 +34,7 @@ def load_oracle(
     profile: str,
     mode: str,
     query_sha256: str,
+    canonical_query_sha256: str,
     dataset_sha256: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     observed_sha256 = file_sha256(path)
@@ -46,6 +50,7 @@ def load_oracle(
         "mode": mode,
         "query_count": EXPECTED_QUERIES,
         "query_sha256": query_sha256,
+        "canonical_query_sha256": canonical_query_sha256,
         "dataset_sha256": dataset_sha256,
         "checksum_algorithm": CHECKSUM_ALGORITHM,
     }
@@ -65,6 +70,28 @@ def load_oracle(
             raise ValueError(f"ClickBench oracle query {number} has invalid rows")
         if not isinstance(checksum, str) or re.fullmatch(r"[0-9a-f]{64}", checksum) is None:
             raise ValueError(f"ClickBench oracle query {number} has invalid checksum")
+    reference = value.get("reference")
+    semantic_results = reference.get("semantic_results") if isinstance(reference, dict) else None
+    engine = reference.get("engine", {}) if isinstance(reference, dict) else {}
+    if (
+        not isinstance(reference, dict)
+        or engine.get("image_digest") != REFERENCE_IMAGE_DIGEST
+        or reference.get("verified_queries") != EXPECTED_QUERIES
+        or reference.get("q24_event_time_watch_id_duplicate_groups") != 0
+        or reference.get("q04_exact_ratio", {}).get("expected_f64_bits")
+        != "0x43bb0960eb622986"
+        or not isinstance(semantic_results, list)
+        or len(semantic_results) != EXPECTED_QUERIES
+    ):
+        raise ValueError("ClickBench oracle lacks the pinned independent reference")
+    for number, result in enumerate(semantic_results, start=1):
+        if (
+            not isinstance(result, dict)
+            or result.get("query") != number
+            or type(result.get("rows")) is not int
+            or result["rows"] < 0
+        ):
+            raise ValueError("ClickBench oracle reference results are not contiguous")
     identity = {
         "path": str(path),
         "sha256": observed_sha256,

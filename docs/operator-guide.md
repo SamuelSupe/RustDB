@@ -245,8 +245,11 @@ Use equivalent local and MinIO data: the gate requires one checksum across all
 four 2/4-GiB, eight-client runs. It revalidates the local size/mtime inventory;
 before and after the MinIO runs, it lists MinIO and requires every URI, size,
 and ETag to match the manifest. Every query must also discover the manifest's
-exact file count. ClickBench requires preloaded
-`queries.sql` and the SHA-256-pinned functional fixture. The gate runs
+exact file count. ClickBench requires the preloaded SHA-256-pinned functional
+fixture and canonical `queries.sql`; the repository supplies the versioned
+deterministic derivative used for execution. The gate binds both query
+identities and runs ClickBench with four CPUs, a 12-GiB container limit, a
+4-GiB engine budget, batch 8192, and I/O concurrency 16. It runs
 `scripts/ci/orbstack.sh all` once, those four external runs, and one ClickBench
 pass. It records the commit, host/profile, normalized fixture inventories,
 commands, logs, runner build ID, resource summaries, and outcome in
@@ -257,7 +260,12 @@ repeated.
 The 100-GiB `count(*)` path is the discovery, snapshot, metadata, concurrency,
 and memory-accounting part of the gate. The functional ClickBench pass checks
 real Parquet data-page execution against 43 pinned row-count and typed-checksum
-oracle entries; neither part is presented as a cross-engine performance claim.
+oracle entries. The canonical official queries remain pinned for the source and
+full profile; the deterministic derivative adds complete tie-breakers only
+where bounded canonical results leave ties unspecified. Oracle generation and
+review use exactly one rowset from a digest-pinned `clickhouse-local` image.
+ClickHouse is not run by the release gate, and neither part is a cross-engine
+performance comparison.
 
 The annotated release tag must bind the accepted commit:
 
