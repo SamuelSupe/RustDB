@@ -42,9 +42,35 @@ hosted_test_with_minio() {
     --test runtime_filter_pruning \
     --test s3_deep_pruning \
     --test s3_query \
+    --test http_shell \
     --test v08_remote \
     --jobs "$test_jobs" -- \
     --skip execution::tests::aggregate_spills_and_join_completes_under_small_memory_limit
+}
+
+v09_acceptance() {
+  test_jobs=${RUSTDB_TEST_JOBS:-1}
+  run cargo test --locked --lib http_read_only::tests --jobs "$test_jobs"
+  run cargo test --locked --lib http_shell:: --jobs "$test_jobs"
+  run cargo test --locked --lib engine::external_source_api::tests --jobs "$test_jobs"
+  run cargo test --locked --test http_shell --jobs "$test_jobs"
+}
+
+test_with_minio_excluding_v09() {
+  require_minio
+  test_jobs=${RUSTDB_TEST_JOBS:-1}
+  run cargo test --locked --all-targets --jobs "$test_jobs" -- \
+    --skip http_read_only::tests \
+    --skip http_shell:: \
+    --skip engine::external_source_api::tests \
+    --skip remote_shell_executes_typed_read_only_queries_over_tls \
+    --skip execution::tests::aggregate_spills_and_join_completes_under_small_memory_limit \
+    --skip cancelling_a_spilling_distinct_query_releases_its_directory \
+    --skip hash_join_spills_and_cleans_query_directory \
+    --skip left_hash_join_spills_preserves_unmatched_rows_and_cleans_up \
+    --skip order_by_top_k_and_full_sort_spill_and_cleanup \
+    --skip dropping_a_partially_consumed_spilling_query_reaps_after_quiescence \
+    --skip high_cardinality_aggregate_spills_and_cleans_query_directory
 }
 
 test_portable() {
@@ -105,7 +131,7 @@ dist_build() {
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|v08|check|release|release-cli|dist|all
+usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|v08|v09|check|release|release-cli|dist|all
 
   lint         formatting and strict Clippy
   test         all-target tests; requires a live configured MinIO
@@ -113,11 +139,12 @@ usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|v08|check|r
   hosted-test  representative live-MinIO tests without dedicated Spill suites
   portable     all-target tests without requiring MinIO (S3 tests may skip)
   v08          one focused v0.8 reliability pass with live MinIO
+  v09          focused HTTP shell, security policy, and persistent-source pass
   check        compile every target without running tests
   release      portable release build of every target
   release-cli  release build of the distributed rustdb CLI
   dist         build and validate the native CLI distribution archive
-  all          lint, live-MinIO tests, and release build
+  all          lint, live-MinIO correctness without dedicated low-memory Spill stress, and release build
 EOF
   exit 2
 }
@@ -140,6 +167,9 @@ case "${1:-}" in
   v08)
     v08_acceptance
     ;;
+  v09)
+    v09_acceptance
+    ;;
   check)
     check_portable
     ;;
@@ -155,7 +185,8 @@ case "${1:-}" in
   all)
     lint
     tool_tests
-    test_with_minio
+    v09_acceptance
+    test_with_minio_excluding_v09
     release_build
     ;;
   *)

@@ -7,9 +7,9 @@
 从可信渠道获取文件后，可用相邻的 `.sha256` 检查意外损坏：
 
 ```sh
-sha256sum -c rustdb-v0.8.0-alpha.1-linux-aarch64.tar.gz.sha256
+sha256sum -c rustdb-v0.9.0-alpha.1-linux-aarch64.tar.gz.sha256
 # macOS：
-shasum -a 256 -c rustdb-v0.8.0-alpha.1-macos-aarch64.tar.gz.sha256
+shasum -a 256 -c rustdb-v0.9.0-alpha.1-macos-aarch64.tar.gz.sha256
 ```
 
 解压后的 `SHA256SUMS` 覆盖所有可安装文件。
@@ -17,8 +17,8 @@ shasum -a 256 -c rustdb-v0.8.0-alpha.1-macos-aarch64.tar.gz.sha256
 ## 安装
 
 ```sh
-tar -xzf rustdb-v0.8.0-alpha.1-linux-aarch64.tar.gz
-cd rustdb-v0.8.0-alpha.1-linux-aarch64
+tar -xzf rustdb-v0.9.0-alpha.1-linux-aarch64.tar.gz
+cd rustdb-v0.9.0-alpha.1-linux-aarch64
 ./install.sh
 ```
 
@@ -41,6 +41,9 @@ DESTDIR=/tmp/package-root ./install.sh --prefix /usr
 解压并校验新版本，然后使用相同 prefix 运行新包中的 `install.sh`。脚本只替换已知
 RustDB 文件，不会修改数据库或查询数据。
 
+HTTP Shell Profile 与服务端 TLS/Token 状态位于操作系统用户级状态目录，
+`install.sh` 不会删除或替换它们。
+
 ## 卸载
 
 在解压目录执行：
@@ -52,6 +55,9 @@ RustDB 文件，不会修改数据库或查询数据。
 
 安装后也可运行 `PREFIX/share/rustdb/uninstall.sh`。卸载只删除已知 CLI 和文档文件，
 不会删除数据库、输入数据、Spill 或用户配置目录。
+
+安装后的文档还包含 `HTTP-SHELL.md`、`HTTP-SHELL.zh-CN.md` 和公开的
+`openapi-v1.yaml` 协议。
 
 ## 平台
 

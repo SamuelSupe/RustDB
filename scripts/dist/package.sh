@@ -101,6 +101,9 @@ install -m 0644 "$root/packaging/dist/CLI.md" "$stage/docs/CLI.md"
 install -m 0644 "$root/packaging/dist/CLI.zh-CN.md" "$stage/docs/CLI.zh-CN.md"
 install -m 0644 "$root/packaging/dist/INSTALL.md" "$stage/docs/INSTALL.md"
 install -m 0644 "$root/packaging/dist/INSTALL.zh-CN.md" "$stage/docs/INSTALL.zh-CN.md"
+install -m 0644 "$root/docs/http-shell.md" "$stage/docs/HTTP-SHELL.md"
+install -m 0644 "$root/docs/http-shell.zh-CN.md" "$stage/docs/HTTP-SHELL.zh-CN.md"
+install -m 0644 "$root/docs/openapi-v1.yaml" "$stage/docs/openapi-v1.yaml"
 printf '%s\n' "$version" >"$stage/VERSION"
 
 sha256() {
@@ -115,7 +118,9 @@ sha256() {
 for file in \
   LICENSE README.md README.zh-CN.md VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
-  docs/INSTALL.md docs/INSTALL.zh-CN.md install.sh uninstall.sh
+  docs/INSTALL.md docs/INSTALL.zh-CN.md \
+  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md docs/openapi-v1.yaml \
+  install.sh uninstall.sh
 do
   digest=$(sha256 "$stage/$file")
   printf '%s  %s\n' "$digest" "$file" >>"$stage/SHA256SUMS"

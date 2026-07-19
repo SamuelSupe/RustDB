@@ -137,6 +137,10 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
 
     let config = EngineConfig::builder()
         .batch_size(128)
+        // Keep this integration test deterministic: one compute lane can
+        // prefetch at most one row group behind the public one-slot queue, so
+        // the stale query snapshot is exercised by a later conditional GET.
+        .compute_threads(1)
         .io_concurrency(1)
         .s3(S3Config {
             endpoint: Some(endpoint.clone()),
@@ -465,12 +469,11 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
             "SELECT payload FROM read_parquet('s3://{BUCKET}/{pruning_path}')"
         ))
         .await?;
-    let first_batch = changing
-        .stream()
-        .next()
-        .await
-        .expect("scan must produce a batch before the object is replaced")?;
-    assert!(first_batch.num_rows() > 0);
+    // `execute` has captured the query snapshot, but data-page reads do not
+    // begin until the result stream is polled. Replace the object in that
+    // deterministic window so the first conditional range GET must reject
+    // the stale ETag. Waiting for a first batch is racy because parallel
+    // row-group readers may have already fetched the whole old object.
     store
         .put(&pruning_path, Bytes::from(pruning_fixture('y')?).into())
         .await?;

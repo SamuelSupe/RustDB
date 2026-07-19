@@ -8,9 +8,9 @@ The adjacent `.sha256` file authenticates accidental corruption when obtained
 through a trusted channel:
 
 ```sh
-sha256sum -c rustdb-v0.8.0-alpha.1-linux-aarch64.tar.gz.sha256
+sha256sum -c rustdb-v0.9.0-alpha.1-linux-aarch64.tar.gz.sha256
 # macOS:
-shasum -a 256 -c rustdb-v0.8.0-alpha.1-macos-aarch64.tar.gz.sha256
+shasum -a 256 -c rustdb-v0.9.0-alpha.1-macos-aarch64.tar.gz.sha256
 ```
 
 After extraction, `SHA256SUMS` covers every installable payload.
@@ -18,8 +18,8 @@ After extraction, `SHA256SUMS` covers every installable payload.
 ## Install
 
 ```sh
-tar -xzf rustdb-v0.8.0-alpha.1-linux-aarch64.tar.gz
-cd rustdb-v0.8.0-alpha.1-linux-aarch64
+tar -xzf rustdb-v0.9.0-alpha.1-linux-aarch64.tar.gz
+cd rustdb-v0.9.0-alpha.1-linux-aarch64
 ./install.sh
 ```
 
@@ -44,6 +44,9 @@ Extract the new archive, verify it, and run its `install.sh` with the same
 prefix. The known RustDB files are replaced; databases and query data are not
 touched.
 
+Imported HTTP Shell Profiles and server TLS/Token state live in the operating
+system user state directory and are not removed or replaced by `install.sh`.
+
 ## Uninstall
 
 From the extracted package:
@@ -57,6 +60,9 @@ An installed copy is also available at
 `PREFIX/share/rustdb/uninstall.sh`. Uninstallation removes only the known CLI
 and documentation files. It never removes database, input, Spill, or user
 configuration directories.
+
+The installed documentation also includes `HTTP-SHELL.md`,
+`HTTP-SHELL.zh-CN.md`, and the public `openapi-v1.yaml` contract.
 
 ## Platforms
 

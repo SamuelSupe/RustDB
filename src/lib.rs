@@ -8,6 +8,9 @@ mod datasource;
 mod engine;
 mod error;
 mod execution;
+mod external_source;
+mod http_read_only;
+pub mod http_shell;
 mod optimizer;
 mod prepared;
 mod runtime;
@@ -28,6 +31,8 @@ pub use engine::{
     Session, Transaction, TransactionAccessMode, TransactionOptions, TransactionPreparedStatement,
 };
 pub use error::{Error, Result};
+pub use external_source::ExternalSourceDefinition;
+pub use http_read_only::HttpReadOnlyPolicy;
 pub use prepared::{ParameterValue, PreparedStatement};
 pub use runtime::{OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot, RecordBatchStream};
 

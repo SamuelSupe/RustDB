@@ -24,6 +24,74 @@ rustdb -f report.sql --format csv --csv-null '\N'
 Formats are `table`, `csv`, and `jsonl`. `--metrics` writes execution metrics
 to stderr after the streamed result has been consumed.
 
+## Read-only HTTPS Shell
+
+Start one TLS server for one persistent Native database. Loopback is the safe
+default; a non-loopback listener also requires its public HTTPS origin so the
+generated certificate has the correct identity:
+
+```sh
+rustdb serve --database /srv/rustdb/analytics
+
+rustdb serve \
+  --database /srv/rustdb/analytics \
+  --listen 0.0.0.0:7400 \
+  --advertise-url https://analytics.example.com:7400
+```
+
+The first start creates a local CA, a renewable server certificate, and a
+random Bearer Token. Stop the server, export its connection bundle, transfer
+the bundle through a trusted channel, and import it on the client:
+
+```sh
+rustdb profile export \
+  --database /srv/rustdb/analytics \
+  --output analytics.rustdb-profile
+rustdb profile import analytics.rustdb-profile --name analytics
+```
+
+Use the named Profile with the remote CLI. Interactive mode waits for each
+background Query; `-c` and `-f` are script-friendly and preserve the local
+renderers. Ctrl-C sends a best-effort cancellation request.
+
+```sh
+rustdb shell --profile analytics -c \
+  "SELECT region, count(*) FROM sales GROUP BY region" --format table
+rustdb shell --profile analytics -f report.sql --format csv >report.csv
+```
+
+The remote boundary is intentionally read-only. It accepts query, metadata,
+and explain statements over Native/system tables and server-local registered
+sources. It rejects DDL/DML, maintenance, uploads, direct `read_csv` or
+`read_parquet`, and remote source administration. See `docs/HTTP-SHELL.md` and
+`docs/openapi-v1.yaml` in the distribution for the lifecycle and public `/v1`
+contract.
+
+`serve` accepts result-retention controls independently of the engine Spill
+limits: `--result-directory`, `--result-ttl-secs`, `--result-global-limit`, and
+`--result-query-limit`. By default, completed results live for one hour; their
+total disk use is the smaller of 10 GiB and 10% of filesystem capacity, and one
+Query can use 25% of that total. The same command accepts `--s3-region`,
+`--s3-endpoint`, `--s3-path-style`, `--s3-allow-http`, and `--s3-anonymous`
+for server-local registered sources. Use HTTP only for trusted development
+endpoints and anonymous mode only for public objects.
+
+Persistent CSV/Parquet registrations are changed only on the server host while
+`rustdb serve` is stopped:
+
+```sh
+rustdb datasource add-parquet \
+  --database /srv/rustdb/analytics \
+  --name sales \
+  --location 's3://lake/sales/*.parquet'
+rustdb datasource list --database /srv/rustdb/analytics
+rustdb datasource refresh --database /srv/rustdb/analytics --name sales
+rustdb datasource remove --database /srv/rustdb/analytics --name sales
+```
+
+Registrations never store object-store credentials. Supply credentials to the
+server through its service account's default credential chain.
+
 ## Persistent Native database
 
 Use `--database` to open a local persistent database instead of an ephemeral
@@ -141,6 +209,9 @@ The most commonly adjusted options are:
 - `--spill-directory PATH`: query Spill root;
 - `--spill-engine-limit` and `--spill-query-limit`: hard Spill quotas;
 - `--runtime-filter-bytes 8MiB`: Join runtime-filter budget.
+
+For `serve`, result TTL/global/per-Query limits are separate from these local
+execution controls; see the HTTPS Shell section above.
 
 Sizes accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`.
 The same limits are available through `NativeStorageConfig` in the Rust API.

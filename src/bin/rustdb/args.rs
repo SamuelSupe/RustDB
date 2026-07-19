@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
+
+pub use super::operations::Operation;
 
 pub const HELP_ZH: &str = include_str!("help.zh-CN.txt");
 
@@ -22,29 +24,6 @@ pub enum PruningModeArg {
 pub struct NativeTableLimitArg {
     pub name: String,
     pub bytes: usize,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum Operation {
-    /// Explicitly migrate a v0.7 Native database to the WAL-enabled v0.8 format.
-    Migrate {
-        /// Native database directory to migrate.
-        database: PathBuf,
-    },
-    /// Create a verified Native backup in a local directory or S3 prefix.
-    Backup {
-        /// Native database directory to back up.
-        database: PathBuf,
-        /// Local directory, file:// directory, or s3:// object prefix.
-        destination: String,
-    },
-    /// Restore a verified local or S3 Native backup into a new database.
-    Restore {
-        /// Local directory, file:// directory, or s3:// backup prefix.
-        backup: String,
-        /// New local Native database directory.
-        database: PathBuf,
-    },
 }
 
 impl From<PruningModeArg> for rustdb::ParquetPruningMode {
@@ -207,7 +186,7 @@ pub struct Args {
     pub metrics: bool,
 }
 
-fn parse_bytes(input: &str) -> Result<usize, String> {
+pub(crate) fn parse_bytes(input: &str) -> Result<usize, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("memory size is empty".to_owned());

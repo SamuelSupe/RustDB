@@ -5,7 +5,7 @@ database-file-compatible with DuckDB.
 
 ## SQL support
 
-| Area | v0.8 alpha.1 development support |
+| Area | v0.9.0-alpha.1 support |
 | --- | --- |
 | Query shape | `SELECT`, non-recursive CTEs, non-LATERAL derived tables, recursive parenthesized set-expression trees |
 | Filtering | `WHERE`, three-valued Boolean logic, comparisons, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`, `LIKE`/`NOT LIKE` with `ESCAPE`, `IN` lists |
@@ -263,9 +263,25 @@ public Arrow boundary.
 
 Serializable isolation, predicate locks, savepoints, public time travel,
 `MERGE`/upsert, relational constraints, secondary indexes, recursive CTEs,
-LATERAL/UNNEST, nested LIST/STRUCT/MAP/JSON execution, replication, service
-protocols, and distributed execution are excluded from v0.8. ORC, Iceberg,
-JSON scan and persistent data-page caching are also outside this release.
+LATERAL/UNNEST, nested LIST/STRUCT/MAP/JSON execution, replication, and
+distributed execution are excluded from v0.9. ORC, Iceberg, JSON scan and
+persistent data-page caching are also outside this release.
+
+## Read-only HTTP Shell (v0.9)
+
+The optional `/v1` HTTP surface is a remote CLI Shell, not the embedded/local
+SQL API over HTTP. It supports authenticated capability negotiation, one
+background read-only Query, status, immutable JSON/NDJSON result pages,
+cancellation, and terminal deletion. Only `SELECT`/non-recursive `WITH`,
+`VALUES`, `SHOW`, `DESCRIBE`, `EXPLAIN`, and `EXPLAIN ANALYZE` are accepted;
+the server reads Native/system tables and server-local registered CSV/Parquet
+sources only. Authentication occurs before body or query-parameter parsing.
+
+Remote DDL/DML, transactions, maintenance, uploads, direct file functions,
+source administration, browser UI/CORS, multi-user identity, durable Query
+recovery, and a general full HTTP database API are deliberately excluded. See
+[http-shell.md](http-shell.md) and [openapi-v1.yaml](openapi-v1.yaml) for the
+complete operational and wire contract.
 
 S3 credentials come from the default credential chain or an application-owned
 in-memory provider. Secrets are not accepted in SQL or endpoint URLs. See

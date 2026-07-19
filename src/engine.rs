@@ -19,8 +19,8 @@ use crate::{
     catalog::PersistentCatalog,
     command::{ParsedStatement, SessionCommand, ViewTable},
     datasource::{
-        MetadataCache, NativeSegmentTable, NativeSystemTable, RegisteredCsvTable,
-        RegisteredParquetTable, SystemTableKind,
+        MetadataCache, NativeSystemTable, RegisteredCsvTable, RegisteredParquetTable,
+        SystemTableKind,
     },
     runtime::{
         ComputeRuntime, GlobalComputeScheduler, MemoryPool, QueryContext, QueryControl,
@@ -133,29 +133,11 @@ impl Engine {
         let metadata_cache = MetadataCache::new(config.metadata_cache_bytes);
         let persistent_catalog = match database.as_ref() {
             Some(database) => {
-                let entries = database
-                    .table_snapshots()
-                    .into_iter()
-                    .map(|(name, snapshot)| {
-                        let provider = NativeSegmentTable::new(
-                            database.path(),
-                            snapshot,
-                            &config,
-                            metadata_cache.clone(),
-                        );
-                        TableEntry::new(name, Arc::new(provider))
-                    })
-                    .chain(database.view_definitions().into_iter().map(|(name, view)| {
-                        let provider = ViewTable::persistent(
-                            name.clone(),
-                            view.sql().to_owned(),
-                            view.schema(),
-                            config.clone(),
-                            metadata_cache.clone(),
-                        );
-                        TableEntry::new(name, Arc::new(provider))
-                    }))
-                    .collect::<Vec<_>>();
+                let entries = external_source_api::persistent_entries(
+                    &config,
+                    metadata_cache.clone(),
+                    database,
+                )?;
                 PersistentCatalog::new(database.catalog_generation(), entries)?
             }
             None => PersistentCatalog::default(),
@@ -509,10 +491,26 @@ impl Session {
         self.execute_parsed(parsed, parse_started.elapsed()).await
     }
 
+    pub(super) async fn execute_http_read_only_direct(&self, sql: &str) -> Result<QueryResult> {
+        let parse_started = Instant::now();
+        let parsed = crate::command::parse(sql)?;
+        self.execute_parsed_mode(parsed, parse_started.elapsed(), true)
+            .await
+    }
+
     async fn execute_parsed(
         &self,
         parsed: ParsedStatement,
         parse_time: Duration,
+    ) -> Result<QueryResult> {
+        self.execute_parsed_mode(parsed, parse_time, false).await
+    }
+
+    async fn execute_parsed_mode(
+        &self,
+        parsed: ParsedStatement,
+        parse_time: Duration,
+        http_read_only: bool,
     ) -> Result<QueryResult> {
         let admission_started = Instant::now();
         let permit = self.acquire_query_permit().await?;
@@ -524,8 +522,14 @@ impl Session {
                     .await
             }
             ParsedStatement::Query(statement) => {
-                self.execute_query(*statement, permit, admission_wait, parse_time)
-                    .await
+                self.execute_query(
+                    *statement,
+                    permit,
+                    admission_wait,
+                    parse_time,
+                    http_read_only,
+                )
+                .await
             }
         }
     }
@@ -536,10 +540,14 @@ impl Session {
         permit: OwnedSemaphorePermit,
         admission_wait: Duration,
         parse_time: Duration,
+        http_read_only: bool,
     ) -> Result<QueryResult> {
         // Start query accounting before file-function schema discovery so the
         // reported elapsed time includes planning and metadata preparation.
         let context = self.query_context()?;
+        if http_read_only {
+            context.enable_http_read_only();
+        }
         context.metrics.record_query_admission_wait(admission_wait);
         context.metrics.record_sql_parse_time(parse_time);
         let plan = match self
@@ -580,10 +588,28 @@ impl Session {
         &self,
         statement: sqlparser::ast::Statement,
     ) -> Result<QueryResult> {
+        self.execute_prepared_mode(statement, false).await
+    }
+
+    pub(crate) async fn execute_prepared_http_read_only(
+        &self,
+        statement: sqlparser::ast::Statement,
+    ) -> Result<QueryResult> {
+        self.execute_prepared_mode(statement, true).await
+    }
+
+    async fn execute_prepared_mode(
+        &self,
+        statement: sqlparser::ast::Statement,
+        http_read_only: bool,
+    ) -> Result<QueryResult> {
         let admission_started = Instant::now();
         let permit = self.acquire_query_permit().await?;
         let admission_wait = admission_started.elapsed();
         let context = self.query_context()?;
+        if http_read_only {
+            context.enable_http_read_only();
+        }
         context.metrics.record_query_admission_wait(admission_wait);
         let plan = match self
             .prepare_ast_for_query(statement, Some(Arc::clone(&context)))
@@ -1128,6 +1154,11 @@ impl QueryResult {
         }
     }
 
+    pub(crate) async fn cancel_and_quiesce(&mut self) -> Result<()> {
+        self.context.cancel();
+        self.context.cleanup_spill_after_tasks().await
+    }
+
     pub fn metrics(&self) -> QueryMetrics {
         self.context.metrics.clone()
     }
@@ -1326,6 +1357,8 @@ mod tests;
 mod copy;
 #[path = "engine/copy_sink.rs"]
 mod copy_sink;
+#[path = "engine/external_source.rs"]
+mod external_source_api;
 #[path = "engine/maintenance.rs"]
 mod maintenance;
 #[path = "engine/memory_snapshot.rs"]

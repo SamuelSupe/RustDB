@@ -9,9 +9,8 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use super::{QueryResult, Session, query_result};
 use crate::{
-    Error, Result, TableEntry,
+    Error, Result,
     command::{NativeWriteCommand, NativeWriteKind},
-    datasource::NativeSegmentTable,
     runtime::{
         BatchEnvelope, MemoryBatchStream, QueryContext, SpillIoPool, boxed_memory_batch_stream,
     },
@@ -329,12 +328,19 @@ pub(super) fn install_native_commit(
             generation,
         );
     }
-    let entries = native_entries(engine, database);
-    if let Err(error) = engine
-        .inner
-        .persistent_catalog
-        .publish(previous_generation, entries)
-    {
+    let installed = super::external_source_api::persistent_entries(
+        &engine.inner.config,
+        engine.inner.metadata_cache.clone(),
+        database,
+    )
+    .and_then(|entries| {
+        engine
+            .inner
+            .persistent_catalog
+            .publish(previous_generation, entries)
+            .map(|_| ())
+    });
+    if let Err(error) = installed {
         engine.inner.native_poisoned.store(true, Ordering::Release);
         return Err(Error::native_commit_post_commit_failure(
             database.path(),
@@ -483,33 +489,4 @@ pub(super) fn abort_prepared<T>(
             format!("{error}; prepared native snapshot cleanup failed: {cleanup}"),
         )),
     }
-}
-
-fn native_entries(
-    engine: &super::Engine,
-    database: &crate::storage::NativeDatabase,
-) -> Vec<TableEntry> {
-    database
-        .table_snapshots()
-        .into_iter()
-        .map(|(name, snapshot)| {
-            let provider = NativeSegmentTable::new(
-                database.path(),
-                snapshot,
-                &engine.inner.config,
-                engine.inner.metadata_cache.clone(),
-            );
-            TableEntry::new(name, Arc::new(provider))
-        })
-        .chain(database.view_definitions().into_iter().map(|(name, view)| {
-            let provider = crate::command::ViewTable::persistent(
-                name.clone(),
-                view.sql().to_owned(),
-                view.schema(),
-                engine.inner.config.clone(),
-                engine.inner.metadata_cache.clone(),
-            );
-            TableEntry::new(name, Arc::new(provider))
-        }))
-        .collect()
 }

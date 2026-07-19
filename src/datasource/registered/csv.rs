@@ -35,6 +35,62 @@ impl RegisteredCsvTable {
         Self::from_discovered(locations, options, config, discovered, None)
     }
 
+    pub(crate) fn from_persisted(
+        locations: Vec<String>,
+        refresh_options: CsvOptions,
+        config: &EngineConfig,
+        schema: SchemaRef,
+        physical_schema: SchemaRef,
+        has_header: bool,
+    ) -> Self {
+        let schema_was_inferred = refresh_options.schema.is_none();
+        let mut query_options = refresh_options.clone();
+        query_options.schema = Some(physical_schema);
+        query_options.header = if has_header {
+            CsvHeader::Present
+        } else {
+            CsvHeader::Absent
+        };
+        Self {
+            id: next_provider_id(),
+            locations: locations.into(),
+            refresh_options,
+            query_options,
+            schema_was_inferred,
+            config: config.clone(),
+            schema,
+            statistics: TableStatistics::default(),
+        }
+    }
+
+    pub(crate) async fn refresh_persisted(
+        locations: Vec<String>,
+        options: CsvOptions,
+        config: &EngineConfig,
+        previous_schema: &arrow::datatypes::Schema,
+    ) -> Result<Self> {
+        let discovered = CsvTable::try_new(locations.clone(), options.clone(), config).await?;
+        Self::from_discovered(
+            locations,
+            options,
+            config,
+            discovered,
+            Some(previous_schema),
+        )
+    }
+
+    pub(crate) fn persisted_state(&self) -> (SchemaRef, SchemaRef, bool) {
+        (
+            Arc::clone(&self.schema),
+            self.query_options
+                .schema
+                .as_ref()
+                .expect("registered CSV has a physical schema")
+                .clone(),
+            self.query_options.header == CsvHeader::Present,
+        )
+    }
+
     fn from_discovered(
         locations: Vec<String>,
         refresh_options: CsvOptions,

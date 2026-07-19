@@ -74,6 +74,9 @@ for file in \
   share/doc/rustdb/CLI.zh-CN.md \
   share/doc/rustdb/INSTALL.md \
   share/doc/rustdb/INSTALL.zh-CN.md \
+  share/doc/rustdb/HTTP-SHELL.md \
+  share/doc/rustdb/HTTP-SHELL.zh-CN.md \
+  share/doc/rustdb/openapi-v1.yaml \
   share/rustdb/VERSION \
   share/rustdb/uninstall.sh
 do

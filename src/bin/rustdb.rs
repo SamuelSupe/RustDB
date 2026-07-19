@@ -1,11 +1,19 @@
+#[path = "rustdb/admin.rs"]
+mod admin;
 #[path = "rustdb/args.rs"]
 mod args;
 #[path = "rustdb/config.rs"]
 mod config;
+#[path = "rustdb/operations.rs"]
+mod operations;
 #[path = "rustdb/output.rs"]
 mod output;
+#[path = "rustdb/remote.rs"]
+mod remote;
 #[path = "rustdb/repl.rs"]
 mod repl;
+#[path = "rustdb/server_config.rs"]
+mod server_config;
 #[path = "rustdb/sql_input.rs"]
 mod sql_input;
 
@@ -17,7 +25,8 @@ use rustdb::{Engine, EngineConfig, Error, Result};
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,rustdb::http_shell=info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -47,7 +56,7 @@ fn main() {
 async fn run(args: Args) -> Result<()> {
     if let Some(operation) = &args.operation {
         ensure_standalone_operation(&args)?;
-        return run_operation(operation, config::engine_config(&args)).await;
+        return run_operation(operation, &args, config::engine_config(&args)).await;
     }
 
     let config = config::engine_config(&args);
@@ -82,7 +91,7 @@ fn ensure_standalone_operation(args: &Args) -> Result<()> {
     Ok(())
 }
 
-async fn run_operation(operation: &Operation, config: EngineConfig) -> Result<()> {
+async fn run_operation(operation: &Operation, global: &Args, config: EngineConfig) -> Result<()> {
     match operation {
         Operation::Migrate { database } => {
             let migration = Engine::migrate(database)?;
@@ -115,6 +124,10 @@ async fn run_operation(operation: &Operation, config: EngineConfig) -> Result<()
             Engine::restore_from_location(backup, database, config).await?;
             println!("database restored: {}", database.display());
         }
+        Operation::Serve(args) => return admin::serve_database(args.as_ref(), global).await,
+        Operation::Shell(args) => return remote::run(args).await,
+        Operation::Profile { command } => return admin::profile(command),
+        Operation::Datasource { command } => return admin::datasource(command, config).await,
     }
     Ok(())
 }

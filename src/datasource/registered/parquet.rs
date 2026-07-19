@@ -59,6 +59,60 @@ impl RegisteredParquetTable {
         ))
     }
 
+    pub(crate) fn from_persisted(
+        locations: Vec<String>,
+        refresh_options: ParquetOptions,
+        config: &EngineConfig,
+        metadata_cache: MetadataCache,
+        schema: SchemaRef,
+        physical_schema: SchemaRef,
+    ) -> Result<Self> {
+        let schema_mode = refresh_options.effective_schema_mode()?;
+        Ok(Self {
+            id: next_provider_id(),
+            locations: locations.into(),
+            refresh_options,
+            config: config.clone(),
+            metadata_cache,
+            schema_mode,
+            schema,
+            physical_schema,
+            statistics: TableStatistics::default(),
+        })
+    }
+
+    pub(crate) async fn refresh_persisted(
+        locations: Vec<String>,
+        options: ParquetOptions,
+        config: &EngineConfig,
+        metadata_cache: MetadataCache,
+        previous_schema: &Schema,
+        previous_physical_schema: &Schema,
+    ) -> Result<Self> {
+        let schema_mode = options.effective_schema_mode()?;
+        let discovered = ParquetTable::try_new_with_cache(
+            locations.clone(),
+            options.clone(),
+            config,
+            metadata_cache.clone(),
+        )
+        .await?;
+        Ok(Self::from_discovered(
+            locations,
+            options,
+            config,
+            metadata_cache,
+            schema_mode,
+            discovered,
+            Some(previous_schema),
+            Some(previous_physical_schema),
+        ))
+    }
+
+    pub(crate) fn persisted_state(&self) -> (SchemaRef, SchemaRef) {
+        (Arc::clone(&self.schema), Arc::clone(&self.physical_schema))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn from_discovered(
         locations: Vec<String>,

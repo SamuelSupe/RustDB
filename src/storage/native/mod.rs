@@ -15,6 +15,7 @@ mod commit;
 mod database_open;
 mod delete_writer;
 mod disk_budget;
+mod external_sources;
 mod io;
 mod lock;
 mod manifest;
@@ -124,6 +125,8 @@ struct NativeState {
     catalog: manifest::CatalogState,
     tables: BTreeMap<String, Arc<table::TableSnapshot>>,
     views: BTreeMap<String, Arc<view::NativeView>>,
+    external_source_generation: u64,
+    external_sources: BTreeMap<String, crate::external_source::StoredExternalSource>,
     retired: Vec<RetiredSnapshot>,
 }
 
@@ -241,6 +244,7 @@ impl NativeDatabase {
         let catalog = manifest::load(&root, marker.database_id())?;
         let tables = load_tables(&root, marker.database_id(), &catalog)?;
         let views = load_views(&root, &catalog)?;
+        let external_sources = external_sources::load(&root, marker.database_id())?;
         table::recover_orphans(&root, marker.database_id(), &tables)?;
         if let Some(wal) = &wal {
             wal.abort_recovered_transactions()?;
@@ -257,6 +261,8 @@ impl NativeDatabase {
                 catalog,
                 tables,
                 views,
+                external_source_generation: external_sources.generation,
+                external_sources: external_sources.sources,
                 retired: Vec::new(),
             }),
             _lock: database_lock,
@@ -308,6 +314,96 @@ impl NativeDatabase {
             .collect()
     }
 
+    pub(crate) fn external_source_definitions(
+        &self,
+    ) -> Vec<crate::external_source::StoredExternalSource> {
+        self.state
+            .lock()
+            .external_sources
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn external_source_snapshot(
+        &self,
+        name: &str,
+    ) -> Option<(u64, crate::external_source::StoredExternalSource)> {
+        let state = self.state.lock();
+        state
+            .external_sources
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .map(|source| (state.external_source_generation, source))
+    }
+
+    pub(crate) fn add_external_source(
+        &self,
+        source: crate::external_source::StoredExternalSource,
+    ) -> Result<()> {
+        let mut state = self.state.lock();
+        let name = source.name().to_owned();
+        validate_external_source_target(self.path(), &state, &name, false)?;
+        let mut next = state.external_sources.clone();
+        next.insert(name, source);
+        let generation = external_sources::store(
+            self.path(),
+            self.database_id(),
+            state.external_source_generation,
+            &next,
+        )?;
+        state.external_source_generation = generation;
+        state.external_sources = next;
+        Ok(())
+    }
+
+    pub(crate) fn replace_external_source(
+        &self,
+        expected_generation: u64,
+        source: crate::external_source::StoredExternalSource,
+    ) -> Result<()> {
+        let mut state = self.state.lock();
+        if state.external_source_generation != expected_generation {
+            return Err(Error::Catalog(format!(
+                "external sources changed while refreshing '{}': expected generation {expected_generation}, found {}",
+                source.name(),
+                state.external_source_generation
+            )));
+        }
+        let name = source.name().to_owned();
+        validate_external_source_target(self.path(), &state, &name, true)?;
+        let mut next = state.external_sources.clone();
+        next.insert(name, source);
+        let generation = external_sources::store(
+            self.path(),
+            self.database_id(),
+            state.external_source_generation,
+            &next,
+        )?;
+        state.external_source_generation = generation;
+        state.external_sources = next;
+        Ok(())
+    }
+
+    pub(crate) fn remove_external_source(&self, name: &str) -> Result<bool> {
+        let mut state = self.state.lock();
+        let normalized = name.to_ascii_lowercase();
+        if !state.external_sources.contains_key(&normalized) {
+            return Ok(false);
+        }
+        let mut next = state.external_sources.clone();
+        next.remove(&normalized);
+        let generation = external_sources::store(
+            self.path(),
+            self.database_id(),
+            state.external_source_generation,
+            &next,
+        )?;
+        state.external_source_generation = generation;
+        state.external_sources = next;
+        Ok(true)
+    }
+
     pub(crate) fn catalog_object_infos(&self) -> Vec<NativeCatalogObjectInfo> {
         let state = self.state.lock();
         state
@@ -326,6 +422,16 @@ impl NativeDatabase {
                         name: name.clone(),
                         object_type: "VIEW",
                         schema: view.schema(),
+                    }),
+            )
+            .chain(
+                state
+                    .external_sources
+                    .iter()
+                    .map(|(name, source)| NativeCatalogObjectInfo {
+                        name: name.clone(),
+                        object_type: "EXTERNAL TABLE",
+                        schema: source.definition().schema(),
                     }),
             )
             .collect()
@@ -412,6 +518,7 @@ impl NativeDatabase {
         source_bytes: u64,
     ) -> Result<NativeWritePlan> {
         self.wal()?;
+        self.reject_external_target(name)?;
         let schema = crate::catalog_name::schema_of(name);
         if !self.schema_exists(schema) {
             return Err(Error::Catalog(format!("schema '{schema}' does not exist")));
@@ -438,6 +545,7 @@ impl NativeDatabase {
         source_bytes: u64,
     ) -> Result<NativeWritePlan> {
         self.wal()?;
+        self.reject_external_target(name)?;
         write_plan::plan_from_snapshot(
             self,
             name,
@@ -634,7 +742,10 @@ impl NativeDatabase {
                 "schema '{target_schema}' does not exist"
             )));
         }
-        if state.tables.contains_key(&new_name) || state.views.contains_key(&new_name) {
+        if state.tables.contains_key(&new_name)
+            || state.views.contains_key(&new_name)
+            || state.external_sources.contains_key(&new_name)
+        {
             return Err(Error::Catalog(format!(
                 "table or view '{new_name}' already exists"
             )));
@@ -671,9 +782,9 @@ impl NativeDatabase {
                 "schema '{schema_name}' does not exist"
             )));
         }
-        if state.tables.contains_key(&name) {
+        if state.tables.contains_key(&name) || state.external_sources.contains_key(&name) {
             return Err(Error::Catalog(format!(
-                "cannot replace table '{name}' with a view"
+                "cannot replace table or external source '{name}' with a view"
             )));
         }
         let previous = state.views.get(&name).cloned();
@@ -784,6 +895,7 @@ impl NativeDatabase {
             .tables
             .keys()
             .chain(state.views.keys())
+            .chain(state.external_sources.keys())
             .any(|object| crate::catalog_name::schema_of(object) == name)
         {
             return Err(Error::Catalog(format!("schema '{name}' is not empty")));
@@ -820,6 +932,16 @@ impl NativeDatabase {
 
     pub(crate) fn drain_retired(&self) -> Result<()> {
         self.vacuum(None).map(|_| ())
+    }
+
+    fn reject_external_target(&self, name: &str) -> Result<()> {
+        let name = name.to_ascii_lowercase();
+        if self.state.lock().external_sources.contains_key(&name) {
+            return Err(Error::Catalog(format!(
+                "external source '{name}' is read-only and cannot be a Native write target"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn vacuum(&self, table_name: Option<&str>) -> Result<u64> {
@@ -875,6 +997,47 @@ impl NativeDatabase {
             None => Ok(removed),
         }
     }
+}
+
+fn validate_external_source_target(
+    path: &Path,
+    state: &NativeState,
+    name: &str,
+    replacing: bool,
+) -> Result<()> {
+    let normalized = crate::catalog_name::local(name, "external source")?.to_ascii_lowercase();
+    if normalized != name {
+        return Err(Error::InvalidArgument(format!(
+            "external source name '{name}' must be normalized"
+        )));
+    }
+    let schema = crate::catalog_name::schema_of(name);
+    if !state.catalog.schemas().contains(schema) {
+        return Err(Error::Catalog(format!("schema '{schema}' does not exist")));
+    }
+    if state.tables.contains_key(name) || state.views.contains_key(name) {
+        return Err(Error::Catalog(format!(
+            "catalog object '{name}' already exists"
+        )));
+    }
+    if replacing != state.external_sources.contains_key(name) {
+        let message = if replacing {
+            format!("external source '{name}' does not exist")
+        } else {
+            format!("external source '{name}' already exists")
+        };
+        return Err(Error::Catalog(message));
+    }
+    for location in match state.external_sources.get(name) {
+        Some(crate::external_source::StoredExternalSource::Csv { locations, .. })
+        | Some(crate::external_source::StoredExternalSource::Parquet { locations, .. }) => {
+            locations.as_slice()
+        }
+        None => &[],
+    } {
+        external_sources::validate_location(path, location)?;
+    }
+    Ok(())
 }
 
 fn retired_storage_bytes(root: &Path, state: &NativeState, table_id: &str) -> Result<u64> {

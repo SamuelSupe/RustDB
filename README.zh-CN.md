@@ -2,13 +2,13 @@
 
 # RustDB
 
-**面向 CSV、Parquet、S3 与本地持久化分析的嵌入式单机 OLAP 引擎。**
+**面向 CSV、Parquet、S3、Native 持久化分析与安全只读 HTTPS Shell 的单机 OLAP 引擎。**
 
-[English](README.md) · [架构](docs/architecture.md) · [SQL 兼容范围](docs/compatibility.md) · [CLI 帮助](packaging/dist/CLI.zh-CN.md)
+[English](README.md) · [HTTP Shell](docs/http-shell.zh-CN.md) · [架构](docs/architecture.md) · [SQL 兼容范围](docs/compatibility.md) · [CLI 帮助](packaging/dist/CLI.zh-CN.md)
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-0.8.0--alpha.1-orange)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.9.0--alpha.1-orange)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -20,7 +20,9 @@
 
 RustDB 可以直接查询本地磁盘或 S3-compatible 对象存储中的 CSV 和
 Parquet，也可以把数据批量导入不可变分段的 Native 数据库，用于重复的本地分析。
-Rust API 与 `rustdb` CLI 都以 Apache Arrow `RecordBatch` 流式返回结果。
+Rust API 与本地 `rustdb` CLI 都以 Apache Arrow `RecordBatch` 流式返回结果。v0.9
+还可通过只启用 TLS 的只读 HTTP Shell 服务一个 Native 数据库，官方远程 CLI 继续
+提供 `table`、`csv` 和 `jsonl` 输出。
 
 SQL Binder、优化器、向量化算子、调度器、内存记账、Native 存储与 Spill
 均由本项目实现；运行时不依赖 DataFusion，项目代码禁止使用 `unsafe`。
@@ -37,16 +39,17 @@ SQL Binder、优化器、向量化算子、调度器、内存记账、Native 存
   恢复、快照隔离、维护，以及经过校验的本地/S3 备份与恢复。
 - **资源受控执行**：多 lane pipeline、引擎/查询内存预算、有界队列、取消，
   以及受配额和磁盘余量治理的 Spill。
-- **默认嵌入式**：提供精简、聚焦的外层 Rust API 与流式 CLI，无需常驻服务进程。
+- **默认嵌入，按需远程**：既可使用精简 Rust API 和本地流式 CLI，也可通过认证的
+  只读 HTTPS Shell 暴露一个 Native 数据库。
 
 ## 能力概览
 
-| 领域 | v0.8 alpha 当前范围 |
+| 领域 | v0.9 alpha 当前范围 |
 | --- | --- |
 | 数据格式 | CSV、gzip CSV、zstd CSV、Parquet |
 | 存储 | 本地文件系统、S3/MinIO、本地持久化 Native 数据库 |
-| 接口 | 嵌入式 Rust API、`rustdb` CLI/REPL |
-| 输出 | 流式 Apache Arrow `RecordBatch` |
+| 接口 | 嵌入式 Rust API、本地 CLI/REPL、只读 HTTPS Shell 与远程 CLI |
+| 输出 | 本地流式 Arrow；远程分页 JSON/NDJSON；CLI 渲染 `table`/`csv`/`jsonl` |
 | 执行 | 向量化、多 lane、内存记账、支持 Spill |
 | SQL | 面向 TPC-H 的分析 SQL、Join、聚合、窗口、集合运算、参数化查询 |
 | 安全 | 项目代码使用 `#![forbid(unsafe_code)]` |
@@ -111,6 +114,48 @@ rustdb \
 ```
 
 AWS、匿名访问和 MinIO 配置请参阅 [S3 配置](docs/s3.md)。
+
+### 只读服务 Native 数据库
+
+一个 TLS 服务进程只打开一个 Native 数据库。默认监听回环地址；远程监听必须显式
+提供客户端可达的 HTTPS advertise URL。
+
+```sh
+rustdb datasource add-parquet \
+  --database /srv/rustdb/analytics \
+  --name sales \
+  --location 's3://lake/sales/*.parquet'
+rustdb serve --database /srv/rustdb/analytics
+
+rustdb serve \
+  --database /srv/rustdb/analytics \
+  --listen 0.0.0.0:7400 \
+  --advertise-url https://analytics.example.com:7400 \
+  --result-ttl-secs 3600 \
+  --result-global-limit 10GiB \
+  --result-query-limit 2GiB
+```
+
+首次启动会生成本地 CA、可续签服务端证书和随机 Bearer Token。停止服务并导出
+Profile 包，通过可信渠道传输，在客户端导入后即可保留原有 CLI 使用体验：
+
+```sh
+rustdb profile export \
+  --database /srv/rustdb/analytics \
+  --output analytics.rustdb-profile
+rustdb profile import analytics.rustdb-profile --name analytics
+rustdb shell --profile analytics -c \
+  "SELECT region, count(*) FROM sales GROUP BY region" --format table
+rustdb shell --profile analytics -f report.sql --format csv >report.csv
+```
+
+远程 SQL 刻意比本地 SQL 更窄：只允许查询、元数据和 Explain 语句；DDL/DML、维护、
+上传、直接文件表函数及远程数据源管理都会被拒绝。持久化 CSV/Parquet 源只能在服务
+停止时通过本地 `rustdb datasource` 管理。`serve` 可独立配置结果保留：
+`--result-directory`、`--result-ttl-secs`、`--result-global-limit`、
+`--result-query-limit`；服务端本地注册源还可使用 `--s3-region`、`--s3-endpoint`、
+`--s3-path-style`、`--s3-allow-http`、`--s3-anonymous`。详见
+[HTTP Shell 中文指南](docs/http-shell.zh-CN.md)和 [OpenAPI 3.1 协议](docs/openapi-v1.yaml)。
 
 ## 嵌入 RustDB
 
@@ -236,7 +281,9 @@ Engine 启动时只回收超过 TTL 且可验证、未被锁定的崩溃残留�
 
 ```mermaid
 flowchart LR
-    SQL["SQL / 参数"] --> Binder["Binder + Session Catalog"]
+    Remote["远程 CLI / HTTPS v1"] --> Guard["TLS + Token + 只读策略"]
+    Guard --> SQL["SQL / 参数"]
+    SQL --> Binder["Binder + Session Catalog"]
     Binder --> Optimizer["规则优化器 + 统计信息"]
     Optimizer --> Pipelines["向量化物理 Pipeline"]
     Local["本地文件"] --> Scan["CSV / Parquet / Native Scan"]
@@ -259,6 +306,9 @@ lease，通过有界队列传递。所有查询 worker 属于同一个可取消 
 - v0.8 发布候选已完成一次 OrbStack 聚焦可靠性门禁，包括真实 MinIO 上的
   CSV/Parquet COPY 与 Native 备份恢复往返；详见[验收约定](docs/acceptance.md)
   和[发行说明](docs/releases/v0.8.0-alpha.1.md)。
+- v0.9 发行门禁增加一次完整 HTTP Shell 正确性运行，覆盖 TLS/Profile 初始化、
+  认证、只读策略、Query 生命周期、分页、取消、配额、清理和三种 CLI 输出；不新增
+  性能阈值或长时间 soak。
 - [`benchmarks/tpch`](benchmarks/tpch) 保留 TPC-H Q1-Q22 查询覆盖。
 - v0.7 ClickBench 功能门禁在 4 CPU / 16 GiB 容器配置下运行 43 条官方查询一次。
 - 已保留的 100 万行运行完成 **43/43 条查询**，证据见
@@ -269,8 +319,9 @@ lease，通过有界队列传递。所有查询 worker 属于同一个可取消 
 
 ## 当前边界
 
-可串行化隔离、savepoint、`MERGE`/upsert、约束、索引、公开 time travel、服务
-协议、分布式执行以及 DuckDB SQL/数据库文件兼容不属于 v0.8。JSON/ORC/Iceberg
+可串行化隔离、savepoint、`MERGE`/upsert、约束、索引、公开 time travel、分布式
+执行以及 DuckDB SQL/数据库文件兼容不属于 v0.9。HTTP 表面只是只读远程 Shell，
+不是写入 API、浏览器 UI、多用户服务、Session 协议或生成式 SDK。JSON/ORC/Iceberg
 Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` 时，结果顺序
 不作保证。
 
@@ -281,6 +332,8 @@ Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` �
 | [架构](docs/architecture.md) | Pipeline、调度、内存、裁剪、Native 存储与 Spill |
 | [兼容范围](docs/compatibility.md) | SQL、类型、格式和明确限制 |
 | [CLI 中文帮助](packaging/dist/CLI.zh-CN.md) / [English](packaging/dist/CLI.md) | 命令、输出、资源和 S3 参数 |
+| [HTTP Shell 中文指南](docs/http-shell.zh-CN.md) / [English](docs/http-shell.md) | TLS、Profile、只读 SQL、Query 生命周期和运维 |
+| [OpenAPI v1](docs/openapi-v1.yaml) | 公开、版本化 HTTP 协议 |
 | [安装中文说明](packaging/dist/INSTALL.zh-CN.md) / [English](packaging/dist/INSTALL.md) | 二进制包安装与卸载 |
 | [S3 与 MinIO](docs/s3.md) | 凭证、endpoint 和对象存储行为 |
 | [故障排查](docs/troubleshooting.md) | 资源、Spill、损坏和输入错误 |
@@ -289,6 +342,8 @@ Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` �
 | [v0.7 迁移](docs/migration-v0.7.md) | 历史执行内核和 benchmark 变化 |
 | [v0.8 迁移](docs/migration-v0.8.md) | WAL 格式、显式数据库迁移与事务 API |
 | [v0.8 路线图](docs/roadmap-v0.8.md) | Native v3、DML/DDL、COPY/维护与 SQL/时间阶段 |
+| [v0.9 发行说明](docs/releases/v0.9.0-alpha.1.md) | 只读 HTTPS Shell 与发布边界 |
+| [v0.9 迁移](docs/migration-v0.9.md) | 升级、Profile、服务状态和回滚说明 |
 
 ## 开发
 
@@ -297,6 +352,9 @@ Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` �
 ```sh
 scripts/ci/orbstack.sh all
 ```
+
+该发行门禁有意排除专用的低内存 Spill 压力用例；需要诊断该执行路径时，再运行
+`scripts/ci/orbstack.sh test`。
 
 也可以执行聚焦检查：
 

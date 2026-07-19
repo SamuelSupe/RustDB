@@ -24,6 +24,60 @@ Native 数据库：
 v0.8 Native 数据库使用校验和 WAL 和快照隔离事务。SQL 支持 BEGIN、COMMIT、
 ROLLBACK；提交前必须消费完或丢弃事务内的所有流式结果。
 
+v0.9 只读 HTTPS Shell：
+  serve --database <路径>            前台启动单个 Native 数据库的 HTTPS 查询服务
+        [--config <TOML>]             服务配置，当前目录有 rustdb.toml 时自动读取
+        [--listen <IP:端口>]          默认 127.0.0.1:7400
+        [--advertise-url <HTTPS URL>] 非回环监听时必填的客户端可访问地址
+        [--state-root <路径>]          CA、服务证书、Token 和连接包的状态根目录
+        [--result-directory <路径>]    后台查询结果的临时持久化目录
+        [--result-ttl-secs <秒>]       已完成查询结果的保留时间，默认 3600
+        [--result-global-limit <大小>] 全部已保留结果的总磁盘配额
+        [--result-query-limit <大小>]  单个已保留结果的磁盘配额
+        [--max-running <数量>]         最大同时执行查询数
+        [--max-queued <数量>]          最大排队查询数
+        [--max-query-time-secs <秒>] 服务端单查询时间上限
+        [--memory-limit <大小>]        服务查询内存上限
+        [--threads <数量>]             计算工作线程数
+        [--s3-region <区域>]            服务端 AWS Region 覆盖
+        [--s3-endpoint <URL>]           服务端 S3-compatible endpoint 覆盖
+        [--s3-path-style]               服务端强制使用 S3 path-style 请求
+        [--s3-allow-http]               服务端允许明文 S3 HTTP，仅限可信开发环境
+        [--s3-anonymous]                服务端 S3 请求不签名，仅用于公开对象
+
+  shell --profile <名称>               通过已导入 Profile 连接远程 HTTPS Shell
+        [-c <SQL> | -f <文件>]         执行 SQL 文本或文件，两者都不指定时进入交互模式
+        [--format <table|csv|jsonl>]   本地输出格式，默认 table
+        [--csv-null <文本>]            CSV 输出中的 NULL 文本
+        [--metrics]                   查询结束后输出服务端指标
+        [--timeout-ms <毫秒>]          请求不超过服务端上限的较短超时
+
+  profile import <连接包> --name <名称>
+                                      通过可信离线渠道导入 CA、Token 和服务地址
+  profile export --database <路径> --output <连接包>
+                                      服务停止时导出连接包
+  profile rotate-token --database <路径>
+                                      服务停止时轮换唯一 Bearer Token
+
+持久外部数据源：
+  datasource add-csv --database <路径> --name <名称> --location <URI> [--location <URI> ...]
+        [--header <auto|present|absent>]
+        [--compression <auto|none|gzip|zstd>] [--delimiter <字符>]
+  datasource add-parquet --database <路径> --name <名称> --location <URI> [--location <URI> ...]
+        [--schema-mode <strict|union|safe-widening>] [--hive-partitioning]
+  datasource list --database <路径>
+  datasource refresh --database <路径> --name <名称>
+  datasource remove --database <路径> --name <名称>
+
+HTTP Shell 安全边界：
+  - 所有网络连接强制 TLS；非回环监听必须显式设置 --advertise-url。
+  - 客户端只通过命名 Profile 读取 CA 和 Bearer Token，不接受命令行明文 Token。
+  - 远程 SQL 仅允许 SELECT/WITH/VALUES/SHOW/DESCRIBE/EXPLAIN/EXPLAIN ANALYZE；拒绝
+    DDL、DML、事务、维护和数据源管理。
+  - 远程 SQL 拒绝 read_csv/read_parquet 直接路径，只能读取 Native 表、
+    系统表和服务端本地预先持久注册的 CSV/Parquet 数据源。
+  - 请先停止 serve 再执行 profile 修改或 datasource 管理。
+
 执行资源：
       --memory-limit <大小>           查询内存上限，例如 512MiB、2GiB
       --threads <数量>                计算工作线程数
@@ -80,6 +134,13 @@ S3/MinIO：
   rustdb restore ./warehouse-backup ./warehouse-restored
   rustdb --s3-region us-east-1 -c \
     "SELECT * FROM read_parquet('s3://bucket/events/*.parquet') LIMIT 10"
+  rustdb datasource add-parquet --database ./warehouse --name events \
+    --location 's3://bucket/events/*.parquet' --schema-mode safe-widening
+  rustdb serve --database ./warehouse
+  rustdb profile export --database ./warehouse --output warehouse.rustdb-profile
+  rustdb profile import warehouse.rustdb-profile --name warehouse
+  rustdb shell --profile warehouse -c "SELECT count(*) FROM events" --format table
+  rustdb shell --profile warehouse -f report.sql --format csv --metrics
 
 交互终端命令：
   .tables    列出已注册的外部表

@@ -5,32 +5,24 @@ resource-heavy performance work as separate gates. This prevents every
 platform job from downloading or generating the same analytical dataset while
 still requiring one real S3-compatible integration run.
 
-## Active v0.8 release gate
+## Active v0.9.0-alpha.1 release gate
 
-v0.8 is reliability-first. Run one focused pass through OrbStack:
+v0.9.0-alpha.1 is the read-only HTTP Shell release. Run its focused correctness
+and resource-lifecycle pass through OrbStack:
 
 ```sh
-scripts/ci/orbstack.sh v08
+scripts/ci/orbstack.sh v09
 ```
 
-This gate covers all four standalone and transaction commit durability
-boundaries, WAL/staging cleanup, migration retry after each publication
-boundary, deterministic snapshot-isolation conflicts, persistent schema
-namespaces and qualified objects, engine/table hard quotas including concurrent
-publication, DML/transactional DDL, mutation-result cancellation/abandonment,
-COPY and maintenance, Native type reopen, the advanced SQL/time slice, and one
-local/MinIO COPY plus backup/restore round trip. It also verifies COPY encoder
-and multipart memory leases plus conservative TTL reclamation of owned remote
-backup/restore crash directories. It does not
-run comparative performance, repeated soak, ClickBench, TPC-H, or dedicated
-low-memory Spill suites. Formatting and all-target compilation remain separate
-cheap checks during development.
-
-The durable-boundary cases also assert the public terminal classification:
-definite pre-commit failure is rolled back, unreconciled WAL publication is
-indeterminate, and post-Catalog failure is committed. Remote COPY and backup
-abandonment must quiesce their multipart/object cleanup before the relevant
-TaskGroup or Engine-owned worker is released.
+This gate covers TLS/Profile bootstrap and renewal, Token rejection before body
+parsing, read-only policy bypass attempts, typed parameters, idempotent
+submission, queueing, timeout, cancellation, shutdown, JSON/NDJSON pagination,
+result TTL and global/per-Query quotas, cleanup, and all remote CLI renderers.
+It also verifies server-local registered sources against live MinIO with region,
+endpoint, path-style, explicit HTTP, and anonymous configuration. It does not
+claim browser, write-API, throughput, soak, ClickBench, or DuckDB compatibility
+coverage. Formatting and all-target compilation remain separate inexpensive
+development checks.
 
 ## Historical v0.7 release gate
 
@@ -50,7 +42,7 @@ timing requirement, or 100M download requirement. The optional full dataset
 profile is `CLICKBENCH_PROFILE=full`.
 
 The TPC-H differential, old fixed-hardware measurements, and low-memory suites
-below remain useful regression tools, but they are not blocking v0.8 unless a
+below remain useful regression tools, but they are not blocking v0.9 unless a
 focused correctness issue explicitly calls for them.
 
 ## Local quality gate
@@ -62,8 +54,10 @@ MinIO services through OrbStack:
 scripts/ci/orbstack.sh all
 ```
 
-It runs formatting, strict Clippy, all Cargo targets, required MinIO tests, and
-the portable release build. Thin-LTO release targets are linked one at a time
+It runs formatting, strict Clippy, the v0.9 and required MinIO correctness
+tests, all Cargo targets except the dedicated low-memory Spill stress cases,
+and the portable release build. Run `scripts/ci/orbstack.sh test` explicitly
+when those stress cases are required. Thin-LTO release targets are linked one at a time
 by default to stay within the pinned OrbStack VM memory; set
 `RUSTDB_RELEASE_BUILD_JOBS` explicitly on a larger builder. `scripts/ci/check.sh` contains the same Cargo
 commands without depending on a particular CI product. To run the live MinIO
@@ -102,8 +96,9 @@ GitHub documents that arm64 macOS hosted runners do not support nested
 virtualization. Consequently, the Linux x64 job is the single hosted
 live-MinIO integration gate. It runs the core library, CLI, CSV, Parquet, and
 MinIO suites once, while excluding the dedicated low-memory Spill integration
-binaries and the long extreme-memory unit case. The complete suite remains
-available through the OrbStack release-candidate gate above. Linux arm64 and
+binaries and the long extreme-memory unit case. The dedicated low-memory case
+remains available through `scripts/ci/orbstack.sh test`, but is not a v0.9
+release blocker. Linux arm64 and
 macOS arm64 compile every target natively, while the Distribution workflow
 builds and validates their release packages. This split exercises the
 supported architectures without repeating the same resource-heavy suite on

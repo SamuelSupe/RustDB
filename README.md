@@ -2,13 +2,13 @@
 
 # RustDB
 
-**An embedded, single-node OLAP engine for CSV, Parquet, S3, and persistent local analytics.**
+**A single-node OLAP engine for CSV, Parquet, S3, persistent Native analytics, and a secure read-only HTTPS Shell.**
 
-[简体中文](README.zh-CN.md) · [Architecture](docs/architecture.md) · [SQL compatibility](docs/compatibility.md) · [CLI guide](packaging/dist/CLI.md)
+[简体中文](README.zh-CN.md) · [HTTP Shell](docs/http-shell.md) · [Architecture](docs/architecture.md) · [SQL compatibility](docs/compatibility.md) · [CLI guide](packaging/dist/CLI.md)
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-0.8.0--alpha.1-orange)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.9.0--alpha.1-orange)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -22,7 +22,9 @@
 RustDB queries CSV and Parquet directly from local disks or S3-compatible
 object stores. Data can optionally be imported into an immutable, persistent
 Native database for repeated local analytics. Results are streamed as Apache
-Arrow `RecordBatch` values, both through the Rust API and the `rustdb` CLI.
+Arrow `RecordBatch` values through the Rust API and local CLI. v0.9 optionally
+serves one Native database through a TLS-only, read-only HTTP Shell while the
+official remote CLI preserves `table`, `csv`, and `jsonl` output.
 
 The SQL binder, optimizer, vectorized operators, scheduler, memory accounting,
 Native storage, and Spill implementation live in this repository. DataFusion
@@ -43,17 +45,18 @@ is not a runtime dependency, and project code forbids `unsafe`.
 - **Resource-aware execution** — multi-lane pipelines, global/query memory
   budgets, cancellation, bounded queues, and governed Spill for blocking
   operators.
-- **Embedded by default** — a small, focused outer Rust API plus a streaming CLI;
-  no server process is required.
+- **Embedded by default, remote when needed** — use the focused Rust API and
+  local streaming CLI, or expose one Native database through an authenticated,
+  read-only HTTPS Shell.
 
 ## At a glance
 
-| Area | Current v0.8 alpha scope |
+| Area | Current v0.9 alpha scope |
 | --- | --- |
 | Sources | CSV, gzip CSV, zstd CSV, Parquet |
 | Storage | Local filesystem, S3/MinIO, persistent local Native database |
-| Interfaces | Embedded Rust API and `rustdb` CLI/REPL |
-| Output | Streaming Apache Arrow `RecordBatch` |
+| Interfaces | Embedded Rust API, local CLI/REPL, read-only HTTPS Shell and remote CLI |
+| Output | Streaming Arrow locally; paged JSON/NDJSON remotely; `table`/`csv`/`jsonl` CLI rendering |
 | Execution | Vectorized, multi-lane, memory-accounted, Spill-capable |
 | SQL | TPC-H-oriented analytics, joins, aggregates, windows, set operations, prepared parameters |
 | Safety | Project code uses `#![forbid(unsafe_code)]` |
@@ -121,6 +124,53 @@ rustdb \
 ```
 
 See [S3 configuration](docs/s3.md) for AWS, anonymous access, and MinIO.
+
+### Serve a Native database read-only
+
+Run one TLS server for one Native database. The default listener is loopback;
+remote binding requires an explicit HTTPS advertise URL.
+
+```sh
+rustdb datasource add-parquet \
+  --database /srv/rustdb/analytics \
+  --name sales \
+  --location 's3://lake/sales/*.parquet'
+rustdb serve --database /srv/rustdb/analytics
+
+rustdb serve \
+  --database /srv/rustdb/analytics \
+  --listen 0.0.0.0:7400 \
+  --advertise-url https://analytics.example.com:7400 \
+  --result-ttl-secs 3600 \
+  --result-global-limit 10GiB \
+  --result-query-limit 2GiB
+```
+
+The first start creates a local CA, renewable server certificate, and random
+Bearer Token. Stop the server, export its Profile bundle, transfer it over a
+trusted channel, import it on the client, then query with the existing CLI
+experience:
+
+```sh
+rustdb profile export \
+  --database /srv/rustdb/analytics \
+  --output analytics.rustdb-profile
+rustdb profile import analytics.rustdb-profile --name analytics
+rustdb shell --profile analytics -c \
+  "SELECT region, count(*) FROM sales GROUP BY region" --format table
+rustdb shell --profile analytics -f report.sql --format csv >report.csv
+```
+
+Remote SQL is deliberately narrower than local SQL: query, metadata, and
+explain statements only. DDL/DML, maintenance, uploads, direct file table
+functions, and remote data-source administration are rejected. Persistent
+CSV/Parquet sources are managed locally with `rustdb datasource` while the
+server is stopped. `serve` can independently configure result retention with
+`--result-directory`, `--result-ttl-secs`, `--result-global-limit`, and
+`--result-query-limit`; it also accepts `--s3-region`, `--s3-endpoint`,
+`--s3-path-style`, `--s3-allow-http`, and `--s3-anonymous` for server-local
+registered sources. See the [HTTP Shell guide](docs/http-shell.md) and
+[OpenAPI 3.1 contract](docs/openapi-v1.yaml).
 
 ## Embed RustDB
 
@@ -253,7 +303,9 @@ startup; unknown, forged, symlinked, fresh, or active paths are never removed.
 
 ```mermaid
 flowchart LR
-    SQL["SQL / prepared parameters"] --> Binder["Binder + session catalog"]
+    Remote["Remote CLI / HTTPS v1"] --> Guard["TLS + Token + read-only policy"]
+    Guard --> SQL["SQL / prepared parameters"]
+    SQL --> Binder["Binder + session catalog"]
     Binder --> Optimizer["Rule optimizer + statistics"]
     Optimizer --> Pipelines["Vectorized physical pipelines"]
     Local["Local files"] --> Scan["CSV / Parquet / Native scan"]
@@ -278,6 +330,10 @@ The full execution model is documented in [architecture.md](docs/architecture.md
   including live-MinIO CSV/Parquet COPY and Native backup/restore. See the
   [acceptance contract](docs/acceptance.md) and
   [release notes](docs/releases/v0.8.0-alpha.1.md).
+- The v0.9 release gate adds one complete HTTP Shell correctness run covering
+  TLS/Profile bootstrap, authentication, read-only policy, Query lifecycle,
+  pagination, cancellation, quotas, cleanup, and all three CLI renderers; it
+  intentionally adds no performance threshold or long soak.
 - TPC-H Q1-Q22 query coverage is retained in [`benchmarks/tpch`](benchmarks/tpch).
 - The v0.7 functional ClickBench gate runs all 43 official queries once in a
   four-CPU/16-GiB container profile.
@@ -291,10 +347,11 @@ are in the [ClickBench guide](benchmarks/clickbench/README.md).
 ## Current boundaries
 
 Serializable isolation, savepoints, `MERGE`/upsert, constraints, indexes,
-public time travel, a server protocol, distributed execution, and DuckDB
-database-file/SQL compatibility are outside v0.8. JSON/ORC/Iceberg scans and
-nested LIST/STRUCT/MAP execution are also excluded. Result order is unspecified
-without an outer `ORDER BY`.
+public time travel, distributed execution, and DuckDB database-file/SQL
+compatibility are outside v0.9. The HTTP surface is a read-only remote Shell,
+not a write API, browser UI, multi-user service, session protocol, or generated
+SDK. JSON/ORC/Iceberg scans and nested LIST/STRUCT/MAP execution are also
+excluded. Result order is unspecified without an outer `ORDER BY`.
 
 ## Documentation
 
@@ -303,6 +360,8 @@ without an outer `ORDER BY`.
 | [Architecture](docs/architecture.md) | Pipelines, scheduling, memory, pruning, Native storage, and Spill |
 | [Compatibility](docs/compatibility.md) | Supported SQL, types, formats, and explicit limitations |
 | [CLI guide](packaging/dist/CLI.md) / [中文](packaging/dist/CLI.zh-CN.md) | Commands, output, resources, and S3 flags |
+| [HTTP Shell](docs/http-shell.md) / [中文](docs/http-shell.zh-CN.md) | TLS, Profiles, read-only SQL, Query lifecycle, and operations |
+| [OpenAPI v1](docs/openapi-v1.yaml) | Public versioned HTTP contract |
 | [Installation](packaging/dist/INSTALL.md) / [中文](packaging/dist/INSTALL.zh-CN.md) | Binary package installation and removal |
 | [S3 and MinIO](docs/s3.md) | Credentials, endpoints, and object-store behavior |
 | [Troubleshooting](docs/troubleshooting.md) | Resource, Spill, corruption, and input errors |
@@ -311,6 +370,8 @@ without an outer `ORDER BY`.
 | [v0.7 migration](docs/migration-v0.7.md) | Historical execution-core and benchmark changes |
 | [v0.8 migration](docs/migration-v0.8.md) | WAL format, explicit database migration, and transaction API |
 | [v0.8 roadmap](docs/roadmap-v0.8.md) | Native v3, DML/DDL, COPY/maintenance, and SQL/time delivery stages |
+| [v0.9 release notes](docs/releases/v0.9.0-alpha.1.md) | Read-only HTTPS Shell and release boundaries |
+| [v0.9 migration](docs/migration-v0.9.md) | Upgrade, Profile, server state, and rollback guidance |
 
 ## Development
 
@@ -319,6 +380,10 @@ The complete default verification path runs through OrbStack:
 ```sh
 scripts/ci/orbstack.sh all
 ```
+
+This release gate intentionally excludes the dedicated low-memory Spill
+stress cases; run `scripts/ci/orbstack.sh test` when investigating that
+execution path.
 
 Focused commands are also available:
 

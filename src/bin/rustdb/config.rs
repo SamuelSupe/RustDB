@@ -4,6 +4,11 @@ use super::args::Args;
 
 pub(super) fn engine_config(args: &Args) -> EngineConfig {
     let mut config = EngineConfig::default();
+    apply_engine_args(&mut config, args);
+    config
+}
+
+pub(super) fn apply_engine_args(config: &mut EngineConfig, args: &Args) {
     if let Some(value) = args.memory_limit {
         config.memory_limit = value;
     }
@@ -76,12 +81,21 @@ pub(super) fn engine_config(args: &Args) -> EngineConfig {
     if let Some(value) = args.runtime_filter_bytes {
         config.execution.runtime_filter_bytes = value;
     }
-    config.s3.region = args.s3_region.clone();
-    config.s3.endpoint = args.s3_endpoint.clone();
-    config.s3.force_path_style = args.s3_path_style;
-    config.s3.allow_http = args.s3_allow_http;
-    config.s3.anonymous = args.s3_anonymous;
-    config
+    if args.s3_region.is_some() {
+        config.s3.region = args.s3_region.clone();
+    }
+    if args.s3_endpoint.is_some() {
+        config.s3.endpoint = args.s3_endpoint.clone();
+    }
+    if args.s3_path_style {
+        config.s3.force_path_style = true;
+    }
+    if args.s3_allow_http {
+        config.s3.allow_http = true;
+    }
+    if args.s3_anonymous {
+        config.s3.anonymous = true;
+    }
 }
 
 fn as_u64(value: usize) -> u64 {

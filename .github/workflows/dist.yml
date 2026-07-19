@@ -56,3 +56,50 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download all platform packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: rustdb-*
+          path: release-assets
+          merge-multiple: true
+      - name: Validate tag, packages, and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          test "$version" = "$package_version"
+          test -f "docs/releases/${GITHUB_REF_NAME}.md"
+          test "$(find release-assets -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 3
+          test "$(find release-assets -maxdepth 1 -name '*.tar.gz.sha256' -type f | wc -l)" -eq 3
+          for archive in release-assets/*.tar.gz; do
+            RUSTDB_DIST_SKIP_EXEC=1 scripts/dist/check.sh "$archive"
+          done
+          install -m 0644 docs/openapi-v1.yaml release-assets/rustdb-openapi-v1.yaml
+          (
+            cd release-assets
+            sha256sum rustdb-openapi-v1.yaml >rustdb-openapi-v1.yaml.sha256
+          )
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/* \
+            --verify-tag \
+            --prerelease \
+            --title "RustDB $GITHUB_REF_NAME" \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md"

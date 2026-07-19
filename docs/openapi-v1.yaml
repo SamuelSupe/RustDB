@@ -1,0 +1,623 @@
+openapi: 3.1.0
+info:
+  title: RustDB Read-only HTTP Shell API
+  version: 0.9.0-alpha.1
+  summary: Versioned background-query API used by the RustDB remote CLI.
+  description: |
+    RustDB v1 exposes one read-only SQL statement per background Query. Query
+    results become readable only after successful completion. Every `/v1`
+    operation requires TLS and a Bearer Token; authentication runs before
+    request-body or query-parameter parsing. This specification deliberately
+    excludes write SQL, Sessions, source administration, uploads, and a query
+    listing operation.
+servers:
+  - url: https://127.0.0.1:7400
+    description: Default loopback listener
+tags:
+  - name: Health
+  - name: Protocol
+  - name: Queries
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      operationId: health
+      summary: Report minimal process health
+      security: []
+      responses:
+        "200":
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "500":
+          $ref: "#/components/responses/Problem"
+  /readyz:
+    get:
+      tags: [Health]
+      operationId: readiness
+      summary: Report minimal request readiness
+      security: []
+      responses:
+        "200":
+          description: The server can accept requests.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ready"
+        "503":
+          description: The server is starting or shutting down.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotReady"
+  /v1/info:
+    get:
+      tags: [Protocol]
+      operationId: serverInfo
+      summary: Negotiate protocol and server capabilities
+      responses:
+        "200":
+          description: Authenticated server information.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServerInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/queries:
+    post:
+      tags: [Queries]
+      operationId: submitQuery
+      summary: Submit one read-only SQL statement
+      description: |
+        A valid envelope creates a background Query. Repeating the same decoded
+        request envelope with the same Idempotency-Key returns the original
+        Query. JSON whitespace and object-member order are not part of the
+        comparison. Reusing the key with a different envelope returns 409.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "202":
+          description: Query accepted or an existing idempotent Query returned.
+          headers:
+            Location:
+              description: Relative status resource for this Query.
+              schema:
+                type: string
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryAccepted"
+        "400":
+          description: Malformed JSON, invalid SQL, or an invalid request value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: The Idempotency-Key was already used with another body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "413":
+          description: Request exceeds the 1 MiB request-body limit.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "415":
+          description: The request Content-Type is not application/json.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "422":
+          description: The JSON shape is invalid or the SQL is outside the read-only allowlist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+            text/plain:
+              schema:
+                type: string
+        "429":
+          description: The bounded admission queue is full.
+          headers:
+            Retry-After:
+              description: Suggested delay in seconds.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/queries/{query_id}:
+    parameters:
+      - $ref: "#/components/parameters/QueryId"
+    get:
+      tags: [Queries]
+      operationId: getQuery
+      summary: Read Query status and bounded metrics
+      responses:
+        "200":
+          description: Current Query state.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/QueryNotFound"
+    delete:
+      tags: [Queries]
+      operationId: deleteQuery
+      summary: Delete a terminal Query and its retained result
+      description: This operation is idempotent after a Query is terminal.
+      responses:
+        "204":
+          description: The terminal Query was deleted or was already absent.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: The Query is queued or running; cancel it first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/queries/{query_id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/QueryId"
+    post:
+      tags: [Queries]
+      operationId: cancelQuery
+      summary: Idempotently request Query cancellation
+      responses:
+        "202":
+          description: Cancellation was signalled, or the Query was terminal.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/QueryNotFound"
+  /v1/queries/{query_id}/results:
+    parameters:
+      - $ref: "#/components/parameters/QueryId"
+      - name: cursor
+        in: query
+        description: |
+          Opaque repeatable page cursor. Mutually exclusive with `offset`.
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 2048
+      - name: offset
+        in: query
+        description: Zero-based immutable result row offset. Defaults to zero.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+      - name: limit
+        in: query
+        description: Requested rows; the 16 MiB encoded-row-payload cap may return fewer.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 1000
+    get:
+      tags: [Queries]
+      operationId: getQueryResults
+      summary: Fetch an immutable completed-result page
+      description: |
+        Results are available only after `state` is `succeeded`. Send
+        `Accept: application/json` or `Accept: application/x-ndjson`. Page
+        reads never mutate a shared server cursor and may be repeated.
+      responses:
+        "200":
+          description: |
+            One result page with at most 10,000 rows and 16 MiB of encoded row
+            arrays. The JSON/NDJSON envelope adds a small amount of framing.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResultPage"
+            application/x-ndjson:
+              schema:
+                type: string
+                description: |
+                  UTF-8 NDJSON: `{"type":"schema","columns":[...]}`, zero
+                  or more `{"type":"row","values":[...]}` records, then
+                  exactly one `{"type":"page","page":{...}}` record.
+        "400":
+          description: Cursor and offset were both supplied or pagination is invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/QueryNotFound"
+        "409":
+          description: The Query has not succeeded and therefore has no result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "507":
+          description: One encoded row exceeds the result-page resource limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Random server Token read from the imported profile's Token file.
+  headers:
+    RequestId:
+      description: Server-generated identifier for logs and support.
+      schema:
+        type: string
+        minLength: 16
+  parameters:
+    QueryId:
+      name: query_id
+      in: path
+      required: true
+      description: Unguessable Query identifier returned by submission.
+      schema:
+        type: string
+        minLength: 32
+        maxLength: 128
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Caller-generated 16-128 character visible ASCII key (no spaces or
+        control characters). Its lifetime is the lifetime of the resulting
+        ephemeral Query.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: "^[!-~]{16,128}$"
+  responses:
+    Problem:
+      description: Structured server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unauthorized:
+      description: Missing or invalid Bearer Token.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            const: 'Bearer realm="rustdb"'
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    QueryNotFound:
+      description: Query ID is unknown, expired, deleted, or from another process run.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+    Ready:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ready
+    NotReady:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: not_ready
+    ServerInfo:
+      type: object
+      additionalProperties: false
+      required:
+        - protocol_version
+        - server_version
+        - read_only
+        - capabilities
+      properties:
+        protocol_version:
+          type: string
+          const: v1
+        server_version:
+          type: string
+          examples: [0.9.0-alpha.1]
+        read_only:
+          type: boolean
+          const: true
+        capabilities:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum:
+              - background_queries
+              - typed_parameters
+              - cursor_pagination
+              - offset_pagination
+              - json_results
+              - ndjson_results
+    QueryRequest:
+      type: object
+      additionalProperties: false
+      required: [sql]
+      properties:
+        sql:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+          description: Exactly one allowed read-only SQL statement.
+        parameters:
+          type: array
+          default: []
+          items:
+            $ref: "#/components/schemas/TypedParameter"
+        timeout_ms:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Optional timeout shorter than or equal to the server limit.
+    TypedParameter:
+      type: object
+      additionalProperties: false
+      required: [type, value]
+      description: |
+        A typed positional parameter. Use JSON null as the value of any listed
+        type to create a typed NULL. Decimal128 requires `precision` and
+        `scale`; Binary is Base64, Date32 is epoch days, and
+        TimestampMicrosecond is microseconds since the Unix epoch. Integer and
+        Decimal values are JSON numbers; Decimal also accepts an exact decimal
+        string. Clients must preserve the original numeric token for exactness.
+      properties:
+        type:
+          type: string
+          enum:
+            - boolean
+            - int64
+            - uint64
+            - float64
+            - decimal128
+            - utf8
+            - binary
+            - date32
+            - timestamp_microsecond
+        value:
+          description: "Value matching `type`, or JSON null for a typed NULL."
+        precision:
+          type: integer
+          minimum: 1
+          maximum: 38
+        scale:
+          type: integer
+          minimum: 0
+          maximum: 38
+    QueryAccepted:
+      type: object
+      additionalProperties: false
+      required: [query_id, state, replayed, status_url, results_url]
+      properties:
+        query_id:
+          type: string
+        state:
+          $ref: "#/components/schemas/QueryState"
+        replayed:
+          type: boolean
+        status_url:
+          type: string
+        results_url:
+          type: string
+    QueryState:
+      type: string
+      enum: [queued, running, succeeded, failed, cancelled]
+    QueryStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - query_id
+        - state
+        - created_at_ms
+      properties:
+        query_id:
+          type: string
+        state:
+          $ref: "#/components/schemas/QueryState"
+        created_at_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Milliseconds since the Unix epoch.
+        started_at_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Omitted until execution starts.
+        finished_at_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Omitted until the Query is terminal.
+        metrics:
+          $ref: "#/components/schemas/QueryMetrics"
+          description: Present after successful execution; otherwise omitted.
+        error:
+          $ref: "#/components/schemas/Problem"
+          description: Present for failed or cancelled Queries; otherwise omitted.
+    QueryMetrics:
+      type: object
+      additionalProperties: false
+      required:
+        - elapsed_ms
+        - rows_scanned
+        - rows_returned
+        - bytes_scanned
+        - peak_memory_bytes
+        - spill_read_bytes
+        - spill_write_bytes
+      properties:
+        elapsed_ms:
+          type: integer
+          format: int64
+          minimum: 0
+        rows_scanned:
+          type: integer
+          format: int64
+          minimum: 0
+        rows_returned:
+          type: integer
+          format: int64
+          minimum: 0
+        bytes_scanned:
+          type: integer
+          format: int64
+          minimum: 0
+        peak_memory_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        spill_read_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        spill_write_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+    ResultColumn:
+      type: object
+      additionalProperties: false
+      required: [name, data_type, nullable]
+      properties:
+        name:
+          type: string
+        data_type:
+          type: string
+          description: Canonical Arrow logical type text.
+        nullable:
+          type: boolean
+    ResultRow:
+      type: array
+      description: Ordered values interpreted using the page's `schema` array.
+      items: {}
+    PageMetadata:
+      type: object
+      additionalProperties: false
+      required: [offset, row_count, complete]
+      properties:
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+        row_count:
+          type: integer
+          minimum: 0
+          maximum: 10000
+        complete:
+          type: boolean
+        next_cursor:
+          type: string
+          description: Omitted on the final page.
+    ResultPage:
+      type: object
+      additionalProperties: false
+      required: [schema, rows, page]
+      properties:
+        schema:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResultColumn"
+        rows:
+          type: array
+          maxItems: 10000
+          items:
+            $ref: "#/components/schemas/ResultRow"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          pattern: "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          examples: [query.not_found]
+        message:
+          type: string
+        request_id:
+          type: string
+        query_id:
+          type: string
+        details:
+          type: object
+          additionalProperties: true

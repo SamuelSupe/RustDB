@@ -51,7 +51,9 @@ case "$destdir" in *'/../'*|*/..|*'/./'*|*/.) echo "DESTDIR must be normalized /
 for file in \
   LICENSE README.md README.zh-CN.md SHA256SUMS VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
-  docs/INSTALL.md docs/INSTALL.zh-CN.md uninstall.sh
+  docs/INSTALL.md docs/INSTALL.zh-CN.md \
+  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md docs/openapi-v1.yaml \
+  uninstall.sh
 do
   [ -f "$package/$file" ] || { echo "incomplete package / 发行包不完整: $file" >&2; exit 1; }
 done
@@ -72,6 +74,9 @@ install -m 0644 "$package/docs/CLI.md" "$doc/CLI.md"
 install -m 0644 "$package/docs/CLI.zh-CN.md" "$doc/CLI.zh-CN.md"
 install -m 0644 "$package/docs/INSTALL.md" "$doc/INSTALL.md"
 install -m 0644 "$package/docs/INSTALL.zh-CN.md" "$doc/INSTALL.zh-CN.md"
+install -m 0644 "$package/docs/HTTP-SHELL.md" "$doc/HTTP-SHELL.md"
+install -m 0644 "$package/docs/HTTP-SHELL.zh-CN.md" "$doc/HTTP-SHELL.zh-CN.md"
+install -m 0644 "$package/docs/openapi-v1.yaml" "$doc/openapi-v1.yaml"
 
 say \
   "RustDB installed in $prefix. Run: $prefix/bin/rustdb --help" \

@@ -43,6 +43,7 @@ pub struct QueryContext {
     catalog_snapshot: RwLock<Option<Catalog>>,
     object_snapshots: RwLock<ObjectSnapshots>,
     object_snapshots_sealed: AtomicBool,
+    http_read_only: AtomicBool,
     view_plans: RwLock<HashMap<String, LogicalPlan>>,
     prepared_providers: RwLock<HashMap<u64, Arc<dyn TableProvider>>>,
     durable_outcome: Mutex<Option<DurableOutcome>>,
@@ -204,6 +205,7 @@ impl QueryContext {
                 memory: snapshot_memory,
             }),
             object_snapshots_sealed: AtomicBool::new(false),
+            http_read_only: AtomicBool::new(false),
             view_plans: RwLock::new(HashMap::new()),
             prepared_providers: RwLock::new(HashMap::new()),
             durable_outcome: Mutex::new(None),
@@ -224,6 +226,14 @@ impl QueryContext {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn enable_http_read_only(&self) {
+        self.http_read_only.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_http_read_only(&self) -> bool {
+        self.http_read_only.load(Ordering::Acquire)
     }
 
     pub(crate) fn mark_native_commit(

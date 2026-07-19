@@ -24,6 +24,65 @@ rustdb -f report.sql --format csv --csv-null '\N'
 输出格式支持 `table`、`csv`、`jsonl`。`--metrics` 会在流式结果消费完毕后，把执行
 指标写到 stderr。
 
+## 只读 HTTPS Shell
+
+一个 TLS 服务进程只打开一个 Native 持久化数据库。默认只监听回环地址；监听非回环
+地址时还必须提供客户端可达的 HTTPS origin，使自动生成的证书包含正确身份：
+
+```sh
+rustdb serve --database /srv/rustdb/analytics
+
+rustdb serve \
+  --database /srv/rustdb/analytics \
+  --listen 0.0.0.0:7400 \
+  --advertise-url https://analytics.example.com:7400
+```
+
+首次启动会生成本地 CA、可续签服务端证书和随机 Bearer Token。停止服务并导出
+连接包，通过可信渠道传输后，再在客户端导入：
+
+```sh
+rustdb profile export \
+  --database /srv/rustdb/analytics \
+  --output analytics.rustdb-profile
+rustdb profile import analytics.rustdb-profile --name analytics
+```
+
+远程 CLI 使用命名 Profile。交互模式会等待每个后台 Query；`-c` 与 `-f` 适合脚本，
+并保留本地输出格式。Ctrl-C 会尽力向服务端发送取消请求。
+
+```sh
+rustdb shell --profile analytics -c \
+  "SELECT region, count(*) FROM sales GROUP BY region" --format table
+rustdb shell --profile analytics -f report.sql --format csv >report.csv
+```
+
+远程边界严格只读，只允许针对 Native/系统表和服务端本地注册源执行查询、元数据与
+Explain 语句；DDL/DML、维护、上传、直接 `read_csv`/`read_parquet` 和远程数据源管理
+都会被拒绝。生命周期和公开 `/v1` 契约见发行包中的 `docs/HTTP-SHELL.zh-CN.md`
+与 `docs/openapi-v1.yaml`。
+
+`serve` 的结果保留控制独立于引擎 Spill 配额：`--result-directory`、
+`--result-ttl-secs`、`--result-global-limit`、`--result-query-limit`。默认已完成结果
+保留一小时；总磁盘配额为 10 GiB 和文件系统容量 10% 中的较小值，单 Query 最多使用
+该总量的 25%。同一命令还支持为服务端本地注册源指定 `--s3-region`、`--s3-endpoint`、
+`--s3-path-style`、`--s3-allow-http` 和 `--s3-anonymous`。HTTP 仅用于可信开发
+endpoint，匿名模式仅用于公开对象。
+
+CSV/Parquet 持久注册只能在服务端主机上、`rustdb serve` 停止时修改：
+
+```sh
+rustdb datasource add-parquet \
+  --database /srv/rustdb/analytics \
+  --name sales \
+  --location 's3://lake/sales/*.parquet'
+rustdb datasource list --database /srv/rustdb/analytics
+rustdb datasource refresh --database /srv/rustdb/analytics --name sales
+rustdb datasource remove --database /srv/rustdb/analytics --name sales
+```
+
+注册信息不会保存对象存储凭证；凭证由服务进程账号的默认凭证链提供。
+
 ## Native 持久化数据库
 
 使用 `--database` 打开本地持久化数据库；不指定时仍使用临时 Engine：
@@ -132,6 +191,9 @@ rustdb --s3-endpoint http://127.0.0.1:9000 \
 - `--spill-directory PATH`：查询 Spill 根目录；
 - `--spill-engine-limit`、`--spill-query-limit`：Spill 硬配额；
 - `--runtime-filter-bytes 8MiB`：Join Runtime Filter 内存预算。
+
+`serve` 的结果 TTL、总/单 Query 配额与这些本地执行控制项彼此独立，详见上方 HTTPS
+Shell 一节。
 
 大小单位支持 `B`、`KB`、`MB`、`GB`、`KiB`、`MiB`、`GiB`。
 Rust API 也可通过 `NativeStorageConfig` 设置这些配额。配额在每次打开时提供，

@@ -189,6 +189,13 @@ fn copy_snapshot(database: &NativeDatabase, destination: &Path) -> Result<()> {
         &source_catalog.join("generations").join(&generation),
         &target_catalog.join("generations").join(generation),
     )?;
+    let external_sources = source_catalog.join(super::external_sources::FILE_NAME);
+    if external_sources.exists() {
+        copy_file(
+            &external_sources,
+            &target_catalog.join(super::external_sources::FILE_NAME),
+        )?;
+    }
 
     native_io::create_private_dir_all(&destination.join("tables"))?;
     native_io::create_private_dir_all(&destination.join("staging"))?;

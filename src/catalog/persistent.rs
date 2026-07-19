@@ -62,6 +62,25 @@ impl PersistentCatalog {
         *current = next;
         Ok(next_generation)
     }
+
+    /// Replaces auxiliary catalog entries without advancing the Native table
+    /// generation. Callers serialize this with Native commit publication.
+    pub(crate) fn replace(
+        &self,
+        expected_generation: u64,
+        entries: impl IntoIterator<Item = TableEntry>,
+    ) -> Result<()> {
+        let next = PersistentCatalogSnapshot::new(expected_generation, entries)?;
+        let mut current = self.current.write();
+        if current.generation() != expected_generation {
+            return Err(Error::Catalog(format!(
+                "persistent catalog changed while replacing auxiliary entries: expected generation {expected_generation}, found {}",
+                current.generation()
+            )));
+        }
+        *current = next;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

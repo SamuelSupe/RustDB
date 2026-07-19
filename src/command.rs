@@ -509,6 +509,12 @@ impl ViewTable {
     }
 
     async fn current_plan(&self, context: Option<Arc<QueryContext>>) -> Result<LogicalPlan> {
+        if context
+            .as_ref()
+            .is_some_and(|context| context.is_http_read_only())
+        {
+            crate::HttpReadOnlyPolicy::validate(&self.query)?;
+        }
         let catalog = context
             .as_ref()
             .and_then(|context| context.catalog_snapshot())

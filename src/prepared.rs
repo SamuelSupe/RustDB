@@ -83,6 +83,16 @@ impl PreparedStatement {
         self.session.execute_prepared(statement).await
     }
 
+    pub(crate) async fn execute_http_read_only(
+        &self,
+        parameters: &[ParameterValue],
+    ) -> Result<QueryResult> {
+        let statement = self.instantiate(parameters)?;
+        self.session
+            .execute_prepared_http_read_only(statement)
+            .await
+    }
+
     pub(crate) fn instantiate(&self, parameters: &[ParameterValue]) -> Result<Statement> {
         if parameters.len() != self.layout.count {
             return Err(Error::InvalidArgument(format!(
