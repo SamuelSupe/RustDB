@@ -280,10 +280,15 @@ async fn command_results_report_admission_and_parse_phases() {
     drop(blocker);
 
     let result = command.await.unwrap().unwrap();
-    let metrics = result.metrics().snapshot();
+    let metrics = result.metrics();
+    collect(result).await;
+    let metrics = metrics.snapshot();
     assert!(metrics.query_admission_wait >= Duration::from_millis(10));
     assert!(metrics.sql_parse_time > Duration::ZERO);
-    assert!(metrics.elapsed < metrics.query_admission_wait);
+    // `elapsed` starts after admission, but its duration is otherwise
+    // independent of the admission wait. Under a loaded test runner the
+    // command can be descheduled long enough for either duration to be larger.
+    assert!(metrics.elapsed > Duration::ZERO);
     assert_eq!(metrics.table_function_prepare_time, Duration::ZERO);
     assert_eq!(metrics.bind_time, Duration::ZERO);
     assert_eq!(metrics.provider_prepare_time, Duration::ZERO);
