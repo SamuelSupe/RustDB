@@ -1,11 +1,11 @@
 # RustDB read-only HTTP Shell
 
-RustDB v0.9 can expose one Native database to the existing command-line query
+RustDB Beta can expose one Native database to the existing command-line query
 experience over HTTPS. The server executes only read-only SQL. It is not a
 browser shell, a write API, or a remote administration service.
 
-For the exact wire contract, see [OpenAPI v1](openapi-v1.yaml). For the design
-and deliberate limits, see [the v0.9 roadmap](roadmap-v0.9.md). A Simplified
+For the exact wire contract, see [OpenAPI v1](openapi-v1.yaml). For deployment,
+monitoring, and recovery, see the [Beta operator guide](operator-guide.md). A Simplified
 Chinese version of this guide is available in
 [http-shell.zh-CN.md](http-shell.zh-CN.md).
 
@@ -17,9 +17,12 @@ The safest default listens only on loopback:
 rustdb serve --database /srv/rustdb/analytics
 ```
 
-First startup creates a local CA, a short-lived server certificate, a random
-Bearer Token, and connection metadata in the operating-system user state
-directory. Secret material is not written into the Native database directory.
+First startup creates a local CA, a short-lived server certificate, an `admin`
+principal, a random profile token, and connection metadata in the
+operating-system user state directory. `principals.json` stores only SHA-256
+token digests; clear-text tokens exist only in permission-restricted profile
+token files and are never logged. The legacy server-side `bearer.token` file is
+not accepted. Secret material is not written into the Native database directory.
 The process stays in the foreground; use systemd, launchd, Docker, or another
 process manager when daemon supervision is required.
 
@@ -59,6 +62,27 @@ The named profile records the advertised URL and paths to local CA and Token
 files. The Token file is permission-restricted and the Token is never accepted
 as a plaintext command-line flag.
 
+Manage principals locally while the server is stopped:
+
+```sh
+rustdb principal list --database /srv/rustdb/analytics
+rustdb principal create --database /srv/rustdb/analytics --id analyst --role query
+rustdb token list --database /srv/rustdb/analytics --principal analyst
+rustdb token rotate --database /srv/rustdb/analytics --principal analyst
+rustdb token revoke --database /srv/rustdb/analytics --token-id <UUID>
+rustdb profile export --database /srv/rustdb/analytics \
+  --token-id <UUID> --output analyst.rustdb-profile
+```
+
+Rotation adds an overlapping credential so clients can move without an
+interruption; revoke the old token explicitly afterwards. `token list` exposes
+only UUID, principal, lifecycle state, and validity. `profile export --token-id`
+reuses the URL and CA in the managed server bundle; add `--server-url` only to
+set an explicit HTTPS origin. Query-role principals can access only Queries
+they own. Admin principals can access every Query, and Idempotency Keys are
+scoped to the submitting principal. `--no-auth` is an explicit development-only
+mode; it uses one fixed anonymous Query owner and never grants Admin permission.
+
 ## Query from the CLI
 
 Open the interactive shell:
@@ -68,8 +92,9 @@ rustdb shell --profile analytics
 ```
 
 Although the protocol creates a background Query ID, the official shell waits,
-polls, fetches immutable pages, and renders them like a local query. `Ctrl-C`
-requests remote cancellation. There are no job-management backslash commands.
+polls sequenced Arrow IPC batches with backpressure, and renders them like a
+local query. `Ctrl-C` requests remote cancellation. There are no job-management
+backslash commands.
 
 Script mode also waits and maps the terminal Query state to the process exit
 code:
@@ -210,9 +235,26 @@ curl --compressed --cacert ca.pem \
   "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?cursor=${CURSOR}&limit=1000"
 ```
 
-Cursor and offset are mutually exclusive. Pages are immutable and repeatable;
-the server does not advance shared fetch state. Results become readable only
-after successful completion.
+JSON/NDJSON require successful completion. Cursor and offset are mutually
+exclusive; pages are immutable and repeatable, and the server does not advance
+shared fetch state.
+
+For incremental typed output while execution is running, request exactly one
+Arrow batch sequence at a time:
+
+```sh
+curl --dump-header batch.headers --cacert ca.pem \
+  -H "Authorization: Bearer $(<token)" \
+  -H 'Accept: application/vnd.apache.arrow.file' \
+  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?batch_seq=0" \
+  --output batch-000.arrow
+```
+
+An Arrow `200` is an independent IPC file containing exactly one RecordBatch.
+A schema-only IPC file with `X-RustDB-Result-Complete: true` marks completion.
+If the requested sequence is not committed yet, `204` has no body and includes
+`Retry-After: 1`. Advance only to the exact `X-RustDB-Next-Batch-Seq`; do not mix
+`batch_seq` with `cursor`, `offset`, or `limit`.
 
 Cancel queued or running work, then delete terminal state:
 
@@ -231,6 +273,8 @@ curl -X DELETE --cacert ca.pem \
 JSON pages have the shape `{schema, rows, page}`. NDJSON starts with one
 `schema` record, emits a `row` array for every row, and ends with one `page`
 record. Rows are positional arrays so duplicate column names remain valid.
+Every persisted result batch carries a SHA-256 that is verified both when read
+and during restart recovery; a mismatch fails and invalidates that result.
 
 ```json
 {
@@ -278,10 +322,10 @@ CLI flags. Precedence is:
 CLI > environment > TOML > defaults
 ```
 
-Important defaults are one running Query, a FIFO queue of 64, a 30-minute Query
-timeout, one-hour result TTL, and result storage limited to the smaller of
-10 GiB and 10% of its filesystem. One Query may use at most 25% of that global
-result limit.
+Important defaults are one running Query, a weighted-fair queue of 64, a
+30-minute Query timeout, one-hour result TTL, a 10 GiB result-store hard limit,
+and a 2 GiB per-Query result hard limit. Every principal has the same default
+weight; the Admin role receives no scheduling priority.
 
 Use these `serve` options when the defaults do not fit the deployment:
 
@@ -289,6 +333,12 @@ Use these `serve` options when the defaults do not fit the deployment:
 | --- | --- | --- | --- |
 | Result location and retention | `--result-directory`, `--result-ttl-secs` | `result_directory`, `result_ttl_secs` | `RUSTDB_RESULT_DIRECTORY`, `RUSTDB_RESULT_TTL_SECS` |
 | Result total/per-Query quota | `--result-global-limit`, `--result-query-limit` | `result_global_limit`, `result_query_limit` | `RUSTDB_RESULT_GLOBAL_LIMIT`, `RUSTDB_RESULT_QUERY_LIMIT` |
+| Query memory/Spill/result reservation | `--query-memory-limit`, `--query-spill-limit`, `--query-result-limit` | `query_memory_limit`, `query_spill_limit`, `query_result_limit` | `RUSTDB_HTTP_QUERY_MEMORY_LIMIT`, `RUSTDB_HTTP_QUERY_SPILL_LIMIT`, `RUSTDB_HTTP_QUERY_RESULT_LIMIT` |
+| Principal running/queue limits | `--principal-max-running`, `--principal-max-queued` | `principal_max_running`, `principal_max_queued` | `RUSTDB_HTTP_PRINCIPAL_MAX_RUNNING`, `RUSTDB_HTTP_PRINCIPAL_MAX_QUEUED` |
+| Principal resource reservation | `--principal-memory-limit`, `--principal-spill-limit`, `--principal-result-limit` | `principal_memory_limit`, `principal_spill_limit`, `principal_result_limit` | `RUSTDB_HTTP_PRINCIPAL_MEMORY_LIMIT`, `RUSTDB_HTTP_PRINCIPAL_SPILL_LIMIT`, `RUSTDB_HTTP_PRINCIPAL_RESULT_LIMIT` |
+| Principal fair-share weight | `--principal-weight` | `principal_weight` | `RUSTDB_HTTP_PRINCIPAL_WEIGHT` |
+| Spill hard limits | `--spill-engine-limit`, `--spill-query-limit` | `spill_engine_limit`, `spill_query_limit` | `RUSTDB_SPILL_ENGINE_LIMIT`, `RUSTDB_SPILL_QUERY_LIMIT` |
+| Authentication escape hatch | `--no-auth` | `no_auth` | `RUSTDB_NO_AUTH` |
 | AWS region and endpoint | `--s3-region`, `--s3-endpoint` | `s3_region`, `s3_endpoint` | `RUSTDB_S3_REGION`, `RUSTDB_S3_ENDPOINT` |
 | S3 request mode | `--s3-path-style`, `--s3-allow-http`, `--s3-anonymous` | `s3_path_style`, `s3_allow_http`, `s3_anonymous` | `RUSTDB_S3_PATH_STYLE`, `RUSTDB_S3_ALLOW_HTTP`, `RUSTDB_S3_ANONYMOUS` |
 
@@ -298,14 +348,16 @@ objects; credentials otherwise come from the server process's default provider
 chain.
 
 `/healthz` and `/readyz` are unauthenticated but disclose only `ok`, `ready`, or
-`not_ready`. Every `/v1` request is authenticated before its body or query
-parameters are parsed. CORS is disabled. Access logs do not include request
-bodies or SQL text.
+`not_ready`. Unless explicit no-auth development mode is enabled, every `/v1`
+request is authenticated before its body or query parameters are parsed. The
+Prometheus `/metrics` endpoint also requires authentication and Admin
+permission. CORS is disabled. Access logs do not include request bodies or SQL
+text; private rotating JSONL audit records contain identity and SQL fingerprints.
 
-Rotate the Token only while the server is stopped. The old Token becomes
-invalid immediately, so export and redistribute a new profile bundle. The
-long-lived CA remains unchanged; the server renews its short-lived leaf
-certificate at startup.
+Manage credentials only while the server is stopped. Rotation adds a new
+overlapping Token; export or distribute it, verify clients, and then explicitly
+revoke the old Token. The long-lived CA remains unchanged; the server renews
+its short-lived leaf certificate at startup.
 
 ## Common failures
 
@@ -314,20 +366,23 @@ certificate at startup.
 | TLS hostname error | Connect through the configured advertise URL. If that URL changed, stop the server, remove only the generated bundle path printed by `rustdb serve`, restart, then export/import the new bundle. |
 | `401` | Import the current profile or redistribute it after Token rotation. |
 | `409 idempotency.key_conflict` | Generate a new key, or retry with the same decoded request envelope. |
-| `409 query.not_complete` | Poll status; results are not exposed while execution is active. |
+| `409 query.not_complete` | Poll status before requesting JSON/NDJSON; use sequenced Arrow IPC for committed running output. |
 | `429` | The 64-entry queue is full; wait for `Retry-After`. |
 | `422 sql.unsupported` | Use an allowed read-only statement and only registered relations. |
 | `query.resource_exhausted` | Reduce the result, consume/delete retained results, or move `--result-directory` to a suitable filesystem. |
-| Query missing after restart | Query jobs and retained results are intentionally process-local. Resubmit with a new Idempotency Key. |
+| Query was active during restart | Queued/running work is recovered as failed with `query.server_restarted` and a safe retry class; submit a new request. |
+| Completed Query missing after restart | It expired, was deleted, failed validation, or is owned by another principal. Review service logs before resubmitting. |
 
-Errors use a stable string `error` code, human-readable `message`, and optional
-`request_id`, `query_id`, and structured `details`. Include IDs—not credentials
-or profile bundles—when collecting diagnostics.
+Errors use a stable string `error` code, human-readable `message`, mandatory
+`retry` classification, and optional `request_id`, `query_id`, and structured
+`details`. Clients must not infer retry safety from the message. Include IDs—not
+credentials or profile bundles—when collecting diagnostics.
 
 ```json
 {
   "error": "sql.unsupported",
   "message": "HTTP queries allow SELECT, WITH, VALUES, SHOW, DESCRIBE, EXPLAIN, and EXPLAIN ANALYZE only",
+  "retry": "never",
   "request_id": "9ae24e09597d4b28aec5a455263a70b2"
 }
 ```

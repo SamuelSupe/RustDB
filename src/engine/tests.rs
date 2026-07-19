@@ -26,6 +26,7 @@ mod memory_snapshot;
 mod native;
 mod native_backup;
 mod native_gc;
+mod native_import;
 mod native_integrity;
 mod native_parquet;
 mod native_quota;

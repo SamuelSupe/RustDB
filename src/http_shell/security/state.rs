@@ -90,9 +90,24 @@ impl SecurityState {
         self.directory.join("bearer.token")
     }
 
+    pub fn principals_path(&self) -> PathBuf {
+        self.directory.join("principals.json")
+    }
+
     #[doc(hidden)]
     pub fn acquire_server_lock(&self) -> Result<ServerStateLock> {
         let path = self.directory.join(SERVER_LOCK_FILE);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(Error::InvalidArgument(format!(
+                    "refusing insecure HTTP server lock {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::io(path.clone(), error)),
+        }
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]

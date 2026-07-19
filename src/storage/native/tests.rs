@@ -10,7 +10,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
-use super::{INIT_FILE, MARKER_FILE, NativeDatabase, NativeWriteMode, marker};
+use super::{INIT_FILE, MARKER_FILE, NativeDatabase, NativeWriteMode, format, marker};
 use crate::Error;
 
 #[test]
@@ -21,6 +21,10 @@ fn creates_and_reopens_database() {
     let database = NativeDatabase::open(&path).unwrap();
     assert_eq!(database.path(), fs::canonicalize(&path).unwrap());
     assert!(path.join(MARKER_FILE).is_file());
+    assert_eq!(
+        marker::read(&path.join(MARKER_FILE)).unwrap().version(),
+        format::CURRENT_DATABASE_VERSION
+    );
     assert!(path.join("catalog").join("CURRENT").is_file());
     assert!(path.join("tables").is_dir());
     assert!(path.join("staging").is_dir());

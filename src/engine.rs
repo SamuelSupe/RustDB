@@ -28,7 +28,10 @@ use crate::{
         scavenge_orphans,
     },
     sql::{LogicalPlan, StatementPlan},
-    storage::{NativeDatabase, RemoteTempDir, RemoteTempKind, scavenge_remote_temp_orphans},
+    storage::{
+        NativeCheckReport, NativeDatabase, NativeRepairPlan, NativeRepairReport, RemoteTempDir,
+        RemoteTempKind, scavenge_remote_temp_orphans,
+    },
 };
 
 pub use memory_snapshot::EngineMemorySnapshot;
@@ -80,10 +83,30 @@ struct EngineInner {
     persistent_catalog: PersistentCatalog,
     transactions: transaction_manager::TransactionManager,
     native_commit: parking_lot::Mutex<()>,
+    import_gate: AsyncMutex<()>,
     native_poisoned: AtomicBool,
 }
 
 impl Engine {
+    /// Performs a strictly read-only integrity check of a Native database.
+    ///
+    /// Integrity failures are accumulated in the returned report. This path
+    /// never opens the database, acquires its lock, replays WAL, or cleans
+    /// temporary files.
+    pub fn check_native(path: impl AsRef<Path>) -> Result<NativeCheckReport> {
+        NativeDatabase::check(path)
+    }
+
+    /// Builds a strictly read-only, conservative Native repair plan.
+    pub fn plan_native_repair(path: impl AsRef<Path>) -> Result<NativeRepairPlan> {
+        NativeDatabase::plan_repair(path)
+    }
+
+    /// Revalidates and applies a conservative Native repair plan.
+    pub fn apply_native_repair(path: impl AsRef<Path>) -> Result<NativeRepairReport> {
+        NativeDatabase::apply_repair(path)
+    }
+
     pub fn migrate(path: impl AsRef<Path>) -> Result<MigrationInfo> {
         let migration = NativeDatabase::migrate(path)?;
         Ok(MigrationInfo {
@@ -94,12 +117,12 @@ impl Engine {
     }
 
     pub fn new(config: EngineConfig) -> Result<Self> {
-        validate_config(&config)?;
+        config.validate()?;
         Self::from_validated_config(config, None)
     }
 
     pub fn open(path: impl AsRef<Path>, config: EngineConfig) -> Result<Self> {
-        validate_config(&config)?;
+        config.validate()?;
         let database = NativeDatabase::open_with_storage(path, config.native_storage.clone())?;
         Self::from_validated_config(config, Some(database))
     }
@@ -109,7 +132,7 @@ impl Engine {
         destination: impl AsRef<Path>,
         config: EngineConfig,
     ) -> Result<Self> {
-        validate_config(&config)?;
+        config.validate()?;
         let source = NativeDatabase::open(backup)?;
         source.backup_to(destination.as_ref())?;
         drop(source);
@@ -159,6 +182,7 @@ impl Engine {
                 persistent_catalog,
                 transactions,
                 native_commit: parking_lot::Mutex::new(()),
+                import_gate: AsyncMutex::new(()),
                 native_poisoned: AtomicBool::new(false),
             }),
         })
@@ -170,6 +194,12 @@ impl Engine {
 
     pub fn memory_snapshot(&self) -> EngineMemorySnapshot {
         EngineMemorySnapshot::from_pool(&self.inner.memory)
+    }
+
+    /// Returns an error when this engine has observed an ambiguous persistent
+    /// Native publication and must be reopened before accepting more work.
+    pub fn health_check(&self) -> Result<()> {
+        self.ensure_native_healthy()
     }
 
     pub fn database_path(&self) -> Option<&Path> {
@@ -239,7 +269,7 @@ impl Engine {
         destination: impl AsRef<Path>,
         config: EngineConfig,
     ) -> Result<Self> {
-        validate_config(&config)?;
+        config.validate()?;
         if !backup.starts_with("s3://") {
             return Self::restore_from(local_location_path(backup)?, destination, config);
         }
@@ -492,10 +522,24 @@ impl Session {
     }
 
     pub(super) async fn execute_http_read_only_direct(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_http_read_only_direct_with_memory_limit(sql, None)
+            .await
+    }
+
+    pub(crate) async fn execute_http_read_only_direct_with_memory_limit(
+        &self,
+        sql: &str,
+        memory_limit: Option<usize>,
+    ) -> Result<QueryResult> {
         let parse_started = Instant::now();
         let parsed = crate::command::parse(sql)?;
-        self.execute_parsed_mode(parsed, parse_started.elapsed(), true)
-            .await
+        self.execute_parsed_mode_with_memory_limit(
+            parsed,
+            parse_started.elapsed(),
+            true,
+            memory_limit,
+        )
+        .await
     }
 
     async fn execute_parsed(
@@ -511,6 +555,17 @@ impl Session {
         parsed: ParsedStatement,
         parse_time: Duration,
         http_read_only: bool,
+    ) -> Result<QueryResult> {
+        self.execute_parsed_mode_with_memory_limit(parsed, parse_time, http_read_only, None)
+            .await
+    }
+
+    async fn execute_parsed_mode_with_memory_limit(
+        &self,
+        parsed: ParsedStatement,
+        parse_time: Duration,
+        http_read_only: bool,
+        memory_limit: Option<usize>,
     ) -> Result<QueryResult> {
         let admission_started = Instant::now();
         let permit = self.acquire_query_permit().await?;
@@ -528,6 +583,7 @@ impl Session {
                     admission_wait,
                     parse_time,
                     http_read_only,
+                    memory_limit,
                 )
                 .await
             }
@@ -541,10 +597,11 @@ impl Session {
         admission_wait: Duration,
         parse_time: Duration,
         http_read_only: bool,
+        memory_limit: Option<usize>,
     ) -> Result<QueryResult> {
         // Start query accounting before file-function schema discovery so the
         // reported elapsed time includes planning and metadata preparation.
-        let context = self.query_context()?;
+        let context = self.query_context_with_memory_limit(memory_limit)?;
         if http_read_only {
             context.enable_http_read_only();
         }
@@ -591,11 +648,13 @@ impl Session {
         self.execute_prepared_mode(statement, false).await
     }
 
-    pub(crate) async fn execute_prepared_http_read_only(
+    pub(crate) async fn execute_prepared_http_read_only_with_memory_limit(
         &self,
         statement: sqlparser::ast::Statement,
+        memory_limit: Option<usize>,
     ) -> Result<QueryResult> {
-        self.execute_prepared_mode(statement, true).await
+        self.execute_prepared_mode_with_memory_limit(statement, true, memory_limit)
+            .await
     }
 
     async fn execute_prepared_mode(
@@ -603,10 +662,20 @@ impl Session {
         statement: sqlparser::ast::Statement,
         http_read_only: bool,
     ) -> Result<QueryResult> {
+        self.execute_prepared_mode_with_memory_limit(statement, http_read_only, None)
+            .await
+    }
+
+    async fn execute_prepared_mode_with_memory_limit(
+        &self,
+        statement: sqlparser::ast::Statement,
+        http_read_only: bool,
+        memory_limit: Option<usize>,
+    ) -> Result<QueryResult> {
         let admission_started = Instant::now();
         let permit = self.acquire_query_permit().await?;
         let admission_wait = admission_started.elapsed();
-        let context = self.query_context()?;
+        let context = self.query_context_with_memory_limit(memory_limit)?;
         if http_read_only {
             context.enable_http_read_only();
         }
@@ -1047,11 +1116,27 @@ impl Session {
     }
 
     fn query_context(&self) -> Result<Arc<QueryContext>> {
+        self.query_context_with_memory_limit(None)
+    }
+
+    fn query_context_with_memory_limit(
+        &self,
+        memory_limit: Option<usize>,
+    ) -> Result<Arc<QueryContext>> {
         let query_id = Uuid::new_v4();
-        let query_memory = self.engine.inner.memory.child(
-            format!("query-{query_id}"),
-            self.engine.inner.config.memory_limit,
-        );
+        let memory_limit = memory_limit
+            .unwrap_or(self.engine.inner.config.memory_limit)
+            .min(self.engine.inner.config.memory_limit);
+        if memory_limit == 0 {
+            return Err(Error::InvalidArgument(
+                "query memory limit must be greater than zero".into(),
+            ));
+        }
+        let query_memory = self
+            .engine
+            .inner
+            .memory
+            .child(format!("query-{query_id}"), memory_limit);
         let context = Arc::new(QueryContext::with_spill_resources(
             query_id,
             query_memory,
@@ -1304,52 +1389,6 @@ fn local_location_path(location: &str) -> Result<std::path::PathBuf> {
         .map_err(|()| Error::InvalidArgument("file URI is not a local path".to_owned()))
 }
 
-fn validate_config(config: &EngineConfig) -> Result<()> {
-    if config.memory_limit == 0 {
-        return Err(Error::InvalidArgument(
-            "memory_limit must be greater than zero".to_owned(),
-        ));
-    }
-    if config.batch_size == 0 {
-        return Err(Error::InvalidArgument(
-            "batch_size must be greater than zero".to_owned(),
-        ));
-    }
-    if config.compute_threads == 0 || config.io_concurrency == 0 {
-        return Err(Error::InvalidArgument(
-            "compute_threads and io_concurrency must be greater than zero".to_owned(),
-        ));
-    }
-    if config.max_concurrent_queries == 0 {
-        return Err(Error::InvalidArgument(
-            "max_concurrent_queries must be greater than zero".to_owned(),
-        ));
-    }
-    if config.s3.anonymous && config.s3.credential_provider.is_some() {
-        return Err(Error::InvalidArgument(
-            "S3 anonymous access and a credential provider are mutually exclusive".to_owned(),
-        ));
-    }
-    if let Some(endpoint) = &config.s3.endpoint {
-        crate::storage::validate_endpoint(endpoint, config.s3.allow_http)?;
-    }
-    config.csv_scan.validate()?;
-    config.execution.validate()?;
-    config.spill.validate()?;
-    config.native_storage.validate()?;
-    ensure_directory_parent(&config.spill.directory)
-}
-
-fn ensure_directory_parent(path: &Path) -> Result<()> {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() && !parent.exists() => {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| Error::io(Some(parent.to_path_buf()), error))
-        }
-        _ => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -1359,6 +1398,8 @@ mod copy;
 mod copy_sink;
 #[path = "engine/external_source.rs"]
 mod external_source_api;
+#[path = "engine/import.rs"]
+mod import;
 #[path = "engine/maintenance.rs"]
 mod maintenance;
 #[path = "engine/memory_snapshot.rs"]

@@ -19,27 +19,7 @@ pub async fn write_result(
     let mut first = true;
     while let Some(batch) = result.stream().next().await {
         let batch = batch?;
-        match format {
-            OutputFormat::Table => {
-                write_table_batch(&batch, first)?;
-            }
-            OutputFormat::Csv => {
-                let mut bytes = Vec::new();
-                csv_writer(first, csv_null)
-                    .build(&mut bytes)
-                    .write(&batch)?;
-                io::stdout()
-                    .write_all(&bytes)
-                    .map_err(|error| Error::io(None, error))?;
-            }
-            OutputFormat::Jsonl => {
-                let mut bytes = Vec::new();
-                LineDelimitedWriter::new(&mut bytes).write(&batch)?;
-                io::stdout()
-                    .write_all(&bytes)
-                    .map_err(|error| Error::io(None, error))?;
-            }
-        }
+        write_batch(&batch, format, csv_null, first)?;
         first = false;
     }
     if first {
@@ -57,6 +37,33 @@ pub async fn write_result(
         }
     }
     Ok(())
+}
+
+pub(crate) fn write_batch(
+    batch: &RecordBatch,
+    format: OutputFormat,
+    csv_null: Option<&str>,
+    header: bool,
+) -> Result<()> {
+    match format {
+        OutputFormat::Table => write_table_batch(batch, header),
+        OutputFormat::Csv => {
+            let mut bytes = Vec::new();
+            csv_writer(header, csv_null)
+                .build(&mut bytes)
+                .write(batch)?;
+            io::stdout()
+                .write_all(&bytes)
+                .map_err(|error| Error::io(None, error))
+        }
+        OutputFormat::Jsonl => {
+            let mut bytes = Vec::new();
+            LineDelimitedWriter::new(&mut bytes).write(batch)?;
+            io::stdout()
+                .write_all(&bytes)
+                .map_err(|error| Error::io(None, error))
+        }
+    }
 }
 
 fn csv_writer(header: bool, null_value: Option<&str>) -> CsvWriterBuilder {

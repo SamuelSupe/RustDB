@@ -1,166 +1,123 @@
-use std::fs;
-
-use arrow::datatypes::{DataType, Field, Schema};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use super::*;
-use crate::storage::native::{NativeWriteMode, manifest};
+use crate::Error;
+
+#[derive(Debug, Eq, PartialEq)]
+struct TreeEntry {
+    relative: PathBuf,
+    mode: u32,
+    contents: Option<Vec<u8>>,
+}
 
 #[test]
-fn explicitly_migrates_legacy_database_and_keeps_a_v07_backup() {
+fn migrate_is_a_no_op_for_the_current_beta_format() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("database");
     drop(NativeDatabase::open(&path).unwrap());
-    make_legacy(&path);
 
-    let legacy = NativeDatabase::open(&path).unwrap();
-    let schema = std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-    assert!(
-        legacy
-            .plan_write("blocked", NativeWriteMode::Create, 0, schema, 1)
-            .is_err()
-    );
-    drop(legacy);
-
+    let before = snapshot(&path);
     let migration = migrate(&path).unwrap();
-    assert_eq!(migration.from_version, LEGACY_DATABASE_FORMAT_VERSION);
-    assert_eq!(migration.to_version, DATABASE_FORMAT_VERSION);
-    let backup = migration.backup_path.unwrap();
-    assert!(backup.is_dir());
-    assert_eq!(
-        marker::read(&backup.join(MARKER_FILE)).unwrap().version(),
-        LEGACY_DATABASE_FORMAT_VERSION
-    );
-    assert_eq!(
-        marker::read(&path.join(MARKER_FILE)).unwrap().version(),
-        DATABASE_FORMAT_VERSION
-    );
-    drop(NativeDatabase::open(&path).unwrap());
 
-    let repeated = migrate(&path).unwrap();
-    assert_eq!(repeated.from_version, DATABASE_FORMAT_VERSION);
-    assert!(repeated.backup_path.is_none());
+    assert_eq!(migration.from_version, format::CURRENT_DATABASE_VERSION);
+    assert_eq!(migration.to_version, format::CURRENT_DATABASE_VERSION);
+    assert!(migration.backup_path.is_none());
+    assert_eq!(snapshot(&path), before);
 }
 
 #[test]
-fn mismatched_existing_backup_does_not_modify_the_legacy_source() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("database");
-    drop(NativeDatabase::open(&path).unwrap());
-    make_legacy(&path);
-    drop(NativeDatabase::open(directory.path().join("database.v0.7-backup")).unwrap());
-
-    assert!(migrate(&path).is_err());
-    assert_eq!(
-        marker::read(&path.join(MARKER_FILE)).unwrap().version(),
-        LEGACY_DATABASE_FORMAT_VERSION
-    );
-}
-
-#[test]
-fn stale_same_database_backup_does_not_modify_the_legacy_source() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("database");
-    drop(NativeDatabase::open(&path).unwrap());
-    make_legacy(&path);
-
-    let database = NativeDatabase::open(&path).unwrap();
-    let backup = default_backup_path(database.path()).unwrap();
-    ensure_backup(&database, &backup).unwrap();
-    let database_id = database.database_id().to_owned();
-    let generation = database.catalog_generation();
-    drop(database);
-
-    manifest::commit(
-        &path,
-        &database_id,
-        generation,
-        std::collections::BTreeMap::new(),
-    )
-    .unwrap();
-
-    let error = migrate(&path).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("not the matching v0.7 catalog snapshot"),
-        "unexpected migration error: {error}"
-    );
-    assert_eq!(
-        marker::read(&path.join(MARKER_FILE)).unwrap().version(),
-        LEGACY_DATABASE_FORMAT_VERSION
-    );
-    assert_eq!(NativeDatabase::open(&path).unwrap().catalog_generation(), 1);
-}
-
-#[test]
-fn migration_resumes_after_each_durable_pre_marker_boundary() {
-    for boundary in ["backup", "empty-wal", "upgraded-marker"] {
+fn alpha_formats_are_rejected_without_modifying_contents_or_permissions() {
+    for version in [1, 2] {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("database");
+        let path = directory.path().join(format!("database-v{version}"));
         drop(NativeDatabase::open(&path).unwrap());
-        make_legacy(&path);
+        rewrite_marker_version(&path, version, false);
+        add_recovery_candidate(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = snapshot(&path);
 
-        let database = NativeDatabase::open(&path).unwrap();
-        let backup = default_backup_path(database.path()).unwrap();
-        ensure_backup(&database, &backup).unwrap();
-        if boundary != "backup" {
-            ensure_empty_wal(database.path()).unwrap();
-        }
-        if boundary == "upgraded-marker" {
-            marker::upgrade_legacy(
-                &database.path().join(MARKER_FILE),
-                &uuid::Uuid::new_v4().to_string(),
-            )
-            .unwrap();
-        }
-        drop(database);
+        assert_unsupported(NativeDatabase::open(&path).unwrap_err(), version, true);
+        assert_eq!(snapshot(&path), before, "open changed alpha v{version}");
 
-        let migration = migrate(&path).unwrap();
-        assert_eq!(
-            marker::read(&path.join(MARKER_FILE)).unwrap().version(),
-            DATABASE_FORMAT_VERSION,
-            "migration did not recover after {boundary}"
-        );
-        assert!(path.join("wal").is_dir());
-        assert!(backup.is_dir());
-        if boundary == "upgraded-marker" {
-            assert_eq!(migration.from_version, DATABASE_FORMAT_VERSION);
-        } else {
-            assert_eq!(migration.from_version, LEGACY_DATABASE_FORMAT_VERSION);
-        }
+        assert_unsupported(crate::Engine::migrate(&path).unwrap_err(), version, true);
+        assert_eq!(snapshot(&path), before, "migrate changed alpha v{version}");
     }
 }
 
 #[test]
-fn migration_failure_before_marker_keeps_the_source_retryable() {
+fn future_format_with_unknown_fields_is_rejected_without_modification() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("database");
+    let path = directory.path().join("future-database");
     drop(NativeDatabase::open(&path).unwrap());
-    make_legacy(&path);
-    fs::create_dir(path.join("wal")).unwrap();
-    fs::write(path.join("wal/unexpected"), b"keep").unwrap();
+    let future = format::CURRENT_DATABASE_VERSION + 1;
+    rewrite_marker_version(&path, future, true);
+    add_recovery_candidate(&path);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o751)).unwrap();
+    let before = snapshot(&path);
 
-    assert!(migrate(&path).is_err());
-    assert_eq!(
-        marker::read(&path.join(MARKER_FILE)).unwrap().version(),
-        LEGACY_DATABASE_FORMAT_VERSION
-    );
-    assert_eq!(fs::read(path.join("wal/unexpected")).unwrap(), b"keep");
+    assert_unsupported(NativeDatabase::open(&path).unwrap_err(), future, false);
+    assert_eq!(snapshot(&path), before);
+}
 
-    fs::remove_file(path.join("wal/unexpected")).unwrap();
-    let migration = migrate(&path).unwrap();
-    assert_eq!(migration.from_version, LEGACY_DATABASE_FORMAT_VERSION);
-    assert_eq!(
-        marker::read(&path.join(MARKER_FILE)).unwrap().version(),
-        DATABASE_FORMAT_VERSION
+fn assert_unsupported(error: Error, found_version: u32, alpha: bool) {
+    assert!(
+        matches!(
+            error,
+            Error::NativeFormatUnsupported {
+                found_version: found,
+                current_version: format::CURRENT_DATABASE_VERSION,
+                alpha: actual_alpha,
+                ..
+            } if found == found_version && actual_alpha == alpha
+        ),
+        "unexpected format error: {error}"
     );
 }
 
-fn make_legacy(path: &Path) {
-    let marker_path = path.join(MARKER_FILE);
+fn rewrite_marker_version(path: &Path, version: u32, future_field: bool) {
+    let marker_path = path.join(super::super::MARKER_FILE);
     let mut value: serde_json::Value =
         serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
-    value["version"] = serde_json::Value::from(LEGACY_DATABASE_FORMAT_VERSION);
-    fs::write(&marker_path, serde_json::to_vec(&value).unwrap()).unwrap();
-    fs::remove_dir(path.join("wal")).unwrap();
+    value["version"] = serde_json::Value::from(version);
+    if future_field {
+        value["future_field"] = serde_json::Value::Bool(true);
+    }
+    fs::write(marker_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+}
+
+fn add_recovery_candidate(path: &Path) {
+    let temporary = path.join(format!(".rustdb.{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(temporary, b"must remain untouched").unwrap();
+}
+
+fn snapshot(root: &Path) -> Vec<TreeEntry> {
+    let mut entries = Vec::new();
+    snapshot_path(root, root, &mut entries);
+    entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+    entries
+}
+
+fn snapshot_path(root: &Path, path: &Path, entries: &mut Vec<TreeEntry>) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+    let contents = metadata.is_file().then(|| fs::read(path).unwrap());
+    entries.push(TreeEntry {
+        relative,
+        mode: metadata.permissions().mode() & 0o777,
+        contents,
+    });
+    if metadata.is_dir() {
+        let mut children = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            snapshot_path(root, &child, entries);
+        }
+    }
 }

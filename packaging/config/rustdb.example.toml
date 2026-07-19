@@ -1,0 +1,38 @@
+# RustDB service configuration schema. This field is required.
+schema_version = 1
+
+[server]
+listen = "127.0.0.1:7400"
+state_root = "/var/lib/rustdb/state"
+result_directory = "/var/lib/rustdb/results"
+result_ttl_secs = 3600
+result_global_limit = "10GiB"
+result_query_limit = "2GiB"
+max_running = 4
+max_queued = 64
+max_query_time_secs = 1800
+query_memory_limit = "512MiB"
+query_spill_limit = "4GiB"
+query_result_limit = "2GiB"
+principal_max_running = 4
+principal_max_queued = 16
+principal_memory_limit = "2GiB"
+principal_spill_limit = "16GiB"
+principal_result_limit = "8GiB"
+principal_weight = 1
+no_auth = false
+
+[engine]
+memory_limit = "2GiB"
+threads = 4
+spill_engine_limit = "16GiB"
+spill_query_limit = "4GiB"
+native_min_free_bytes = "1GiB"
+native_min_free_ratio = 0.10
+
+# AWS credentials are never stored here. Use the default credential chain.
+# s3_region = "us-east-1"
+# s3_endpoint = "https://s3.example.com"
+# s3_path_style = false
+# s3_allow_http = false
+# s3_anonymous = false

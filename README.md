@@ -4,25 +4,26 @@
 
 **A single-node OLAP engine for CSV, Parquet, S3, persistent Native analytics, and a secure read-only HTTPS Shell.**
 
-[简体中文](README.zh-CN.md) · [HTTP Shell](docs/http-shell.md) · [Architecture](docs/architecture.md) · [SQL compatibility](docs/compatibility.md) · [CLI guide](packaging/dist/CLI.md)
+[简体中文](README.zh-CN.md) · [Operator guide](docs/operator-guide.md) · [HTTP Shell](docs/http-shell.md) · [Architecture](docs/architecture.md) · [SQL compatibility](docs/compatibility.md) · [CLI guide](packaging/dist/CLI.md)
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-0.9.0--alpha.1-orange)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.0.0--beta.1-blue)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 </div>
 
 > [!WARNING]
-> RustDB is experimental alpha software. It is suitable for evaluation,
-> development, and reproducible engine research, but its storage format and
-> public API are not yet production-stable.
+> RustDB Beta is pre-production software. It is suitable for evaluation,
+> development, and reproducible engine research. The Beta series establishes
+> compatibility from beta.1 forward; alpha Native databases must be re-imported.
+> Its operational model is still being proven, and it has no production SLA.
 
 RustDB queries CSV and Parquet directly from local disks or S3-compatible
 object stores. Data can optionally be imported into an immutable, persistent
 Native database for repeated local analytics. Results are streamed as Apache
-Arrow `RecordBatch` values through the Rust API and local CLI. v0.9 optionally
+Arrow `RecordBatch` values through the Rust API and local CLI. Beta optionally
 serves one Native database through a TLS-only, read-only HTTP Shell while the
 official remote CLI preserves `table`, `csv`, and `jsonl` output.
 
@@ -51,12 +52,12 @@ is not a runtime dependency, and project code forbids `unsafe`.
 
 ## At a glance
 
-| Area | Current v0.9 alpha scope |
+| Area | Current v1.0 Beta scope |
 | --- | --- |
 | Sources | CSV, gzip CSV, zstd CSV, Parquet |
 | Storage | Local filesystem, S3/MinIO, persistent local Native database |
 | Interfaces | Embedded Rust API, local CLI/REPL, read-only HTTPS Shell and remote CLI |
-| Output | Streaming Arrow locally; paged JSON/NDJSON remotely; `table`/`csv`/`jsonl` CLI rendering |
+| Output | Streaming Arrow locally; sequenced Arrow IPC plus paged JSON/NDJSON remotely; `table`/`csv`/`jsonl` CLI rendering |
 | Execution | Vectorized, multi-lane, memory-accounted, Spill-capable |
 | SQL | TPC-H-oriented analytics, joins, aggregates, windows, set operations, prepared parameters |
 | Safety | Project code uses `#![forbid(unsafe_code)]` |
@@ -146,10 +147,11 @@ rustdb serve \
   --result-query-limit 2GiB
 ```
 
-The first start creates a local CA, renewable server certificate, and random
-Bearer Token. Stop the server, export its Profile bundle, transfer it over a
-trusted channel, import it on the client, then query with the existing CLI
-experience:
+The first start creates a local CA, renewable server certificate, an Admin
+principal, and a random profile token. The principal directory stores only
+SHA-256 token digests. Stop the server, export its Profile bundle, transfer it
+over a trusted channel, import it on the client, then query with the existing
+CLI experience:
 
 ```sh
 rustdb profile export \
@@ -161,6 +163,21 @@ rustdb shell --profile analytics -c \
 rustdb shell --profile analytics -f report.sql --format csv >report.csv
 ```
 
+Use the stopped-server local commands `rustdb principal list|create|set-enabled|set-role` and
+`rustdb token list|rotate|revoke` to manage Query and Admin identities. Token
+listing exposes only UUID, principal, lifecycle state, and validity, never a
+secret or digest. Export a non-default credential by UUID while reusing the
+managed bundle's URL and CA (or provide an explicit `--server-url`):
+
+```sh
+rustdb token list --database /srv/rustdb/analytics --principal analyst
+rustdb profile export --database /srv/rustdb/analytics \
+  --token-id <UUID> --output analyst.rustdb-profile
+```
+
+Query-role principals can access only their own Query IDs; Admin can access
+every Query.
+
 Remote SQL is deliberately narrower than local SQL: query, metadata, and
 explain statements only. DDL/DML, maintenance, uploads, direct file table
 functions, and remote data-source administration are rejected. Persistent
@@ -171,6 +188,10 @@ server is stopped. `serve` can independently configure result retention with
 `--s3-path-style`, `--s3-allow-http`, and `--s3-anonymous` for server-local
 registered sources. See the [HTTP Shell guide](docs/http-shell.md) and
 [OpenAPI 3.1 contract](docs/openapi-v1.yaml).
+
+For a redacted, read-only support snapshot, run
+`rustdb diagnostics --database PATH [--output FILE]`; see the
+[diagnostics guide](docs/diagnostics.md).
 
 ## Embed RustDB
 
@@ -209,6 +230,19 @@ query Spill is cleaned up.
 
 `Engine::new` is ephemeral. `Engine::open` enables a persistent local database
 whose immutable segments can be populated directly from CSV or Parquet:
+
+```sh
+rustdb import --database ./warehouse --table events \
+  --location /data/events.csv.gz --format csv \
+  --import-id events-2026-07-19 --header present --compression auto
+```
+
+`import_id` is a permanent idempotency key: replaying the identical request
+returns its durable receipt without rereading the source, while changing the
+request returns `native.import_conflict`. Embedded callers use
+`Session::import` with the same contract. This is the recommended direct
+CSV/Parquet-to-Native path; see [idempotent Native import](docs/native-import.md).
+Use CTAS when SQL transformation is required:
 
 ```rust,no_run
 use futures::StreamExt;
@@ -275,10 +309,11 @@ retry `commit` or `rollback` on that handle, reopen the database, and reconcile
 the visible Catalog generation before issuing another write. SQL `COMMIT`
 follows the same rule and clears the session's active transaction.
 
-The CLI opens this database with `rustdb --database ./warehouse`. Existing
-v0.7 databases remain read-only until `rustdb migrate ./warehouse` validates
-the source, creates or verifies an exact `.v0.7-backup` catalog snapshot, and
-atomically enables the v0.8 WAL.
+The CLI opens this database with `rustdb --database ./warehouse`. Beta uses a
+new Native compatibility epoch and rejects alpha databases without mutating
+them. Re-import CSV/Parquet into a fresh Beta directory; `rustdb migrate PATH`
+is now a format-validation command, not an alpha in-place migration. See the
+[Beta migration guide](docs/migration-v1-beta.md).
 Consistent backup and restore are available for local directories and S3:
 
 ```sh
@@ -326,14 +361,13 @@ The full execution model is documented in [architecture.md](docs/architecture.md
 
 ## Functional status
 
-- The v0.8 release-candidate gate passed one focused OrbStack reliability run,
-  including live-MinIO CSV/Parquet COPY and Native backup/restore. See the
-  [acceptance contract](docs/acceptance.md) and
-  [release notes](docs/releases/v0.8.0-alpha.1.md).
-- The v0.9 release gate adds one complete HTTP Shell correctness run covering
-  TLS/Profile bootstrap, authentication, read-only policy, Query lifecycle,
-  pagination, cancellation, quotas, cleanup, and all three CLI renderers; it
-  intentionally adds no performance threshold or long soak.
+- The Beta contract requires one complete OrbStack release run plus an explicit
+  100-GiB/10,000-object equivalent local/MinIO CSV-or-Parquet workload at 2/4
+  GiB and eight-client concurrency, followed by one ClickBench pass. The gate
+  writes commit-bound `evidence.json`; publication is blocked until an annotated
+  tag binds that accepted commit. See the
+  [Beta roadmap](docs/roadmap-v1-beta.md) and
+  [operator guide](docs/operator-guide.md).
 - TPC-H Q1-Q22 query coverage is retained in [`benchmarks/tpch`](benchmarks/tpch).
 - The v0.7 functional ClickBench gate runs all 43 official queries once in a
   four-CPU/16-GiB container profile.
@@ -348,8 +382,8 @@ are in the [ClickBench guide](benchmarks/clickbench/README.md).
 
 Serializable isolation, savepoints, `MERGE`/upsert, constraints, indexes,
 public time travel, distributed execution, and DuckDB database-file/SQL
-compatibility are outside v0.9. The HTTP surface is a read-only remote Shell,
-not a write API, browser UI, multi-user service, session protocol, or generated
+compatibility are outside Beta. The HTTP surface is a read-only remote Shell,
+not a write API, browser UI, broad multi-tenant service, session protocol, or generated
 SDK. JSON/ORC/Iceberg scans and nested LIST/STRUCT/MAP execution are also
 excluded. Result order is unspecified without an outer `ORDER BY`.
 
@@ -359,13 +393,20 @@ excluded. Result order is unspecified without an outer `ORDER BY`.
 | --- | --- |
 | [Architecture](docs/architecture.md) | Pipelines, scheduling, memory, pruning, Native storage, and Spill |
 | [Compatibility](docs/compatibility.md) | Supported SQL, types, formats, and explicit limitations |
+| [Operator guide](docs/operator-guide.md) / [中文](docs/operator-guide.zh-CN.md) | Supported platforms, deployment, auth, metrics, audit, recovery, and Beta gate |
 | [CLI guide](packaging/dist/CLI.md) / [中文](packaging/dist/CLI.zh-CN.md) | Commands, output, resources, and S3 flags |
 | [HTTP Shell](docs/http-shell.md) / [中文](docs/http-shell.zh-CN.md) | TLS, Profiles, read-only SQL, Query lifecycle, and operations |
 | [OpenAPI v1](docs/openapi-v1.yaml) | Public versioned HTTP contract |
 | [Installation](packaging/dist/INSTALL.md) / [中文](packaging/dist/INSTALL.zh-CN.md) | Binary package installation and removal |
 | [S3 and MinIO](docs/s3.md) | Credentials, endpoints, and object-store behavior |
 | [Troubleshooting](docs/troubleshooting.md) | Resource, Spill, corruption, and input errors |
+| [Diagnostics](docs/diagnostics.md) / [中文](docs/diagnostics.zh-CN.md) | Redacted support snapshot and safe sharing boundary |
+| [Idempotent Native import](docs/native-import.md) | CSV/Parquet import receipts, replay, and conflict handling |
+| [Native check and repair](docs/native-repair.md) | Read-only integrity checks and conservative repair |
 | [Acceptance](docs/acceptance.md) | Correctness and release checks |
+| [v1.0 Beta release notes](docs/releases/v1.0.0-beta.1.md) | Compatibility epoch, packages, supply chain, and known limits |
+| [Alpha to Beta migration](docs/migration-v1-beta.md) | Required fresh import and rollback boundary |
+| [v1.0 Beta roadmap](docs/roadmap-v1-beta.md) | Completion contract and release evidence |
 | [v0.8 release notes](docs/releases/v0.8.0-alpha.1.md) | New transactional Native storage, SQL, COPY, and operations surface |
 | [v0.7 migration](docs/migration-v0.7.md) | Historical execution-core and benchmark changes |
 | [v0.8 migration](docs/migration-v0.8.md) | WAL format, explicit database migration, and transaction API |

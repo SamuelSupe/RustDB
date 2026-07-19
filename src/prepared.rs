@@ -83,13 +83,14 @@ impl PreparedStatement {
         self.session.execute_prepared(statement).await
     }
 
-    pub(crate) async fn execute_http_read_only(
+    pub(crate) async fn execute_http_read_only_with_memory_limit(
         &self,
         parameters: &[ParameterValue],
+        memory_limit: usize,
     ) -> Result<QueryResult> {
         let statement = self.instantiate(parameters)?;
         self.session
-            .execute_prepared_http_read_only(statement)
+            .execute_prepared_http_read_only_with_memory_limit(statement, Some(memory_limit))
             .await
     }
 

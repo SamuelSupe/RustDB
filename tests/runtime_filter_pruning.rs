@@ -97,10 +97,7 @@ async fn runtime_filter_prunes_hive_files_before_opening_them() -> Result<()> {
     write_hive_partition(directory.path(), 1)?;
     write_hive_partition(directory.path(), 2)?;
     let pattern = format!("{}/*/*.parquet", directory.path().display());
-    let options = ParquetOptions {
-        hive_partitioning: true,
-        ..ParquetOptions::default()
-    };
+    let options = ParquetOptions::default().hive_partitioning(true);
     let optimized = EngineConfig::builder()
         .batch_size(128)
         .parquet_page_index(ParquetPruningMode::Disabled)

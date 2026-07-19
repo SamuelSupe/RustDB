@@ -57,13 +57,11 @@ async fn reads_magic_detected_multi_member_csv_from_minio() -> Result<()> {
     store.put(&zstd_path, Bytes::from(zstd).into()).await?;
 
     let config = EngineConfig::builder()
-        .s3(S3Config {
-            endpoint: Some(endpoint),
-            region: Some("us-east-1".to_owned()),
-            force_path_style: true,
-            allow_http: true,
-            ..S3Config::default()
-        })
+        .s3(S3Config::default()
+            .endpoint(endpoint)
+            .region("us-east-1")
+            .force_path_style(true)
+            .allow_http(true))
         .build();
     let session = Engine::new(config)?.session();
     for path in [&gzip_path, &zstd_path] {
@@ -142,13 +140,11 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
         // the stale query snapshot is exercised by a later conditional GET.
         .compute_threads(1)
         .io_concurrency(1)
-        .s3(S3Config {
-            endpoint: Some(endpoint.clone()),
-            region: Some("us-east-1".to_owned()),
-            force_path_style: true,
-            allow_http: true,
-            ..S3Config::default()
-        })
+        .s3(S3Config::default()
+            .endpoint(endpoint.clone())
+            .region("us-east-1")
+            .force_path_style(true)
+            .allow_http(true))
         .build();
     let mut uncached_config = config.clone();
     uncached_config.metadata_cache_bytes = 0;
@@ -227,10 +223,7 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
         .register_parquet(
             "widening_s3",
             [format!("s3://{BUCKET}/{prefix}widening/*.parquet")],
-            ParquetOptions {
-                schema_mode: ParquetSchemaMode::SafeWidening,
-                ..ParquetOptions::default()
-            },
+            ParquetOptions::default().schema_mode(ParquetSchemaMode::SafeWidening),
         )
         .await?;
     let mut widened = session
@@ -507,14 +500,12 @@ async fn queries_csv_and_parquet_from_minio() -> Result<()> {
         .put(&public_path, Bytes::from_static(b"id\n1\n2\n").into())
         .await?;
     let anonymous = EngineConfig::builder()
-        .s3(S3Config {
-            endpoint: Some(endpoint.clone()),
-            region: Some("us-east-1".to_owned()),
-            force_path_style: true,
-            anonymous: true,
-            allow_http: true,
-            ..S3Config::default()
-        })
+        .s3(S3Config::default()
+            .endpoint(endpoint.clone())
+            .region("us-east-1")
+            .force_path_style(true)
+            .anonymous(true)
+            .allow_http(true))
         .build();
     let anonymous_session = Engine::new(anonymous)?.session();
     let mut anonymous_result = anonymous_session

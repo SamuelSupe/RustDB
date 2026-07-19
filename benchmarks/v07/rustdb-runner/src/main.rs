@@ -53,6 +53,10 @@ fn run() -> Result<(), String> {
     config.batch_size = args.batch_size;
     config.metadata_cache_bytes = args.metadata_cache_bytes;
     config.spill.directory = args.spill_directory.clone();
+    config.s3.endpoint = args.s3_endpoint.clone();
+    config.s3.region = args.s3_region.clone();
+    config.s3.force_path_style = args.s3_path_style;
+    config.s3.allow_http = args.s3_allow_http;
     let engine = match args.database.as_ref() {
         Some(path) => Engine::open(path, config),
         None => Engine::new(config),
@@ -308,6 +312,7 @@ async fn run_query(
         checksum_backend: CHECKSUM_BACKEND,
         checksum_compute_ms: checksum_compute.as_secs_f64() * 1_000.0,
         complete: true,
+        discovered_files: metrics.discovered_files,
         scanned_rows: metrics.rows_scanned,
         scanned_bytes: metrics.bytes_scanned,
         parquet_reader_builds: metrics.parquet_reader_builds,

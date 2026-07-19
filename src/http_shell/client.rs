@@ -1,5 +1,6 @@
-use std::{fmt, time::Duration};
+use std::{fmt, io::Cursor, time::Duration};
 
+use arrow::ipc::reader::FileReader;
 use reqwest::{Client, Response, StatusCode, header};
 use serde::Deserialize;
 use url::Url;
@@ -8,6 +9,10 @@ use uuid::Uuid;
 use crate::{Error, Result};
 
 use super::{
+    arrow_transport::{
+        ARROW_RESULT_MEDIA_TYPE, ArrowResultBatch, ArrowResultPoll, BATCH_SEQ_HEADER,
+        NEXT_BATCH_SEQ_HEADER, RESULT_COMPLETE_HEADER,
+    },
     error::ErrorBody,
     security::ClientProfile,
     types::{JsonResultPage, QueryRequest, QueryState, QueryStatusResponse, SubmitResponse},
@@ -163,6 +168,78 @@ impl RemoteClient {
         success(response).await?.json().await.map_err(remote_error)
     }
 
+    /// Pulls one committed Arrow IPC result batch by sequence number.
+    ///
+    /// A pending response is intentionally distinct from completion so callers
+    /// can apply their own bounded polling/backpressure policy.
+    pub async fn arrow_batch(&self, query_id: &str, batch_seq: u64) -> Result<ArrowResultPoll> {
+        let mut url = self.url(&format!("v1/queries/{query_id}/results"))?;
+        url.query_pairs_mut()
+            .append_pair("batch_seq", &batch_seq.to_string());
+        let response = self
+            .authenticated(self.client.get(url))
+            .header(header::ACCEPT, ARROW_RESULT_MEDIA_TYPE)
+            .send()
+            .await
+            .map_err(remote_error)?;
+        let response = success(response).await?;
+        let next_batch_seq = header_u64(response.headers(), NEXT_BATCH_SEQ_HEADER)?;
+        let complete = response
+            .headers()
+            .get(RESULT_COMPLETE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        if response.status() == StatusCode::NO_CONTENT {
+            if complete {
+                return Err(Error::Execution(
+                    "remote completed Arrow result omitted its schema".into(),
+                ));
+            }
+            return Ok(ArrowResultPoll::Pending { next_batch_seq });
+        }
+        let returned_seq = header_u64(response.headers(), BATCH_SEQ_HEADER)?;
+        if returned_seq != batch_seq
+            || !matches!(
+                next_batch_seq,
+                value if value == batch_seq || value == batch_seq.saturating_add(1)
+            )
+        {
+            return Err(Error::Execution(
+                "remote Arrow result returned a discontinuous batch sequence".into(),
+            ));
+        }
+        let bytes = response.bytes().await.map_err(remote_error)?;
+        let mut reader = FileReader::try_new(Cursor::new(bytes), None)?;
+        let schema = reader.schema();
+        let Some(batch) = reader.next().transpose()? else {
+            if complete && next_batch_seq == batch_seq {
+                return Ok(ArrowResultPoll::Complete {
+                    next_batch_seq,
+                    schema,
+                });
+            }
+            return Err(Error::Execution(
+                "remote pending Arrow result contained no batch".into(),
+            ));
+        };
+        if next_batch_seq != batch_seq.saturating_add(1) {
+            return Err(Error::Execution(
+                "remote Arrow batch did not advance its sequence".into(),
+            ));
+        }
+        if reader.next().is_some() {
+            return Err(Error::Execution(
+                "remote Arrow result contained more than one batch".into(),
+            ));
+        }
+        Ok(ArrowResultPoll::Batch(ArrowResultBatch {
+            batch_seq: returned_seq,
+            next_batch_seq,
+            result_complete: complete,
+            batch,
+        }))
+    }
+
     pub async fn cancel(&self, query_id: &str) -> Result<QueryStatusResponse> {
         let response = self
             .authenticated(
@@ -198,6 +275,14 @@ impl RemoteClient {
             ))
         })
     }
+}
+
+fn header_u64(headers: &header::HeaderMap, name: &str) -> Result<u64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| Error::Execution(format!("remote response omitted valid {name}")))
 }
 
 async fn success(response: Response) -> Result<Response> {

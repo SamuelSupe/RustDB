@@ -179,6 +179,16 @@ impl Session {
         self.execute_http_read_only_direct(sql).await
     }
 
+    pub(crate) async fn execute_http_read_only_with_memory_limit(
+        &self,
+        sql: &str,
+        memory_limit: usize,
+    ) -> Result<super::QueryResult> {
+        crate::HttpReadOnlyPolicy::validate(sql)?;
+        self.execute_http_read_only_direct_with_memory_limit(sql, Some(memory_limit))
+            .await
+    }
+
     fn install_new_source(&self, source: StoredExternalSource) -> Result<()> {
         self.engine.ensure_native_healthy()?;
         let _gate = self.engine.inner.native_commit.lock();

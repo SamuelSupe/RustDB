@@ -6,18 +6,34 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::Error;
+use crate::{Error, RetryClass};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct ErrorBody {
     pub error: String,
     pub message: String,
+    #[serde(default)]
+    pub retry: RetryClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+}
+
+impl ErrorBody {
+    pub fn new(error: impl Into<String>, message: impl Into<String>, retry: RetryClass) -> Self {
+        Self {
+            error: error.into(),
+            message: message.into(),
+            retry,
+            request_id: None,
+            query_id: None,
+            details: None,
+        }
+    }
 }
 
 pub(crate) struct HttpError {
@@ -36,11 +52,8 @@ impl HttpError {
         Self {
             status,
             body: Box::new(ErrorBody {
-                error: code.into(),
-                message: message.into(),
                 request_id: request_id.into(),
-                query_id: None,
-                details: None,
+                ..ErrorBody::new(code, message, RetryClass::Never)
             }),
             retry_after: None,
         }
@@ -53,54 +66,61 @@ impl HttpError {
 
     pub(crate) fn retry_after(mut self, seconds: u64) -> Self {
         self.retry_after = Some(seconds);
+        self.body.retry = RetryClass::Safe;
+        self
+    }
+
+    pub(crate) fn retry_class(mut self, retry: RetryClass) -> Self {
+        self.body.retry = retry;
         self
     }
 
     pub(crate) fn from_engine(error: &Error, request_id: String) -> Self {
-        match error {
+        let response = match error {
             Error::SqlParse(_) => Self::new(
                 StatusCode::BAD_REQUEST,
-                "sql.parse",
+                error.code().as_str(),
                 error.to_string(),
                 request_id,
             ),
             Error::InvalidArgument(message) => Self::new(
                 StatusCode::BAD_REQUEST,
-                "request.invalid",
+                error.code().as_str(),
                 message.clone(),
                 request_id,
             ),
             Error::Unsupported(message) => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "sql.unsupported",
+                error.code().as_str(),
                 message.clone(),
                 request_id,
             ),
             Error::Catalog(message) => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "sql.catalog",
+                error.code().as_str(),
                 message.clone(),
                 request_id,
             ),
             Error::ResourceExhausted(_) | Error::NativeDiskQuotaExceeded { .. } => Self::new(
                 StatusCode::INSUFFICIENT_STORAGE,
-                "query.resource_exhausted",
+                error.code().as_str(),
                 "query resources were exhausted",
                 request_id,
             ),
             Error::Cancelled => Self::new(
                 StatusCode::CONFLICT,
-                "query.cancelled",
+                error.code().as_str(),
                 "query was cancelled",
                 request_id,
             ),
             _ => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "server.internal",
+                error.code().as_str(),
                 "the server could not complete the request",
                 request_id,
             ),
-        }
+        };
+        response.retry_class(error.retry_class())
     }
 }
 
@@ -128,5 +148,29 @@ impl IntoResponse for HttpError {
             response.headers_mut().insert("x-request-id", value);
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Error, RetryClass};
+
+    use super::HttpError;
+
+    #[test]
+    fn engine_errors_keep_the_stable_code_and_retry_contract() {
+        let exhausted = HttpError::from_engine(
+            &Error::ResourceExhausted("memory budget".into()),
+            "request-1".into(),
+        );
+        assert_eq!(exhausted.body.error, "query.resource_exhausted");
+        assert_eq!(exhausted.body.retry, RetryClass::Safe);
+
+        let invalid = HttpError::from_engine(
+            &Error::InvalidArgument("bad value".into()),
+            "request-2".into(),
+        );
+        assert_eq!(invalid.body.error, "request.invalid");
+        assert_eq!(invalid.body.retry, RetryClass::Never);
     }
 }

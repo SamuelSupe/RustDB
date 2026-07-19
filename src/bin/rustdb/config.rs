@@ -24,6 +24,12 @@ pub(super) fn apply_engine_args(config: &mut EngineConfig, args: &Args) {
             .table_limit_bytes
             .insert(limit.name.clone(), as_u64(limit.bytes));
     }
+    if let Some(value) = args.native_min_free_bytes {
+        config.native_storage.min_free_bytes = as_u64(value);
+    }
+    if let Some(value) = args.native_min_free_ratio {
+        config.native_storage.min_free_ratio = value;
+    }
     if let Some(value) = args.threads {
         config.compute_threads = value;
     }

@@ -87,6 +87,22 @@ pub(super) fn commit(
     database: &NativeDatabase,
     prepared: PreparedSnapshot,
 ) -> Result<NativeCommit> {
+    commit_inner(database, prepared, None)
+}
+
+pub(super) fn commit_import(
+    database: &NativeDatabase,
+    prepared: PreparedSnapshot,
+    intent: crate::NativeImportIntent,
+) -> Result<NativeCommit> {
+    commit_inner(database, prepared, Some(intent))
+}
+
+fn commit_inner(
+    database: &NativeDatabase,
+    prepared: PreparedSnapshot,
+    import: Option<crate::NativeImportIntent>,
+) -> Result<NativeCommit> {
     let PreparedSnapshot {
         wal,
         mut wal_owner,
@@ -98,6 +114,22 @@ pub(super) fn commit(
     let commit_base_generation = state.catalog.generation();
     let transaction_id = staging.transaction_id().to_owned();
     let current = state.catalog.tables().get(&name);
+    if let Some(intent) = &import {
+        if intent.table != name {
+            return abort_with(
+                staging,
+                &mut wal_owner,
+                Error::Internal("Native import target changed before commit".to_owned()),
+            );
+        }
+        if state.catalog.imports().contains_key(&intent.import_id) {
+            return abort_with(
+                staging,
+                &mut wal_owner,
+                Error::native_import_conflict(&intent.import_id),
+            );
+        }
+    }
     let parent_matches = match (snapshot.operation(), snapshot.parent(), current) {
         (SnapshotOperation::Import, None, None) => true,
         (
@@ -140,13 +172,39 @@ pub(super) fn commit(
     };
     let mut tables = state.catalog.tables().clone();
     tables.insert(name.clone(), reference);
-    let prepared_catalog = match manifest::prepare_commit(
-        database.path(),
-        database.database_id(),
-        commit_base_generation,
-        tables,
-        &transaction_id,
-    ) {
+    let prepare_result = match import.as_ref() {
+        Some(intent) => commit_base_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                Error::ResourceExhausted("catalog generation counter is exhausted".to_owned())
+            })
+            .and_then(|generation| {
+                let receipt = crate::NativeImportReceipt::committed(
+                    intent,
+                    generation,
+                    &transaction_id,
+                    &snapshot,
+                );
+                manifest::prepare_catalog_commit_with_import(
+                    database.path(),
+                    database.database_id(),
+                    commit_base_generation,
+                    state.catalog.schemas().clone(),
+                    tables,
+                    state.catalog.views().clone(),
+                    Some(receipt),
+                    &transaction_id,
+                )
+            }),
+        None => manifest::prepare_commit(
+            database.path(),
+            database.database_id(),
+            commit_base_generation,
+            tables,
+            &transaction_id,
+        ),
+    };
+    let prepared_catalog = match prepare_result {
         Ok(prepared) => prepared,
         Err(error) => {
             return abort_published(database, &snapshot, &mut wal_owner, error);

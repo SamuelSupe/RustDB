@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-use super::{DATABASE_FORMAT_VERSION, FORMAT_NAME, LEGACY_DATABASE_FORMAT_VERSION, io};
+use super::{format, io};
 
 pub(super) const MAX_DATABASE_MARKER_BYTES: usize = 4 * 1024;
 
@@ -20,8 +20,8 @@ pub(super) struct DatabaseMarker {
 impl DatabaseMarker {
     pub(super) fn new() -> Self {
         Self {
-            format: FORMAT_NAME.to_owned(),
-            version: DATABASE_FORMAT_VERSION,
+            format: format::NAME.to_owned(),
+            version: format::CURRENT_DATABASE_VERSION,
             database_id: Uuid::new_v4().to_string(),
         }
     }
@@ -37,26 +37,30 @@ impl DatabaseMarker {
     pub(super) fn version(&self) -> u32 {
         self.version
     }
+}
 
-    pub(super) fn uses_wal(&self) -> bool {
-        self.version == DATABASE_FORMAT_VERSION
-    }
+#[derive(Deserialize)]
+struct DatabaseMarkerHeader {
+    format: String,
+    version: u32,
+}
 
-    pub(super) fn is_legacy(&self) -> bool {
-        self.version == LEGACY_DATABASE_FORMAT_VERSION
+pub(super) fn preflight_if_present(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => preflight(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::io(Some(path.to_path_buf()), error)),
     }
+}
 
-    fn upgraded(&self) -> Self {
-        Self {
-            format: self.format.clone(),
-            version: DATABASE_FORMAT_VERSION,
-            database_id: self.database_id.clone(),
-        }
-    }
+fn preflight(path: &Path) -> Result<()> {
+    let bytes = io::read_bounded(path, MAX_DATABASE_MARKER_BYTES, "database marker")?;
+    validate_header(path, &bytes)
 }
 
 pub(super) fn read(path: &Path) -> Result<DatabaseMarker> {
     let bytes = io::read_bounded(path, MAX_DATABASE_MARKER_BYTES, "database marker")?;
+    validate_header(path, &bytes)?;
     let marker: DatabaseMarker = serde_json::from_slice(&bytes).map_err(|error| {
         Error::native_storage(path, format!("invalid database marker: {error}"))
     })?;
@@ -67,18 +71,6 @@ pub(super) fn read(path: &Path) -> Result<DatabaseMarker> {
 pub(super) fn write_new(path: &Path, marker: &DatabaseMarker) -> Result<()> {
     let bytes = encode(path, marker)?;
     io::atomic_create(path, &bytes)
-}
-
-pub(super) fn upgrade_legacy(path: &Path, transaction_id: &str) -> Result<()> {
-    let marker = read(path)?;
-    if !marker.is_legacy() {
-        return Err(Error::InvalidArgument(
-            "database marker is not a legacy v0.7 format".to_owned(),
-        ));
-    }
-    let upgraded = marker.upgraded();
-    let bytes = encode(path, &upgraded)?;
-    io::atomic_replace(path, &bytes, transaction_id)
 }
 
 fn encode(path: &Path, marker: &DatabaseMarker) -> Result<Vec<u8>> {
@@ -94,25 +86,35 @@ fn encode(path: &Path, marker: &DatabaseMarker) -> Result<Vec<u8>> {
 }
 
 fn validate(path: &Path, marker: &DatabaseMarker) -> Result<()> {
-    if marker.format != FORMAT_NAME {
-        return Err(Error::native_storage(
-            path,
-            format!("expected format '{FORMAT_NAME}', found '{}'", marker.format),
-        ));
-    }
-    if !matches!(
-        marker.version,
-        LEGACY_DATABASE_FORMAT_VERSION | DATABASE_FORMAT_VERSION
-    ) {
+    if marker.format != format::NAME {
         return Err(Error::native_storage(
             path,
             format!(
-                "unsupported database format version {}; supported versions are {LEGACY_DATABASE_FORMAT_VERSION} and {DATABASE_FORMAT_VERSION}",
-                marker.version,
+                "expected format '{}', found '{}'",
+                format::NAME,
+                marker.format
             ),
         ));
     }
+    format::require_current_database_version(path, marker.version)?;
     Uuid::parse_str(&marker.database_id)
         .map_err(|error| Error::native_storage(path, format!("invalid database id: {error}")))?;
     Ok(())
+}
+
+fn validate_header(path: &Path, bytes: &[u8]) -> Result<()> {
+    let header: DatabaseMarkerHeader = serde_json::from_slice(bytes).map_err(|error| {
+        Error::native_storage(path, format!("invalid database marker: {error}"))
+    })?;
+    if header.format != format::NAME {
+        return Err(Error::native_storage(
+            path,
+            format!(
+                "expected format '{}', found '{}'",
+                format::NAME,
+                header.format
+            ),
+        ));
+    }
+    format::require_current_database_version(path, header.version)
 }

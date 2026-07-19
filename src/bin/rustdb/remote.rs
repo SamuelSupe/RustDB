@@ -1,16 +1,16 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
+use arrow::record_batch::RecordBatch;
 use rustdb::{
     Error, Result,
     http_shell::{
-        JsonResultPage, QueryRequest, QueryState, RemoteClient, SchemaColumn,
+        ArrowResultPoll, QueryRequest, QueryState, RemoteClient,
         security::{default_profile_root, load_profile},
     },
 };
-use serde_json::Value;
 
-use super::{args::OutputFormat, operations::ShellArgs};
+use super::operations::ShellArgs;
 
 pub(super) async fn run(args: &ShellArgs) -> Result<()> {
     let profile = load_profile(default_profile_root()?, &args.profile)?;
@@ -49,26 +49,21 @@ async fn execute(client: &RemoteClient, sql: &str, args: &ShellArgs) -> Result<(
         })
         .await?;
     let query_id = accepted.query_id;
-    let status = wait_or_cancel(client, &query_id).await?;
-    match status.state {
-        QueryState::Succeeded => {}
-        QueryState::Cancelled => return Err(Error::Cancelled),
-        QueryState::Failed => {
-            let message = status
-                .error
-                .map(|error| format!("{}: {}", error.error, error.message))
-                .unwrap_or_else(|| "remote query failed without an error detail".into());
-            return Err(Error::Execution(format!("{message} [query {query_id}]")));
+    if let Err(error) = fetch_arrow_batches(client, &query_id, args).await {
+        if matches!(&error, Error::Cancelled) {
+            return Err(error);
         }
-        QueryState::Queued | QueryState::Running => {
-            return Err(Error::Internal(
-                "remote wait returned a non-terminal state".into(),
-            ));
+        if let Ok(status) = client.status(&query_id).await
+            && matches!(status.state, QueryState::Failed | QueryState::Cancelled)
+        {
+            return terminal_status(&status, &query_id);
         }
+        return Err(Error::Execution(format!(
+            "{error} [query {query_id}; the background query was not cancelled]"
+        )));
     }
-    let mut renderer = Renderer::new(args.format, args.csv_null.as_deref());
-    let render = fetch_pages(client, &query_id, &mut renderer).await;
-    render?;
+    let status = wait_or_cancel(client, &query_id).await?;
+    terminal_status(&status, &query_id)?;
     if args.metrics
         && let Some(metrics) = status.metrics
     {
@@ -84,6 +79,27 @@ async fn execute(client: &RemoteClient, sql: &str, args: &ShellArgs) -> Result<(
         );
     }
     client.delete(&query_id).await
+}
+
+fn terminal_status(status: &rustdb::http_shell::QueryStatusResponse, query_id: &str) -> Result<()> {
+    match status.state {
+        QueryState::Succeeded => Ok(()),
+        QueryState::Cancelled => Err(Error::Cancelled),
+        QueryState::Failed => {
+            let message = status
+                .error
+                .as_ref()
+                .map(|error| format!("{}: {}", error.error, error.message))
+                .unwrap_or_else(|| "remote query failed without an error detail".into());
+            Err(Error::Execution(format!("{message} [query {query_id}]")))
+        }
+        QueryState::Queued | QueryState::Running => Err(Error::Internal(
+            "remote wait returned a non-terminal state".into(),
+        )),
+        _ => Err(Error::Unsupported(
+            "the remote server returned a query state unsupported by this CLI".into(),
+        )),
+    }
 }
 
 async fn wait_or_cancel(
@@ -116,15 +132,16 @@ async fn wait_or_cancel(
     }
 }
 
-async fn fetch_pages(
+async fn fetch_arrow_batches(
     client: &RemoteClient,
     query_id: &str,
-    renderer: &mut Renderer<'_>,
+    args: &ShellArgs,
 ) -> Result<()> {
-    let mut cursor = None;
+    let mut batch_seq = 0_u64;
+    let mut first = true;
     loop {
-        let page = {
-            let request = client.page(query_id, cursor.as_deref(), 1_000);
+        let poll = {
+            let request = client.arrow_batch(query_id, batch_seq);
             tokio::pin!(request);
             tokio::select! {
                 result = &mut request => result?,
@@ -135,18 +152,42 @@ async fn fetch_pages(
                 }
             }
         };
-        renderer.write(&page)?;
-        if page.page.complete {
-            break;
-        }
-        cursor = page.page.next_cursor;
-        if cursor.is_none() {
-            return Err(Error::Internal(
-                "remote result page omitted its continuation cursor".into(),
-            ));
+        match poll {
+            ArrowResultPoll::Batch(value) => {
+                super::output::write_batch(
+                    &value.batch,
+                    args.format,
+                    args.csv_null.as_deref(),
+                    first,
+                )?;
+                first = false;
+                batch_seq = value.next_batch_seq;
+                if value.result_complete {
+                    return Ok(());
+                }
+            }
+            ArrowResultPoll::Pending { .. } => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            ArrowResultPoll::Complete { schema, .. } => {
+                if first {
+                    super::output::write_batch(
+                        &RecordBatch::new_empty(schema),
+                        args.format,
+                        args.csv_null.as_deref(),
+                        true,
+                    )?;
+                }
+                return Ok(());
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "the remote server returned an Arrow result variant unsupported by this CLI"
+                        .into(),
+                ));
+            }
         }
     }
-    Ok(())
 }
 
 async fn best_effort_cancel(client: &RemoteClient, query_id: &str) {
@@ -201,132 +242,4 @@ async fn repl(client: &RemoteClient, args: &ShellArgs) -> Result<()> {
             eprintln!("error: {error}");
         }
     }
-}
-
-struct Renderer<'a> {
-    format: OutputFormat,
-    csv_null: Option<&'a str>,
-    schema: Option<Vec<SchemaColumn>>,
-}
-
-impl<'a> Renderer<'a> {
-    fn new(format: OutputFormat, csv_null: Option<&'a str>) -> Self {
-        Self {
-            format,
-            csv_null,
-            schema: None,
-        }
-    }
-
-    fn write(&mut self, page: &JsonResultPage) -> Result<()> {
-        if self.schema.is_none() {
-            self.write_header(&page.schema)?;
-            self.schema = Some(page.schema.clone());
-        } else if self.schema.as_deref() != Some(page.schema.as_slice()) {
-            return Err(Error::Execution(
-                "remote result schema changed between pages".into(),
-            ));
-        }
-        let schema = self.schema.as_ref().expect("initialized above");
-        for row in &page.rows {
-            if row.len() != schema.len() {
-                return Err(Error::Execution(
-                    "remote result row width does not match its schema".into(),
-                ));
-            }
-            match self.format {
-                OutputFormat::Table => println!(
-                    "{}",
-                    row.iter()
-                        .map(display_value)
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                ),
-                OutputFormat::Csv => println!(
-                    "{}",
-                    row.iter()
-                        .map(|value| csv_value(value, self.csv_null))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
-                OutputFormat::Jsonl => println!("{}", json_object(schema, row)?),
-            }
-        }
-        Ok(())
-    }
-
-    fn write_header(&self, schema: &[SchemaColumn]) -> Result<()> {
-        match self.format {
-            OutputFormat::Table => {
-                let names = schema
-                    .iter()
-                    .map(|column| column.name.as_str())
-                    .collect::<Vec<_>>();
-                println!("{}", names.join(" | "));
-                println!(
-                    "{}",
-                    names
-                        .iter()
-                        .map(|name| "-".repeat(name.chars().count().max(1)))
-                        .collect::<Vec<_>>()
-                        .join("-+-")
-                );
-            }
-            OutputFormat::Csv => println!(
-                "{}",
-                schema
-                    .iter()
-                    .map(|column| csv_text(&column.name))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            OutputFormat::Jsonl => {}
-        }
-        Ok(())
-    }
-}
-
-fn display_value(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".into(),
-        Value::String(value) => value.clone(),
-        value => value.to_string(),
-    }
-}
-
-fn csv_value(value: &Value, null: Option<&str>) -> String {
-    match value {
-        Value::Null => csv_text(null.unwrap_or("")),
-        Value::String(value) => csv_text(value),
-        value => csv_text(&value.to_string()),
-    }
-}
-
-fn csv_text(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
-}
-
-fn json_object(schema: &[SchemaColumn], row: &[Value]) -> Result<String> {
-    let mut output = String::from("{");
-    for (index, (column, value)) in schema.iter().zip(row).enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push_str(
-            &serde_json::to_string(&column.name)
-                .map_err(|error| Error::Internal(format!("failed to encode JSON key: {error}")))?,
-        );
-        output.push(':');
-        output.push_str(
-            &serde_json::to_string(value).map_err(|error| {
-                Error::Internal(format!("failed to encode JSON value: {error}"))
-            })?,
-        );
-    }
-    output.push('}');
-    Ok(output)
 }

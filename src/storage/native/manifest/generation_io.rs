@@ -6,7 +6,7 @@ use crate::{Error, Result};
 
 use super::{
     CATALOG_GENERATION_BUDGET_PER_TABLE_BYTES, CatalogState, FORMAT_VERSION, LEGACY_FORMAT_VERSION,
-    MAX_CATALOG_MANIFEST_BYTES, MAX_CURRENT_BYTES,
+    MAX_CATALOG_MANIFEST_BYTES, MAX_CURRENT_BYTES, PREVIOUS_FORMAT_VERSION,
 };
 use crate::storage::native::io;
 
@@ -78,6 +78,7 @@ fn generation_budget(state: &CatalogState) -> Result<usize> {
         .len()
         .saturating_add(state.views.len())
         .saturating_add(state.schemas.len())
+        .saturating_add(state.imports.len())
         .max(1)
         .checked_mul(CATALOG_GENERATION_BUDGET_PER_TABLE_BYTES)
         .ok_or_else(|| Error::ResourceExhausted("catalog byte budget overflow".to_owned()))?;
@@ -118,12 +119,12 @@ pub(super) fn read_generation(root: &Path, generation: u64) -> Result<CatalogSta
     }
     if !matches!(
         envelope.manifest.format_version,
-        LEGACY_FORMAT_VERSION | FORMAT_VERSION
+        LEGACY_FORMAT_VERSION | PREVIOUS_FORMAT_VERSION | FORMAT_VERSION
     ) {
         return Err(Error::native_storage(
             &path,
             format!(
-                "unsupported catalog format version {}; supported versions are {LEGACY_FORMAT_VERSION} and {FORMAT_VERSION}",
+                "unsupported catalog format version {}; supported versions are {LEGACY_FORMAT_VERSION}, {PREVIOUS_FORMAT_VERSION}, and {FORMAT_VERSION}",
                 envelope.manifest.format_version,
             ),
         ));
@@ -153,13 +154,13 @@ pub(super) fn current_path(root: &Path) -> PathBuf {
     root.join("catalog").join("CURRENT")
 }
 
-pub(super) fn generation_path(root: &Path, generation: u64) -> PathBuf {
+pub(in crate::storage::native) fn generation_path(root: &Path, generation: u64) -> PathBuf {
     root.join("catalog")
         .join("generations")
         .join(format!("{generation:020}.json"))
 }
 
-pub(super) fn generation_from_name(path: &Path) -> Option<u64> {
+pub(in crate::storage::native) fn generation_from_name(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
     let digits = name.strip_suffix(".json")?;
     if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {

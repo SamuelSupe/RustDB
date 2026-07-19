@@ -180,13 +180,11 @@ fn engine_config(endpoint: &str) -> EngineConfig {
     EngineConfig::builder()
         .batch_size(128)
         .io_concurrency(1)
-        .s3(S3Config {
-            endpoint: Some(endpoint.to_owned()),
-            region: Some("us-east-1".to_owned()),
-            force_path_style: true,
-            allow_http: true,
-            ..S3Config::default()
-        })
+        .s3(S3Config::default()
+            .endpoint(endpoint)
+            .region("us-east-1")
+            .force_path_style(true)
+            .allow_http(true))
         .build()
 }
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -15,6 +16,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from oracle import compare_result, load_oracle
 
 
 SCHEMA = "rustdb-clickbench-v1"
@@ -35,16 +38,26 @@ def positive(value: str) -> int:
     return number
 
 
+def sha256_value(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("must be a lowercase SHA-256")
+    return value
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run one functional ClickBench pass with RustDB"
     )
     parser.add_argument("--queries", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--oracle", type=Path)
     parser.add_argument(
         "--dataset-profile", choices=("functional", "full"), default="functional"
     )
-    parser.add_argument("--data-etag")
+    parser.add_argument("--data-etag", dest="expected_source_etag")
+    parser.add_argument("--expected-query-sha256", type=sha256_value)
+    parser.add_argument("--expected-data-sha256", type=sha256_value)
+    parser.add_argument("--expected-oracle-sha256", type=sha256_value)
     parser.add_argument(
         "--binary-as-string",
         action="store_true",
@@ -76,6 +89,18 @@ def sha256(path: Path) -> str:
         while block := source.read(1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
+
+
+def identity_facts(path: Path, expected: str | None, label: str) -> dict[str, Any]:
+    observed = sha256(path)
+    verified = expected is not None and hmac.compare_digest(observed, expected)
+    if expected is not None and not verified:
+        raise RuntimeError(f"{label} SHA-256 is {observed}, expected {expected}")
+    return {
+        "sha256": observed,
+        "expected_sha256": expected,
+        "identity_verified": verified,
+    }
 
 
 def load_queries(path: Path) -> list[str]:
@@ -241,6 +266,7 @@ def run_query(args: argparse.Namespace, number: int, sql_path: Path) -> dict[str
         "result_rows": run["rows"] if run else None,
         "engine_elapsed_ms": run["elapsed_ms"] if run else None,
         "result_checksum_sha256": report.get("result_checksum_sha256") if report else None,
+        "checksum_algorithm": report.get("checksum_algorithm") if report else None,
         "peak_engine_reservation_bytes": (
             run.get("engine_peak_reservation_bytes") if run else None
         ),
@@ -265,6 +291,35 @@ def main() -> int:
         raise RuntimeError(f"benchmark binary is not executable: {args.binary}")
     if not args.data.is_file():
         raise RuntimeError(f"ClickBench data file does not exist: {args.data}")
+    query_identity = identity_facts(
+        args.queries,
+        args.expected_query_sha256,
+        "ClickBench query file",
+    )
+    data_identity = identity_facts(
+        args.data,
+        args.expected_data_sha256,
+        "ClickBench data file",
+    )
+    if (args.oracle is None) != (args.expected_oracle_sha256 is None):
+        raise RuntimeError("ClickBench oracle path and expected SHA-256 must be set together")
+    if (
+        args.dataset_profile == "functional"
+        and args.mode == "execute"
+        and args.oracle is None
+    ):
+        raise RuntimeError("the functional ClickBench execution requires the pinned oracle")
+    oracle = None
+    oracle_identity = None
+    if args.oracle is not None and args.expected_oracle_sha256 is not None:
+        oracle, oracle_identity = load_oracle(
+            args.oracle,
+            expected_sha256=args.expected_oracle_sha256,
+            profile=args.dataset_profile,
+            mode=args.mode,
+            query_sha256=query_identity["sha256"],
+            dataset_sha256=data_identity["sha256"],
+        )
     args.output.mkdir(parents=True, exist_ok=False)
     for directory in ("rendered", "reports", "logs", "spill"):
         (args.output / directory).mkdir()
@@ -279,14 +334,29 @@ def main() -> int:
         "query_count": len(queries),
         "queries": {
             "path": str(args.queries),
-            "sha256": sha256(args.queries),
-        },
+        }
+        | query_identity,
         "dataset": {
             "profile": args.dataset_profile,
             "path": str(args.data),
             "bytes": args.data.stat().st_size,
-            "etag": args.data_etag,
-        },
+            "expected_source_etag": args.expected_source_etag,
+        }
+        | data_identity,
+        "oracle": (
+            {
+                "schema": oracle["schema"],
+                "profile": oracle["profile"],
+                "mode": oracle["mode"],
+                "query_count": oracle["query_count"],
+                "checksum_algorithm": oracle["checksum_algorithm"],
+                "query_sha256": oracle["query_sha256"],
+                "dataset_sha256": oracle["dataset_sha256"],
+            }
+            | oracle_identity
+            if oracle is not None and oracle_identity is not None
+            else {"identity_verified": False, "reason": "not configured"}
+        ),
         "resource_contract": {
             "container_cpus": cgroup_value("/sys/fs/cgroup/cpu.max"),
             "container_memory_bytes": cgroup_value("/sys/fs/cgroup/memory.max"),
@@ -318,6 +388,20 @@ def main() -> int:
             flush=True,
         )
         result = run_query(args, index, sql_path)
+        if oracle is not None:
+            expected = oracle["results"][index - 1]
+            oracle_error = compare_result(result, expected, oracle["checksum_algorithm"])
+            result["oracle_expected_rows"] = expected["rows"]
+            result["oracle_expected_checksum_sha256"] = expected["checksum"]
+            result["oracle_match"] = result["status"] == "passed" and oracle_error is None
+            result["oracle_error"] = oracle_error
+            if not result["oracle_match"]:
+                result["status"] = "failed"
+        else:
+            result["oracle_expected_rows"] = None
+            result["oracle_expected_checksum_sha256"] = None
+            result["oracle_match"] = None
+            result["oracle_error"] = "not configured"
         manifest["results"].append(result)
         write_json(args.output / "manifest.json", manifest)
         print(

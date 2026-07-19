@@ -314,7 +314,7 @@ fn new_snapshot_limit(
         .ok_or_else(|| {
             Error::ResourceExhausted("native peak source byte count overflow".to_owned())
         })?;
-    let peak_limit = storage_limit(peak_source_bytes, 3, "peak")?;
+    let peak_limit = storage_limit(peak_source_bytes, 2, "peak")?;
     let peak_used = retained_old_storage_bytes
         .checked_add(inherited_storage_bytes)
         .ok_or_else(|| Error::ResourceExhausted("native peak byte count overflow".to_owned()))?
@@ -322,7 +322,7 @@ fn new_snapshot_limit(
         .ok_or_else(|| Error::ResourceExhausted("native peak byte count overflow".to_owned()))?;
     let peak_remaining = peak_limit.checked_sub(peak_used).ok_or_else(|| {
         Error::ResourceExhausted(format!(
-            "native write requires {peak_used} bytes before creating a new snapshot, exceeding the 3x plus metadata allowance limit of {peak_limit} bytes"
+            "native write requires {peak_used} bytes before creating a new snapshot, exceeding the 2x plus metadata allowance limit of {peak_limit} bytes"
         ))
     })?;
     final_remaining
@@ -330,7 +330,7 @@ fn new_snapshot_limit(
         .checked_sub(CATALOG_HEADROOM_BYTES)
         .ok_or_else(|| {
             Error::ResourceExhausted(format!(
-                "native write has insufficient space under the 2x/3x plus metadata allowance limits for {CATALOG_HEADROOM_BYTES} bytes of catalog metadata"
+                "native write has insufficient space under the 2x final/peak plus metadata allowance limits for {CATALOG_HEADROOM_BYTES} bytes of catalog metadata"
             ))
         })
 }

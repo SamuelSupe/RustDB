@@ -11,11 +11,15 @@ use crate::{Error, Result};
 
 mod active_wal;
 mod backup;
+mod check;
 mod commit;
 mod database_open;
 mod delete_writer;
+mod disk_admission;
 mod disk_budget;
 mod external_sources;
+mod format;
+mod import;
 mod io;
 mod lock;
 mod manifest;
@@ -23,6 +27,7 @@ mod marker;
 mod migration;
 mod quota;
 mod rebase;
+mod repair;
 mod schema;
 mod segment;
 mod table;
@@ -59,11 +64,13 @@ mod quota_publication_test_hook {
     }
 }
 
+pub use check::{NativeCheckIssue, NativeCheckReport};
 pub(crate) use commit::NativeCommit;
 #[cfg(test)]
 pub(crate) use commit::test_failpoint::{
     Boundary as NativeCommitTestBoundary, arm as arm_native_commit_test_failpoint,
 };
+pub use repair::{NativeRepairAction, NativeRepairPlan, NativeRepairReport};
 #[cfg(test)]
 pub(crate) fn arm_native_wal_ambiguous_reconciliation() {
     wal::test_failpoint::arm_ambiguous_reconciliation();
@@ -101,9 +108,6 @@ mod startup_tests;
 #[cfg(test)]
 mod tests;
 
-const FORMAT_NAME: &str = "rustdb-native";
-const DATABASE_FORMAT_VERSION: u32 = 2;
-const LEGACY_DATABASE_FORMAT_VERSION: u32 = 1;
 const MARKER_FILE: &str = ".rustdb";
 const INIT_FILE: &str = ".rustdb-init";
 
@@ -114,6 +118,7 @@ pub(crate) struct NativeDatabase {
     format_version: u32,
     wal: Option<Arc<wal::Wal>>,
     quota: crate::NativeStorageConfig,
+    disk_admission: disk_admission::DiskAdmission,
     active_quota_writes: Mutex<BTreeMap<String, quota::ActiveWrite>>,
     quota_publication_gate: Mutex<()>,
     state: Mutex<NativeState>,
@@ -187,6 +192,18 @@ pub(crate) struct NativeWalInfo {
 }
 
 impl NativeDatabase {
+    pub(crate) fn check(path: impl AsRef<Path>) -> Result<NativeCheckReport> {
+        check::database(path.as_ref())
+    }
+
+    pub(crate) fn plan_repair(path: impl AsRef<Path>) -> Result<NativeRepairPlan> {
+        repair::plan(path.as_ref())
+    }
+
+    pub(crate) fn apply_repair(path: impl AsRef<Path>) -> Result<NativeRepairReport> {
+        repair::apply(path.as_ref())
+    }
+
     pub(crate) fn migrate(path: impl AsRef<Path>) -> Result<NativeMigration> {
         migration::migrate(path.as_ref())
     }
@@ -208,6 +225,11 @@ impl NativeDatabase {
                 "native database path must be valid UTF-8",
             ));
         }
+        // Existing format markers are inspected before chmod, lock-file
+        // creation, temporary cleanup, or any other recovery write. Alpha and
+        // future databases must be rejected without changing their directory.
+        marker::preflight_if_present(&root.join(MARKER_FILE))?;
+        marker::preflight_if_present(&root.join(INIT_FILE))?;
         prepare_root_before_lock(&root)?;
         let database_lock = lock::DatabaseLock::acquire(&root)?;
         let marker_path = root.join(MARKER_FILE);
@@ -231,14 +253,8 @@ impl NativeDatabase {
         }
 
         let marker = marker::read(&marker_path)?;
-        let wal = if marker.uses_wal() {
-            let wal = Arc::new(wal::Wal::open(&root, marker.database_id())?);
-            wal.recover_catalog(&root, marker.database_id())?;
-            Some(wal)
-        } else {
-            debug_assert!(marker.is_legacy());
-            None
-        };
+        let wal = Arc::new(wal::Wal::open(&root, marker.database_id())?);
+        wal.recover_catalog(&root, marker.database_id())?;
         manifest::recover_future_generations(&root, marker.database_id())?;
         write::recover_staging(&root, marker.database_id())?;
         let catalog = manifest::load(&root, marker.database_id())?;
@@ -246,15 +262,16 @@ impl NativeDatabase {
         let views = load_views(&root, &catalog)?;
         let external_sources = external_sources::load(&root, marker.database_id())?;
         table::recover_orphans(&root, marker.database_id(), &tables)?;
-        if let Some(wal) = &wal {
-            wal.abort_recovered_transactions()?;
-        }
+        wal.abort_recovered_transactions()?;
+        let quota = crate::NativeStorageConfig::default();
+        let disk_admission = disk_admission::DiskAdmission::new(&root, &quota);
         Ok(Self {
             root,
             database_id: marker.database_id().to_owned(),
             format_version: marker.version(),
-            wal,
-            quota: crate::NativeStorageConfig::default(),
+            wal: Some(wal),
+            quota,
+            disk_admission,
             active_quota_writes: Mutex::new(BTreeMap::new()),
             quota_publication_gate: Mutex::new(()),
             state: Mutex::new(NativeState {
@@ -273,7 +290,9 @@ impl NativeDatabase {
         path: impl AsRef<Path>,
         quota: crate::NativeStorageConfig,
     ) -> Result<Self> {
+        quota.validate()?;
         let mut database = Self::open(path)?;
+        database.disk_admission = disk_admission::DiskAdmission::new(&database.root, &quota);
         database.quota = quota;
         Ok(database)
     }
@@ -498,12 +517,6 @@ impl NativeDatabase {
     }
 
     pub(in crate::storage::native) fn wal(&self) -> Result<Arc<wal::Wal>> {
-        if self.format_version == LEGACY_DATABASE_FORMAT_VERSION {
-            return Err(Error::Unsupported(
-                "native database format v1 is read-only; run 'rustdb migrate' before writing"
-                    .to_owned(),
-            ));
-        }
         self.wal.clone().ok_or_else(|| {
             Error::Unsupported("native database WAL is unavailable; reopen the database".to_owned())
         })

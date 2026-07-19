@@ -10,6 +10,7 @@ use arrow::datatypes::SchemaRef;
 use crate::{Error, ParquetSchemaMode, Result};
 
 mod builder;
+mod validate;
 pub use builder::{CsvOptionsBuilder, EngineConfigBuilder};
 
 const DEFAULT_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -111,6 +112,7 @@ impl Default for ExecutionConfig {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SpillConfig {
     pub directory: PathBuf,
     pub engine_limit_bytes: Option<u64>,
@@ -194,12 +196,16 @@ impl Default for SpillConfig {
 ///
 /// Limits are process configuration: they are applied by `Engine::open` and
 /// are not persisted in the database directory.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct NativeStorageConfig {
     pub engine_limit_bytes: Option<u64>,
     pub default_table_limit_bytes: Option<u64>,
     pub table_limit_bytes: BTreeMap<String, u64>,
+    /// Minimum fraction of the filesystem kept free for non-RustDB activity.
+    pub min_free_ratio: f64,
+    /// Absolute filesystem reserve; the larger ratio/byte reserve wins.
+    pub min_free_bytes: u64,
 }
 
 impl NativeStorageConfig {
@@ -209,6 +215,11 @@ impl NativeStorageConfig {
             "native_storage.default_table_limit_bytes",
             self.default_table_limit_bytes,
         )?;
+        if !self.min_free_ratio.is_finite() || !(0.0..1.0).contains(&self.min_free_ratio) {
+            return Err(Error::InvalidArgument(
+                "native_storage.min_free_ratio must be finite and in the range [0, 1)".to_owned(),
+            ));
+        }
         if let (Some(engine), Some(table)) =
             (self.engine_limit_bytes, self.default_table_limit_bytes)
             && table > engine
@@ -284,6 +295,18 @@ impl NativeStorageConfig {
     }
 }
 
+impl Default for NativeStorageConfig {
+    fn default() -> Self {
+        Self {
+            engine_limit_bytes: None,
+            default_table_limit_bytes: None,
+            table_limit_bytes: BTreeMap::new(),
+            min_free_ratio: 0.10,
+            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+        }
+    }
+}
+
 fn validate_optional_limit(name: &str, value: Option<u64>) -> Result<()> {
     if matches!(value, Some(0)) {
         return Err(Error::InvalidArgument(format!(
@@ -345,6 +368,7 @@ impl EngineConfig {
 }
 
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct S3Config {
     pub region: Option<String>,
     pub endpoint: Option<String>,
@@ -371,7 +395,49 @@ impl std::fmt::Debug for S3Config {
     }
 }
 
+impl S3Config {
+    #[must_use]
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    #[must_use]
+    pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
+    #[must_use]
+    pub fn force_path_style(mut self, enabled: bool) -> Self {
+        self.force_path_style = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn anonymous(mut self, enabled: bool) -> Self {
+        self.anonymous = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn allow_http(mut self, enabled: bool) -> Self {
+        self.allow_http = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn credential_provider(
+        mut self,
+        provider: object_store::aws::AwsCredentialProvider,
+    ) -> Self {
+        self.credential_provider = Some(provider);
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CsvHeader {
     #[default]
     Auto,
@@ -422,6 +488,7 @@ impl CsvOptions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ParquetOptions {
     pub schema: Option<Arc<arrow::datatypes::Schema>>,
     pub union_by_name: bool,
@@ -430,6 +497,30 @@ pub struct ParquetOptions {
 }
 
 impl ParquetOptions {
+    #[must_use]
+    pub fn schema(mut self, schema: Arc<arrow::datatypes::Schema>) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    #[must_use]
+    pub fn union_by_name(mut self, enabled: bool) -> Self {
+        self.union_by_name = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn schema_mode(mut self, mode: ParquetSchemaMode) -> Self {
+        self.schema_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn hive_partitioning(mut self, enabled: bool) -> Self {
+        self.hive_partitioning = enabled;
+        self
+    }
+
     pub(crate) fn effective_schema_mode(&self) -> Result<ParquetSchemaMode> {
         match (self.union_by_name, self.schema_mode) {
             (false, mode) => Ok(mode),
@@ -584,6 +675,14 @@ mod tests {
             NativeStorageConfig {
                 engine_limit_bytes: Some(10),
                 table_limit_bytes: BTreeMap::from([("events".to_owned(), 11)]),
+                ..NativeStorageConfig::default()
+            },
+            NativeStorageConfig {
+                min_free_ratio: f64::NAN,
+                ..NativeStorageConfig::default()
+            },
+            NativeStorageConfig {
+                min_free_ratio: 1.0,
                 ..NativeStorageConfig::default()
             },
         ] {

@@ -4,23 +4,23 @@
 
 **面向 CSV、Parquet、S3、Native 持久化分析与安全只读 HTTPS Shell 的单机 OLAP 引擎。**
 
-[English](README.md) · [HTTP Shell](docs/http-shell.zh-CN.md) · [架构](docs/architecture.md) · [SQL 兼容范围](docs/compatibility.md) · [CLI 帮助](packaging/dist/CLI.zh-CN.md)
+[English](README.md) · [运维指南](docs/operator-guide.zh-CN.md) · [HTTP Shell](docs/http-shell.zh-CN.md) · [架构](docs/architecture.md) · [SQL 兼容范围](docs/compatibility.md) · [CLI 帮助](packaging/dist/CLI.zh-CN.md)
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-0.9.0--alpha.1-orange)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.0.0--beta.1-blue)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 </div>
 
 > [!WARNING]
-> RustDB 目前仍是实验性的 alpha 软件，适合功能评估、开发与可复现的引擎研究；
-> Native 存储格式和公开 API 尚未承诺生产级稳定性。
+> RustDB Beta 仍是预生产软件，适合功能评估、开发与可复现的引擎研究。兼容性
+> 从 beta.1 开始建立；alpha Native 数据库必须重新导入。当前尚不提供生产 SLA。
 
 RustDB 可以直接查询本地磁盘或 S3-compatible 对象存储中的 CSV 和
 Parquet，也可以把数据批量导入不可变分段的 Native 数据库，用于重复的本地分析。
-Rust API 与本地 `rustdb` CLI 都以 Apache Arrow `RecordBatch` 流式返回结果。v0.9
+Rust API 与本地 `rustdb` CLI 都以 Apache Arrow `RecordBatch` 流式返回结果。Beta
 还可通过只启用 TLS 的只读 HTTP Shell 服务一个 Native 数据库，官方远程 CLI 继续
 提供 `table`、`csv` 和 `jsonl` 输出。
 
@@ -44,12 +44,12 @@ SQL Binder、优化器、向量化算子、调度器、内存记账、Native 存
 
 ## 能力概览
 
-| 领域 | v0.9 alpha 当前范围 |
+| 领域 | v1.0 Beta 当前范围 |
 | --- | --- |
 | 数据格式 | CSV、gzip CSV、zstd CSV、Parquet |
 | 存储 | 本地文件系统、S3/MinIO、本地持久化 Native 数据库 |
 | 接口 | 嵌入式 Rust API、本地 CLI/REPL、只读 HTTPS Shell 与远程 CLI |
-| 输出 | 本地流式 Arrow；远程分页 JSON/NDJSON；CLI 渲染 `table`/`csv`/`jsonl` |
+| 输出 | 本地流式 Arrow；远程序列化 Arrow IPC 与分页 JSON/NDJSON；CLI 渲染 `table`/`csv`/`jsonl` |
 | 执行 | 向量化、多 lane、内存记账、支持 Spill |
 | SQL | 面向 TPC-H 的分析 SQL、Join、聚合、窗口、集合运算、参数化查询 |
 | 安全 | 项目代码使用 `#![forbid(unsafe_code)]` |
@@ -136,7 +136,8 @@ rustdb serve \
   --result-query-limit 2GiB
 ```
 
-首次启动会生成本地 CA、可续签服务端证书和随机 Bearer Token。停止服务并导出
+首次启动会生成本地 CA、可续签服务端证书、Admin principal 和随机 Profile Token；
+principal 目录只保存 Token 的 SHA-256 digest。停止服务并导出
 Profile 包，通过可信渠道传输，在客户端导入后即可保留原有 CLI 使用体验：
 
 ```sh
@@ -149,6 +150,20 @@ rustdb shell --profile analytics -c \
 rustdb shell --profile analytics -f report.sql --format csv >report.csv
 ```
 
+服务停止时使用本地 `rustdb principal list|create|set-enabled|set-role` 与
+`rustdb token list|rotate|revoke` 管理 Query/Admin 身份。Token 列表只输出 UUID、
+principal、生命周期状态和有效期，绝不输出 secret 或 digest。可按 UUID 导出普通
+principal 的 Profile，并复用服务端已管理连接包的 URL 与 CA；需要覆盖地址时再增加
+`--server-url`：
+
+```sh
+rustdb token list --database /srv/rustdb/analytics --principal analyst
+rustdb profile export --database /srv/rustdb/analytics \
+  --token-id <UUID> --output analyst.rustdb-profile
+```
+
+Query 角色只能访问自己的 Query ID，Admin 可以访问所有 Query。
+
 远程 SQL 刻意比本地 SQL 更窄：只允许查询、元数据和 Explain 语句；DDL/DML、维护、
 上传、直接文件表函数及远程数据源管理都会被拒绝。持久化 CSV/Parquet 源只能在服务
 停止时通过本地 `rustdb datasource` 管理。`serve` 可独立配置结果保留：
@@ -156,6 +171,10 @@ rustdb shell --profile analytics -f report.sql --format csv >report.csv
 `--result-query-limit`；服务端本地注册源还可使用 `--s3-region`、`--s3-endpoint`、
 `--s3-path-style`、`--s3-allow-http`、`--s3-anonymous`。详见
 [HTTP Shell 中文指南](docs/http-shell.zh-CN.md)和 [OpenAPI 3.1 协议](docs/openapi-v1.yaml)。
+
+需要生成脱敏、只读的支持快照时，可运行
+`rustdb diagnostics --database 路径 [--output 文件]`，详见
+[诊断报告指南](docs/diagnostics.zh-CN.md)。
 
 ## 嵌入 RustDB
 
@@ -193,6 +212,17 @@ while let Some(batch) = result.stream().next().await {
 
 `Engine::new` 是临时会话；`Engine::open` 会打开本地持久化数据库，可以直接从
 CSV 或 Parquet 导入不可变分段：
+
+```sh
+rustdb import --database ./warehouse --table events \
+  --location /data/events.csv.gz --format csv \
+  --import-id events-2026-07-19 --header present --compression auto
+```
+
+`import_id` 是永久幂等键：完全相同的请求会直接返回持久回执，不重新读取数据源；
+修改请求则返回 `native.import_conflict`。嵌入式调用方使用同一契约的
+`Session::import`。这是 CSV/Parquet 直接进入 Native 的推荐路径，详见
+[幂等 Native 导入](docs/native-import.md)。需要先执行 SQL 变换时再使用 CTAS：
 
 ```rust,no_run
 use futures::StreamExt;
@@ -255,9 +285,10 @@ let engine = Engine::open("./warehouse", config)?;
 `rollback`，而应重新打开数据库，核对可见 Catalog generation 后再写入。SQL
 `COMMIT` 遵循同一规则，并会清除 Session 中的活动事务。
 
-CLI 使用 `rustdb --database ./warehouse` 打开数据库。已有 v0.7 数据库在执行
-`rustdb migrate ./warehouse` 前保持只读；迁移会校验源数据、创建或校验与
-当前 catalog 快照完全一致的 `.v0.7-backup`，再原子启用 v0.8 WAL。
+CLI 使用 `rustdb --database ./warehouse` 打开数据库。Beta 启用新的 Native
+兼容 epoch，并会在不修改目录的前提下拒绝 alpha 数据库。请将 CSV/Parquet 重新导入
+新的 Beta 目录；`rustdb migrate PATH` 现在只负责格式校验，不做 alpha 原地迁移。
+详见 [Beta 迁移指南](docs/migration-v1-beta.md)。
 
 本地目录和 S3 都支持一致性备份与恢复：
 
@@ -303,12 +334,11 @@ lease，通过有界队列传递。所有查询 worker 属于同一个可取消 
 
 ## 功能状态
 
-- v0.8 发布候选已完成一次 OrbStack 聚焦可靠性门禁，包括真实 MinIO 上的
-  CSV/Parquet COPY 与 Native 备份恢复往返；详见[验收约定](docs/acceptance.md)
-  和[发行说明](docs/releases/v0.8.0-alpha.1.md)。
-- v0.9 发行门禁增加一次完整 HTTP Shell 正确性运行，覆盖 TLS/Profile 初始化、
-  认证、只读策略、Query 生命周期、分页、取消、配额、清理和三种 CLI 输出；不新增
-  性能阈值或长时间 soak。
+- Beta 契约要求完成一次 OrbStack 发行验收，再以等价的 100 GiB/10,000 对象本地与
+  MinIO CSV 或 Parquet 负载，在 2/4 GiB、8 客户端并发下完成四次运行，最后执行一次
+  ClickBench。门禁生成绑定 commit 的 `evidence.json`；只有 annotated tag 绑定该已验收
+  commit 后才允许发布。详见
+  [Beta 路线图](docs/roadmap-v1-beta.md)和[运维指南](docs/operator-guide.zh-CN.md)。
 - [`benchmarks/tpch`](benchmarks/tpch) 保留 TPC-H Q1-Q22 查询覆盖。
 - v0.7 ClickBench 功能门禁在 4 CPU / 16 GiB 容器配置下运行 43 条官方查询一次。
 - 已保留的 100 万行运行完成 **43/43 条查询**，证据见
@@ -320,8 +350,8 @@ lease，通过有界队列传递。所有查询 worker 属于同一个可取消 
 ## 当前边界
 
 可串行化隔离、savepoint、`MERGE`/upsert、约束、索引、公开 time travel、分布式
-执行以及 DuckDB SQL/数据库文件兼容不属于 v0.9。HTTP 表面只是只读远程 Shell，
-不是写入 API、浏览器 UI、多用户服务、Session 协议或生成式 SDK。JSON/ORC/Iceberg
+执行以及 DuckDB SQL/数据库文件兼容不属于 Beta。HTTP 表面只是只读远程 Shell，
+不是写入 API、浏览器 UI、广义多租户服务、Session 协议或生成式 SDK。JSON/ORC/Iceberg
 Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` 时，结果顺序
 不作保证。
 
@@ -331,13 +361,20 @@ Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` �
 | --- | --- |
 | [架构](docs/architecture.md) | Pipeline、调度、内存、裁剪、Native 存储与 Spill |
 | [兼容范围](docs/compatibility.md) | SQL、类型、格式和明确限制 |
+| [运维指南](docs/operator-guide.zh-CN.md) / [English](docs/operator-guide.md) | 支持平台、部署、认证、指标、审计、恢复和 Beta 门禁 |
 | [CLI 中文帮助](packaging/dist/CLI.zh-CN.md) / [English](packaging/dist/CLI.md) | 命令、输出、资源和 S3 参数 |
 | [HTTP Shell 中文指南](docs/http-shell.zh-CN.md) / [English](docs/http-shell.md) | TLS、Profile、只读 SQL、Query 生命周期和运维 |
 | [OpenAPI v1](docs/openapi-v1.yaml) | 公开、版本化 HTTP 协议 |
 | [安装中文说明](packaging/dist/INSTALL.zh-CN.md) / [English](packaging/dist/INSTALL.md) | 二进制包安装与卸载 |
 | [S3 与 MinIO](docs/s3.md) | 凭证、endpoint 和对象存储行为 |
 | [故障排查](docs/troubleshooting.md) | 资源、Spill、损坏和输入错误 |
+| [诊断报告](docs/diagnostics.zh-CN.md) / [English](docs/diagnostics.md) | 脱敏支持快照与安全分享边界 |
+| [幂等 Native 导入](docs/native-import.md) | CSV/Parquet 导入回执、重放与冲突处理 |
+| [Native 检查与修复](docs/native-repair.md) | 只读完整性检查和保守修复 |
 | [验收说明](docs/acceptance.md) | 正确性与版本发布检查 |
+| [v1.0 Beta 发行说明](docs/releases/v1.0.0-beta.1.md) | 兼容 epoch、安装包、供应链与已知边界 |
+| [Alpha 到 Beta 迁移](docs/migration-v1-beta.md) | 强制重新导入与回滚边界 |
+| [v1.0 Beta 路线图](docs/roadmap-v1-beta.md) | 完成契约与发行证据 |
 | [v0.8 发行说明](docs/releases/v0.8.0-alpha.1.md) | 新增事务 Native 存储、SQL、COPY 与运维能力 |
 | [v0.7 迁移](docs/migration-v0.7.md) | 历史执行内核和 benchmark 变化 |
 | [v0.8 迁移](docs/migration-v0.8.md) | WAL 格式、显式数据库迁移与事务 API |

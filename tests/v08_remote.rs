@@ -28,13 +28,11 @@ async fn copy_and_native_backup_round_trip_through_minio() -> Result<()> {
     let config = EngineConfig::builder()
         .compute_threads(1)
         .spill_directory(directory.path().join("spill"))
-        .s3(S3Config {
-            endpoint: Some(endpoint.clone()),
-            region: Some("us-east-1".to_owned()),
-            force_path_style: true,
-            allow_http: true,
-            ..S3Config::default()
-        })
+        .s3(S3Config::default()
+            .endpoint(endpoint.clone())
+            .region("us-east-1")
+            .force_path_style(true)
+            .allow_http(true))
         .build();
     let engine = Engine::open(&database, config.clone())?;
     let session = engine.session();

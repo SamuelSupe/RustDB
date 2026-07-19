@@ -64,7 +64,11 @@ for file in \
   LICENSE README.md README.zh-CN.md SHA256SUMS VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
   docs/INSTALL.md docs/INSTALL.zh-CN.md \
-  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md docs/openapi-v1.yaml \
+  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md \
+  docs/OPERATOR-GUIDE.md docs/OPERATOR-GUIDE.zh-CN.md \
+  docs/DIAGNOSTICS.md docs/DIAGNOSTICS.zh-CN.md \
+  docs/NATIVE-IMPORT.md docs/NATIVE-REPAIR.md docs/COMPATIBILITY.md \
+  docs/openapi-v1.yaml RELEASE-NOTES.md \
   install.sh uninstall.sh
 do
   [ -f "$package/$file" ] || { echo "missing package file / 缺少文件: $file" >&2; exit 1; }
@@ -74,7 +78,7 @@ done
 [ -x "$package/uninstall.sh" ]
 
 checksum_entries=$(awk 'NF { entries += 1 } END { print entries + 0 }' "$package/SHA256SUMS")
-[ "$checksum_entries" -eq 14 ] || {
+[ "$checksum_entries" -eq 22 ] || {
   echo "incomplete package checksum manifest / 包内校验清单不完整" >&2
   exit 1
 }
@@ -96,7 +100,11 @@ for file in \
   LICENSE README.md README.zh-CN.md VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
   docs/INSTALL.md docs/INSTALL.zh-CN.md \
-  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md docs/openapi-v1.yaml \
+  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md \
+  docs/OPERATOR-GUIDE.md docs/OPERATOR-GUIDE.zh-CN.md \
+  docs/DIAGNOSTICS.md docs/DIAGNOSTICS.zh-CN.md \
+  docs/NATIVE-IMPORT.md docs/NATIVE-REPAIR.md docs/COMPATIBILITY.md \
+  docs/openapi-v1.yaml RELEASE-NOTES.md \
   install.sh uninstall.sh
 do
   matches=$(awk -v file="$file" '$2 == file { matches += 1 } END { print matches + 0 }' "$package/SHA256SUMS")
@@ -117,6 +125,14 @@ if [ "${RUSTDB_DIST_SKIP_EXEC:-0}" != "1" ]; then
   [ -f "$install_root/usr/share/doc/rustdb/README.zh-CN.md" ]
   [ -f "$install_root/usr/share/doc/rustdb/HTTP-SHELL.md" ]
   [ -f "$install_root/usr/share/doc/rustdb/HTTP-SHELL.zh-CN.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/OPERATOR-GUIDE.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/OPERATOR-GUIDE.zh-CN.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/DIAGNOSTICS.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/DIAGNOSTICS.zh-CN.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/NATIVE-IMPORT.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/NATIVE-REPAIR.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/COMPATIBILITY.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/RELEASE-NOTES.md" ]
   [ -f "$install_root/usr/share/doc/rustdb/openapi-v1.yaml" ]
   DESTDIR="$install_root" RUSTDB_LANG=zh-CN \
     "$package/uninstall.sh" --prefix /usr >/dev/null

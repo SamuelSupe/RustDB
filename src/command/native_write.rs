@@ -11,6 +11,7 @@ pub(crate) enum NativeWriteKind {
     Replace,
     Append,
     CopyFrom,
+    Import,
     Compact,
     Alter,
 }
@@ -21,6 +22,7 @@ pub(crate) struct NativeWriteCommand {
     pub(crate) query: Box<Query>,
     pub(crate) kind: NativeWriteKind,
     pub(crate) returning: Option<Vec<SelectItem>>,
+    pub(crate) import: Option<crate::NativeImportIntent>,
 }
 
 pub(super) fn parse(statement: &Statement, sql: &str) -> Result<Option<NativeWriteCommand>> {
@@ -54,6 +56,7 @@ pub(super) fn parse(statement: &Statement, sql: &str) -> Result<Option<NativeWri
                     NativeWriteKind::Create
                 },
                 returning: None,
+                import: None,
             }))
         }
         Statement::Insert(insert) => {
@@ -83,6 +86,7 @@ pub(super) fn parse(statement: &Statement, sql: &str) -> Result<Option<NativeWri
                 query: source,
                 kind: NativeWriteKind::Append,
                 returning: insert.returning.clone(),
+                import: None,
             }))
         }
         _ => Ok(None),

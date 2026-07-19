@@ -10,11 +10,15 @@ use parking_lot::Mutex;
 
 use crate::{Error, Result};
 
-use super::table::TableSnapshot;
+use super::{
+    disk_admission::{DiskAdmission, DiskReservation},
+    table::TableSnapshot,
+};
 
 #[derive(Clone)]
 pub(super) struct DiskBudget {
     inner: Arc<Mutex<State>>,
+    reservation: Option<DiskReservation>,
 }
 
 struct State {
@@ -28,10 +32,19 @@ pub(super) struct QuotaFile {
 }
 
 impl DiskBudget {
+    #[cfg(test)]
     pub(super) fn new(limit: u64) -> Self {
         Self {
             inner: Arc::new(Mutex::new(State { limit, used: 0 })),
+            reservation: None,
         }
+    }
+
+    pub(super) fn with_admission(limit: u64, admission: &DiskAdmission) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(State { limit, used: 0 })),
+            reservation: Some(admission.reserve(limit)?),
+        })
     }
 
     #[cfg(test)]
@@ -63,9 +76,15 @@ impl DiskBudget {
         self.release(bytes);
     }
 
-    pub(super) fn raise_limit(&self, limit: u64) {
+    pub(super) fn raise_limit(&self, limit: u64) -> Result<()> {
         let mut state = self.inner.lock();
-        state.limit = state.limit.max(limit);
+        if limit > state.limit {
+            if let Some(reservation) = &self.reservation {
+                reservation.raise(limit)?;
+            }
+            state.limit = limit;
+        }
+        Ok(())
     }
 
     fn reserve(&self, bytes: u64) -> io::Result<()> {

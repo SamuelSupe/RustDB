@@ -28,4 +28,16 @@ pub(crate) struct Args {
 
     #[arg(long)]
     pub(crate) database: Option<PathBuf>,
+
+    #[arg(long)]
+    pub(crate) s3_endpoint: Option<String>,
+
+    #[arg(long)]
+    pub(crate) s3_region: Option<String>,
+
+    #[arg(long)]
+    pub(crate) s3_path_style: bool,
+
+    #[arg(long)]
+    pub(crate) s3_allow_http: bool,
 }

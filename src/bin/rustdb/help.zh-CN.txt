@@ -2,6 +2,9 @@ RustDB - 查询本地磁盘和 S3/MinIO 上的 CSV、Parquet 与 Native 数据
 
 使用方法：rustdb [选项] [命令]
 
+配置验证：
+  rustdb config validate [路径]        解析并验证版本化服务配置（默认 rustdb.toml）
+
 不指定 -c 或 -f 时启动交互终端。SQL 语句必须以分号结束。
 
 查询输入：
@@ -17,14 +20,27 @@ Native 数据库：
       --native-default-table-limit <大小>
                                       单张 Native 表的默认硬配额
       --native-table-limit <表=大小>  单表硬配额，可重复；支持 schema.table
-  migrate <路径>                      显式迁移 v0.7 数据库，并保留安全备份
+      --native-min-free-bytes <大小>  Native 文件系统至少保留空间，默认 1GiB
+      --native-min-free-ratio <比例>  Native 文件系统至少保留比例，默认 0.10
+  migrate <路径>                      验证数据库使用当前 Beta 格式；alpha 数据需重新导入
+  native check <路径> [--json]        严格只读检查 marker、manifest 与全部数据文件
+  native repair <路径> [--json]       只输出保守修复计划，不修改任何文件
+  native repair <路径> --apply [--json]
+                                      复核计划、备份元数据后执行安全修复
+  import --database <路径> --table <名称> --location <URI>
+         --format <csv|parquet> --import-id <ID>
+         [--header <auto|present|absent>] [--delimiter <字符>]
+         [--compression <auto|none|gzip|zstd>] [--json]
+                                      幂等导入到新的 Native 表；同一请求重放不重复写入
   backup <数据库> <目标>              备份到本地目录或 s3:// 前缀
   restore <备份> <新数据库>           从本地目录或 s3:// 前缀恢复
+  diagnostics --database <路径> [--output <JSON>]
+                                      生成脱敏、版本化的只读诊断报告
 
 v0.8 Native 数据库使用校验和 WAL 和快照隔离事务。SQL 支持 BEGIN、COMMIT、
 ROLLBACK；提交前必须消费完或丢弃事务内的所有流式结果。
 
-v0.9 只读 HTTPS Shell：
+Beta 只读 HTTPS Shell：
   serve --database <路径>            前台启动单个 Native 数据库的 HTTPS 查询服务
         [--config <TOML>]             服务配置，当前目录有 rustdb.toml 时自动读取
         [--listen <IP:端口>]          默认 127.0.0.1:7400
@@ -37,13 +53,25 @@ v0.9 只读 HTTPS Shell：
         [--max-running <数量>]         最大同时执行查询数
         [--max-queued <数量>]          最大排队查询数
         [--max-query-time-secs <秒>] 服务端单查询时间上限
+        [--query-memory-limit <大小>] 单 Query 内存 reservation 与硬上限
+        [--query-spill-limit <大小>]  单 Query Spill reservation
+        [--query-result-limit <大小>] 单 Query 结果 reservation
+        [--principal-max-running <数量>] 单 principal 最大运行数
+        [--principal-max-queued <数量>] 单 principal 最大排队数
+        [--principal-memory-limit <大小>] 单 principal 内存 reservation
+        [--principal-spill-limit <大小>] 单 principal Spill reservation
+        [--principal-result-limit <大小>] 单 principal 结果 reservation
+        [--principal-weight <1..1024>] 加权公平调度份额，Admin 无隐式优先级
         [--memory-limit <大小>]        服务查询内存上限
         [--threads <数量>]             计算工作线程数
+        [--spill-engine-limit <大小>] 引擎 Spill 硬上限
+        [--spill-query-limit <大小>]  单 Query Spill 硬上限
         [--s3-region <区域>]            服务端 AWS Region 覆盖
         [--s3-endpoint <URL>]           服务端 S3-compatible endpoint 覆盖
         [--s3-path-style]               服务端强制使用 S3 path-style 请求
         [--s3-allow-http]               服务端允许明文 S3 HTTP，仅限可信开发环境
         [--s3-anonymous]                服务端 S3 请求不签名，仅用于公开对象
+        [--no-auth]                     显式关闭认证，仅用于隔离开发环境
 
   shell --profile <名称>               通过已导入 Profile 连接远程 HTTPS Shell
         [-c <SQL> | -f <文件>]         执行 SQL 文本或文件，两者都不指定时进入交互模式
@@ -55,9 +83,21 @@ v0.9 只读 HTTPS Shell：
   profile import <连接包> --name <名称>
                                       通过可信离线渠道导入 CA、Token 和服务地址
   profile export --database <路径> --output <连接包>
-                                      服务停止时导出连接包
-  profile rotate-token --database <路径>
-                                      服务停止时轮换唯一 Bearer Token
+        [--token-id <UUID>] [--server-url <HTTPS URL>]
+                                      服务停止时导出指定 Token 的连接包
+  principal list --database <路径>     服务停止时列出 principal
+  principal create --database <路径> --id <ID> [--role <query|admin>]
+                                      创建 principal 及首个本地 Profile Token
+  principal set-enabled --database <路径> --id <ID> --state <enabled|disabled>
+                                      启用或禁用 principal，保护最后一个 admin
+  principal set-role --database <路径> --id <ID> --role <query|admin>
+                                      修改角色，保护最后一个 admin
+  token list --database <路径> [--principal <ID>]
+                                      仅列出 Token UUID、归属、状态和有效期
+  token rotate --database <路径> --principal <ID>
+                                      新增可重叠轮换的 Token，不立即撤销旧 Token
+  token revoke --database <路径> --token-id <UUID>
+                                      撤销 Token 并删除本地明文 Profile Token 文件
 
 持久外部数据源：
   datasource add-csv --database <路径> --name <名称> --location <URI> [--location <URI> ...]
@@ -71,6 +111,9 @@ v0.9 只读 HTTPS Shell：
 
 HTTP Shell 安全边界：
   - 所有网络连接强制 TLS；非回环监听必须显式设置 --advertise-url。
+  - 默认启用多 principal 认证；服务端 principals.json 只保存 SHA-256 digest，
+    明文 Token 仅存在于权限 0600 的本地 Profile Token 文件。
+  - query 角色只能访问自己创建的 Query；admin 可访问所有 Query；幂等键按 principal 隔离。
   - 客户端只通过命名 Profile 读取 CA 和 Bearer Token，不接受命令行明文 Token。
   - 远程 SQL 仅允许 SELECT/WITH/VALUES/SHOW/DESCRIBE/EXPLAIN/EXPLAIN ANALYZE；拒绝
     DDL、DML、事务、维护和数据源管理。
@@ -129,15 +172,26 @@ S3/MinIO：
     --native-default-table-limit 5GiB --native-table-limit events=10GiB \
     -c "SELECT count(*) FROM events"
   rustdb migrate ./warehouse
+  rustdb native check ./warehouse
+  rustdb native check ./warehouse --json
+  rustdb native repair ./warehouse
+  rustdb native repair ./warehouse --apply --json
+  rustdb import --database ./warehouse --table events --location ./events.csv \
+    --format csv --import-id events-2026-07-19 --header present
   rustdb backup ./warehouse ./warehouse-backup
   rustdb --s3-region us-east-1 backup ./warehouse s3://bucket/rustdb/snapshot
   rustdb restore ./warehouse-backup ./warehouse-restored
+  rustdb diagnostics --database ./warehouse --output diagnostics.json
   rustdb --s3-region us-east-1 -c \
     "SELECT * FROM read_parquet('s3://bucket/events/*.parquet') LIMIT 10"
   rustdb datasource add-parquet --database ./warehouse --name events \
     --location 's3://bucket/events/*.parquet' --schema-mode safe-widening
   rustdb serve --database ./warehouse
-  rustdb profile export --database ./warehouse --output warehouse.rustdb-profile
+  rustdb principal create --database ./warehouse --id analyst --role query
+  rustdb token rotate --database ./warehouse --principal analyst
+  rustdb token list --database ./warehouse --principal analyst
+  rustdb profile export --database ./warehouse --token-id <UUID> \
+    --output analyst.rustdb-profile
   rustdb profile import warehouse.rustdb-profile --name warehouse
   rustdb shell --profile warehouse -c "SELECT count(*) FROM events" --format table
   rustdb shell --profile warehouse -f report.sql --format csv --metrics

@@ -87,6 +87,21 @@ pub fn copy_profile_bundle(source: impl AsRef<Path>, destination: impl AsRef<Pat
     )
 }
 
+/// Copies the endpoint and CA from a managed bundle while substituting one
+/// explicitly selected local credential. This is the onboarding path for
+/// non-bootstrap principals; the token value never becomes a CLI argument.
+pub fn export_profile_bundle_with_token(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    token_path: impl AsRef<Path>,
+) -> Result<()> {
+    let source = source.as_ref();
+    check_secure_directory(source)?;
+    let manifest = read_manifest(source)?;
+    let server_url = decode_manifest(&manifest)?;
+    export_profile_bundle(destination, &server_url, source.join(CA_FILE), token_path)
+}
+
 /// Exports a permission-restricted directory suitable for offline transfer.
 pub fn export_profile_bundle(
     destination: impl AsRef<Path>,

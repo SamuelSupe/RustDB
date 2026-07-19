@@ -1,13 +1,16 @@
 openapi: 3.1.0
 info:
   title: RustDB Read-only HTTP Shell API
-  version: 0.9.0-alpha.1
+  version: 1.0.0-beta.1
   summary: Versioned background-query API used by the RustDB remote CLI.
   description: |
-    RustDB v1 exposes one read-only SQL statement per background Query. Query
-    results become readable only after successful completion. Every `/v1`
-    operation requires TLS and a Bearer Token; authentication runs before
-    request-body or query-parameter parsing. This specification deliberately
+    RustDB v1 exposes one read-only SQL statement per background Query. Committed
+    Arrow batches may be polled while execution runs; JSON/NDJSON pages become
+    readable only after successful completion. Every `/v1`
+    operation requires TLS and a principal Bearer Token; authentication runs
+    before request-body or query-parameter parsing. Query-role principals can
+    access only their own Query IDs, Admin principals can access every Query,
+    and Idempotency Keys are scoped to the submitting principal. This specification deliberately
     excludes write SQL, Sessions, source administration, uploads, and a query
     listing operation.
 servers:
@@ -17,6 +20,7 @@ tags:
   - name: Health
   - name: Protocol
   - name: Queries
+  - name: Operations
 security:
   - bearerAuth: []
 paths:
@@ -54,6 +58,32 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NotReady"
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: prometheusMetrics
+      summary: Read low-cardinality service metrics
+      description: |
+        Requires an Admin principal. Query-role principals and the explicit
+        no-auth development actor do not receive Admin permission.
+      responses:
+        "200":
+          description: Prometheus text exposition without principal or Query-ID labels.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: The authenticated principal is not an Admin.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/info:
     get:
       tags: [Protocol]
@@ -109,9 +139,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Problem"
-            text/plain:
-              schema:
-                type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "409":
@@ -123,26 +150,27 @@ paths:
         "413":
           description: Request exceeds the 1 MiB request-body limit.
           content:
-            text/plain:
+            application/json:
               schema:
-                type: string
+                $ref: "#/components/schemas/Problem"
         "415":
           description: The request Content-Type is not application/json.
           content:
-            text/plain:
+            application/json:
               schema:
-                type: string
+                $ref: "#/components/schemas/Problem"
         "422":
           description: The JSON shape is invalid or the SQL is outside the read-only allowlist.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Problem"
-            text/plain:
-              schema:
-                type: string
         "429":
-          description: The bounded admission queue is full.
+          description: |
+            The engine or principal admission queue is full
+            (`admission.queue_full`), or the Query reservation exceeds a
+            configured admission layer (`admission.resource_limit`). Queue-full
+            responses are safely retryable and include Retry-After.
           headers:
             Retry-After:
               description: Suggested delay in seconds.
@@ -241,22 +269,50 @@ paths:
           minimum: 1
           maximum: 10000
           default: 1000
+      - name: batch_seq
+        in: query
+        description: |
+          Zero-based committed-batch sequence for incremental Arrow IPC polling.
+          Required with `Accept: application/vnd.apache.arrow.file` and mutually
+          exclusive with `cursor`, `offset`, and `limit`.
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
     get:
       tags: [Queries]
       operationId: getQueryResults
-      summary: Fetch an immutable completed-result page
+      summary: Fetch a result page or poll one committed Arrow IPC batch
       description: |
-        Results are available only after `state` is `succeeded`. Send
-        `Accept: application/json` or `Accept: application/x-ndjson`. Page
-        reads never mutate a shared server cursor and may be repeated.
+        JSON and NDJSON pages are available only after `state` is `succeeded`.
+        Send `Accept: application/json` or `Accept: application/x-ndjson` with
+        row pagination. For incremental, backpressured delivery while a Query
+        is still running, send `Accept: application/vnd.apache.arrow.file` and
+        only `batch_seq`. Each Arrow 200 response is one independent Arrow IPC
+        file containing exactly one RecordBatch. A completed zero-row result,
+        or a poll after the final batch, returns a schema-only Arrow IPC file.
+        Reads are immutable and repeatable; clients advance only to the exact
+        `X-RustDB-Next-Batch-Seq` returned by the server.
       responses:
         "200":
           description: |
-            One result page with at most 10,000 rows and 16 MiB of encoded row
-            arrays. The JSON/NDJSON envelope adds a small amount of framing.
+            For JSON/NDJSON, one result page with at most 10,000 rows and 16 MiB
+            of encoded row arrays. For Arrow, one independent IPC file with one
+            committed RecordBatch, or a schema-only completion file. The
+            RustDB batch headers below are present only on Arrow responses.
           headers:
             X-Request-Id:
               $ref: "#/components/headers/RequestId"
+            X-RustDB-Batch-Seq:
+              $ref: "#/components/headers/BatchSeq"
+            X-RustDB-Next-Batch-Seq:
+              $ref: "#/components/headers/NextBatchSeq"
+            X-RustDB-Batch-Rows:
+              $ref: "#/components/headers/BatchRows"
+            X-RustDB-Result-State:
+              $ref: "#/components/headers/ResultState"
+            X-RustDB-Result-Complete:
+              $ref: "#/components/headers/ResultComplete"
           content:
             application/json:
               schema:
@@ -268,21 +324,46 @@ paths:
                   UTF-8 NDJSON: `{"type":"schema","columns":[...]}`, zero
                   or more `{"type":"row","values":[...]}` records, then
                   exactly one `{"type":"page","page":{...}}` record.
+            application/vnd.apache.arrow.file:
+              schema:
+                type: string
+                format: binary
+                description: |
+                  One Arrow IPC file containing one committed RecordBatch, or a
+                  schema-only file when the requested sequence is complete.
+        "204":
+          description: |
+            No Arrow batch is committed at `batch_seq` yet. The response has no
+            body. Poll again after `Retry-After`; do not infer completion from
+            an empty body.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+            X-RustDB-Batch-Seq:
+              $ref: "#/components/headers/BatchSeq"
+            X-RustDB-Next-Batch-Seq:
+              $ref: "#/components/headers/NextBatchSeq"
+            X-RustDB-Result-State:
+              $ref: "#/components/headers/ResultState"
+            X-RustDB-Result-Complete:
+              $ref: "#/components/headers/ResultComplete"
+            Retry-After:
+              description: Minimum polling delay in seconds.
+              schema:
+                type: integer
+                const: 1
         "400":
-          description: Cursor and offset were both supplied or pagination is invalid.
+          description: Pagination modes were mixed, a sequence was omitted, or a position is invalid.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Problem"
-            text/plain:
-              schema:
-                type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/QueryNotFound"
         "409":
-          description: The Query has not succeeded and therefore has no result.
+          description: The selected result mode cannot produce output for the Query state.
           content:
             application/json:
               schema:
@@ -293,19 +374,56 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "503":
+          description: The result reader is shutting down.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: opaque
-      description: Random server Token read from the imported profile's Token file.
+      description: |
+        Opaque principal credential read from an imported Profile Token file.
+        The server stores only its SHA-256 digest. Query and Admin roles are
+        authorized independently after authentication.
   headers:
     RequestId:
       description: Server-generated identifier for logs and support.
       schema:
         type: string
         minLength: 16
+    BatchSeq:
+      description: Sequence encoded by this Arrow response.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    NextBatchSeq:
+      description: Exact sequence to request on the next Arrow poll.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    BatchRows:
+      description: Rows in the returned Arrow RecordBatch; present on Arrow 200 only.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    ResultState:
+      description: Query/result state observed while serving the Arrow response.
+      schema:
+        type: string
+        enum: [queued, running, succeeded, failed, cancelled, invalidated]
+    ResultComplete:
+      description: True only when no batch follows `X-RustDB-Next-Batch-Seq`.
+      schema:
+        type: string
+        enum: ["true", "false"]
   parameters:
     QueryId:
       name: query_id
@@ -348,7 +466,7 @@ components:
           schema:
             $ref: "#/components/schemas/Problem"
     QueryNotFound:
-      description: Query ID is unknown, expired, deleted, or from another process run.
+      description: Query ID is unknown, expired, deleted, or owned by another principal.
       content:
         application/json:
           schema:
@@ -392,7 +510,7 @@ components:
           const: v1
         server_version:
           type: string
-          examples: [0.9.0-alpha.1]
+          examples: [1.0.0-beta.1]
         read_only:
           type: boolean
           const: true
@@ -403,6 +521,8 @@ components:
             type: string
             enum:
               - background_queries
+              - arrow_ipc_results
+              - batch_sequence_resume
               - typed_parameters
               - cursor_pagination
               - offset_pagination
@@ -606,7 +726,7 @@ components:
     Problem:
       type: object
       additionalProperties: false
-      required: [error, message]
+      required: [error, message, retry]
       properties:
         error:
           type: string
@@ -614,6 +734,10 @@ components:
           examples: [query.not_found]
         message:
           type: string
+        retry:
+          type: string
+          enum: [never, safe, reopen_required, outcome_unknown, unknown]
+          description: Machine-readable retry safety; clients must not infer this from `message`.
         request_id:
           type: string
         query_id:

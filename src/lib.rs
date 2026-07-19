@@ -11,6 +11,7 @@ mod execution;
 mod external_source;
 mod http_read_only;
 pub mod http_shell;
+mod import;
 mod optimizer;
 mod prepared;
 mod runtime;
@@ -30,11 +31,18 @@ pub use engine::{
     CommitInfo, Engine, EngineMemorySnapshot, MigrationInfo, QueryCancellation, QueryResult,
     Session, Transaction, TransactionAccessMode, TransactionOptions, TransactionPreparedStatement,
 };
-pub use error::{Error, Result};
+pub use error::{Error, ErrorCode, Result, RetryClass};
 pub use external_source::ExternalSourceDefinition;
 pub use http_read_only::HttpReadOnlyPolicy;
+pub(crate) use import::NativeImportIntent;
+pub use import::{
+    NativeImportFormat, NativeImportOptions, NativeImportReceipt, NativeImportResult,
+};
 pub use prepared::{ParameterValue, PreparedStatement};
 pub use runtime::{OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot, RecordBatchStream};
+pub use storage::{
+    NativeCheckIssue, NativeCheckReport, NativeRepairAction, NativeRepairPlan, NativeRepairReport,
+};
 
 #[doc(hidden)]
 pub fn split_sql_statements(sql: &str) -> Result<Vec<String>> {

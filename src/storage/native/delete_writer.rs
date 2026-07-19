@@ -22,6 +22,8 @@ pub(crate) struct NativeDeleteWriter {
 
 impl NativeDeleteWriter {
     pub(super) fn begin(database: &NativeDatabase, plan: NativeWritePlan) -> Result<Self> {
+        let disk_budget =
+            DiskBudget::with_admission(plan.new_snapshot_limit, &database.disk_admission)?;
         let staging = StagedSnapshot::begin(database.path(), database.database_id())?;
         let wal = database.wal()?;
         if let Err(error) = wal.begin(staging.transaction_id(), plan.expected_generation) {
@@ -33,7 +35,6 @@ impl NativeDeleteWriter {
                 )),
             };
         }
-        let disk_budget = DiskBudget::new(plan.new_snapshot_limit);
         let wal_owner = ActiveWal::new(Arc::clone(&wal), staging.transaction_id());
         Ok(Self {
             wal,

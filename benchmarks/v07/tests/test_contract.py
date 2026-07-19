@@ -83,6 +83,7 @@ def query(
     if engine == "rustdb":
         value.update(
             {
+                "discovered_files": 1,
                 "scanned_rows": 3,
                 "scanned_bytes": 128,
                 "parquet_reader_builds": 0,
@@ -1212,6 +1213,7 @@ class ContractTests(unittest.TestCase):
         for run_value in value["engines"]["rustdb"]["runs"]:
             measured = run_value["queries"][0]
             for field in (
+                "discovered_files",
                 "parquet_range_bytes_read",
                 "parquet_range_read_time_ms",
                 "parquet_decode_compute_time_ms",

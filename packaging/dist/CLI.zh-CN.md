@@ -38,7 +38,7 @@ rustdb serve \
   --advertise-url https://analytics.example.com:7400
 ```
 
-首次启动会生成本地 CA、可续签服务端证书和随机 Bearer Token。停止服务并导出
+首次启动会生成本地 CA、可续签服务端证书、Admin principal 和随机 Profile Token。停止服务并导出
 连接包，通过可信渠道传输后，再在客户端导入：
 
 ```sh
@@ -47,6 +47,21 @@ rustdb profile export \
   --output analytics.rustdb-profile
 rustdb profile import analytics.rustdb-profile --name analytics
 ```
+
+服务停止时可清点 Token 且不暴露凭证材料，并为指定 Query/Admin principal 导出
+Profile。按 Token 导出默认复用已管理连接包的 URL 与 CA；需要覆盖 HTTPS origin 时
+增加 `--server-url`。
+
+```sh
+rustdb token list --database /srv/rustdb/analytics --principal analyst
+rustdb token rotate --database /srv/rustdb/analytics --principal analyst
+rustdb profile export --database /srv/rustdb/analytics \
+  --token-id <UUID> --output analyst.rustdb-profile
+rustdb token revoke --database /srv/rustdb/analytics --token-id <UUID>
+```
+
+`token list` 只输出 UUID、principal、active/revoked/inactive 状态和 valid-until，
+绝不输出 Token secret、digest 或 Token 文件路径。
 
 远程 CLI 使用命名 Profile。交互模式会等待每个后台 Query；`-c` 与 `-f` 适合脚本，
 并保留本地输出格式。Ctrl-C 会尽力向服务端发送取消请求。
@@ -64,8 +79,10 @@ Explain 语句；DDL/DML、维护、上传、直接 `read_csv`/`read_parquet` �
 
 `serve` 的结果保留控制独立于引擎 Spill 配额：`--result-directory`、
 `--result-ttl-secs`、`--result-global-limit`、`--result-query-limit`。默认已完成结果
-保留一小时；总磁盘配额为 10 GiB 和文件系统容量 10% 中的较小值，单 Query 最多使用
-该总量的 25%。同一命令还支持为服务端本地注册源指定 `--s3-region`、`--s3-endpoint`、
+保留一小时；总硬上限为 10 GiB，单 Query 上限为 2 GiB。可通过 `--query-*-limit`、
+`--principal-*-limit`、principal 运行/排队上限和 `--principal-weight` 配置分层准入；
+Admin 不会获得隐式优先级。引擎通过 `--spill-engine-limit` 与 `--spill-query-limit`
+执行对应 Spill 硬上限。同一命令还支持为服务端本地注册源指定 `--s3-region`、`--s3-endpoint`、
 `--s3-path-style`、`--s3-allow-http` 和 `--s3-anonymous`。HTTP 仅用于可信开发
 endpoint，匿名模式仅用于公开对象。
 

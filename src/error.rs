@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+mod code;
+
+pub use code::{ErrorCode, RetryClass};
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -67,6 +71,24 @@ pub enum Error {
     NativeStorage { path: PathBuf, message: String },
 
     #[error(
+        "unsupported native database format{path}: found version {found_version}, current beta version is {current_version}; {reason}",
+        path = display_required_path(.path),
+        reason = native_format_reason(.alpha)
+    )]
+    NativeFormatUnsupported {
+        path: PathBuf,
+        found_version: u32,
+        current_version: u32,
+        alpha: bool,
+    },
+
+    #[error("native repair refused{path}: {message}", path = display_required_path(.path))]
+    NativeRepairRefused { path: PathBuf, message: String },
+
+    #[error("native import_id '{import_id}' conflicts with a previously committed request")]
+    NativeImportConflict { import_id: String },
+
+    #[error(
         "durable operation outcome is unknown for transaction {transaction_id}{path}: {message}",
         path = display_required_path(.path)
     )]
@@ -116,7 +138,70 @@ fn native_quota_scope(table: Option<&str>) -> String {
         .unwrap_or_else(|| "engine".to_owned())
 }
 
+fn native_format_reason(alpha: &bool) -> &'static str {
+    if *alpha {
+        "alpha databases are intentionally not migrated; re-import the source CSV or Parquet data"
+    } else {
+        "this database must be opened by a compatible RustDB version"
+    }
+}
+
 impl Error {
+    /// Returns the stable machine-readable code for this error category.
+    pub const fn code(&self) -> ErrorCode {
+        match self {
+            Self::Io { .. } => ErrorCode::Io,
+            Self::Arrow(_) => ErrorCode::Arrow,
+            Self::Parquet(_) => ErrorCode::Parquet,
+            Self::ObjectStore(_) => ErrorCode::ObjectStore,
+            Self::SqlParse(_) => ErrorCode::SqlParse,
+            Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
+            Self::Unsupported(_) => ErrorCode::Unsupported,
+            Self::ResourceExhausted(_) => ErrorCode::ResourceExhausted,
+            Self::NativeDiskQuotaExceeded { .. } => ErrorCode::NativeDiskQuotaExceeded,
+            Self::Cancelled => ErrorCode::Cancelled,
+            Self::Catalog(_) => ErrorCode::Catalog,
+            Self::TransactionClosed { .. } => ErrorCode::TransactionClosed,
+            Self::TransactionConflict { .. } => ErrorCode::TransactionConflict,
+            Self::NativeStorage { .. } => ErrorCode::NativeStorage,
+            Self::NativeFormatUnsupported { .. } => ErrorCode::NativeFormatUnsupported,
+            Self::NativeRepairRefused { .. } => ErrorCode::NativeRepairRefused,
+            Self::NativeImportConflict { .. } => ErrorCode::NativeImportConflict,
+            Self::CommitOutcomeUnknown { .. } => ErrorCode::CommitOutcomeUnknown,
+            Self::NativeCommitPostCommitFailure { .. } => ErrorCode::NativeCommitPostCommitFailure,
+            Self::CopyPostCommitFailure { .. } => ErrorCode::CopyPostCommitFailure,
+            Self::Execution(_) => ErrorCode::Execution,
+            Self::Internal(_) => ErrorCode::Internal,
+        }
+    }
+
+    /// Classifies retry safety without requiring callers to parse the message.
+    pub const fn retry_class(&self) -> RetryClass {
+        match self {
+            Self::ResourceExhausted(_) | Self::NativeDiskQuotaExceeded { .. } => RetryClass::Safe,
+            Self::TransactionConflict { .. } => RetryClass::ReopenRequired,
+            Self::CommitOutcomeUnknown { .. } => RetryClass::OutcomeUnknown,
+            Self::Io { .. }
+            | Self::Arrow(_)
+            | Self::Parquet(_)
+            | Self::ObjectStore(_)
+            | Self::NativeStorage { .. }
+            | Self::NativeCommitPostCommitFailure { .. }
+            | Self::CopyPostCommitFailure { .. }
+            | Self::Execution(_)
+            | Self::Internal(_) => RetryClass::Unknown,
+            Self::SqlParse(_)
+            | Self::InvalidArgument(_)
+            | Self::Unsupported(_)
+            | Self::NativeFormatUnsupported { .. }
+            | Self::NativeRepairRefused { .. }
+            | Self::NativeImportConflict { .. }
+            | Self::Cancelled
+            | Self::Catalog(_)
+            | Self::TransactionClosed { .. } => RetryClass::Never,
+        }
+    }
+
     pub fn io(path: impl Into<Option<PathBuf>>, source: std::io::Error) -> Self {
         Self::Io {
             path: path.into(),
@@ -146,6 +231,22 @@ impl Error {
             added_bytes,
             peak_bytes,
             limit_bytes,
+        }
+    }
+
+    pub(crate) fn native_repair_refused(
+        path: impl Into<PathBuf>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::NativeRepairRefused {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn native_import_conflict(import_id: impl Into<String>) -> Self {
+        Self::NativeImportConflict {
+            import_id: import_id.into(),
         }
     }
 
@@ -187,3 +288,24 @@ impl Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, ErrorCode, RetryClass};
+
+    #[test]
+    fn exposes_stable_codes_and_retry_classes() {
+        let invalid = Error::InvalidArgument("bad input".into());
+        assert_eq!(invalid.code(), ErrorCode::InvalidArgument);
+        assert_eq!(invalid.code().as_str(), "request.invalid");
+        assert_eq!(invalid.retry_class(), RetryClass::Never);
+
+        let exhausted = Error::ResourceExhausted("memory".into());
+        assert_eq!(exhausted.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(exhausted.retry_class(), RetryClass::Safe);
+
+        let unknown = Error::commit_outcome_unknown("db", "tx-1", "ambiguous publish");
+        assert_eq!(unknown.code(), ErrorCode::CommitOutcomeUnknown);
+        assert_eq!(unknown.retry_class(), RetryClass::OutcomeUnknown);
+    }
+}

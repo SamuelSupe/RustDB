@@ -102,6 +102,7 @@ pub(super) fn parse(statement: &Statement) -> Result<Option<CopyCommand>> {
         query,
         kind: super::NativeWriteKind::CopyFrom,
         returning: None,
+        import: None,
     })))
 }
 

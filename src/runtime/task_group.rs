@@ -84,6 +84,15 @@ enum TaskFailure {
         path: PathBuf,
         message: String,
     },
+    NativeFormatUnsupported {
+        path: PathBuf,
+        found_version: u32,
+        current_version: u32,
+        alpha: bool,
+    },
+    NativeImportConflict {
+        import_id: String,
+    },
     CommitOutcomeUnknown {
         path: PathBuf,
         transaction_id: String,
@@ -450,6 +459,20 @@ impl TaskFailure {
                 path: path.clone(),
                 message: message.clone(),
             },
+            Error::NativeFormatUnsupported {
+                path,
+                found_version,
+                current_version,
+                alpha,
+            } => Self::NativeFormatUnsupported {
+                path: path.clone(),
+                found_version: *found_version,
+                current_version: *current_version,
+                alpha: *alpha,
+            },
+            Error::NativeImportConflict { import_id } => Self::NativeImportConflict {
+                import_id: import_id.clone(),
+            },
             Error::CommitOutcomeUnknown {
                 path,
                 transaction_id,
@@ -483,7 +506,8 @@ impl TaskFailure {
             | Error::Arrow(_)
             | Error::Parquet(_)
             | Error::ObjectStore(_)
-            | Error::SqlParse(_) => Self::Execution(error.to_string()),
+            | Error::SqlParse(_)
+            | Error::NativeRepairRefused { .. } => Self::Execution(error.to_string()),
         })
     }
 
@@ -525,6 +549,20 @@ impl TaskFailure {
             Self::NativeStorage { path, message } => Error::NativeStorage {
                 path: path.clone(),
                 message: message.clone(),
+            },
+            Self::NativeFormatUnsupported {
+                path,
+                found_version,
+                current_version,
+                alpha,
+            } => Error::NativeFormatUnsupported {
+                path: path.clone(),
+                found_version: *found_version,
+                current_version: *current_version,
+                alpha: *alpha,
+            },
+            Self::NativeImportConflict { import_id } => Error::NativeImportConflict {
+                import_id: import_id.clone(),
             },
             Self::CommitOutcomeUnknown {
                 path,

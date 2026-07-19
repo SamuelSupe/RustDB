@@ -5,7 +5,7 @@ database-file-compatible with DuckDB.
 
 ## SQL support
 
-| Area | v0.9.0-alpha.1 support |
+| Area | v1.0.0-beta.1 support |
 | --- | --- |
 | Query shape | `SELECT`, non-recursive CTEs, non-LATERAL derived tables, recursive parenthesized set-expression trees |
 | Filtering | `WHERE`, three-valued Boolean logic, comparisons, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`, `LIKE`/`NOT LIKE` with `ESCAPE`, `IN` lists |
@@ -48,7 +48,7 @@ left rows. `NATURAL`, pure non-equi, and `CROSS` joins remain unsupported.
 
 Prepared values are substituted into a parsed AST and then use the normal
 Binder, object snapshot, and optimizer path. They cannot replace identifiers,
-file patterns, or table-function options. v0.8 parameter values include TIME,
+file patterns, or table-function options. Beta parameter values include TIME,
 arbitrary timestamp precision, TIMESTAMPTZ, UUID, and all three Arrow interval
 families. SQL `PREPARE`/`EXECUTE`, server-side plan caching, and inferred
 parameter types remain outside the embedded API.
@@ -155,7 +155,7 @@ both are cumulative across lanes and may exceed query wall time. Coalesced range
 bytes describe requested positional-read spans, not physical media traffic.
 These values are additive diagnostics, not performance guarantees.
 
-## Persistent Native alpha
+## Persistent Native Beta
 
 `Engine::open(path, config)` persists immutable base/delta segments, versioned
 delete vectors, schemas, tables, and views in a versioned Catalog. CTAS,
@@ -164,11 +164,12 @@ Catalog generation boundary. `Engine::new` remains ephemeral. Local and
 S3/MinIO backup publish a validated manifest last; restore refuses to replace
 an existing destination. The CLI exposes `backup` and `restore` subcommands.
 
-v0.8 database marker v2 adds a checksummed, contiguous-LSN WAL. Commit intent is
-synced before Catalog `CURRENT` publication; open replays a durable unpublished
-generation and rejects corrupt records or generation gaps. Database marker v1
-remains readable but is write-protected until `rustdb migrate PATH` creates a
-matching v0.7 backup and atomically enables WAL.
+Beta Native databases use marker epoch `3`. Alpha epochs `1` and `2` are
+rejected before permission changes, locking, WAL recovery, or cleanup; import
+CSV/Parquet into a fresh Beta database instead. The checksummed contiguous-LSN
+WAL syncs commit intent before Catalog `CURRENT` publication. Open replays a
+durable unpublished generation and rejects corrupt records or generation gaps.
+See [migration-v1-beta.md](migration-v1-beta.md).
 
 Transactions use optimistic multi-writer snapshot isolation. Read-only and
 read-write handles, prepared statements, SQL transaction control, read-your-
@@ -259,27 +260,41 @@ Integer `SUM` returns `Decimal128(38, 0)` and Decimal input returns precision 38
 at its input scale. This avoids narrowing a wide partial accumulator at the
 public Arrow boundary.
 
+## Platform and service support
+
+Linux x86_64 and AArch64 are the supported binary and non-root OCI deployment
+targets. macOS Apple Silicon is supported for embedded use, the CLI, and
+development. Windows and macOS Intel are unsupported. Native databases require
+a local filesystem with atomic rename, `fsync`, and advisory file locks.
+
+AWS S3 through the default credential chain is supported. MinIO
+`RELEASE.2025-04-22T22-12-26Z` is the tested S3-compatible target; other
+S3-compatible services are best effort and require deployment-specific
+validation. HTTPS is required by default. See [operator-guide.md](operator-guide.md).
+
 ## Deliberate exclusions
 
 Serializable isolation, predicate locks, savepoints, public time travel,
 `MERGE`/upsert, relational constraints, secondary indexes, recursive CTEs,
 LATERAL/UNNEST, nested LIST/STRUCT/MAP/JSON execution, replication, and
-distributed execution are excluded from v0.9. ORC, Iceberg, JSON scan and
+distributed execution are excluded from Beta. ORC, Iceberg, JSON scan and
 persistent data-page caching are also outside this release.
 
-## Read-only HTTP Shell (v0.9)
+## Read-only HTTPS Shell (Beta)
 
 The optional `/v1` HTTP surface is a remote CLI Shell, not the embedded/local
-SQL API over HTTP. It supports authenticated capability negotiation, one
-background read-only Query, status, immutable JSON/NDJSON result pages,
-cancellation, and terminal deletion. Only `SELECT`/non-recursive `WITH`,
+SQL API over HTTP. It supports authenticated capability negotiation,
+background read-only Queries, status, immutable JSON/NDJSON result pages,
+cancellation, and terminal deletion. Query-role principals can access only
+their own Query IDs; Admin principals can access every Query and `/metrics`.
+Only `SELECT`/non-recursive `WITH`,
 `VALUES`, `SHOW`, `DESCRIBE`, `EXPLAIN`, and `EXPLAIN ANALYZE` are accepted;
 the server reads Native/system tables and server-local registered CSV/Parquet
 sources only. Authentication occurs before body or query-parameter parsing.
 
 Remote DDL/DML, transactions, maintenance, uploads, direct file functions,
-source administration, browser UI/CORS, multi-user identity, durable Query
-recovery, and a general full HTTP database API are deliberately excluded. See
+source administration, browser UI/CORS, remote Sessions, and a general full
+HTTP database API are deliberately excluded. See
 [http-shell.md](http-shell.md) and [openapi-v1.yaml](openapi-v1.yaml) for the
 complete operational and wire contract.
 

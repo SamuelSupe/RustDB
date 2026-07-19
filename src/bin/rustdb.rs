@@ -4,6 +4,8 @@ mod admin;
 mod args;
 #[path = "rustdb/config.rs"]
 mod config;
+#[path = "rustdb/diagnostics.rs"]
+mod diagnostics;
 #[path = "rustdb/operations.rs"]
 mod operations;
 #[path = "rustdb/output.rs"]
@@ -19,19 +21,12 @@ mod sql_input;
 
 use clap::Parser;
 
-use args::{Args, Operation};
+use args::{Args, LogFormatArg, Operation};
 use rustdb::{Engine, EngineConfig, Error, Result};
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn,rustdb::http_shell=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let args = Args::parse();
+    init_logging(args.log_format);
     if args.help_zh {
         print!("{}", args::HELP_ZH);
         return;
@@ -50,6 +45,27 @@ fn main() {
     if let Err(error) = runtime.block_on(run(args)) {
         eprintln!("error: {error}");
         std::process::exit(1);
+    }
+}
+
+fn init_logging(format: LogFormatArg) {
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "warn,rustdb::http_shell=info".into())
+    };
+    match format {
+        LogFormatArg::Text => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .init(),
+        LogFormatArg::Json => tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .init(),
     }
 }
 
@@ -93,6 +109,54 @@ fn ensure_standalone_operation(args: &Args) -> Result<()> {
 
 async fn run_operation(operation: &Operation, global: &Args, config: EngineConfig) -> Result<()> {
     match operation {
+        Operation::Import(args) => {
+            let format = match args.format {
+                operations::NativeImportFormatArg::Csv => rustdb::NativeImportFormat::Csv,
+                operations::NativeImportFormatArg::Parquet => rustdb::NativeImportFormat::Parquet,
+            };
+            let header = match args.header {
+                operations::CsvHeaderArg::Auto => rustdb::CsvHeader::Auto,
+                operations::CsvHeaderArg::Present => rustdb::CsvHeader::Present,
+                operations::CsvHeaderArg::Absent => rustdb::CsvHeader::Absent,
+            };
+            let compression = match args.compression {
+                operations::CsvCompressionArg::Auto => rustdb::CsvCompression::Auto,
+                operations::CsvCompressionArg::None => rustdb::CsvCompression::None,
+                operations::CsvCompressionArg::Gzip => rustdb::CsvCompression::Gzip,
+                operations::CsvCompressionArg::Zstd => rustdb::CsvCompression::Zstd,
+            };
+            let csv = rustdb::CsvOptions::builder()
+                .header(header)
+                .delimiter(args.delimiter)
+                .compression(compression)
+                .build();
+            let options = rustdb::NativeImportOptions::new(
+                &args.import_id,
+                &args.table,
+                &args.location,
+                format,
+            )
+            .csv_options(csv);
+            let engine = Engine::open(&args.database, config)?;
+            let result = engine.session().import(options).await?;
+            if args.json {
+                print_json(&result, "Native import receipt")?;
+            } else {
+                let receipt = result.receipt();
+                println!(
+                    "Native import {}: table={} rows={} generation={} ({})",
+                    receipt.import_id(),
+                    receipt.table(),
+                    receipt.rows(),
+                    receipt.catalog_generation(),
+                    if result.replayed() {
+                        "replayed"
+                    } else {
+                        "committed"
+                    }
+                );
+            }
+        }
         Operation::Migrate { database } => {
             let migration = Engine::migrate(database)?;
             if migration.migrated() {
@@ -111,6 +175,121 @@ async fn run_operation(operation: &Operation, global: &Args, config: EngineConfi
                 );
             }
         }
+        Operation::Native { command } => match command {
+            operations::NativeOperation::Check { database, json } => {
+                let report = Engine::check_native(database)?;
+                if *json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).map_err(|error| {
+                            Error::Internal(format!(
+                                "failed to encode Native check report: {error}"
+                            ))
+                        })?
+                    );
+                } else {
+                    println!(
+                        "Native check {}: {}",
+                        report.path().display(),
+                        if report.is_ok() { "OK" } else { "FAILED" }
+                    );
+                    println!(
+                        "format={:?} catalog_generation={:?} tables={} snapshots={} files={} bytes={}",
+                        report.format_version(),
+                        report.catalog_generation(),
+                        report.checked_tables(),
+                        report.checked_snapshots(),
+                        report.checked_files(),
+                        report.checked_bytes()
+                    );
+                    for issue in report.warnings() {
+                        println!(
+                            "warning [{}]{}: {}",
+                            issue.code(),
+                            issue_path(issue),
+                            issue.message()
+                        );
+                    }
+                    for issue in report.errors() {
+                        println!(
+                            "error [{}]{}: {}",
+                            issue.code(),
+                            issue_path(issue),
+                            issue.message()
+                        );
+                    }
+                }
+                if !report.is_ok() {
+                    return Err(Error::Execution(format!(
+                        "Native check found {} integrity error(s)",
+                        report.errors().len()
+                    )));
+                }
+            }
+            operations::NativeOperation::Repair {
+                database,
+                apply,
+                json,
+            } => {
+                if *apply {
+                    let report = Engine::apply_native_repair(database)?;
+                    if *json {
+                        print_json(&report, "Native repair report")?;
+                    } else {
+                        println!(
+                            "Native repair {}: {} action(s), {}",
+                            report.plan().path().display(),
+                            report.applied_actions(),
+                            if report.succeeded() { "OK" } else { "FAILED" }
+                        );
+                        if let Some(backup) = report.backup_path() {
+                            println!("metadata backup: {}", backup.display());
+                        }
+                        print_check_issues(report.after());
+                    }
+                    if !report.succeeded() {
+                        return Err(Error::NativeRepairRefused {
+                            path: database.clone(),
+                            message: "post-repair integrity check still reports errors; metadata backup was retained"
+                                .to_owned(),
+                        });
+                    }
+                } else {
+                    let plan = Engine::plan_native_repair(database)?;
+                    if *json {
+                        print_json(&plan, "Native repair plan")?;
+                    } else {
+                        println!(
+                            "Native repair plan {}: {} action(s), {} blocker(s)",
+                            plan.path().display(),
+                            plan.actions().len(),
+                            plan.blockers().len()
+                        );
+                        for action in plan.actions() {
+                            println!("action: {action:?}");
+                        }
+                        for blocker in plan.blockers() {
+                            println!(
+                                "blocker [{}]{}: {}",
+                                blocker.code(),
+                                issue_path(blocker),
+                                blocker.message()
+                            );
+                        }
+                        println!("dry run only; pass --apply to write changes");
+                    }
+                    if !plan.is_applicable() {
+                        return Err(Error::NativeRepairRefused {
+                            path: database.clone(),
+                            message: format!(
+                                "repair plan has {} blocker(s)",
+                                plan.blockers().len()
+                            ),
+                        });
+                    }
+                }
+            }
+        },
         Operation::Backup {
             database,
             destination,
@@ -124,11 +303,57 @@ async fn run_operation(operation: &Operation, global: &Args, config: EngineConfi
             Engine::restore_from_location(backup, database, config).await?;
             println!("database restored: {}", database.display());
         }
+        Operation::Diagnostics { database, output } => {
+            return diagnostics::run(database, output.as_deref(), &config);
+        }
+        Operation::Config { command } => match command {
+            operations::ConfigOperation::Validate { path } => {
+                let path = server_config::validate_path(path.as_deref(), global)?;
+                println!("configuration is valid: {}", path.display());
+            }
+        },
         Operation::Serve(args) => return admin::serve_database(args.as_ref(), global).await,
         Operation::Shell(args) => return remote::run(args).await,
         Operation::Profile { command } => return admin::profile(command),
+        Operation::Principal { command } => return admin::principal(command),
+        Operation::Token { command } => return admin::token(command),
         Operation::Datasource { command } => return admin::datasource(command, config).await,
     }
+    Ok(())
+}
+
+fn issue_path(issue: &rustdb::NativeCheckIssue) -> String {
+    issue
+        .path()
+        .map(|path| format!(" at {}", path.display()))
+        .unwrap_or_default()
+}
+
+fn print_check_issues(report: &rustdb::NativeCheckReport) {
+    for issue in report.warnings() {
+        println!(
+            "warning [{}]{}: {}",
+            issue.code(),
+            issue_path(issue),
+            issue.message()
+        );
+    }
+    for issue in report.errors() {
+        println!(
+            "error [{}]{}: {}",
+            issue.code(),
+            issue_path(issue),
+            issue.message()
+        );
+    }
+}
+
+fn print_json(value: &impl serde::Serialize, kind: &str) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value)
+            .map_err(|error| Error::Internal(format!("failed to encode {kind}: {error}")))?
+    );
     Ok(())
 }
 

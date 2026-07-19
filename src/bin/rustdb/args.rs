@@ -14,6 +14,13 @@ pub enum OutputFormat {
     Jsonl,
 }
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum LogFormatArg {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum PruningModeArg {
     Auto,
@@ -49,6 +56,10 @@ pub struct Args {
     #[arg(long)]
     pub help_zh: bool,
 
+    /// Process log format. JSON emits one structured event per line.
+    #[arg(long, value_enum, default_value_t)]
+    pub log_format: LogFormatArg,
+
     /// Execute a SQL statement and exit.
     #[arg(short = 'c', long, conflicts_with = "file")]
     pub command: Option<String>,
@@ -72,6 +83,14 @@ pub struct Args {
     /// Per-table Native hard limit as TABLE=SIZE or SCHEMA.TABLE=SIZE; repeatable.
     #[arg(long = "native-table-limit", value_parser = parse_native_table_limit)]
     pub native_table_limits: Vec<NativeTableLimitArg>,
+
+    /// Minimum free bytes retained on the Native database filesystem.
+    #[arg(long, value_parser = parse_bytes)]
+    pub native_min_free_bytes: Option<usize>,
+
+    /// Minimum free filesystem ratio retained for Native writes (default 0.10).
+    #[arg(long)]
+    pub native_min_free_ratio: Option<f64>,
 
     /// Result rendering format.
     #[arg(long, value_enum, default_value_t)]
@@ -294,5 +313,74 @@ mod tests {
         let args = Args::try_parse_from(["rustdb", "restore", "s3://bucket/snapshot", "restored"])
             .unwrap();
         assert!(matches!(args.operation, Some(Operation::Restore { .. })));
+    }
+
+    #[test]
+    fn parses_native_check_operation() {
+        let args =
+            Args::try_parse_from(["rustdb", "native", "check", "warehouse", "--json"]).unwrap();
+        assert!(matches!(
+            args.operation,
+            Some(Operation::Native {
+                command: super::super::operations::NativeOperation::Check {
+                    database,
+                    json: true,
+                }
+            }) if database.as_path() == Path::new("warehouse")
+        ));
+
+        let args = Args::try_parse_from([
+            "rustdb",
+            "native",
+            "repair",
+            "warehouse",
+            "--apply",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.operation,
+            Some(Operation::Native {
+                command: super::super::operations::NativeOperation::Repair {
+                    database,
+                    apply: true,
+                    json: true,
+                }
+            }) if database.as_path() == Path::new("warehouse")
+        ));
+    }
+
+    #[test]
+    fn parses_idempotent_native_import() {
+        let args = Args::try_parse_from([
+            "rustdb",
+            "import",
+            "--database",
+            "warehouse",
+            "--table",
+            "events",
+            "--location",
+            "events.csv.gz",
+            "--format",
+            "csv",
+            "--import-id",
+            "load-2026-07-19",
+            "--header",
+            "present",
+            "--compression",
+            "gzip",
+            "--delimiter",
+            "|",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.operation,
+            Some(Operation::Import(super::super::operations::ImportArgs {
+                database,
+                table,
+                delimiter: b'|',
+                ..
+            })) if database.as_path() == Path::new("warehouse") && table == "events"
+        ));
     }
 }

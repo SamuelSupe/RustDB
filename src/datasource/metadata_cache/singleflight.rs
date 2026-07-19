@@ -141,6 +141,15 @@ pub(super) enum SharedLoadError {
         path: PathBuf,
         message: String,
     },
+    NativeFormatUnsupported {
+        path: PathBuf,
+        found_version: u32,
+        current_version: u32,
+        alpha: bool,
+    },
+    NativeImportConflict {
+        import_id: String,
+    },
     CommitOutcomeUnknown {
         path: PathBuf,
         transaction_id: String,
@@ -210,6 +219,21 @@ impl SharedLoadError {
                 path: path.clone(),
                 message: message.clone(),
             },
+            Error::NativeFormatUnsupported {
+                path,
+                found_version,
+                current_version,
+                alpha,
+            } => Self::NativeFormatUnsupported {
+                path: path.clone(),
+                found_version: *found_version,
+                current_version: *current_version,
+                alpha: *alpha,
+            },
+            Error::NativeImportConflict { import_id } => Self::NativeImportConflict {
+                import_id: import_id.clone(),
+            },
+            Error::NativeRepairRefused { .. } => Self::Execution(error.to_string()),
             Error::CommitOutcomeUnknown {
                 path,
                 transaction_id,
@@ -295,6 +319,18 @@ impl SharedLoadError {
                 message,
             },
             Self::NativeStorage { path, message } => Error::NativeStorage { path, message },
+            Self::NativeFormatUnsupported {
+                path,
+                found_version,
+                current_version,
+                alpha,
+            } => Error::NativeFormatUnsupported {
+                path,
+                found_version,
+                current_version,
+                alpha,
+            },
+            Self::NativeImportConflict { import_id } => Error::NativeImportConflict { import_id },
             Self::CommitOutcomeUnknown {
                 path,
                 transaction_id,

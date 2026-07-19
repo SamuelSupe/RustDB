@@ -45,6 +45,41 @@ fn reopen_resolves_every_native_commit_durability_boundary() {
 }
 
 #[test]
+fn reopen_makes_native_import_retry_safe_around_catalog_publication() {
+    for (boundary, committed) in [
+        (test_failpoint::Boundary::CatalogPrepared, false),
+        (test_failpoint::Boundary::CatalogPublished, true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database");
+        let database = NativeDatabase::open(&path).unwrap();
+        let intent = crate::NativeImportIntent {
+            import_id: "events-load".to_owned(),
+            table: "events".to_owned(),
+            request_fingerprint: "a".repeat(64),
+        };
+
+        test_failpoint::arm(boundary);
+        let error = database
+            .commit_import(prepared_table(&database), intent.clone())
+            .unwrap_err();
+        assert_boundary_error(boundary, &error);
+        drop(database);
+
+        let reopened = NativeDatabase::open(&path).unwrap();
+        let receipt = reopened.check_import(&intent).unwrap();
+        assert_eq!(receipt.is_some(), committed);
+        assert_eq!(reopened.table_snapshot("events").is_ok(), committed);
+        if !committed {
+            reopened
+                .commit_import(prepared_table(&reopened), intent.clone())
+                .unwrap();
+            assert!(reopened.check_import(&intent).unwrap().is_some());
+        }
+    }
+}
+
+#[test]
 fn reopen_resolves_every_transaction_commit_durability_boundary() {
     for (boundary, committed) in [
         (test_failpoint::Boundary::SnapshotPublished, false),

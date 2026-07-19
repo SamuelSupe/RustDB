@@ -209,6 +209,7 @@ fn as_i32(value: &Value) -> Option<i32> {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum QueryState {
     Queued,
@@ -219,6 +220,7 @@ pub enum QueryState {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct SubmitResponse {
     pub query_id: String,
     pub state: QueryState,
@@ -228,6 +230,7 @@ pub struct SubmitResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct QueryStatusResponse {
     pub query_id: String,
     pub state: QueryState,
@@ -243,6 +246,7 @@ pub struct QueryStatusResponse {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct HttpQueryMetrics {
     pub elapsed_ms: u64,
     pub rows_returned: u64,
@@ -254,6 +258,7 @@ pub struct HttpQueryMetrics {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct SchemaColumn {
     pub name: String,
     pub data_type: String,
@@ -261,6 +266,7 @@ pub struct SchemaColumn {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct PageMetadata {
     pub offset: u64,
     pub row_count: usize,
@@ -270,6 +276,7 @@ pub struct PageMetadata {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct JsonResultPage {
     pub schema: Vec<SchemaColumn>,
     pub rows: Vec<Vec<Value>>,
@@ -277,6 +284,7 @@ pub struct JsonResultPage {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[non_exhaustive]
 pub struct InfoResponse {
     pub protocol_version: &'static str,
     pub server_version: &'static str,

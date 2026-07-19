@@ -4,7 +4,7 @@
 
 本发行包提供独立的 `rustdb` 命令，用于查询本地磁盘和 S3-compatible
 对象存储上的 CSV、Parquet 数据、管理本地持久化 Native OLAP 数据库，以及通过
-v0.9 只读 HTTPS Shell 暴露该数据库。引擎仍是单机嵌入式；可选服务模式使用一个
+Beta 只读 HTTPS Shell 暴露该数据库。引擎仍是单机嵌入式；可选服务模式使用一个
 `rustdb serve` 进程服务一个 Native 数据库。
 
 ## 快速开始
@@ -29,6 +29,8 @@ rustdb --help-zh
 升级和卸载方法见 [docs/INSTALL.zh-CN.md](docs/INSTALL.zh-CN.md)，查询和资源参数见
 [docs/CLI.zh-CN.md](docs/CLI.zh-CN.md)。TLS 启动、离线 Profile、服务端本地数据源、
 远程 CLI 与原始 HTTP 用法见 [docs/HTTP-SHELL.zh-CN.md](docs/HTTP-SHELL.zh-CN.md)。
+支持部署、认证、指标、审计、备份、修复和故障处理见
+[docs/OPERATOR-GUIDE.zh-CN.md](docs/OPERATOR-GUIDE.zh-CN.md)。
 
 ## 包内容
 
@@ -37,7 +39,11 @@ rustdb --help-zh
 - `docs/CLI*.md`：中英文 CLI 帮助；
 - `docs/INSTALL*.md`：中英文安装帮助；
 - `docs/HTTP-SHELL*.md`：中英文 HTTPS Shell 帮助；
+- `docs/OPERATOR-GUIDE*.md`：中英文运维指南；
+- `docs/DIAGNOSTICS*.md`、`docs/NATIVE-IMPORT.md`、`docs/NATIVE-REPAIR.md`、
+  `docs/COMPATIBILITY.md`：支持、导入、恢复和兼容参考；
 - `docs/openapi-v1.yaml`：公开 OpenAPI 3.1 协议；
+- `RELEASE-NOTES.md`：当前版本变化和已知边界；
 - `SHA256SUMS`：所有安装文件的校验值；
 - `VERSION`、`LICENSE`。
 
@@ -50,6 +56,6 @@ S3 凭证从 AWS 默认凭证链获取。不要把 Access Key 写入 SQL、Shell
 参数。明文 HTTP endpoint 必须显式添加 `--s3-allow-http`，并且只应在可信开发网络
 使用。
 
-远程 Shell 始终使用 TLS 和自动生成的 Bearer Token，并严格只读：不能执行
+远程 Shell 始终使用 TLS 和只保存 digest 的 principal token，并严格只读：不能执行
 DDL/DML、上传文件、管理数据源或调用直接文件表函数。请像保护密码一样保护导出的
 Profile 包。

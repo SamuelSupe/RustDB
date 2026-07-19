@@ -31,6 +31,7 @@ struct WriteRun {
     returning: Option<ReturningProjection>,
     transaction: Option<Arc<super::transaction::TransactionWorkspace>>,
     transaction_catalog: crate::Catalog,
+    import: Option<crate::NativeImportIntent>,
     _mutation: Option<super::transaction::MutationLease>,
 }
 
@@ -48,11 +49,17 @@ impl Session {
             query,
             kind,
             returning,
+            import,
         } = command;
         let database = self.engine.inner.database.as_ref().ok_or_else(|| {
             Error::Unsupported("native writes require Engine::open(path, config)".to_owned())
         })?;
         let transaction = self.native_transaction.clone();
+        if import.is_some() && transaction.is_some() {
+            return Err(Error::Unsupported(
+                "Native import cannot run inside an explicit transaction".to_owned(),
+            ));
+        }
         let mutation = transaction
             .as_ref()
             .map(|transaction| transaction.begin_mutation())
@@ -89,7 +96,7 @@ impl Session {
         let generation = catalog.persistent_generation().unwrap_or(0);
         let source_bytes = context.object_snapshot_bytes()?;
         let mode = match kind {
-            NativeWriteKind::Create => NativeWriteMode::Create,
+            NativeWriteKind::Create | NativeWriteKind::Import => NativeWriteMode::Create,
             NativeWriteKind::Replace | NativeWriteKind::Compact | NativeWriteKind::Alter => {
                 NativeWriteMode::Replace
             }
@@ -150,6 +157,7 @@ impl Session {
             NativeWriteKind::Replace => "CREATE OR REPLACE TABLE",
             NativeWriteKind::Append => "INSERT",
             NativeWriteKind::CopyFrom => "COPY FROM",
+            NativeWriteKind::Import => "IMPORT",
             NativeWriteKind::Compact => "COMPACT",
             NativeWriteKind::Alter => "ALTER TABLE",
         };
@@ -169,6 +177,7 @@ impl Session {
                 returning,
                 transaction,
                 transaction_catalog,
+                import,
                 _mutation: mutation,
             })
             .await?;
@@ -196,6 +205,7 @@ async fn run_write(input: MemoryBatchStream, run: WriteRun) -> Result<Vec<BatchE
         returning,
         transaction,
         transaction_catalog,
+        import,
         _mutation,
     } = run;
     let (writer, returned) = write_input(
@@ -250,10 +260,9 @@ async fn run_write(input: MemoryBatchStream, run: WriteRun) -> Result<Vec<BatchE
         None => {
             let commit_engine = engine.clone();
             let commit_context = Arc::clone(&context);
-            engine
-                .inner
-                .spill_io
-                .run(move || commit_prepared(commit_engine, commit_context, prepared))?;
+            engine.inner.spill_io.run(move || {
+                commit_prepared_with_import(commit_engine, commit_context, prepared, import)
+            })?;
         }
     }
     Ok(match status {
@@ -266,6 +275,15 @@ pub(super) fn commit_prepared(
     engine: super::Engine,
     context: Arc<QueryContext>,
     prepared: crate::storage::PreparedSnapshot,
+) -> Result<()> {
+    commit_prepared_with_import(engine, context, prepared, None)
+}
+
+fn commit_prepared_with_import(
+    engine: super::Engine,
+    context: Arc<QueryContext>,
+    prepared: crate::storage::PreparedSnapshot,
+    import: Option<crate::NativeImportIntent>,
 ) -> Result<()> {
     let _gate = engine.inner.native_commit.lock();
     let database_path = engine.database_path().map(std::path::Path::to_path_buf);
@@ -289,7 +307,11 @@ pub(super) fn commit_prepared(
             Error::Internal("persistent engine lost its native database".to_owned()),
         );
     };
-    let commit = match database.commit_write(prepared) {
+    let commit_result = match import {
+        Some(intent) => database.commit_import(prepared, intent),
+        None => database.commit_write(prepared),
+    };
+    let commit = match commit_result {
         Ok(commit) => commit,
         Err(error) => {
             if let Error::NativeCommitPostCommitFailure {

@@ -76,6 +76,14 @@ for file in \
   share/doc/rustdb/INSTALL.zh-CN.md \
   share/doc/rustdb/HTTP-SHELL.md \
   share/doc/rustdb/HTTP-SHELL.zh-CN.md \
+  share/doc/rustdb/OPERATOR-GUIDE.md \
+  share/doc/rustdb/OPERATOR-GUIDE.zh-CN.md \
+  share/doc/rustdb/DIAGNOSTICS.md \
+  share/doc/rustdb/DIAGNOSTICS.zh-CN.md \
+  share/doc/rustdb/NATIVE-IMPORT.md \
+  share/doc/rustdb/NATIVE-REPAIR.md \
+  share/doc/rustdb/COMPATIBILITY.md \
+  share/doc/rustdb/RELEASE-NOTES.md \
   share/doc/rustdb/openapi-v1.yaml \
   share/rustdb/VERSION \
   share/rustdb/uninstall.sh

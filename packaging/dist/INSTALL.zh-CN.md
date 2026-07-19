@@ -7,9 +7,9 @@
 从可信渠道获取文件后，可用相邻的 `.sha256` 检查意外损坏：
 
 ```sh
-sha256sum -c rustdb-v0.9.0-alpha.1-linux-aarch64.tar.gz.sha256
+sha256sum -c rustdb-v1.0.0-beta.1-linux-aarch64.tar.gz.sha256
 # macOS：
-shasum -a 256 -c rustdb-v0.9.0-alpha.1-macos-aarch64.tar.gz.sha256
+shasum -a 256 -c rustdb-v1.0.0-beta.1-macos-aarch64.tar.gz.sha256
 ```
 
 解压后的 `SHA256SUMS` 覆盖所有可安装文件。
@@ -17,8 +17,8 @@ shasum -a 256 -c rustdb-v0.9.0-alpha.1-macos-aarch64.tar.gz.sha256
 ## 安装
 
 ```sh
-tar -xzf rustdb-v0.9.0-alpha.1-linux-aarch64.tar.gz
-cd rustdb-v0.9.0-alpha.1-linux-aarch64
+tar -xzf rustdb-v1.0.0-beta.1-linux-aarch64.tar.gz
+cd rustdb-v1.0.0-beta.1-linux-aarch64
 ./install.sh
 ```
 
@@ -56,8 +56,8 @@ HTTP Shell Profile 与服务端 TLS/Token 状态位于操作系统用户级状�
 安装后也可运行 `PREFIX/share/rustdb/uninstall.sh`。卸载只删除已知 CLI 和文档文件，
 不会删除数据库、输入数据、Spill 或用户配置目录。
 
-安装后的文档还包含 `HTTP-SHELL.md`、`HTTP-SHELL.zh-CN.md` 和公开的
-`openapi-v1.yaml` 协议。
+安装后的文档还包含中英文 HTTP Shell、运维和诊断指南，Native 导入/修复与兼容参考、
+发行说明，以及公开的 `openapi-v1.yaml` 协议。
 
 ## 平台
 

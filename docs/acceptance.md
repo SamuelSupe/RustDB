@@ -5,24 +5,49 @@ resource-heavy performance work as separate gates. This prevents every
 platform job from downloading or generating the same analytical dataset while
 still requiring one real S3-compatible integration run.
 
-## Active v0.9.0-alpha.1 release gate
+## Active v1.0.0-beta.1 release gate
 
-v0.9.0-alpha.1 is the read-only HTTP Shell release. Run its focused correctness
-and resource-lifecycle pass through OrbStack:
+The Beta decision is a single, commit-bound acceptance run. It first runs the
+ordinary OrbStack quality gate, then validates the same explicit CSV or Parquet
+workload on local storage and MinIO with 2 GiB and 4 GiB engine budgets, four
+compute threads, and eight concurrent clients. Finally it runs the already
+downloaded ClickBench fixture once:
 
 ```sh
-scripts/ci/orbstack.sh v09
+RUSTDB_BETA_ACCEPTANCE_OUTPUT=/absolute/evidence-directory \
+RUSTDB_BETA_LOCAL_FIXTURE=/absolute/local-fixture \
+RUSTDB_BETA_LOCAL_FORMAT=parquet \
+RUSTDB_BETA_MINIO_MANIFEST=/absolute/minio-manifest.json \
+RUSTDB_BETA_MINIO_FORMAT=parquet \
+RUSTDB_BETA_CLICKBENCH_DATA_DIR=/absolute/clickbench-data \
+RUSTDB_BETA_CLICKBENCH_PROFILE=functional \
+scripts/ci/beta_acceptance.sh
 ```
 
-This gate covers TLS/Profile bootstrap and renewal, Token rejection before body
-parsing, read-only policy bypass attempts, typed parameters, idempotent
-submission, queueing, timeout, cancellation, shutdown, JSON/NDJSON pagination,
-result TTL and global/per-Query quotas, cleanup, and all remote CLI renderers.
-It also verifies server-local registered sources against live MinIO with region,
-endpoint, path-style, explicit HTTP, and anonymous configuration. It does not
-claim browser, write-API, throughput, soak, ClickBench, or DuckDB compatibility
-coverage. Formatting and all-target compilation remain separate inexpensive
-development checks.
+Preflight requires a clean committed worktree, a 4-core/16-GiB-class host, an
+explicit local fixture of at least 100 GiB and 10,000 files, an equivalent
+MinIO inventory of at least 100 GiB and 10,000 objects, and a preloaded
+ClickBench functional dataset. Local and MinIO fixtures are flat directories or
+prefixes containing only the selected CSV or Parquet format. The gate owns the
+SQL (`SELECT count(*)` over the complete fixture), derives the expected file
+count from the normalized manifest, revalidates the local size/mtime inventory,
+and checks the live MinIO URI/size/ETag inventory before and after execution.
+The large-file query intentionally exercises discovery, snapshot, metadata,
+concurrency, and memory accounting; the pinned ClickBench oracle supplies
+data-page and result-correctness coverage. No fixture is downloaded implicitly.
+The four external runs must produce the same checksum and finish without active
+tasks, reservations, or Spill artifacts. The evidence directory is outside the
+repository and is finalized on success, failure, or interruption.
+
+This is a functional and resource-accounting baseline. It is deliberately one
+run, not a repeated timing, soak, dedicated low-memory Spill, or cross-engine
+performance gate. Details and exact environment variables are in
+[`roadmap-v1-beta.md`](roadmap-v1-beta.md) and the bilingual operator guides.
+
+## Historical v0.9 release gate
+
+The focused HTTP Shell regression stage remains available as
+`scripts/ci/orbstack.sh v09`, but it is not sufficient to publish Beta.
 
 ## Historical v0.7 release gate
 
@@ -54,7 +79,7 @@ MinIO services through OrbStack:
 scripts/ci/orbstack.sh all
 ```
 
-It runs formatting, strict Clippy, the v0.9 and required MinIO correctness
+It runs formatting, strict Clippy, the HTTP and required MinIO correctness
 tests, all Cargo targets except the dedicated low-memory Spill stress cases,
 and the portable release build. Run `scripts/ci/orbstack.sh test` explicitly
 when those stress cases are required. Thin-LTO release targets are linked one at a time

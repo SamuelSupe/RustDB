@@ -383,10 +383,7 @@ async fn safe_widening_reads_real_files_and_refreshes_missing_and_new_columns() 
         .register_parquet(
             "widening",
             [format!("{}/*.parquet", data.display())],
-            ParquetOptions {
-                schema_mode: ParquetSchemaMode::SafeWidening,
-                ..ParquetOptions::default()
-            },
+            ParquetOptions::default().schema_mode(ParquetSchemaMode::SafeWidening),
         )
         .await?;
     let mut widened = session
@@ -473,10 +470,7 @@ async fn dictionary_encoded_files_decode_in_every_schema_mode() -> Result<()> {
             .register_parquet(
                 table,
                 [pattern.clone()],
-                ParquetOptions {
-                    schema_mode: mode,
-                    ..ParquetOptions::default()
-                },
+                ParquetOptions::default().schema_mode(mode),
             )
             .await?;
         let mut result = session

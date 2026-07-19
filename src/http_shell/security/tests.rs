@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::{
     BearerToken, SecurityState, ServerEndpoint, TlsMaterial, copy_profile_bundle,
-    export_profile_bundle, import_profile_bundle, load_profile,
+    export_profile_bundle, export_profile_bundle_with_token, import_profile_bundle, load_profile,
 };
 
 fn state(temp: &TempDir) -> SecurityState {
@@ -177,6 +177,14 @@ fn profile_bundle_round_trips_without_embedding_the_token_in_metadata() {
     );
     assert!(import_profile_bundle(&profiles, "../escape", &bundle).is_err());
     assert!(!format!("{imported:?}").contains(clear_text));
+
+    BearerToken::rotate(&state).unwrap();
+    let rotated = fs::read_to_string(state.token_path()).unwrap();
+    let alternate_bundle = temp.path().join("alternate-bundle");
+    export_profile_bundle_with_token(&bundle, &alternate_bundle, state.token_path()).unwrap();
+    let alternate = import_profile_bundle(&profiles, "alternate", &alternate_bundle).unwrap();
+    assert_eq!(alternate.server_url(), endpoint.public_url());
+    assert_eq!(fs::read_to_string(alternate.token_path()).unwrap(), rotated);
 }
 
 #[cfg(unix)]

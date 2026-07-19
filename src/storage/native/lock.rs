@@ -19,6 +19,28 @@ pub(super) struct DatabaseLock {
 }
 
 impl DatabaseLock {
+    pub(super) fn acquire_existing(root: &Path) -> Result<Self> {
+        let path = root.join(LOCK_FILE);
+        io::require_regular_file(&path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| Error::io(Some(path.clone()), error))?;
+        file.try_lock().map_err(|error| {
+            Error::native_storage(
+                &path,
+                format!("database is already open or the lock is unavailable: {error}"),
+            )
+        })?;
+        let contents =
+            io::read_open_bounded(&mut file, &path, LOCK_CONTENT.len(), "database lock marker")?;
+        if contents != LOCK_CONTENT {
+            return Err(Error::native_storage(&path, "invalid database lock marker"));
+        }
+        Ok(Self { _file: file, path })
+    }
+
     pub(super) fn acquire(root: &Path) -> Result<Self> {
         let path = root.join(LOCK_FILE);
         let (mut file, created) = match OpenOptions::new()

@@ -52,7 +52,11 @@ for file in \
   LICENSE README.md README.zh-CN.md SHA256SUMS VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
   docs/INSTALL.md docs/INSTALL.zh-CN.md \
-  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md docs/openapi-v1.yaml \
+  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md \
+  docs/OPERATOR-GUIDE.md docs/OPERATOR-GUIDE.zh-CN.md \
+  docs/DIAGNOSTICS.md docs/DIAGNOSTICS.zh-CN.md \
+  docs/NATIVE-IMPORT.md docs/NATIVE-REPAIR.md docs/COMPATIBILITY.md \
+  docs/openapi-v1.yaml RELEASE-NOTES.md \
   uninstall.sh
 do
   [ -f "$package/$file" ] || { echo "incomplete package / 发行包不完整: $file" >&2; exit 1; }
@@ -76,6 +80,14 @@ install -m 0644 "$package/docs/INSTALL.md" "$doc/INSTALL.md"
 install -m 0644 "$package/docs/INSTALL.zh-CN.md" "$doc/INSTALL.zh-CN.md"
 install -m 0644 "$package/docs/HTTP-SHELL.md" "$doc/HTTP-SHELL.md"
 install -m 0644 "$package/docs/HTTP-SHELL.zh-CN.md" "$doc/HTTP-SHELL.zh-CN.md"
+install -m 0644 "$package/docs/OPERATOR-GUIDE.md" "$doc/OPERATOR-GUIDE.md"
+install -m 0644 "$package/docs/OPERATOR-GUIDE.zh-CN.md" "$doc/OPERATOR-GUIDE.zh-CN.md"
+install -m 0644 "$package/docs/DIAGNOSTICS.md" "$doc/DIAGNOSTICS.md"
+install -m 0644 "$package/docs/DIAGNOSTICS.zh-CN.md" "$doc/DIAGNOSTICS.zh-CN.md"
+install -m 0644 "$package/docs/NATIVE-IMPORT.md" "$doc/NATIVE-IMPORT.md"
+install -m 0644 "$package/docs/NATIVE-REPAIR.md" "$doc/NATIVE-REPAIR.md"
+install -m 0644 "$package/docs/COMPATIBILITY.md" "$doc/COMPATIBILITY.md"
+install -m 0644 "$package/RELEASE-NOTES.md" "$doc/RELEASE-NOTES.md"
 install -m 0644 "$package/docs/openapi-v1.yaml" "$doc/openapi-v1.yaml"
 
 say \

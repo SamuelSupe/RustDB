@@ -4,7 +4,7 @@ use futures::StreamExt;
 use rustdb::{
     Engine, EngineConfig,
     http_shell::{
-        HttpServerConfig, QueryRequest, QueryState, RemoteClient, TypedParameter,
+        ArrowResultPoll, HttpServerConfig, QueryRequest, QueryState, RemoteClient, TypedParameter,
         security::import_profile_bundle, serve_with_shutdown,
     },
 };
@@ -25,13 +25,11 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     );
     drain(engine.session().execute(&create_view).await.unwrap()).await;
     let listen = free_loopback_address();
-    let config = HttpServerConfig {
-        listen,
-        state_root: state_root.clone(),
-        result_global_limit_bytes: Some(1024 * 1024),
-        result_query_limit_bytes: Some(64 * 1024),
-        ..HttpServerConfig::default()
-    };
+    let mut config = HttpServerConfig::default();
+    config.listen = listen;
+    config.state_root = state_root.clone();
+    config.result_global_limit_bytes = Some(1024 * 1024);
+    config.result_query_limit_bytes = Some(64 * 1024);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(serve_with_shutdown(engine, config, async move {
         let _ = shutdown_rx.await;
@@ -184,6 +182,27 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     assert_eq!(ndjson.headers()["content-type"], "application/x-ndjson");
     let lines = ndjson.text().await.unwrap();
     assert_eq!(lines.lines().count(), 3);
+
+    let first_arrow = client.arrow_batch(&paged_id, 0).await.unwrap();
+    match first_arrow {
+        ArrowResultPoll::Batch(batch) => {
+            assert_eq!(batch.batch_seq, 0);
+            assert_eq!(batch.next_batch_seq, 1);
+            assert_eq!(batch.batch.num_rows(), 3);
+            assert!(batch.result_complete);
+        }
+        _ => panic!("completed query must return its first Arrow result batch"),
+    }
+    match client.arrow_batch(&paged_id, 1).await.unwrap() {
+        ArrowResultPoll::Complete {
+            next_batch_seq,
+            schema,
+        } => {
+            assert_eq!(next_batch_seq, 1);
+            assert_eq!(schema.fields().len(), 1);
+        }
+        _ => panic!("resuming after the final batch must return schema-only completion"),
+    }
     client.delete(&paged_id).await.unwrap();
 
     let accepted = client

@@ -80,6 +80,7 @@ impl Session {
                         query,
                         kind: NativeWriteKind::Alter,
                         returning: None,
+                        import: None,
                     },
                     permit,
                     admission_wait,

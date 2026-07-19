@@ -8,9 +8,9 @@ The adjacent `.sha256` file authenticates accidental corruption when obtained
 through a trusted channel:
 
 ```sh
-sha256sum -c rustdb-v0.9.0-alpha.1-linux-aarch64.tar.gz.sha256
+sha256sum -c rustdb-v1.0.0-beta.1-linux-aarch64.tar.gz.sha256
 # macOS:
-shasum -a 256 -c rustdb-v0.9.0-alpha.1-macos-aarch64.tar.gz.sha256
+shasum -a 256 -c rustdb-v1.0.0-beta.1-macos-aarch64.tar.gz.sha256
 ```
 
 After extraction, `SHA256SUMS` covers every installable payload.
@@ -18,8 +18,8 @@ After extraction, `SHA256SUMS` covers every installable payload.
 ## Install
 
 ```sh
-tar -xzf rustdb-v0.9.0-alpha.1-linux-aarch64.tar.gz
-cd rustdb-v0.9.0-alpha.1-linux-aarch64
+tar -xzf rustdb-v1.0.0-beta.1-linux-aarch64.tar.gz
+cd rustdb-v1.0.0-beta.1-linux-aarch64
 ./install.sh
 ```
 
@@ -61,8 +61,9 @@ An installed copy is also available at
 and documentation files. It never removes database, input, Spill, or user
 configuration directories.
 
-The installed documentation also includes `HTTP-SHELL.md`,
-`HTTP-SHELL.zh-CN.md`, and the public `openapi-v1.yaml` contract.
+The installed documentation also includes bilingual HTTP Shell, operator, and
+diagnostics guides, Native import/repair and compatibility references, release
+notes, and the public `openapi-v1.yaml` contract.
 
 ## Platforms
 

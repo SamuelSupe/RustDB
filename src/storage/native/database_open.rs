@@ -159,9 +159,7 @@ pub(super) fn open_existing(root: &Path, marker_path: &Path, init_path: &Path) -
     io::require_directory(&root.join("catalog").join("generations"))?;
     io::require_directory(&root.join("tables"))?;
     io::require_directory(&root.join("staging"))?;
-    if marker.uses_wal() {
-        io::require_directory(&root.join("wal"))?;
-    }
+    io::require_directory(&root.join("wal"))?;
     manifest::validate_current(root, marker.database_id())?;
 
     if init_path.exists() {

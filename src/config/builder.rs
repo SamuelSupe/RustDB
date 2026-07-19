@@ -164,6 +164,18 @@ impl EngineConfigBuilder {
     }
 
     #[must_use]
+    pub fn native_min_free_ratio(mut self, ratio: f64) -> Self {
+        self.config.native_storage.min_free_ratio = ratio;
+        self
+    }
+
+    #[must_use]
+    pub fn native_min_free_bytes(mut self, bytes: u64) -> Self {
+        self.config.native_storage.min_free_bytes = bytes;
+        self
+    }
+
+    #[must_use]
     pub fn native_table_limit_bytes(mut self, name: impl Into<String>, bytes: u64) -> Self {
         let name = name.into();
         let normalized = NativeStorageConfig::canonical_table_name(&name)

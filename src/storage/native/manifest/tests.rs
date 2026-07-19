@@ -122,6 +122,7 @@ fn immutable_generation_cannot_be_replaced_and_checksum_is_verified() {
         schemas: std::collections::BTreeSet::from(["main".to_owned()]),
         tables: BTreeMap::from([("other".to_owned(), table_reference())]),
         views: BTreeMap::new(),
+        imports: BTreeMap::new(),
     };
     assert!(matches!(
         ensure_generation(database.path(), &conflicting).unwrap_err(),
@@ -156,6 +157,7 @@ fn recovery_removes_a_valid_unpublished_future_generation() {
         schemas: std::collections::BTreeSet::from(["main".to_owned()]),
         tables: BTreeMap::new(),
         views: BTreeMap::new(),
+        imports: BTreeMap::new(),
     };
     ensure_generation(database.path(), &future).unwrap();
     let path = database

@@ -49,6 +49,7 @@ pub(super) fn parse_custom(sql: &str) -> Result<Option<SessionCommand>> {
         query,
         kind: NativeWriteKind::Compact,
         returning: None,
+        import: None,
     })))
 }
 

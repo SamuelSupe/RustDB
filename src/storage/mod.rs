@@ -21,6 +21,9 @@ pub(crate) use native::{
     NativeTransactionChanges, NativeView, TableSnapshot as NativeTableSnapshot,
     decode_native_segment_batch, native_segment_encoding_required, native_segment_physical_schema,
 };
+pub use native::{
+    NativeCheckIssue, NativeCheckReport, NativeRepairAction, NativeRepairPlan, NativeRepairReport,
+};
 pub(crate) use native::{
     NativeCommit, NativeTableWriter, NativeWriteMode, NativeWritePlan, PreparedSnapshot,
 };

@@ -5,10 +5,12 @@ use uuid::Uuid;
 use crate::{Error, Result};
 
 use super::super::io;
-use super::{INITIALIZING_PREFIX, MAX_TRANSACTION_MARKER_BYTES, Marker, TRANSACTION_MARKER};
+use super::{
+    INITIALIZING_PREFIX, MAX_TRANSACTION_MARKER_BYTES, Marker, OwnedStaging, TRANSACTION_MARKER,
+};
 
 enum StagingEntry {
-    Initializing,
+    Initializing(String),
     Transaction(String),
 }
 
@@ -26,7 +28,7 @@ pub(in crate::storage::native) fn recover_staging(
         };
         require_managed_directory(&path)?;
         match kind {
-            StagingEntry::Initializing => removable.push(path),
+            StagingEntry::Initializing(_) => removable.push(path),
             StagingEntry::Transaction(transaction_id) => {
                 if has_matching_marker(&path, database_id, &transaction_id)? {
                     removable.push(path);
@@ -41,10 +43,39 @@ pub(in crate::storage::native) fn recover_staging(
     Ok(())
 }
 
+pub(in crate::storage::native) fn inspect_owned_staging(
+    database_root: &Path,
+    database_id: &str,
+) -> Result<Vec<OwnedStaging>> {
+    let staging = database_root.join("staging");
+    let mut owned = Vec::new();
+    for entry in fs::read_dir(&staging).map_err(|error| Error::io(Some(staging.clone()), error))? {
+        let entry = entry.map_err(|error| Error::io(Some(staging.clone()), error))?;
+        let path = entry.path();
+        let Some(kind) = classify(&path) else {
+            continue;
+        };
+        require_managed_directory(&path)?;
+        let transaction_id = match kind {
+            StagingEntry::Initializing(transaction_id)
+            | StagingEntry::Transaction(transaction_id) => transaction_id,
+        };
+        if has_matching_marker(&path, database_id, &transaction_id)? {
+            owned.push(OwnedStaging {
+                path,
+                transaction_id,
+            });
+        }
+    }
+    owned.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(owned)
+}
+
 fn classify(path: &Path) -> Option<StagingEntry> {
     let name = path.file_name()?.to_str()?;
     if let Some(transaction_id) = name.strip_prefix(INITIALIZING_PREFIX) {
-        return canonical_uuid(transaction_id).then_some(StagingEntry::Initializing);
+        return canonical_uuid(transaction_id)
+            .then(|| StagingEntry::Initializing(transaction_id.to_owned()));
     }
     canonical_uuid(name).then(|| StagingEntry::Transaction(name.to_owned()))
 }

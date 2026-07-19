@@ -16,13 +16,15 @@ mod generation_io;
 mod recovery;
 
 use generation_io::{
-    current_path, ensure_generation, generation_path, read_current, read_generation, write_current,
+    current_path, ensure_generation, read_current, read_generation, write_current,
 };
+pub(super) use generation_io::{generation_from_name, generation_path};
 pub(super) use recovery::{prune_old_generations, recover_future_generations};
 
 const INITIAL_GENERATION: u64 = 0;
 const LEGACY_FORMAT_VERSION: u32 = 1;
-const FORMAT_VERSION: u32 = 2;
+const PREVIOUS_FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 pub(super) const MAX_CURRENT_BYTES: usize = 32;
 pub(super) const MAX_TABLE_NAME_BYTES: usize = 255;
 pub(super) const MAX_VIEW_SQL_BYTES: usize = 1024 * 1024;
@@ -45,6 +47,8 @@ pub(super) struct CatalogState {
     tables: BTreeMap<String, TableReference>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     views: BTreeMap<String, ViewReference>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    imports: BTreeMap<String, crate::NativeImportReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -80,6 +84,10 @@ impl CatalogState {
 
     pub(super) fn views(&self) -> &BTreeMap<String, ViewReference> {
         &self.views
+    }
+
+    pub(super) fn imports(&self) -> &BTreeMap<String, crate::NativeImportReceipt> {
+        &self.imports
     }
 
     pub(super) fn transaction_id(&self) -> Option<&str> {
@@ -191,6 +199,7 @@ pub(super) fn ensure_initial(root: &Path, database_id: &str) -> Result<()> {
         schemas: BTreeSet::from([crate::catalog_name::DEFAULT_SCHEMA.to_owned()]),
         tables: BTreeMap::new(),
         views: BTreeMap::new(),
+        imports: BTreeMap::new(),
     };
     ensure_generation(root, &state)?;
 
@@ -233,9 +242,11 @@ pub(super) fn load(root: &Path, database_id: &str) -> Result<CatalogState> {
     }
     validate_catalog(
         &generation_path(root, generation),
+        state.generation,
         &state.schemas,
         &state.tables,
         &state.views,
+        &state.imports,
     )?;
     Ok(state)
 }
@@ -260,9 +271,11 @@ pub(super) fn load_generation(
     }
     validate_catalog(
         &generation_path(root, generation),
+        state.generation,
         &state.schemas,
         &state.tables,
         &state.views,
+        &state.imports,
     )?;
     Ok(state)
 }
@@ -319,6 +332,29 @@ pub(super) fn prepare_catalog_commit(
     views: BTreeMap<String, ViewReference>,
     transaction_id: &str,
 ) -> Result<CatalogState> {
+    prepare_catalog_commit_with_import(
+        root,
+        database_id,
+        expected_generation,
+        schemas,
+        tables,
+        views,
+        None,
+        transaction_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_catalog_commit_with_import(
+    root: &Path,
+    database_id: &str,
+    expected_generation: u64,
+    schemas: BTreeSet<String>,
+    tables: BTreeMap<String, TableReference>,
+    views: BTreeMap<String, ViewReference>,
+    receipt: Option<crate::NativeImportReceipt>,
+    transaction_id: &str,
+) -> Result<CatalogState> {
     Uuid::parse_str(transaction_id).map_err(|error| {
         Error::InvalidArgument(format!(
             "invalid transaction id '{transaction_id}': {error}"
@@ -334,6 +370,13 @@ pub(super) fn prepare_catalog_commit(
     let generation = expected_generation.checked_add(1).ok_or_else(|| {
         Error::ResourceExhausted("catalog generation counter is exhausted".to_owned())
     })?;
+    let mut imports = current.imports.clone();
+    if let Some(receipt) = receipt {
+        if imports.contains_key(receipt.import_id()) {
+            return Err(Error::native_import_conflict(receipt.import_id()));
+        }
+        imports.insert(receipt.import_id().to_owned(), receipt);
+    }
     let state = CatalogState {
         database_id: database_id.to_owned(),
         format_version: FORMAT_VERSION,
@@ -342,9 +385,17 @@ pub(super) fn prepare_catalog_commit(
         schemas,
         tables,
         views,
+        imports,
     };
     let path = generation_path(root, generation);
-    validate_catalog(&path, &state.schemas, &state.tables, &state.views)?;
+    validate_catalog(
+        &path,
+        state.generation,
+        &state.schemas,
+        &state.tables,
+        &state.views,
+        &state.imports,
+    )?;
     ensure_generation(root, &state)?;
 
     Ok(state)
@@ -463,6 +514,7 @@ pub(super) fn projected_generation_bytes(
         schemas,
         tables,
         views,
+        imports: current.imports.clone(),
     };
     generation_io::encoded_generation_size(root, &state)
 }
@@ -488,9 +540,17 @@ fn validate_planned_update_with_views(
         schemas: schemas.clone(),
         tables,
         views,
+        imports: current.imports.clone(),
     };
     let path = generation_path(root, generation);
-    validate_catalog(&path, &state.schemas, &state.tables, &state.views)?;
+    validate_catalog(
+        &path,
+        state.generation,
+        &state.schemas,
+        &state.tables,
+        &state.views,
+        &state.imports,
+    )?;
     generation_io::validate_generation_size(root, &state)
 }
 
@@ -515,9 +575,11 @@ fn validate_tables(path: &Path, tables: &BTreeMap<String, TableReference>) -> Re
 
 fn validate_catalog(
     path: &Path,
+    generation: u64,
     schemas: &BTreeSet<String>,
     tables: &BTreeMap<String, TableReference>,
     views: &BTreeMap<String, ViewReference>,
+    imports: &BTreeMap<String, crate::NativeImportReceipt>,
 ) -> Result<()> {
     validate_schemas(path, schemas)?;
     validate_tables(path, tables)?;
@@ -534,6 +596,24 @@ fn validate_catalog(
             ));
         }
         view.validate(path, name)?;
+    }
+    for (import_id, receipt) in imports {
+        receipt.validate(import_id).map_err(|error| {
+            Error::native_storage(
+                path,
+                format!("invalid Native import receipt '{import_id}': {error}"),
+            )
+        })?;
+        validate_name(path, receipt.table(), "import receipt table")?;
+        if receipt.catalog_generation() > generation {
+            return Err(Error::native_storage(
+                path,
+                format!(
+                    "Native import receipt '{import_id}' refers to future catalog generation {}",
+                    receipt.catalog_generation()
+                ),
+            ));
+        }
     }
     Ok(())
 }

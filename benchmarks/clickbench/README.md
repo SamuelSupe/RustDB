@@ -12,6 +12,13 @@ for the allocator, Parquet decoder, and container runtime. Every query fully
 consumes its streamed result and records its typed checksum, execution metrics,
 stderr, rendered SQL, and cleanup status.
 
+The functional pass is also bound to the pinned
+`functional-oracle-v1.json`. The oracle names the exact query and dataset
+SHA-256 identities and records the expected row count plus
+`rustdb-typed-multiset-sha256-v1` checksum for each of the 43 queries. The
+runner rejects a mismatch immediately in its manifest, and Beta finalization
+independently compares all 43 results with the preflight copy of the oracle.
+
 The official Parquet file intentionally has no logical date/time annotations.
 Following the official ClickBench DataFusion adapter, the runner treats
 `EventDate` as epoch days and `EventTime` as epoch seconds. This adaptation is

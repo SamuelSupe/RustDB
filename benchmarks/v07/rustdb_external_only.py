@@ -14,13 +14,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from contract import CHECKSUM_BACKENDS, CURRENT_CHECKSUM_MODE
+from contract import (
+    CHECKSUM_BACKENDS,
+    CURRENT_CHECKSUM_MODE,
+    validate_engine_root_memory,
+)
 from coordinator import Worker, command, file_facts, path_facts, run_command
 from host_facts import collect as collect_host_facts
 
 
 SCHEMA = "rustdb-external-only-diagnostic-v1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+BETA_LOCAL_FIXTURE_SCHEMA = "rustdb-beta-local-fixture-v1"
+BETA_OBJECT_FIXTURE_SCHEMA = "rustdb-beta-object-manifest-v1"
 
 
 def arguments() -> argparse.Namespace:
@@ -48,6 +54,7 @@ def arguments() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=nonnegative, default=1)
     parser.add_argument("--iterations", type=positive, default=2)
+    parser.add_argument("--query-timeout-seconds", type=positive, default=300)
     parser.add_argument("--rustdb-command-json", required=True)
     return parser.parse_args()
 
@@ -99,6 +106,7 @@ def validate_run(
     expected: dict[str, int],
     storage_track: str,
     run_id: str,
+    expected_discovered_files: int | None = None,
 ) -> str:
     fields: dict[str, Any] = {
         "kind": "run",
@@ -147,6 +155,17 @@ def validate_run(
             raise RuntimeError(f"{label} has inconsistent elapsed time")
         nonnegative_integer(query.get("rows"), "rows")
         nonnegative_integer(query.get("batches"), "batches")
+        discovered_files = nonnegative_integer(
+            query.get("discovered_files"), "discovered_files"
+        )
+        if (
+            expected_discovered_files is not None
+            and discovered_files != expected_discovered_files
+        ):
+            raise RuntimeError(
+                f"{label} discovered {discovered_files} files; "
+                f"expected {expected_discovered_files}"
+            )
         if query.get("checksum_mode") != CURRENT_CHECKSUM_MODE:
             raise RuntimeError(f"{label} used an unexpected checksum mode")
         if query.get("checksum_backend") != CHECKSUM_BACKENDS["rustdb"]:
@@ -156,6 +175,16 @@ def validate_run(
         if not valid_sha(checksum):
             raise RuntimeError(f"{label} has an invalid checksum")
         checksums.add(checksum)
+    try:
+        validate_engine_root_memory(
+            value,
+            queries,
+            f"RustDB run {run_id!r}",
+            expected["memory_limit_bytes"],
+            required=True,
+        )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
     if len(checksums) != 1:
         raise RuntimeError(f"RustDB run {run_id!r} returned inconsistent checksums")
     return checksums.pop()
@@ -166,6 +195,9 @@ def summary(runs: list[dict[str, Any]], memory_limit: int) -> dict[str, Any]:
     checksums = {query["checksum"] for query in queries}
     if len(checksums) != 1:
         raise RuntimeError("measured RustDB runs have inconsistent checksums")
+    discovered_files = {query["discovered_files"] for query in queries}
+    if len(discovered_files) != 1:
+        raise RuntimeError("measured RustDB runs discovered different file counts")
     peak_rss = max(run["peak_rss_bytes"] for run in runs)
     return {
         "iterations": len(runs),
@@ -189,6 +221,14 @@ def summary(runs: list[dict[str, Any]], memory_limit: int) -> dict[str, Any]:
         "terminal_reservation_bytes": max(
             query["current_reservation_bytes"] for query in queries
         ),
+        "engine_root_current_reservation_bytes": max(
+            run["engine_root_current_reservation_bytes"] for run in runs
+        ),
+        "engine_root_lifetime_peak_reservation_bytes": max(
+            run["engine_root_lifetime_peak_reservation_bytes"] for run in runs
+        ),
+        "engine_root_memory_limit_bytes": memory_limit,
+        "discovered_files": discovered_files.pop(),
     }
 
 
@@ -243,6 +283,14 @@ def validate_report(value: dict[str, Any]) -> None:
         raise RuntimeError("external-only report has an invalid storage track")
     if value.get("storage_medium") not in ("local-nvme", "minio"):
         raise RuntimeError("external-only report has an invalid storage medium")
+    dataset = value.get("dataset")
+    if not isinstance(dataset, dict):
+        raise RuntimeError("external-only report omitted its dataset facts")
+    expected_discovered_files = dataset.get("expected_discovered_files")
+    if expected_discovered_files is not None:
+        expected_discovered_files = nonnegative_integer(
+            expected_discovered_files, "dataset.expected_discovered_files"
+        )
     warmup = nonnegative_integer(value.get("warmup"), "warmup")
     iterations = positive_integer(value.get("iterations"), "iterations")
     warmup_runs = value.get("warmup_runs")
@@ -255,7 +303,12 @@ def validate_report(value: dict[str, Any]) -> None:
     for index, run in enumerate(warmup_runs):
         checksums.add(
             validate_run(
-                run, value["hello"], expected, storage_track, f"warmup-{index}-rustdb"
+                run,
+                value["hello"],
+                expected,
+                storage_track,
+                f"warmup-{index}-rustdb",
+                expected_discovered_files,
             )
         )
     for index, run in enumerate(runs):
@@ -266,6 +319,7 @@ def validate_report(value: dict[str, Any]) -> None:
                 expected,
                 storage_track,
                 f"measured-{index}-rustdb",
+                expected_discovered_files,
             )
         )
     if len(checksums) != 1:
@@ -302,11 +356,42 @@ def nonnegative_number(value: Any, label: str) -> float:
     return float(value)
 
 
+def dataset_facts(path: Path) -> dict[str, Any]:
+    facts = path_facts(path)
+    expected = beta_manifest_discovered_files(path)
+    if expected is not None:
+        facts["expected_discovered_files"] = expected
+    return facts
+
+
+def beta_manifest_discovered_files(path: Path) -> int | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    fields = {
+        BETA_LOCAL_FIXTURE_SCHEMA: "files",
+        BETA_OBJECT_FIXTURE_SCHEMA: "objects",
+    }
+    field = fields.get(value.get("schema"))
+    if field is None:
+        return None
+    entries = value.get(field)
+    if not isinstance(entries, list):
+        raise RuntimeError(f"Beta fixture manifest {field} must be an array")
+    return len(entries)
+
+
 def main() -> int:
     args = arguments()
     expected = config(args)
     sql = args.query.read_text(encoding="utf-8")
-    dataset = path_facts(args.dataset)
+    dataset = dataset_facts(args.dataset)
+    expected_discovered_files = dataset.get("expected_discovered_files")
     query = file_facts(args.query)
     rustdb_command = command(args.rustdb_command_json, "rustdb")
     worker = Worker("rustdb", rustdb_command)
@@ -316,13 +401,33 @@ def main() -> int:
         validate_hello(worker.hello, expected)
         for index in range(args.warmup):
             run_id = f"warmup-{index}-rustdb"
-            response = worker.run(run_command(run_id, sql, args.storage_track, 0))
-            validate_run(response, worker.hello, expected, args.storage_track, run_id)
+            response = worker.run(
+                run_command(run_id, sql, args.storage_track, 0),
+                timeout=args.query_timeout_seconds,
+            )
+            validate_run(
+                response,
+                worker.hello,
+                expected,
+                args.storage_track,
+                run_id,
+                expected_discovered_files,
+            )
             warmup_runs.append(response)
         for index in range(args.iterations):
             run_id = f"measured-{index}-rustdb"
-            response = worker.run(run_command(run_id, sql, args.storage_track, 0))
-            validate_run(response, worker.hello, expected, args.storage_track, run_id)
+            response = worker.run(
+                run_command(run_id, sql, args.storage_track, 0),
+                timeout=args.query_timeout_seconds,
+            )
+            validate_run(
+                response,
+                worker.hello,
+                expected,
+                args.storage_track,
+                run_id,
+                expected_discovered_files,
+            )
             runs.append(response)
     finally:
         worker.close()

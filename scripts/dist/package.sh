@@ -103,6 +103,14 @@ install -m 0644 "$root/packaging/dist/INSTALL.md" "$stage/docs/INSTALL.md"
 install -m 0644 "$root/packaging/dist/INSTALL.zh-CN.md" "$stage/docs/INSTALL.zh-CN.md"
 install -m 0644 "$root/docs/http-shell.md" "$stage/docs/HTTP-SHELL.md"
 install -m 0644 "$root/docs/http-shell.zh-CN.md" "$stage/docs/HTTP-SHELL.zh-CN.md"
+install -m 0644 "$root/docs/operator-guide.md" "$stage/docs/OPERATOR-GUIDE.md"
+install -m 0644 "$root/docs/operator-guide.zh-CN.md" "$stage/docs/OPERATOR-GUIDE.zh-CN.md"
+install -m 0644 "$root/docs/diagnostics.md" "$stage/docs/DIAGNOSTICS.md"
+install -m 0644 "$root/docs/diagnostics.zh-CN.md" "$stage/docs/DIAGNOSTICS.zh-CN.md"
+install -m 0644 "$root/docs/native-import.md" "$stage/docs/NATIVE-IMPORT.md"
+install -m 0644 "$root/docs/native-repair.md" "$stage/docs/NATIVE-REPAIR.md"
+install -m 0644 "$root/docs/compatibility.md" "$stage/docs/COMPATIBILITY.md"
+install -m 0644 "$root/docs/releases/v${version}.md" "$stage/RELEASE-NOTES.md"
 install -m 0644 "$root/docs/openapi-v1.yaml" "$stage/docs/openapi-v1.yaml"
 printf '%s\n' "$version" >"$stage/VERSION"
 
@@ -119,7 +127,11 @@ for file in \
   LICENSE README.md README.zh-CN.md VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
   docs/INSTALL.md docs/INSTALL.zh-CN.md \
-  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md docs/openapi-v1.yaml \
+  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md \
+  docs/OPERATOR-GUIDE.md docs/OPERATOR-GUIDE.zh-CN.md \
+  docs/DIAGNOSTICS.md docs/DIAGNOSTICS.zh-CN.md \
+  docs/NATIVE-IMPORT.md docs/NATIVE-REPAIR.md docs/COMPATIBILITY.md \
+  docs/openapi-v1.yaml RELEASE-NOTES.md \
   install.sh uninstall.sh
 do
   digest=$(sha256 "$stage/$file")

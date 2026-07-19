@@ -82,6 +82,7 @@ pub(crate) struct QueryRun {
     pub(crate) checksum_backend: &'static str,
     pub(crate) checksum_compute_ms: f64,
     pub(crate) complete: bool,
+    pub(crate) discovered_files: u64,
     pub(crate) scanned_rows: u64,
     pub(crate) scanned_bytes: u64,
     pub(crate) parquet_reader_builds: u64,

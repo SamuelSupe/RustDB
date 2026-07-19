@@ -1,10 +1,10 @@
 # RustDB 只读 HTTP Shell
 
-RustDB v0.9 可以通过 HTTPS 把一个 Native 数据库提供给现有命令行查询体验。
+RustDB Beta 可以通过 HTTPS 把一个 Native 数据库提供给现有命令行查询体验。
 服务端只执行只读 SQL；它不是浏览器 Shell、写入 API 或远程管理服务。
 
 精确协议见 [OpenAPI v1](openapi-v1.yaml)，设计边界见
-[v0.9 路线图](roadmap-v0.9.md)，英文说明见 [http-shell.md](http-shell.md)。
+[Beta 中文运维指南](operator-guide.zh-CN.md)，英文说明见 [http-shell.md](http-shell.md)。
 
 ## 启动本地服务
 
@@ -14,8 +14,10 @@ RustDB v0.9 可以通过 HTTPS 把一个 Native 数据库提供给现有命令�
 rustdb serve --database /srv/rustdb/analytics
 ```
 
-首次启动会在操作系统用户状态目录生成本地 CA、短周期服务端证书、随机 Bearer
-Token 和连接元数据；这些敏感文件不会写入 Native 数据库目录。进程保持前台运行，
+首次启动会在操作系统用户状态目录生成本地 CA、短周期服务端证书、`admin`
+principal、随机 Profile Token 和连接元数据。`principals.json` 只保存 Token 的
+SHA-256 digest；明文只存在于权限受限的 Profile Token 文件且不会写入日志。旧版
+服务端 `bearer.token` 不会被接受。这些敏感文件不会写入 Native 数据库目录。进程保持前台运行，
 需要守护时请使用 systemd、launchd、Docker 等进程管理器。
 
 允许远程连接时，必须同时显式配置监听地址和客户端可访问的 HTTPS URL：
@@ -49,6 +51,25 @@ rustdb profile import analytics.rustdb-profile --name analytics
 命名 Profile 只记录 advertise URL、CA 文件路径和 Token 文件路径。Token 文件使用
 严格权限，命令行不接受明文 Token 参数。
 
+principal 必须在服务停止时由本地 CLI 管理：
+
+```sh
+rustdb principal list --database /srv/rustdb/analytics
+rustdb principal create --database /srv/rustdb/analytics --id analyst --role query
+rustdb token list --database /srv/rustdb/analytics --principal analyst
+rustdb token rotate --database /srv/rustdb/analytics --principal analyst
+rustdb token revoke --database /srv/rustdb/analytics --token-id <UUID>
+rustdb profile export --database /srv/rustdb/analytics \
+  --token-id <UUID> --output analyst.rustdb-profile
+```
+
+轮换会先增加一个可重叠使用的新凭证，客户端切换后再显式撤销旧 Token。`token list`
+只显示 UUID、principal、生命周期状态和有效期；`profile export --token-id` 复用服务端
+已管理连接包的 URL 与 CA，需要明确覆盖 HTTPS origin 时再加 `--server-url`。query 角色
+只能访问自己创建的 Query，admin 可以访问所有 Query；Idempotency Key 按提交 principal
+隔离。`--no-auth` 仅用于显式开发配置，所有请求归属固定 anonymous Query owner，并且
+不会获得 admin 权限。
+
 ## 使用远程 CLI 查询
 
 启动交互式 Shell：
@@ -57,8 +78,9 @@ rustdb profile import analytics.rustdb-profile --name analytics
 rustdb shell --profile analytics
 ```
 
-协议层会创建后台 Query ID，但官方 CLI 会自动轮询、分页拉取并按本地查询方式输出。
-`Ctrl-C` 会请求取消远程查询。v0.9 不提供 `\jobs`、`\fetch` 等作业管理命令。
+协议层会创建后台 Query ID，但官方 CLI 会在背压下轮询有序 Arrow IPC batch，并按
+本地查询方式输出。`Ctrl-C` 会请求取消远程查询。Beta 不提供 `\jobs`、`\fetch` 等
+作业管理命令。
 
 脚本模式也会等待查询结束，并根据最终 Query 状态设置进程退出码：
 
@@ -188,8 +210,23 @@ curl --compressed --cacert ca.pem \
   "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?cursor=${CURSOR}&limit=1000"
 ```
 
-Cursor 与 offset 互斥。页面不可变且可重复读取，服务端没有共享读取游标。只有
-Query 成功完成后才能读取结果。
+JSON/NDJSON 仅在 Query 成功完成后可读。Cursor 与 offset 互斥；页面不可变且可重复
+读取，服务端没有共享读取游标。
+
+执行期间需要增量、精确类型输出时，每次只请求一个 Arrow batch sequence：
+
+```sh
+curl --dump-header batch.headers --cacert ca.pem \
+  -H "Authorization: Bearer $(<token)" \
+  -H 'Accept: application/vnd.apache.arrow.file' \
+  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?batch_seq=0" \
+  --output batch-000.arrow
+```
+
+Arrow `200` 是独立 IPC file，且只包含一个 RecordBatch；带
+`X-RustDB-Result-Complete: true` 的 schema-only IPC file 表示完成。请求序号尚未提交
+时返回无 body 的 `204` 和 `Retry-After: 1`。客户端只能前进到服务端返回的精确
+`X-RustDB-Next-Batch-Seq`，且不得把 `batch_seq` 与 `cursor`、`offset`、`limit` 混用。
 
 取消运行中 Query，终止后再删除其状态和结果：
 
@@ -207,6 +244,8 @@ curl -X DELETE --cacert ca.pem \
 
 JSON 页面结构为 `{schema, rows, page}`；NDJSON 首行是 `schema`，之后每行一个
 `row` 数组，末行是 `page`。结果行使用位置数组，因此可以保留列顺序和重复列名。
+每个持久结果 batch 都带 SHA-256，读取及重启恢复时都会校验；不一致会使该结果失败并
+失效，不会返回被修改的数据。
 
 ```json
 {
@@ -250,9 +289,9 @@ Schema 和 JSON/NDJSON framing 会让 HTTP body 略大。非终页包含 `next_c
 CLI > 环境变量 > TOML > 默认值
 ```
 
-默认同时执行 1 条 Query、FIFO 排队 64 条、Query 超时 30 分钟、结果 TTL 1 小时；
-结果总配额为 10 GiB 和所在文件系统容量 10% 中的较小值，单 Query 最多使用总
-配额的 25%。
+默认同时执行 1 条 Query、加权公平排队 64 条、Query 超时 30 分钟、结果 TTL 1 小时；
+结果存储硬上限为 10 GiB，单 Query 结果硬上限为 2 GiB。所有 principal 默认权重
+相同，Admin 角色没有调度优先级。
 
 部署默认值不合适时，可通过以下 `serve` 配置项调整：
 
@@ -260,6 +299,12 @@ CLI > 环境变量 > TOML > 默认值
 | --- | --- | --- | --- |
 | 结果目录与保留时间 | `--result-directory`、`--result-ttl-secs` | `result_directory`、`result_ttl_secs` | `RUSTDB_RESULT_DIRECTORY`、`RUSTDB_RESULT_TTL_SECS` |
 | 全局/单 Query 结果配额 | `--result-global-limit`、`--result-query-limit` | `result_global_limit`、`result_query_limit` | `RUSTDB_RESULT_GLOBAL_LIMIT`、`RUSTDB_RESULT_QUERY_LIMIT` |
+| Query 内存/Spill/结果 reservation | `--query-memory-limit`、`--query-spill-limit`、`--query-result-limit` | `query_memory_limit`、`query_spill_limit`、`query_result_limit` | `RUSTDB_HTTP_QUERY_MEMORY_LIMIT`、`RUSTDB_HTTP_QUERY_SPILL_LIMIT`、`RUSTDB_HTTP_QUERY_RESULT_LIMIT` |
+| Principal 运行/排队上限 | `--principal-max-running`、`--principal-max-queued` | `principal_max_running`、`principal_max_queued` | `RUSTDB_HTTP_PRINCIPAL_MAX_RUNNING`、`RUSTDB_HTTP_PRINCIPAL_MAX_QUEUED` |
+| Principal 资源 reservation | `--principal-memory-limit`、`--principal-spill-limit`、`--principal-result-limit` | `principal_memory_limit`、`principal_spill_limit`、`principal_result_limit` | `RUSTDB_HTTP_PRINCIPAL_MEMORY_LIMIT`、`RUSTDB_HTTP_PRINCIPAL_SPILL_LIMIT`、`RUSTDB_HTTP_PRINCIPAL_RESULT_LIMIT` |
+| Principal 公平调度权重 | `--principal-weight` | `principal_weight` | `RUSTDB_HTTP_PRINCIPAL_WEIGHT` |
+| Spill 硬上限 | `--spill-engine-limit`、`--spill-query-limit` | `spill_engine_limit`、`spill_query_limit` | `RUSTDB_SPILL_ENGINE_LIMIT`、`RUSTDB_SPILL_QUERY_LIMIT` |
+| 认证开发开关 | `--no-auth` | `no_auth` | `RUSTDB_NO_AUTH` |
 | AWS Region 与 endpoint | `--s3-region`、`--s3-endpoint` | `s3_region`、`s3_endpoint` | `RUSTDB_S3_REGION`、`RUSTDB_S3_ENDPOINT` |
 | S3 请求模式 | `--s3-path-style`、`--s3-allow-http`、`--s3-anonymous` | `s3_path_style`、`s3_allow_http`、`s3_anonymous` | `RUSTDB_S3_PATH_STYLE`、`RUSTDB_S3_ALLOW_HTTP`、`RUSTDB_S3_ANONYMOUS` |
 
@@ -268,11 +313,13 @@ endpoint，`--s3-anonymous` 只适用于公开对象；其他情况下由服务�
 凭证。
 
 `/healthz`、`/readyz` 无需认证，但只返回 `ok`、`ready` 或 `not_ready`。每个 `/v1`
-请求都会在解析 body 或 query parameter 前完成认证。CORS 始终关闭。HTTP trace 不记录
-请求 body 或 SQL 原文。
+请求默认都会在解析 body 或 query parameter 前完成认证；只有显式 no-auth 开发模式
+例外。Prometheus `/metrics` 同样需要认证，并要求 Admin 权限。CORS 始终关闭。
+HTTP trace 不记录请求 body 或 SQL 原文；私有轮转 JSONL audit 会记录身份和 SQL
+fingerprint。
 
-Token 只能在服务停止时轮换，旧 Token 立即失效；随后需要重新导出并分发 Profile。
-长期 CA 保持不变，短周期服务端证书会在启动时自动续签。
+Token 只能在服务停止时管理。轮换会增加一枚可重叠 Token；分发并验证新 Profile 后，
+再显式撤销旧 Token。长期 CA 保持不变，短周期服务端证书会在启动时自动续签。
 
 ## 常见问题
 
@@ -281,20 +328,23 @@ Token 只能在服务停止时轮换，旧 Token 立即失效；随后需要重�
 | TLS 主机名错误 | 必须通过 advertise URL 连接。如果 URL 已变化，先停服，仅删除 `rustdb serve` 打印的自动连接包路径，重启后再导出/导入新包。 |
 | `401` | 导入当前 Profile；Token 轮换后重新分发。 |
 | `409 idempotency.key_conflict` | 换一个 Key，或使用相同的已解码请求 envelope 重试。 |
-| `409 query.not_complete` | 继续轮询；执行期间不能读取结果。 |
+| `409 query.not_complete` | 请求 JSON/NDJSON 前继续轮询；运行期间已提交输出可用有序 Arrow IPC。 |
 | `429` | 64 条队列已满，按 `Retry-After` 等待。 |
 | `422 sql.unsupported` | 仅使用允许的只读语句和已注册关系。 |
 | `query.resource_exhausted` | 缩小结果、消费/删除保留结果，或把 `--result-directory` 放到合适的文件系统。 |
-| 重启后 Query 不存在 | Query 和结果按设计只存在于进程内；请使用新的 Idempotency Key 重新提交。 |
+| Query 在重启时仍为 queued/running | 重启恢复后会以 `query.server_restarted` 和 safe retry class 标记失败；请提交新请求。 |
+| 已完成 Query 在重启后不存在 | 结果已过 TTL、被删除、校验失败，或属于其他 principal；重新提交前先检查服务日志。 |
 
-错误响应包含稳定字符串 `error` 错误码、可读 `message`，以及可选的
-`request_id`、`query_id` 和结构化 `details`。收集诊断信息时只提供这些 ID，
-不要提交 Token 或 Profile 连接包。
+错误响应包含稳定字符串 `error` 错误码、可读 `message`、必需的 `retry` 重试
+分类，以及可选的 `request_id`、`query_id` 和结构化 `details`。客户端不得从
+message 文本推断重试安全性。收集诊断信息时只提供这些 ID，不要提交 Token 或
+Profile 连接包。
 
 ```json
 {
   "error": "sql.unsupported",
   "message": "HTTP queries allow SELECT, WITH, VALUES, SHOW, DESCRIBE, EXPLAIN, and EXPLAIN ANALYZE only",
+  "retry": "never",
   "request_id": "9ae24e09597d4b28aec5a455263a70b2"
 }
 ```

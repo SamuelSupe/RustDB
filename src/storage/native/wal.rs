@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
 };
@@ -24,6 +24,80 @@ pub(in crate::storage::native) struct CatalogCommit {
     pub(super) transaction_id: String,
     pub(super) expected_generation: u64,
     pub(super) generation: u64,
+}
+
+pub(in crate::storage::native) struct WalInspection {
+    pub(super) checkpoint_catalog_generation: u64,
+    pub(super) referenced_transactions: BTreeSet<String>,
+    pub(super) committed_generations: BTreeMap<u64, String>,
+    pub(super) files: Vec<PathBuf>,
+}
+
+pub(in crate::storage::native) fn inspect_read_only(
+    database_root: &Path,
+    database_id: &str,
+) -> Result<WalInspection> {
+    let directory = database_root.join("wal");
+    super::io::require_directory(&directory)?;
+    let (next_lsn, checkpoint_catalog_generation) = checkpoint::read(&directory, database_id)?;
+    let mut paths = fs::read_dir(&directory)
+        .map_err(|error| Error::io(Some(directory.clone()), error))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| Error::io(Some(directory.clone()), error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    paths.sort_unstable();
+
+    let mut referenced_transactions = BTreeSet::new();
+    let mut committed_generations = BTreeMap::new();
+    let mut files = Vec::new();
+    let mut state = State {
+        next_lsn,
+        transactions: HashMap::new(),
+    };
+    let mut expected = next_lsn;
+    for path in paths {
+        if path.file_name().and_then(|name| name.to_str()) == Some(checkpoint::FILE_NAME) {
+            files.push(path);
+            continue;
+        }
+        if is_atomic_temp(&path) {
+            continue;
+        }
+        let Some(lsn) = record::lsn_from_path(&path) else {
+            return Err(Error::native_storage(
+                &path,
+                "unrecognized entry in WAL directory",
+            ));
+        };
+        let wal_record = record::read(&path, database_id, lsn)?;
+        referenced_transactions.insert(wal_record.transaction_id().to_owned());
+        if let RecordKind::CatalogCommit { generation, .. } = wal_record.kind() {
+            committed_generations.insert(*generation, wal_record.transaction_id().to_owned());
+        }
+        files.push(path.clone());
+        if lsn < next_lsn {
+            continue;
+        }
+        if lsn != expected {
+            return Err(Error::native_storage(
+                &path,
+                format!("WAL LSN sequence is not contiguous: expected {expected}, found {lsn}"),
+            ));
+        }
+        apply_record(&mut state, &wal_record)?;
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| Error::ResourceExhausted("WAL LSN counter is exhausted".to_owned()))?;
+    }
+    Ok(WalInspection {
+        checkpoint_catalog_generation,
+        referenced_transactions,
+        committed_generations,
+        files,
+    })
 }
 
 #[derive(Debug)]
@@ -362,26 +436,29 @@ fn remove_atomic_temps(directory: &Path) -> Result<()> {
         let path = entry
             .map_err(|error| Error::io(Some(directory.to_path_buf()), error))?
             .path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(inner) = name
-            .strip_prefix('.')
-            .and_then(|name| name.strip_suffix(".tmp"))
-        else {
-            continue;
-        };
-        let Some((target, uuid)) = inner.rsplit_once('.') else {
-            continue;
-        };
-        if Uuid::parse_str(uuid).is_ok()
-            && (record::lsn_from_path(&PathBuf::from(target)).is_some()
-                || target == checkpoint::FILE_NAME)
-        {
+        if is_atomic_temp(&path) {
             super::io::remove_file(&path)?;
         }
     }
     Ok(())
+}
+
+fn is_atomic_temp(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(inner) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((target, uuid)) = inner.rsplit_once('.') else {
+        return false;
+    };
+    Uuid::parse_str(uuid).is_ok()
+        && (record::lsn_from_path(&PathBuf::from(target)).is_some()
+            || target == checkpoint::FILE_NAME)
 }
 
 #[cfg(test)]

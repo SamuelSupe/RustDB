@@ -16,6 +16,7 @@ mod types;
 pub(crate) use types::{canonical_type, merge_types};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ParquetSchemaMode {
     #[default]
     Strict,

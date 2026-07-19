@@ -13,6 +13,7 @@ use super::io;
 mod initialization;
 mod recovery;
 
+pub(in crate::storage::native) use recovery::inspect_owned_staging;
 pub(super) use recovery::recover_staging;
 
 const INITIALIZING_PREFIX: &str = ".rustdb-transaction-init-";
@@ -24,6 +25,11 @@ const MAX_TRANSACTION_MARKER_BYTES: usize = 4 * 1024;
 struct Marker {
     database_id: String,
     transaction_id: String,
+}
+
+pub(in crate::storage::native) struct OwnedStaging {
+    pub(super) path: PathBuf,
+    pub(super) transaction_id: String,
 }
 
 pub(crate) struct StagedSnapshot {

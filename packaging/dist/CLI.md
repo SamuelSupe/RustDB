@@ -40,7 +40,7 @@ rustdb serve \
 ```
 
 The first start creates a local CA, a renewable server certificate, and a
-random Bearer Token. Stop the server, export its connection bundle, transfer
+an Admin principal and random profile Token. Stop the server, export its connection bundle, transfer
 the bundle through a trusted channel, and import it on the client:
 
 ```sh
@@ -49,6 +49,22 @@ rustdb profile export \
   --output analytics.rustdb-profile
 rustdb profile import analytics.rustdb-profile --name analytics
 ```
+
+With the server stopped, list credentials without exposing secret material and
+export a Profile for a specific Query/Admin principal. The token-specific
+export reuses the managed bundle's URL and CA; add `--server-url` to override
+the HTTPS origin.
+
+```sh
+rustdb token list --database /srv/rustdb/analytics --principal analyst
+rustdb token rotate --database /srv/rustdb/analytics --principal analyst
+rustdb profile export --database /srv/rustdb/analytics \
+  --token-id <UUID> --output analyst.rustdb-profile
+rustdb token revoke --database /srv/rustdb/analytics --token-id <UUID>
+```
+
+`token list` emits only UUID, principal, active/revoked/inactive state, and
+valid-until; it never emits the token secret, digest, or token-file path.
 
 Use the named Profile with the remote CLI. Interactive mode waits for each
 background Query; `-c` and `-f` are script-friendly and preserve the local
@@ -70,8 +86,11 @@ contract.
 `serve` accepts result-retention controls independently of the engine Spill
 limits: `--result-directory`, `--result-ttl-secs`, `--result-global-limit`, and
 `--result-query-limit`. By default, completed results live for one hour; their
-total disk use is the smaller of 10 GiB and 10% of filesystem capacity, and one
-Query can use 25% of that total. The same command accepts `--s3-region`,
+total hard limit is 10 GiB and one Query can use 2 GiB. Layered admission is
+configured with `--query-*-limit`, `--principal-*-limit`, principal running and
+queue limits, and `--principal-weight`; Admin has no implicit priority. The
+engine enforces the corresponding Spill hard limits through
+`--spill-engine-limit` and `--spill-query-limit`. The same command accepts `--s3-region`,
 `--s3-endpoint`, `--s3-path-style`, `--s3-allow-http`, and `--s3-anonymous`
 for server-local registered sources. Use HTTP only for trusted development
 endpoints and anonymous mode only for public objects.

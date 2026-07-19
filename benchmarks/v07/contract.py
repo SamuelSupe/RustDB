@@ -887,6 +887,7 @@ def validate_rustdb_metrics(
     nonnegative_int(value.get("scanned_rows"), f"{label}.scanned_rows")
     nonnegative_int(value.get("scanned_bytes"), f"{label}.scanned_bytes")
     for field in (
+        "discovered_files",
         "parquet_reader_builds",
         "parquet_local_file_opens",
         "csv_source_bytes",

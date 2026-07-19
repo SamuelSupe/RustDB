@@ -1,0 +1,12 @@
+.git
+.github
+.workflow
+target
+dist
+data
+tmp
+benchmarks/results
+**/.DS_Store
+**/__pycache__
+**/*.pyc
+**/* 2.*
