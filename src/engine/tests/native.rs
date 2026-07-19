@@ -891,8 +891,22 @@ async fn cancelled_and_abandoned_native_writes_release_wal_memory_and_staging() 
         .await
         .unwrap();
     wait_for_native_writes(&engine, 1).await;
+    let abandoned_tasks = abandoned.context.tasks.clone();
     drop(abandoned);
-    wait_for_native_writes(&engine, 0).await;
+    tokio::time::timeout(Duration::from_secs(5), abandoned_tasks.quiesce())
+        .await
+        .expect("abandoned native write did not quiesce");
+    assert_eq!(
+        engine
+            .inner
+            .database
+            .as_ref()
+            .unwrap()
+            .wal_info()
+            .unwrap()
+            .active_writes,
+        0
+    );
     assert!(!session.table_names().contains(&"abandoned".to_owned()));
     assert_eq!(
         std::fs::read_dir(database.join("staging")).unwrap().count(),

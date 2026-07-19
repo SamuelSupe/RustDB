@@ -37,7 +37,12 @@ fn check_is_strictly_read_only_even_while_database_is_locked() {
     assert!(report.is_ok(), "unexpected errors: {:?}", report.errors());
     assert_eq!(report.checked_tables(), 1);
     assert_eq!(report.checked_snapshots(), 1);
-    assert!(report.checked_files() >= 7);
+    // The checker owns the six files reachable from the committed catalog:
+    // database marker, catalog head/generation, snapshot marker/manifest, and
+    // the segment. Transient recovery candidates are deliberately outside the
+    // committed snapshot and must not be counted or inspected.
+    assert_eq!(report.checked_files(), 6);
+    assert!(!report.verified_files().contains(&recovery_candidate));
     assert!(report.checked_bytes() > 0);
     assert!(
         report
