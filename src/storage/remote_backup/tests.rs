@@ -58,6 +58,7 @@ impl MultipartUpload for FailingUpload {
         Ok(PutResult {
             e_tag: Some("fake-etag".to_owned()),
             version: None,
+            extensions: Default::default(),
         })
     }
 

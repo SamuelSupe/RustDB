@@ -22,6 +22,12 @@ is a no-op, and on an alpha database it explains that re-import is required.
 Compatibility and N-2 support begin with `v1.0.0-beta.1`; they do not apply
 retroactively to alpha artifacts.
 
+Embedded callers that construct `S3Config` with a custom
+`AwsCredentialProvider` must rebuild against `object_store` `0.14.1`. The
+provider type is part of the public configuration boundary, so a provider
+compiled against `0.13` is not source-compatible with Beta. The default
+credential chain and CLI configuration require no code migration.
+
 Review the [compatibility matrix](compatibility.md) before rebuilding. Use the
 [operator guide](operator-guide.md) for supported filesystems, configuration,
 backup verification, service identity, and the release gate. Do not copy alpha
@@ -36,3 +42,7 @@ alpha 目录作为回滚来源，在新的空 Beta 目录中从 CSV/Parquet 重�
 重建前请核对[兼容矩阵](compatibility.md)，部署、身份、备份验证和发行门禁以
 [中文运维指南](operator-guide.zh-CN.md)为准；不要把 alpha HTTP 状态或保留结果复制到
 Beta 部署。
+
+嵌入式调用方如果为 `S3Config` 注入自定义 `AwsCredentialProvider`，需要改用
+`object_store` `0.14.1` 重新编译；基于 `0.13` 的 provider 类型与 Beta 不源码兼容。
+使用默认凭证链或 CLI 配置的用户不需要代码迁移。

@@ -227,7 +227,7 @@ object-store request/byte counters:
   remains a bounded conservative skip;
 - conditional S3 reads still fail if the query-fixed object changes.
 
-The Arrow/Parquet `59.1.0`, object-store `0.13.2`, sqlparser `0.62.0`, and
+The Arrow/Parquet `59.1.0`, object-store `0.14.1`, sqlparser `0.62.0`, and
 async-compression `0.4.42` pins are part of the release gate. A dependency
 update must be handled as a separate coordinated compatibility change.
 

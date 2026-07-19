@@ -155,6 +155,7 @@ impl MultipartUpload for BlockingPartsUpload {
         Ok(PutResult {
             e_tag: Some("test-etag".to_owned()),
             version: None,
+            extensions: Default::default(),
         })
     }
 
@@ -183,6 +184,7 @@ impl MultipartUpload for BlockingUpload {
         Ok(PutResult {
             e_tag: Some("test-etag".to_owned()),
             version: None,
+            extensions: Default::default(),
         })
     }
 
