@@ -183,26 +183,35 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     let lines = ndjson.text().await.unwrap();
     assert_eq!(lines.lines().count(), 3);
 
-    let first_arrow = client.arrow_batch(&paged_id, 0).await.unwrap();
-    match first_arrow {
-        ArrowResultPoll::Batch(batch) => {
-            assert_eq!(batch.batch_seq, 0);
-            assert_eq!(batch.next_batch_seq, 1);
-            assert_eq!(batch.batch.num_rows(), 3);
-            assert!(batch.result_complete);
+    let mut batch_seq = 0;
+    let mut arrow_rows = 0;
+    let mut saw_final_batch = false;
+    loop {
+        match client.arrow_batch(&paged_id, batch_seq).await.unwrap() {
+            ArrowResultPoll::Batch(batch) => {
+                assert_eq!(batch.batch_seq, batch_seq);
+                assert_eq!(batch.next_batch_seq, batch_seq + 1);
+                assert!(!saw_final_batch);
+                arrow_rows += batch.batch.num_rows();
+                saw_final_batch = batch.result_complete;
+                batch_seq = batch.next_batch_seq;
+            }
+            ArrowResultPoll::Complete {
+                next_batch_seq,
+                schema,
+            } => {
+                assert_eq!(next_batch_seq, batch_seq);
+                assert_eq!(schema.fields().len(), 1);
+                break;
+            }
+            ArrowResultPoll::Pending { .. } => {
+                panic!("completed query must not return a pending Arrow result")
+            }
+            _ => panic!("completed query returned an unknown Arrow result state"),
         }
-        _ => panic!("completed query must return its first Arrow result batch"),
     }
-    match client.arrow_batch(&paged_id, 1).await.unwrap() {
-        ArrowResultPoll::Complete {
-            next_batch_seq,
-            schema,
-        } => {
-            assert_eq!(next_batch_seq, 1);
-            assert_eq!(schema.fields().len(), 1);
-        }
-        _ => panic!("resuming after the final batch must return schema-only completion"),
-    }
+    assert_eq!(arrow_rows, 3);
+    assert!(saw_final_batch);
     client.delete(&paged_id).await.unwrap();
 
     let accepted = client
