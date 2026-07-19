@@ -200,11 +200,12 @@ fn result_root_has_one_process_owner() {
 #[cfg(unix)]
 #[test]
 fn result_root_rejects_a_symlinked_owner_marker() {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("results");
     fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     let outside = directory.path().join("outside-owner");
     fs::write(&outside, b"rustdb-http-results-v1\n").unwrap();
     symlink(&outside, root.join("OWNER")).unwrap();

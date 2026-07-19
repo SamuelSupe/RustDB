@@ -534,9 +534,19 @@ mod tests {
     use super::PrincipalStore;
     use crate::http_shell::security::{PrincipalId, Role, SecurityState};
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        directory
+    }
+
     #[test]
     fn bootstrap_persists_only_digest_and_reloads_authentication() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = private_tempdir();
         let state =
             SecurityState::open(temporary.path(), "00000000-0000-0000-0000-000000000001").unwrap();
         fs::write(state.directory().join("bearer.token"), "a".repeat(64)).unwrap();
@@ -564,7 +574,7 @@ mod tests {
 
     #[test]
     fn create_rotate_and_revoke_survive_reload() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = private_tempdir();
         let state =
             SecurityState::open(temporary.path(), "00000000-0000-0000-0000-000000000002").unwrap();
         let store = PrincipalStore::new(state);
@@ -622,7 +632,7 @@ mod tests {
 
     #[test]
     fn principal_lifecycle_preserves_one_enabled_admin() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = private_tempdir();
         let state =
             SecurityState::open(temporary.path(), "00000000-0000-0000-0000-000000000003").unwrap();
         let store = PrincipalStore::new(state);

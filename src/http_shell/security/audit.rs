@@ -238,9 +238,19 @@ mod tests {
     use super::{AuditEvent, AuditKind, AuditLog};
     use crate::http_shell::security::SecurityState;
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        directory
+    }
+
     #[test]
     fn writes_private_records_without_secret_fields() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = private_tempdir();
         let state =
             SecurityState::open(temporary.path(), "00000000-0000-0000-0000-000000000042").unwrap();
         let log = AuditLog::open(&state).unwrap();
@@ -270,7 +280,7 @@ mod tests {
     fn refuses_dangling_audit_symlink_without_creating_its_target() {
         use std::os::unix::fs::symlink;
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = private_tempdir();
         let state =
             SecurityState::open(temporary.path(), "00000000-0000-0000-0000-000000000042").unwrap();
         let outside = temporary.path().join("outside-audit.jsonl");
