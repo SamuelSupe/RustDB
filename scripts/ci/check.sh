@@ -108,6 +108,9 @@ check_portable() {
 }
 
 tool_tests() {
+  echo "+ cargo metadata --locked --no-deps --format-version 1 --manifest-path benchmarks/v07/rustdb-runner/Cargo.toml >/dev/null"
+  cargo metadata --locked --no-deps --format-version 1 \
+    --manifest-path benchmarks/v07/rustdb-runner/Cargo.toml >/dev/null
   run python3 -m unittest discover -s benchmarks/tests -p 'test_*.py'
   run python3 tools/tpch/test_canonicalize.py
   run python3 tools/tpch/test_harness.py
