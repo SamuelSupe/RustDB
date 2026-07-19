@@ -154,7 +154,8 @@ fn producer_upgrade_invalidates_completed_results() {
 #[test]
 fn terminal_query_cannot_regress_to_running() {
     let temporary = tempfile::tempdir().unwrap();
-    let journal = QueryJournal::open(QueryJournalConfig::new(temporary.path())).unwrap();
+    let root = temporary.path().join("journal");
+    let journal = QueryJournal::open(QueryJournalConfig::new(&root)).unwrap();
     let digest = scoped_idempotency_digest(&owner(), "terminal-regression-key").unwrap();
     journal
         .upsert(query("stable", QueryState::Succeeded, digest.clone()))
