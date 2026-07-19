@@ -263,7 +263,7 @@ async fn cancelled_or_abandoned_staged_mutation_rolls_back_the_transaction() {
         Error::Cancelled
     ));
     drop(schema_result);
-    wait_for_transaction_results(&schema_transaction).await;
+    wait_for_transaction_results(&schema_transaction.shared).await;
     assert!(matches!(
         schema_transaction.commit().unwrap_err(),
         Error::TransactionClosed {
@@ -313,7 +313,7 @@ async fn cancelled_or_abandoned_staged_mutation_rolls_back_the_transaction() {
         "partial transactional RETURNING must observe cancellation"
     );
     drop(insert_result);
-    wait_for_transaction_results(&insert_transaction).await;
+    wait_for_transaction_results(&insert_transaction.shared).await;
     assert!(matches!(
         insert_transaction.commit().unwrap_err(),
         Error::TransactionClosed {
@@ -342,9 +342,12 @@ async fn cancelled_or_abandoned_staged_mutation_rolls_back_the_transaction() {
     );
 }
 
-async fn wait_for_transaction_results(transaction: &Transaction) {
+async fn wait_for_transaction_results(shared: &Shared) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while transaction.shared.state.lock().active_results != 0 {
+        while {
+            let state = shared.state.lock();
+            state.active_results != 0 || state.rollback_pending
+        } {
             tokio::task::yield_now().await;
         }
     })
@@ -493,7 +496,17 @@ async fn sql_commit_rejects_an_unconsumed_result_without_closing_the_transaction
         Err(error) => error,
     };
     assert!(error.to_string().contains("active result stream"));
+    let shared = Arc::clone(
+        &session
+            .sql_transaction
+            .lock()
+            .await
+            .as_ref()
+            .expect("SQL transaction should remain active")
+            .shared,
+    );
     drop(result);
+    wait_for_transaction_results(&shared).await;
     consume(session.execute("ROLLBACK").await.unwrap()).await;
 }
 
@@ -1300,3 +1313,6 @@ async fn query_session_scalar(session: &Session, sql: &str) -> i64 {
         .unwrap()
         .value(0)
 }
+
+#[path = "sql_tests.rs"]
+mod sql_tests;

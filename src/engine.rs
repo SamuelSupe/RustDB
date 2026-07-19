@@ -506,7 +506,13 @@ impl Session {
             return self.execute_transaction_control(command, parse_time).await;
         }
 
-        let transaction = self.sql_transaction.lock().await;
+        let mut transaction = self.sql_transaction.lock().await;
+        if transaction
+            .as_ref()
+            .is_some_and(Transaction::can_release_session)
+        {
+            transaction.take();
+        }
         if let Some(transaction) = transaction.as_ref() {
             return transaction.execute(sql).await;
         }
@@ -633,7 +639,13 @@ impl Session {
         &self,
         statement: sqlparser::ast::Statement,
     ) -> Result<QueryResult> {
-        let transaction = self.sql_transaction.lock().await;
+        let mut transaction = self.sql_transaction.lock().await;
+        if transaction
+            .as_ref()
+            .is_some_and(Transaction::can_release_session)
+        {
+            transaction.take();
+        }
         if let Some(transaction) = transaction.as_ref() {
             return transaction.execute_statement(statement).await;
         }
@@ -871,6 +883,12 @@ impl Session {
         let batch = match command {
             SessionCommand::BeginTransaction { read_only } => {
                 let mut active = self.sql_transaction.lock().await;
+                if active
+                    .as_ref()
+                    .is_some_and(Transaction::can_release_session)
+                {
+                    active.take();
+                }
                 if active.is_some() {
                     return Err(context.error_with_cleanup(Error::InvalidArgument(
                         "a transaction is already active for this session".to_owned(),
@@ -904,7 +922,7 @@ impl Session {
                 {
                     context.mark_native_commit(path.clone(), transaction_id.clone(), *generation);
                 }
-                if outcome.is_err() && !transaction.is_active() {
+                if outcome.is_err() && transaction.can_release_session() {
                     active.take();
                 }
                 let commit = outcome.map_err(|error| {
@@ -930,9 +948,11 @@ impl Session {
                         "no transaction is active".to_owned(),
                     ))
                 })?;
-                transaction
-                    .rollback()
-                    .map_err(|error| context.error_with_cleanup(error))?;
+                let outcome = transaction.rollback();
+                if outcome.is_err() && transaction.can_release_session() {
+                    active.take();
+                }
+                outcome.map_err(|error| context.error_with_cleanup(error))?;
                 active.take();
                 crate::command::status("ROLLBACK")
             }

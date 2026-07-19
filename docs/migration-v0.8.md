@@ -36,7 +36,9 @@ transaction.commit()?;
 cannot commit while one of its result streams is still alive. After a mutation
 has been staged, its result must be consumed through end-of-stream. Cancelling,
 abandoning, or receiving an execution error from that result rolls back the
-whole transaction because v0.8 has no statement savepoints.
+whole transaction because v0.8 has no statement savepoints. Dropping a result
+signals cancellation without blocking; wait for background query cleanup before
+issuing transaction control on the same session.
 
 Commit errors are terminal and classified by durability. A
 `NativeCommitPostCommitFailure` means the Catalog generation is committed and

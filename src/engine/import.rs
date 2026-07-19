@@ -23,7 +23,13 @@ impl Session {
                 "Native import cannot run inside an explicit transaction".to_owned(),
             ));
         }
-        let sql_transaction = self.sql_transaction.lock().await;
+        let mut sql_transaction = self.sql_transaction.lock().await;
+        if sql_transaction
+            .as_ref()
+            .is_some_and(super::Transaction::can_release_session)
+        {
+            sql_transaction.take();
+        }
         if sql_transaction.is_some() {
             return Err(Error::Unsupported(
                 "Native import cannot run inside an SQL transaction".to_owned(),

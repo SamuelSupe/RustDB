@@ -213,8 +213,9 @@ impl Transaction {
         })
     }
 
-    pub(super) fn is_active(&self) -> bool {
-        self.shared.state.lock().lifecycle == Lifecycle::Active
+    pub(super) fn can_release_session(&self) -> bool {
+        let state = self.shared.state.lock();
+        state.lifecycle != Lifecycle::Active && state.active_results == 0 && !state.rollback_pending
     }
 
     pub async fn execute(&self, sql: &str) -> Result<QueryResult> {
@@ -251,7 +252,7 @@ impl Transaction {
         ensure_lifecycle(&self.shared, state.lifecycle)?;
         if state.active_results != 0 {
             return Err(Error::InvalidArgument(format!(
-                "transaction {} has {} active result stream(s); consume or drop them before commit",
+                "transaction {} has {} active result stream(s); consume to end-of-stream, or drop and wait for query cleanup before commit",
                 self.shared.transaction_id, state.active_results
             )));
         }
@@ -328,7 +329,7 @@ impl Shared {
         ensure_lifecycle(self, state.lifecycle)?;
         if state.active_results != 0 {
             return Err(Error::InvalidArgument(format!(
-                "transaction {} has {} active result stream(s); consume or drop them before rollback",
+                "transaction {} has {} active result stream(s); consume to end-of-stream, or drop and wait for query cleanup before rollback",
                 self.transaction_id, state.active_results
             )));
         }
@@ -345,15 +346,14 @@ impl Shared {
                 state.lifecycle = Lifecycle::RolledBack;
                 state.rollback_pending = true;
             }
-            if state.active_results == 0 && state.rollback_pending {
-                state.rollback_pending = false;
-                true
-            } else {
-                false
-            }
+            state.active_results == 0 && state.rollback_pending
         };
-        if rollback && let Err(error) = self.workspace.rollback(engine) {
-            tracing::error!(%error, transaction_id = %self.transaction_id, "failed to finish deferred transaction rollback");
+        if rollback {
+            let outcome = self.workspace.rollback(engine);
+            self.state.lock().rollback_pending = false;
+            if let Err(error) = outcome {
+                tracing::error!(%error, transaction_id = %self.transaction_id, "failed to finish deferred transaction rollback");
+            }
         }
     }
 }

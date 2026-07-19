@@ -299,8 +299,9 @@ Persistent objects use `main` by default and may be addressed as
 and `information_schema.schemata`; qualified names work across DML, DDL, COPY,
 and maintenance. Transactional mutation results must be consumed to
 end-of-stream: cancellation or abandonment after staging rolls back the
-transaction. A `CopyPostCommitFailure` means COPY output is already durable and
-must not be retried.
+transaction. Dropping a result is non-blocking, so transaction control on the
+same session must wait for background query cleanup. A `CopyPostCommitFailure`
+means COPY output is already durable and must not be retried.
 
 Commit failures have explicit terminal meaning. `NativeCommitPostCommitFailure`
 means the transaction is committed; `Transaction::commit_info()` retains its
