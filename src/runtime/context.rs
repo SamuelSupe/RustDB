@@ -579,9 +579,30 @@ impl QueryContext {
             if existing == &snapshot {
                 return Ok(());
             }
-            return Err(Error::Execution(format!(
-                "object identity changed while preparing query: {uri}"
-            )));
+            let sealed = self.object_snapshots_sealed.load(Ordering::Acquire);
+            if sealed || !existing.can_refine_to(&snapshot) {
+                return Err(Error::Execution(format!(
+                    "object identity changed while preparing query: {uri}"
+                )));
+            }
+            let previous_bytes = snapshot_entry_bytes(uri, existing);
+            let refined_bytes = snapshot_entry_bytes(uri, &snapshot);
+            let growth = refined_bytes.saturating_sub(previous_bytes);
+            snapshots.memory.try_grow(growth).map_err(|_| {
+                Error::ResourceExhausted(format!(
+                    "refining object snapshot metadata for '{uri}' requires {growth} additional \
+                     bytes, but the query memory limit is {} bytes with {} bytes currently \
+                     available; narrow the file pattern or increase the memory limit",
+                    self.memory.limit(),
+                    self.memory.available()
+                ))
+            })?;
+            let previous = snapshots.entries.insert(uri.to_owned(), snapshot);
+            debug_assert!(previous.is_some());
+            snapshots
+                .memory
+                .shrink(previous_bytes.saturating_sub(refined_bytes));
+            return Ok(());
         }
         if self.object_snapshots_sealed.load(Ordering::Acquire) {
             return Err(Error::Execution(format!(
@@ -603,6 +624,7 @@ impl QueryContext {
     }
 
     pub(crate) fn seal_object_snapshots(&self) {
+        let _snapshots = self.object_snapshots.write();
         self.object_snapshots_sealed.store(true, Ordering::Release);
     }
 
@@ -835,6 +857,10 @@ type SpillCleanupHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 #[cfg(test)]
 #[path = "context_cleanup_tests.rs"]
 mod cleanup_tests;
+
+#[cfg(test)]
+#[path = "context_snapshot_tests.rs"]
+mod snapshot_tests;
 
 #[cfg(test)]
 mod tests {

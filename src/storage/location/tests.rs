@@ -13,7 +13,7 @@ use super::{LocationResolver, ObjectSnapshot, literal_prefix, resolve_concrete_s
 use crate::{
     S3Config,
     runtime::{MemoryPool, QueryContext},
-    storage::CopyManifestEntry,
+    storage::{CopyManifestEntry, local_etag},
 };
 
 #[tokio::test]
@@ -36,6 +36,21 @@ async fn expands_local_globs_in_stable_order_and_deduplicates() {
         objects[0].head_snapshot().await.unwrap(),
         objects[0].snapshot().clone()
     );
+}
+
+#[tokio::test]
+async fn local_etag_matches_the_object_store_wire_identity() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("identity.csv");
+    fs::write(&path, b"value\n1\n").unwrap();
+    let object = LocationResolver::new(S3Config::default())
+        .resolve(&[path.display().to_string()])
+        .await
+        .unwrap()
+        .remove(0);
+    let expected = local_etag(&fs::metadata(path).unwrap());
+
+    assert_eq!(object.snapshot().e_tag.as_deref(), Some(expected.as_str()));
 }
 
 #[tokio::test]

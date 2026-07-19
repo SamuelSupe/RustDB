@@ -1,4 +1,4 @@
-use std::{fmt, fs::Metadata};
+use std::{fmt, fs::Metadata, time::SystemTime};
 
 /// Strong, process-local identity for an opened local file.
 ///
@@ -52,6 +52,34 @@ impl fmt::Display for LocalFileIdentity {
             self.ctime_nanoseconds
         )
     }
+}
+
+/// Reproduces the ETag emitted by `object_store::local::LocalFileSystem`.
+///
+/// Direct local readers validate an opened descriptor without issuing another
+/// object-store request, so their wire identity must use the same quoted form
+/// as the query snapshot.
+pub(crate) fn local_etag(metadata: &Metadata) -> String {
+    let inode = inode(metadata);
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .unwrap_or_default()
+        .as_micros();
+    format!("\"{inode:x}-{mtime:x}-{size:x}\"")
+}
+
+#[cfg(unix)]
+fn inode(metadata: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.ino()
+}
+
+#[cfg(not(unix))]
+fn inode(_metadata: &Metadata) -> u64 {
+    0
 }
 
 #[cfg(test)]

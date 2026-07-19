@@ -42,6 +42,16 @@ impl From<&ObjectMeta> for ObjectSnapshot {
 }
 
 impl ObjectSnapshot {
+    /// Returns whether `actual` only adds identity tokens that were absent
+    /// from this unsealed snapshot. Existing opaque tokens are never
+    /// normalized or replaced.
+    pub(crate) fn can_refine_to(&self, actual: &Self) -> bool {
+        self.size == actual.size
+            && identity_refines(&self.e_tag, &actual.e_tag)
+            && identity_refines(&self.version, &actual.version)
+            && identity_refines(&self.local_identity, &actual.local_identity)
+    }
+
     /// Verifies that an object GET still refers to the identity captured for
     /// this query. Some S3-compatible stores omit ETag and version values, so
     /// size remains a required fallback identity check.
@@ -91,6 +101,14 @@ impl ObjectSnapshot {
             actual.version,
             actual.local_identity,
         ))
+    }
+}
+
+fn identity_refines<T: PartialEq>(existing: &Option<T>, actual: &Option<T>) -> bool {
+    match (existing, actual) {
+        (Some(existing), Some(actual)) => existing == actual,
+        (Some(_), None) => false,
+        (None, _) => true,
     }
 }
 

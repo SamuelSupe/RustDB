@@ -1,9 +1,9 @@
 use std::{
-    fs::{File, Metadata},
+    fs::File,
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Instant, SystemTime},
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -11,7 +11,7 @@ use bytes::Bytes;
 use crate::{
     Error, Result,
     runtime::{QueryControl, QueryLocalFileHandle, QueryMetrics},
-    storage::{LocalFileIdentity, ObjectSnapshot},
+    storage::{LocalFileIdentity, ObjectSnapshot, local_etag},
 };
 
 const READ_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -391,29 +391,6 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(buffer)
-}
-
-fn local_etag(metadata: &Metadata) -> String {
-    let inode = inode(metadata);
-    let size = metadata.len();
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .unwrap_or_default()
-        .as_micros();
-    format!("{inode:x}-{mtime:x}-{size:x}")
-}
-
-#[cfg(unix)]
-fn inode(metadata: &Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.ino()
-}
-
-#[cfg(not(unix))]
-fn inode(_metadata: &Metadata) -> u64 {
-    0
 }
 
 fn check_cancelled(control: Option<&QueryControl>) -> Result<()> {

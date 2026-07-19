@@ -11,7 +11,7 @@ mod s3_uri;
 pub(crate) use copy_manifest::CopyManifestEntry;
 pub(crate) use copy_manifest::{FILE_NAME as COPY_MANIFEST_FILE, encode as encode_copy_manifest};
 pub(crate) use destination::WriteDestination;
-pub(crate) use local_identity::LocalFileIdentity;
+pub(crate) use local_identity::{LocalFileIdentity, local_etag};
 pub(crate) use location::validate_endpoint;
 pub use location::{LocationResolver, ObjectSnapshot, ObjectSource};
 pub(crate) use native::{

@@ -1,9 +1,9 @@
 use std::{
-    fs::{File, Metadata},
+    fs::File,
     io,
     pin::Pin,
     task::{Context, Poll},
-    time::{Instant, SystemTime},
+    time::Instant,
 };
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf, SeekFrom, Take};
@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf, SeekFrom, Take};
 use super::{CsvInput, QueryIo, input_error};
 use crate::{
     Error, Result,
-    storage::{LocalFileIdentity, ObjectSnapshot},
+    storage::{LocalFileIdentity, ObjectSnapshot, local_etag},
 };
 
 pub(super) async fn open(
@@ -118,27 +118,4 @@ fn validate_file_identity(file: &File, uri: &str, expected: &ObjectSnapshot) -> 
 
 fn identity_io_error(error: Error) -> io::Error {
     io::Error::other(error.to_string())
-}
-
-fn local_etag(metadata: &Metadata) -> String {
-    let inode = inode(metadata);
-    let size = metadata.len();
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .unwrap_or_default()
-        .as_micros();
-    format!("{inode:x}-{mtime:x}-{size:x}")
-}
-
-#[cfg(unix)]
-fn inode(metadata: &Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.ino()
-}
-
-#[cfg(not(unix))]
-fn inode(_metadata: &Metadata) -> u64 {
-    0
 }
