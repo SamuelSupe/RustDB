@@ -2,6 +2,16 @@ name: Distribution
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the validated packages to an existing GitHub Release
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: Existing release tag to receive the runnable packages
+        required: false
+        type: string
   push:
     tags:
       - "v*"
@@ -40,8 +50,11 @@ jobs:
           grep -Fqx "RustDB-Acceptance-Status: passed" <<<"$tag_message"
           test -f "docs/releases/${GITHUB_REF_NAME}.md"
       - name: Confirm manual packaging mode
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release != true
         run: echo "Manual dispatch builds and validates packages without publishing a release."
+      - name: Confirm manual publish mode
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
+        run: echo "Manual dispatch will publish validated packages to the requested release."
 
   release-security:
     name: Release security gates
@@ -276,3 +289,53 @@ jobs:
             --prerelease \
             --title "RustDB $GITHUB_REF_NAME" \
             --notes-file "docs/releases/${GITHUB_REF_NAME}.md"
+
+  manual-release:
+    name: Publish manual runnable packages
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
+    needs: [tag-contract, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Download all platform packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: rustdb-package-*
+          path: release-assets
+          merge-multiple: true
+      - name: Validate release target and packages
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_TAG"
+          version="${RELEASE_TAG#v}"
+          package_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          test "$RELEASE_TAG" != "$version"
+          test "$version" = "$package_version"
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          test "$(find release-assets -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 3
+          test "$(find release-assets -maxdepth 1 -name '*.tar.gz.sha256' -type f | wc -l)" -eq 3
+          for archive in release-assets/*.tar.gz; do
+            RUSTDB_DIST_SKIP_EXEC=1 scripts/dist/check.sh "$archive"
+          done
+      - name: Upload runnable packages to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$RELEASE_TAG" \
+            release-assets/*.tar.gz \
+            release-assets/*.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
