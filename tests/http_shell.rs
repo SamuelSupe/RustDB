@@ -41,7 +41,7 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     let client = RemoteClient::from_profile(&profile).unwrap();
     wait_for_server(&client, &server).await;
     let admin_socket = bundle.parent().unwrap().join("admin.sock");
-    let admin_status = send_admin_command(&admin_socket, AdminCommand::Status)
+    let admin_status = send_admin_command(&admin_socket, AdminCommand::Status {})
         .await
         .unwrap();
     assert!(admin_status.ok);
@@ -72,7 +72,7 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
         .unwrap()
         .to_owned();
     assert!(
-        send_admin_command(&admin_socket, AdminCommand::ReloadTokens)
+        send_admin_command(&admin_socket, AdminCommand::ReloadTokens {})
             .await
             .unwrap()
             .ok
@@ -371,7 +371,7 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     client.delete(&oversized_id).await.unwrap();
 
     assert!(
-        send_admin_command(&admin_socket, AdminCommand::Shutdown)
+        send_admin_command(&admin_socket, AdminCommand::Shutdown {})
             .await
             .unwrap()
             .ok

@@ -520,7 +520,7 @@ async fn rss_pressure_throttles_or_rejects_only_new_submissions() {
         .rss_pressure
         .observe(RssGuardian::default().assess(850, 1_000, None));
     let rejected = manager
-        .submit(&alice, "rss-reject-key", request, "reject")
+        .submit(&alice, "rss-rejected-key", request, "reject")
         .unwrap_err();
     assert_eq!(rejected.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(rejected.body.error, "admission.rss_rejected");

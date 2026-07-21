@@ -328,7 +328,7 @@ async fn startup_removes_expired_terminal_results_and_stale_temporary_files() {
         let store = ResultStore::open(ResultStoreConfig::new(&root)).unwrap();
         let (schema, _) = fixture();
         let writer = store.writer("expired", schema).unwrap();
-        drop(writer);
+        writer.abort().await.unwrap();
     }
     let query = root.join("q-expired");
     let mut stored = manifest::load(&query.join(MANIFEST_FILE)).unwrap();

@@ -32,8 +32,10 @@ pub(super) async fn run(command: &ServiceOperation) -> Result<()> {
             print_report(&report, *json)?;
             require_healthy(&report)
         }
-        ServiceOperation::Status { server } => send(server, AdminCommand::Status).await,
-        ServiceOperation::ReloadTokens { server } => send(server, AdminCommand::ReloadTokens).await,
+        ServiceOperation::Status { server } => send(server, AdminCommand::Status {}).await,
+        ServiceOperation::ReloadTokens { server } => {
+            send(server, AdminCommand::ReloadTokens {}).await
+        }
         ServiceOperation::RotateToken { server, principal } => {
             send(
                 server,
@@ -52,7 +54,7 @@ pub(super) async fn run(command: &ServiceOperation) -> Result<()> {
             )
             .await
         }
-        ServiceOperation::Shutdown { server } => send(server, AdminCommand::Shutdown).await,
+        ServiceOperation::Shutdown { server } => send(server, AdminCommand::Shutdown {}).await,
     }
 }
 

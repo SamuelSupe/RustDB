@@ -28,11 +28,11 @@ const ADMIN_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum AdminCommand {
-    Status,
-    ReloadTokens,
+    Status {},
+    ReloadTokens {},
     RotateToken { principal: String },
     RevokeToken { token_id: String },
-    Shutdown,
+    Shutdown {},
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -144,7 +144,7 @@ async fn serve_connection(stream: UnixStream, context: AdminContext) -> Result<(
         };
         let (response, shutdown) = match serde_json::from_slice::<AdminCommand>(&line) {
             Ok(command) => {
-                let shutdown = matches!(&command, AdminCommand::Shutdown);
+                let shutdown = matches!(&command, AdminCommand::Shutdown {});
                 (execute(command, &context).await, shutdown)
             }
             Err(error) => (
@@ -219,7 +219,7 @@ where
 
 async fn execute(command: AdminCommand, context: &AdminContext) -> AdminResponse {
     match command {
-        AdminCommand::Status => {
+        AdminCommand::Status {} => {
             let (queued, running, terminal) = context.queries.admin_counts();
             AdminResponse::ok(json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -228,8 +228,8 @@ async fn execute(command: AdminCommand, context: &AdminContext) -> AdminResponse
                 "terminal_queries": terminal,
             }))
         }
-        AdminCommand::Shutdown => AdminResponse::ok(json!({ "shutdown": "requested" })),
-        AdminCommand::ReloadTokens => {
+        AdminCommand::Shutdown {} => AdminResponse::ok(json!({ "shutdown": "requested" })),
+        AdminCommand::ReloadTokens {} => {
             mutate(context, |store, authenticator| {
                 store.reload_into(authenticator)?;
                 Ok(json!({ "tokens": "reloaded" }))

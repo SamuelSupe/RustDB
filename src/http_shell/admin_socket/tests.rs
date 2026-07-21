@@ -9,9 +9,14 @@ fn command_protocol_is_strict_json_lines_payload() {
     let command: AdminCommand =
         serde_json::from_str(r#"{"command":"rotate_token","principal":"alice"}"#).unwrap();
     assert!(matches!(command, AdminCommand::RotateToken { principal } if principal == "alice"));
-    assert!(
-        serde_json::from_str::<AdminCommand>(r#"{"command":"status","unexpected":true}"#).is_err()
+    assert_eq!(
+        serde_json::to_string(&AdminCommand::Status {}).unwrap(),
+        r#"{"command":"status"}"#
     );
+    for command in ["status", "reload_tokens", "shutdown"] {
+        let payload = format!(r#"{{"command":"{command}","unexpected":true}}"#);
+        assert!(serde_json::from_str::<AdminCommand>(&payload).is_err());
+    }
     let response = AdminResponse::error("failure");
     assert!(!response.ok);
 }
