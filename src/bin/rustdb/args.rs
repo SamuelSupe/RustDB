@@ -313,6 +313,14 @@ mod tests {
         let args = Args::try_parse_from(["rustdb", "restore", "s3://bucket/snapshot", "restored"])
             .unwrap();
         assert!(matches!(args.operation, Some(Operation::Restore { .. })));
+
+        let args =
+            Args::try_parse_from(["rustdb", "backup-check", "s3://bucket/snapshot", "--json"])
+                .unwrap();
+        assert!(matches!(
+            args.operation,
+            Some(Operation::BackupCheck { json: true, .. })
+        ));
     }
 
     #[test]

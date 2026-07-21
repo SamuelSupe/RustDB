@@ -62,6 +62,31 @@ finish
         self.assertIn("ARG=37\n", result.stdout)
         self.assertIn("ARG=clickbench\n", result.stdout)
 
+    def test_beta2_release_boundary_and_lifecycle_stage_are_pinned(self):
+        contract = inputs.release_contract(ROOT)
+        self.assertEqual(contract["version"], "1.0.0-beta.2")
+        self.assertEqual(contract["native_epoch"], 4)
+        self.assertEqual(contract["config_schema"], 2)
+        self.assertEqual(contract["http_api"], "v2")
+        self.assertIn("beta2-lifecycle", reports.STEPS)
+        lifecycle = evidence.execution_contract()["lifecycle_gate"]
+        self.assertEqual(lifecycle["timeout_seconds"], 3600)
+        self.assertEqual(lifecycle["passes"], 1)
+        self.assertIn("restart_interrupted_arrow_prefix", lifecycle["covers"])
+
+    def test_release_steps_require_one_ordered_local_and_minio_tpch_pass(self):
+        records = [
+            {"name": name, "phase": phase, "exit_code": 0}
+            for name in reports.STEPS
+            for phase in ("started", "finished")
+        ]
+        reports.validate_steps(records)
+        self.assertEqual(reports.STEPS.count("tpch-sf1-local"), 1)
+        self.assertEqual(reports.STEPS.count("tpch-sf1-minio"), 1)
+        records[4:8] = records[6:8] + records[4:6]
+        with self.assertRaisesRegex(ValueError, "required order"):
+            reports.validate_steps(records)
+
     def runner_command(self, *, minio: bool, fixture: Path | None) -> list[str]:
         workspace = self.root / "workspace"
         temporary = self.root / "runner-tmp"
@@ -325,7 +350,25 @@ finish
         output = self.root / "evidence"
         output.mkdir()
         (output / "inputs.json").write_text(
-            json.dumps({"preflight_complete": True}), encoding="utf-8"
+            json.dumps(
+                {
+                    "schema": inputs.SCHEMA,
+                    "preflight_complete": True,
+                    "release": {
+                        "version": "1.0.0-beta.2",
+                        "native_epoch": 4,
+                        "config_schema": 2,
+                        "http_api": "v2",
+                        "source_sha256": {
+                            "cargo": "a" * 64,
+                            "native_format": "b" * 64,
+                            "service_config": "c" * 64,
+                            "http_server": "d" * 64,
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
         )
         args = argparse.Namespace(
             workspace=self.root,

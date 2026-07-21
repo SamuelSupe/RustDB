@@ -6,10 +6,10 @@ use std::{
 
 use crate::{Error, Result};
 
-const ROOT_MARKER: &[u8] = b"rustdb-http-results-v1\n";
-pub(super) const QUERY_MARKER: &[u8] = b"rustdb-http-query-result-v1\n";
+const ROOT_MARKER: &[u8] = b"rustdb-http-results-v2\n";
+pub(super) const QUERY_MARKER: &[u8] = b"rustdb-http-query-result-v2\n";
 const ROOT_LOCK_FILE: &str = ".server.lock";
-const ROOT_LOCK_MARKER: &[u8] = b"rustdb-http-result-lock-v1\n";
+const ROOT_LOCK_MARKER: &[u8] = b"rustdb-http-result-lock-v2\n";
 
 pub(super) fn establish_root_marker(root: &Path) -> Result<()> {
     let marker = root.join("OWNER");
@@ -45,6 +45,26 @@ pub(super) fn establish_root_marker(root: &Path) -> Result<()> {
         )));
     }
     write_private(&marker, ROOT_MARKER)
+}
+
+pub(super) fn validate_root(root: &Path) -> Result<()> {
+    validate_secure_directory(root)?;
+    let marker = root.join("OWNER");
+    let metadata =
+        fs::symlink_metadata(&marker).map_err(|error| Error::io(Some(marker.clone()), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::InvalidArgument(format!(
+            "HTTP result directory owner marker is not a regular file: {}",
+            marker.display()
+        )));
+    }
+    if fs::read(&marker).map_err(|error| Error::io(Some(marker), error))? != ROOT_MARKER {
+        return Err(Error::InvalidArgument(format!(
+            "HTTP result directory has an unknown owner marker: {}",
+            root.display()
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn acquire_root_lock(root: &Path) -> Result<File> {
@@ -105,6 +125,51 @@ pub(super) fn acquire_root_lock(root: &Path) -> Result<File> {
             .and_then(|_| file.sync_all())
             .map_err(|error| Error::io(Some(path.clone()), error))?;
     } else if marker != ROOT_LOCK_MARKER {
+        return Err(Error::InvalidArgument(format!(
+            "invalid HTTP result lock marker at {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+pub(super) fn acquire_existing_root_lock(root: &Path) -> Result<File> {
+    validate_root(root)?;
+    let path = root.join(ROOT_LOCK_FILE);
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|error| Error::io(Some(path.clone()), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::InvalidArgument(format!(
+            "HTTP result lock is not a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "HTTP result lock {} must be private",
+                path.display()
+            )));
+        }
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| Error::io(Some(path.clone()), error))?;
+    file.try_lock().map_err(|error| {
+        Error::InvalidArgument(format!(
+            "HTTP result directory {} is already in use: {error}",
+            root.display()
+        ))
+    })?;
+    let mut marker = Vec::new();
+    file.rewind()
+        .and_then(|_| file.read_to_end(&mut marker))
+        .map_err(|error| Error::io(Some(path.clone()), error))?;
+    if marker != ROOT_LOCK_MARKER {
         return Err(Error::InvalidArgument(format!(
             "invalid HTTP result lock marker at {}",
             path.display()
@@ -183,6 +248,28 @@ pub(super) fn secure_directory(path: &Path) -> Result<()> {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))
                 .map_err(|error| Error::io(Some(path.to_owned()), error))?;
         } else if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "HTTP state directory {} must be private",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_secure_directory(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| Error::io(Some(path.to_owned()), error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::InvalidArgument(format!(
+            "HTTP state path is not a real directory: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
             return Err(Error::InvalidArgument(format!(
                 "HTTP state directory {} must be private",
                 path.display()

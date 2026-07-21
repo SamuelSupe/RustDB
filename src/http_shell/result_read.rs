@@ -47,6 +47,10 @@ impl ResultReadTracker {
             idle.await;
         }
     }
+
+    pub(crate) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
 }
 
 pub(crate) struct ResultReadGuard {

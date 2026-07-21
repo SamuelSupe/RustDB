@@ -44,6 +44,7 @@ pub(super) fn recover_records(
             .unwrap_or(0)
             > 1;
         let mut changed = false;
+        let mut result_summary = None;
         let result = if duplicate_digest {
             delete_recovered_result(store, stored.as_ref());
             fail_persisted(
@@ -57,7 +58,9 @@ pub(super) fn recover_records(
         } else if query.state == QueryState::Succeeded && query.result_available {
             match stored.as_ref().map(RecoveredResult::state) {
                 Some(StoredResultState::Completed) => {
-                    stored.as_ref().and_then(RecoveredResult::result)
+                    let recovered = stored.as_ref().expect("stored result exists");
+                    result_summary = Some(recovered.summary());
+                    recovered.result()
                 }
                 Some(StoredResultState::Invalidated) => {
                     fail_persisted(
@@ -77,6 +80,20 @@ pub(super) fn recover_records(
                         RetryClass::Never,
                     );
                     changed = true;
+                    None
+                }
+            }
+        } else if query.state == QueryState::Interrupted {
+            match stored.as_ref().map(RecoveredResult::state) {
+                Some(StoredResultState::Interrupted | StoredResultState::Completed) => {
+                    let recovered = stored.as_ref().expect("stored result exists");
+                    let summary = recovered.summary();
+                    query.result_available = summary.available();
+                    result_summary = Some(summary);
+                    recovered.result()
+                }
+                _ => {
+                    query.result_available = false;
                     None
                 }
             }
@@ -110,7 +127,7 @@ pub(super) fn recover_records(
                 },
             );
         }
-        let record = Arc::new(QueryRecord::from_persisted(query, result));
+        let record = Arc::new(QueryRecord::from_persisted(query, result, result_summary));
         records.insert(record.id.clone(), record);
     }
     for (_, result) in recovered {

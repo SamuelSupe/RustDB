@@ -43,6 +43,9 @@ hosted_test_with_minio() {
     --test s3_deep_pruning \
     --test s3_query \
     --test http_shell \
+    --test beta2_lifecycle \
+    --test config_cli \
+    --test query_journal \
     --test v08_remote \
     --jobs "$test_jobs" -- \
     --skip execution::tests::aggregate_spills_and_join_completes_under_small_memory_limit
@@ -54,6 +57,24 @@ v09_acceptance() {
   run cargo test --locked --lib http_shell:: --jobs "$test_jobs"
   run cargo test --locked --lib engine::external_source_api::tests --jobs "$test_jobs"
   run cargo test --locked --test http_shell --jobs "$test_jobs"
+}
+
+beta2_lifecycle() {
+  test_jobs=${RUSTDB_TEST_JOBS:-1}
+  run cargo test --locked --test beta2_lifecycle --jobs "$test_jobs"
+  run cargo test --locked --lib \
+    storage::native::migration::tests::legacy_formats_are_rejected_without_modifying_contents_or_permissions \
+    --jobs "$test_jobs" -- --exact
+  run cargo test --locked --test http_shell --jobs "$test_jobs"
+  run cargo test --locked --lib \
+    http_shell::query::tests::shutdown_forced_abort_seals_and_quiesces_before_deadline \
+    --jobs "$test_jobs" -- --exact
+  run cargo test --locked --lib \
+    http_shell::result_store::tests::restart_preserves_batches_committed_before_interruption \
+    --jobs "$test_jobs" -- --exact
+  run cargo test --locked --test query_journal \
+    restart_interrupts_active_queries_and_persists_the_transition_once \
+    --jobs "$test_jobs" -- --exact
 }
 
 test_with_minio_excluding_v09() {
@@ -134,7 +155,7 @@ dist_build() {
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|v08|v09|check|release|release-cli|dist|all
+usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|v08|v09|beta2|check|release|release-cli|dist|all
 
   lint         formatting and strict Clippy
   test         all-target tests; requires a live configured MinIO
@@ -143,6 +164,7 @@ usage: scripts/ci/check.sh lint|test|minio-test|hosted-test|portable|v08|v09|che
   portable     all-target tests without requiring MinIO (S3 tests may skip)
   v08          one focused v0.8 reliability pass with live MinIO
   v09          focused HTTP shell, security policy, and persistent-source pass
+  beta2        one focused Beta 2 lifecycle, recovery, and fresh-format pass
   check        compile every target without running tests
   release      portable release build of every target
   release-cli  release build of the distributed rustdb CLI
@@ -172,6 +194,9 @@ case "${1:-}" in
     ;;
   v09)
     v09_acceptance
+    ;;
+  beta2)
+    beta2_lifecycle
     ;;
   check)
     check_portable

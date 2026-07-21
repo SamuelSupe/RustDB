@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use super::record::QueryRecord;
+use crate::RssGuardDecision;
 use crate::http_shell::{
     metrics::{HttpMetrics, QueryOutcome},
     security::{AuditEvent, AuditKind, AuditLog},
@@ -29,12 +30,23 @@ impl QueryObserver {
             .scheduler_wait(u64::try_from(scheduler_wait.as_millis()).unwrap_or(u64::MAX));
     }
 
+    pub(super) fn rss_submission_blocked(&self, decision: RssGuardDecision) {
+        match decision {
+            RssGuardDecision::Throttle => self.metrics.rss_submission_throttled(),
+            RssGuardDecision::Reject | RssGuardDecision::CancelLargest => {
+                self.metrics.rss_submission_rejected();
+            }
+            RssGuardDecision::Normal => {}
+        }
+    }
+
     pub(super) fn terminal(&self, record: &QueryRecord, was_running: bool) {
         let status = record.status();
         let (outcome, text) = match status.state {
             QueryState::Succeeded => (QueryOutcome::Succeeded, "succeeded"),
             QueryState::Cancelled => (QueryOutcome::Cancelled, "cancelled"),
             QueryState::Failed => (QueryOutcome::Failed, "failed"),
+            QueryState::Interrupted => (QueryOutcome::Failed, "interrupted"),
             QueryState::Queued | QueryState::Running => return,
         };
         self.metrics.query_finished(outcome, was_running);

@@ -30,8 +30,8 @@ services:
       MINIO_ROOT_USER: rustdb-test
       MINIO_ROOT_PASSWORD: rustdb-test-secret
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${RUSTDB_MINIO_HOST_PORT:-9000}:9000"
+      - "${RUSTDB_MINIO_CONSOLE_PORT:-9001}:9001"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 2s

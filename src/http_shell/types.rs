@@ -217,6 +217,9 @@ pub enum QueryState {
     Succeeded,
     Failed,
     Cancelled,
+    /// Execution stopped because the server exited before the Query reached a
+    /// normal terminal state. Committed result batches may still be readable.
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -243,6 +246,32 @@ pub struct QueryStatusResponse {
     pub error: Option<crate::http_shell::error::ErrorBody>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<HttpQueryMetrics>,
+    pub result_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_expires_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_batches: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct QueryListRequest {
+    pub state: Option<QueryState>,
+    pub created_after_ms: Option<u64>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct QueryListResponse {
+    pub queries: Vec<QueryStatusResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

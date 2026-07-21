@@ -3,7 +3,7 @@
 RustDB Beta 可以通过 HTTPS 把一个 Native 数据库提供给现有命令行查询体验。
 服务端只执行只读 SQL；它不是浏览器 Shell、写入 API 或远程管理服务。
 
-精确协议见 [OpenAPI v1](openapi-v1.yaml)，设计边界见
+精确协议见 [OpenAPI v2](openapi-v2.yaml)，设计边界见
 [Beta 中文运维指南](operator-guide.zh-CN.md)，英文说明见 [http-shell.md](http-shell.md)。
 
 ## 启动本地服务
@@ -151,7 +151,7 @@ curl --cacert ca.pem \
     ],
     "timeout_ms": 60000
   }' \
-  https://analytics.example.com:7400/v1/queries
+  https://analytics.example.com:7400/v2/queries
 ```
 
 参数只能替代表达式值，不能替代表名、列名、数据源 pattern、S3 配置或表函数
@@ -171,7 +171,7 @@ QUERY_ID=$(
     -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: example-query-0001' \
     --data '{"sql":"SELECT count(*) AS rows FROM sales"}' \
-    https://analytics.example.com:7400/v1/queries |
+    https://analytics.example.com:7400/v2/queries |
   jq -r .query_id
 )
 ```
@@ -185,12 +185,24 @@ QUERY_ID=$(
 ```sh
 curl --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}"
 ```
 
 状态时间使用 Unix epoch 毫秒：`created_at_ms` 必有，`started_at_ms` 和
-`finished_at_ms` 按阶段出现。成功 Query 包含受限的 `metrics`；失败或取消 Query
-改为包含 `error`。尚不存在的可选字段会被省略，而不是编码成 JSON `null`。
+`finished_at_ms` 按阶段出现。每个状态都有 `result_available`；保留结果还会给出
+`result_expires_at_ms`、`result_rows`、`result_bytes`、`result_batches`。成功 Query
+包含受限 `metrics`；失败、取消或中断 Query 包含 `error`。尚不存在的可选字段会被
+省略，而不是编码成 JSON `null`。
+
+Query 列表按创建时间稳定倒序，可按状态和创建时间过滤。Query 角色只看到自己的
+任务，Admin 可看到全部 principal。默认每页 50 条、最多 200 条；下一页必须原样传回
+不透明的 `next_cursor`：
+
+```sh
+curl --cacert ca.pem \
+  -H "Authorization: Bearer $(<token)" \
+  "https://analytics.example.com:7400/v2/queries?state=interrupted&created_after_ms=1784500000000&limit=50"
+```
 
 使用 offset 获取 JSON：
 
@@ -198,7 +210,7 @@ curl --cacert ca.pem \
 curl --compressed --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
   -H 'Accept: application/json' \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?offset=0&limit=1000"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}/results?offset=0&limit=1000"
 ```
 
 也可以用上一页返回的不透明 Cursor 获取 NDJSON：
@@ -207,7 +219,7 @@ curl --compressed --cacert ca.pem \
 curl --compressed --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
   -H 'Accept: application/x-ndjson' \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?cursor=${CURSOR}&limit=1000"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}/results?cursor=${CURSOR}&limit=1000"
 ```
 
 JSON/NDJSON 仅在 Query 成功完成后可读。Cursor 与 offset 互斥；页面不可变且可重复
@@ -219,12 +231,14 @@ JSON/NDJSON 仅在 Query 成功完成后可读。Cursor 与 offset 互斥；页�
 curl --dump-header batch.headers --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
   -H 'Accept: application/vnd.apache.arrow.file' \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?batch_seq=0" \
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}/results?batch_seq=0" \
   --output batch-000.arrow
 ```
 
 Arrow `200` 是独立 IPC file，且只包含一个 RecordBatch；带
-`X-RustDB-Result-Complete: true` 的 schema-only IPC file 表示完成。请求序号尚未提交
+`X-RustDB-Result-Complete: true` 的 schema-only IPC file 表示完成。若停服中断执行，
+已提交 batch 仍可读取，最后响应带 `X-RustDB-Result-State: interrupted` 与完成标记；
+它是明确不完整的结果前缀，不是成功的完整结果，JSON/NDJSON 也不可读取。请求序号尚未提交
 时返回无 body 的 `204` 和 `Retry-After: 1`。客户端只能前进到服务端返回的精确
 `X-RustDB-Next-Batch-Seq`，且不得把 `batch_seq` 与 `cursor`、`offset`、`limit` 混用。
 
@@ -233,11 +247,11 @@ Arrow `200` 是独立 IPC file，且只包含一个 RecordBatch；带
 ```sh
 curl -X POST --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/cancel"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}/cancel"
 
 curl -X DELETE --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}"
 ```
 
 ## 结果编码
@@ -303,6 +317,10 @@ CLI > 环境变量 > TOML > 默认值
 | Principal 运行/排队上限 | `--principal-max-running`、`--principal-max-queued` | `principal_max_running`、`principal_max_queued` | `RUSTDB_HTTP_PRINCIPAL_MAX_RUNNING`、`RUSTDB_HTTP_PRINCIPAL_MAX_QUEUED` |
 | Principal 资源 reservation | `--principal-memory-limit`、`--principal-spill-limit`、`--principal-result-limit` | `principal_memory_limit`、`principal_spill_limit`、`principal_result_limit` | `RUSTDB_HTTP_PRINCIPAL_MEMORY_LIMIT`、`RUSTDB_HTTP_PRINCIPAL_SPILL_LIMIT`、`RUSTDB_HTTP_PRINCIPAL_RESULT_LIMIT` |
 | Principal 公平调度权重 | `--principal-weight` | `principal_weight` | `RUSTDB_HTTP_PRINCIPAL_WEIGHT` |
+| RSS 压力保护 | 仅 TOML | `rss_warning_ratio`、`rss_high_ratio`、`rss_critical_ratio`、`rss_sample_interval_ms` | — |
+| 阻塞服务 I/O 线程池 | `--service-io-threads` | `service_io_threads` | `RUSTDB_SERVICE_IO_THREADS` |
+| 本机 Admin socket | `--admin-socket` | `admin_socket` | `RUSTDB_ADMIN_SOCKET` |
+| TLS 续期检查 | `--tls-renew-interval-secs` | `tls_renew_interval_secs` | `RUSTDB_TLS_RENEW_INTERVAL_SECS` |
 | Spill 硬上限 | `--spill-engine-limit`、`--spill-query-limit` | `spill_engine_limit`、`spill_query_limit` | `RUSTDB_SPILL_ENGINE_LIMIT`、`RUSTDB_SPILL_QUERY_LIMIT` |
 | 认证开发开关 | `--no-auth` | `no_auth` | `RUSTDB_NO_AUTH` |
 | AWS Region 与 endpoint | `--s3-region`、`--s3-endpoint` | `s3_region`、`s3_endpoint` | `RUSTDB_S3_REGION`、`RUSTDB_S3_ENDPOINT` |
@@ -312,14 +330,30 @@ CLI > 环境变量 > TOML > 默认值
 endpoint，`--s3-anonymous` 只适用于公开对象；其他情况下由服务进程的默认凭证链提供
 凭证。
 
-`/healthz`、`/readyz` 无需认证，但只返回 `ok`、`ready` 或 `not_ready`。每个 `/v1`
+`/healthz`、`/readyz` 无需认证，但只返回 `ok`、`ready` 或 `not_ready`。每个 `/v2`
 请求默认都会在解析 body 或 query parameter 前完成认证；只有显式 no-auth 开发模式
 例外。Prometheus `/metrics` 同样需要认证，并要求 Admin 权限。CORS 始终关闭。
 HTTP trace 不记录请求 body 或 SQL 原文；私有轮转 JSONL audit 会记录身份和 SQL
 fingerprint。
 
-Token 只能在服务停止时管理。轮换会增加一枚可重叠 Token；分发并验证新 Profile 后，
-再显式撤销旧 Token。长期 CA 保持不变，短周期服务端证书会在启动时自动续签。
+RSS guard 以物理内存与 Linux cgroup 上限中的较小者为基准采样进程。默认 70/80/90%
+水位依次暂停新提交、拒绝新提交、取消内存占用最大的运行 Query；HTTP 拒绝会返回
+`Retry-After`，同幂等键重放在压力 admission 前完成。结果与服务状态阻塞 I/O 使用独立
+有界线程池，不占用计算 lane。
+
+principal 和角色变更仍要求停服。运行中的服务只开放窄范围本机 Admin socket，用于
+状态、Token 重载/轮换/撤销和有界停服：
+
+```sh
+rustdb service status --database /srv/rustdb/analytics
+rustdb service rotate-token --database /srv/rustdb/analytics --principal analyst
+rustdb service revoke-token --database /srv/rustdb/analytics --token-id <UUID>
+rustdb service shutdown --database /srv/rustdb/analytics
+```
+
+除非显式覆盖，该 socket 位于每数据库私有状态目录内，权限为 `0600`。轮换会增加一枚
+可重叠 Token；分发并验证新 Profile 后再撤销旧 Token。长期 CA 保持不变，临近过期的
+叶证书会被周期性续签并热加载，不需要停止 listener。
 
 ## 常见问题
 
@@ -329,10 +363,12 @@ Token 只能在服务停止时管理。轮换会增加一枚可重叠 Token；�
 | `401` | 导入当前 Profile；Token 轮换后重新分发。 |
 | `409 idempotency.key_conflict` | 换一个 Key，或使用相同的已解码请求 envelope 重试。 |
 | `409 query.not_complete` | 请求 JSON/NDJSON 前继续轮询；运行期间已提交输出可用有序 Arrow IPC。 |
-| `429` | 64 条队列已满，按 `Retry-After` 等待。 |
+| `429 admission.queue_full` | admission 队列已满，按 `Retry-After` 等待。 |
+| `429 admission.rss_throttled` | RSS 超过 warning 水位；按 `Retry-After` 等待并降低并发。 |
+| `503 admission.rss_rejected` | RSS 超过 high/critical 水位；停止提交并排查内存压力。 |
 | `422 sql.unsupported` | 仅使用允许的只读语句和已注册关系。 |
 | `query.resource_exhausted` | 缩小结果、消费/删除保留结果，或把 `--result-directory` 放到合适的文件系统。 |
-| Query 在重启时仍为 queued/running | 重启恢复后会以 `query.server_restarted` 和 safe retry class 标记失败；请提交新请求。 |
+| Query 在重启时仍为 queued/running | 恢复后进入终态 `interrupted` 并带 `query.interrupted`；已提交 Arrow batch 仍可作为明确不完整的前缀读取，需要完整结果时请重新提交。 |
 | 已完成 Query 在重启后不存在 | 结果已过 TTL、被删除、校验失败，或属于其他 principal；重新提交前先检查服务日志。 |
 
 错误响应包含稳定字符串 `error` 错误码、可读 `message`、必需的 `retry` 重试

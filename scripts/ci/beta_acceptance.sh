@@ -7,6 +7,8 @@ INPUT_HELPER="$ROOT/scripts/ci/beta_acceptance_inputs.py"
 EVIDENCE_HELPER="$ROOT/scripts/ci/beta_acceptance_evidence.py"
 LOCAL_HELPER="$ROOT/scripts/ci/beta_acceptance_local.py"
 MINIO_HELPER="$ROOT/scripts/ci/beta_acceptance_minio.py"
+TIMEOUT_HELPER="$ROOT/scripts/ci/beta_acceptance_timeout.py"
+TPCH_HELPER="$ROOT/scripts/ci/beta_acceptance_tpch.py"
 EXTERNAL_RUNNER="$ROOT/benchmarks/v07/rustdb_external_only.py"
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 CURRENT_STEP=bootstrap
@@ -207,11 +209,60 @@ run_clickbench() {
     "$ROOT/benchmarks/clickbench/run.sh"
 }
 
+run_beta2_lifecycle() {
+  python3 -B "$TIMEOUT_HELPER" --seconds 3600 -- \
+    docker compose --project-directory "$ROOT" run --rm --no-deps --no-TTY \
+      dev ./scripts/ci/check.sh beta2
+}
+
+capture_tpch() {
+  python3 -B "$TPCH_HELPER" capture \
+    --workspace "$ROOT" --output "$OUTPUT" --medium "$1"
+}
+
+run_tpch_local() {
+  local compare_status=0 capture_status=0
+  "$ROOT/tools/tpch/generate.sh" 1 || return $?
+  env TPCH_SKIP_BUILD=0 TPCH_REQUIRE_SPILL=0 TPCH_RUSTFLAGS= \
+    TPCH_MEMORY_LIMIT_BYTES=4294967296 TPCH_THREADS=4 \
+    TPCH_BATCH_SIZE=8192 TPCH_IO_CONCURRENCY=16 \
+    "$ROOT/tools/tpch/compare.sh" --report \
+      --queries benchmarks/tpch/cases/sf1-local.txt 1 || compare_status=$?
+  capture_tpch local || capture_status=$?
+  [[ $compare_status -eq 0 ]] || return "$compare_status"
+  return "$capture_status"
+}
+
+run_tpch_minio() {
+  local compare_status=0 capture_status=0 uri uri_log
+  uri_log="$TEMP_ROOT/tpch-minio-upload.log"
+  "$ROOT/tools/tpch/upload_minio.sh" 1 | tee "$uri_log" || return $?
+  uri=$(tail -n 1 "$uri_log")
+  [[ $uri = s3://rustdb-tests/tpch-sf1 ]] || {
+    echo "unexpected TPC-H MinIO root: $uri" >&2
+    return 1
+  }
+  env TPCH_SKIP_BUILD=1 TPCH_REQUIRE_SPILL=0 \
+    TPCH_MEMORY_LIMIT_BYTES=4294967296 TPCH_THREADS=4 \
+    TPCH_BATCH_SIZE=8192 TPCH_IO_CONCURRENCY=16 \
+    TPCH_S3_ENDPOINT=http://minio:9000 TPCH_S3_REGION=us-east-1 \
+    TPCH_S3_PATH_STYLE=1 \
+    "$ROOT/tools/tpch/compare.sh" --report \
+      --queries benchmarks/tpch/cases/sf1-minio.txt \
+      --rustdb-root "$uri" 1 || compare_status=$?
+  capture_tpch minio || capture_status=$?
+  [[ $compare_status -eq 0 ]] || return "$compare_status"
+  return "$capture_status"
+}
+
 run_step preflight preflight
 CURRENT_STEP=environment-setup
 TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/rustdb-beta-acceptance.XXXXXX")
 
 run_step orbstack-all "$ROOT/scripts/ci/orbstack.sh" all
+run_step beta2-lifecycle run_beta2_lifecycle
+run_step tpch-sf1-local run_tpch_local
+run_step tpch-sf1-minio run_tpch_minio
 run_step minio-fixture-verify verify_minio_fixture before
 run_step runner-build build_runner
 RUSTDB_BUILD_ID=$(<"$TEMP_ROOT/runner-build-id")

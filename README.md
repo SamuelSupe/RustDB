@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-1.0.0--beta.1-blue)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.0.0--beta.2-blue)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -16,9 +16,9 @@
 
 > [!WARNING]
 > RustDB Beta is pre-production software. It is suitable for evaluation,
-> development, and reproducible engine research. The Beta series establishes
-> compatibility from beta.1 forward; alpha Native databases must be re-imported.
-> Its operational model is still being proven, and it has no production SLA.
+> development, and reproducible engine research. Beta 2 is a deliberate format,
+> configuration, and HTTP protocol reset: create a fresh database and service
+> state instead of migrating Beta 1 artifacts. It has no production SLA.
 
 RustDB queries CSV and Parquet directly from local disks or S3-compatible
 object stores. Data can optionally be imported into an immutable, persistent
@@ -42,7 +42,7 @@ is not a runtime dependency, and project code forbids `unsafe`.
   and bounded parallel decoding of a single large file.
 - **Persistent Native analytics** — transactional DML/DDL, stable row versions,
   checksummed WAL recovery, snapshot isolation, maintenance, and verified
-  local/S3 backup and restore.
+  local/S3 service bundles containing Native data plus safe HTTP control state.
 - **Resource-aware execution** — multi-lane pipelines, global/query memory
   budgets, cancellation, bounded queues, and governed Spill for blocking
   operators.
@@ -187,7 +187,7 @@ server is stopped. `serve` can independently configure result retention with
 `--result-query-limit`; it also accepts `--s3-region`, `--s3-endpoint`,
 `--s3-path-style`, `--s3-allow-http`, and `--s3-anonymous` for server-local
 registered sources. See the [HTTP Shell guide](docs/http-shell.md) and
-[OpenAPI 3.1 contract](docs/openapi-v1.yaml).
+[OpenAPI 3.1 contract](docs/openapi-v2.yaml).
 
 For a redacted, read-only support snapshot, run
 `rustdb diagnostics --database PATH [--output FILE]`; see the
@@ -310,18 +310,24 @@ retry `commit` or `rollback` on that handle, reopen the database, and reconcile
 the visible Catalog generation before issuing another write. SQL `COMMIT`
 follows the same rule and clears the session's active transaction.
 
-The CLI opens this database with `rustdb --database ./warehouse`. Beta uses a
-new Native compatibility epoch and rejects alpha databases without mutating
-them. Re-import CSV/Parquet into a fresh Beta directory; `rustdb migrate PATH`
-is now a format-validation command, not an alpha in-place migration. See the
+The CLI opens this database with `rustdb --database ./warehouse`. Beta 2 uses a
+new Native format epoch and rejects all earlier RustDB databases without mutating
+them. Re-import CSV/Parquet into a fresh Beta 2 directory; `rustdb migrate PATH`
+is a format-validation command, not an in-place migration. See the
 [Beta migration guide](docs/migration-v1-beta.md).
-Consistent backup and restore are available for local directories and S3:
+Consistent service backup and restore are available for local directories and
+S3. The bundle includes Native data and safe HTTP control state; pass the same
+state root used by `serve` when it is not the platform default:
 
 ```sh
-rustdb backup ./warehouse ./warehouse-backup
-rustdb --s3-region us-east-1 backup ./warehouse s3://bucket/rustdb/snapshot
-rustdb restore ./warehouse-backup ./warehouse-restored
+rustdb backup ./warehouse ./warehouse-backup --state-root ./service-state
+rustdb backup-check ./warehouse-backup
+rustdb restore ./warehouse-backup ./warehouse-restored --state-root ./restored-state
 ```
+
+The bundle deliberately excludes retained query results and journals, Spill,
+temporary files, audit logs, locks, and the Admin socket. Restore requires both
+the database target and its per-database service-state target to be fresh.
 
 If an embedded caller abandons an in-flight remote-backup future, RustDB keeps
 the Engine-owned upload running until it either publishes a complete manifest
@@ -339,7 +345,7 @@ startup; unknown, forged, symlinked, fresh, or active paths are never removed.
 
 ```mermaid
 flowchart LR
-    Remote["Remote CLI / HTTPS v1"] --> Guard["TLS + Token + read-only policy"]
+    Remote["Remote CLI / HTTPS v2"] --> Guard["TLS + Token + read-only policy"]
     Guard --> SQL["SQL / prepared parameters"]
     SQL --> Binder["Binder + session catalog"]
     Binder --> Optimizer["Rule optimizer + statistics"]
@@ -401,7 +407,7 @@ excluded. Result order is unspecified without an outer `ORDER BY`.
 | [Operator guide](docs/operator-guide.md) / [中文](docs/operator-guide.zh-CN.md) | Supported platforms, deployment, auth, metrics, audit, recovery, and Beta gate |
 | [CLI guide](packaging/dist/CLI.md) / [中文](packaging/dist/CLI.zh-CN.md) | Commands, output, resources, and S3 flags |
 | [HTTP Shell](docs/http-shell.md) / [中文](docs/http-shell.zh-CN.md) | TLS, Profiles, read-only SQL, Query lifecycle, and operations |
-| [OpenAPI v1](docs/openapi-v1.yaml) | Public versioned HTTP contract |
+| [OpenAPI v2](docs/openapi-v2.yaml) | Public versioned HTTP contract |
 | [Installation](packaging/dist/INSTALL.md) / [中文](packaging/dist/INSTALL.zh-CN.md) | Binary package installation and removal |
 | [S3 and MinIO](docs/s3.md) | Credentials, endpoints, and object-store behavior |
 | [Troubleshooting](docs/troubleshooting.md) | Resource, Spill, corruption, and input errors |
@@ -409,9 +415,9 @@ excluded. Result order is unspecified without an outer `ORDER BY`.
 | [Idempotent Native import](docs/native-import.md) | CSV/Parquet import receipts, replay, and conflict handling |
 | [Native check and repair](docs/native-repair.md) | Read-only integrity checks and conservative repair |
 | [Acceptance](docs/acceptance.md) | Correctness and release checks |
-| [v1.0 Beta release notes](docs/releases/v1.0.0-beta.1.md) | Compatibility epoch, packages, supply chain, and known limits |
-| [Alpha to Beta migration](docs/migration-v1-beta.md) | Required fresh import and rollback boundary |
-| [v1.0 Beta roadmap](docs/roadmap-v1-beta.md) | Completion contract and release evidence |
+| [Beta 2 release notes](docs/releases/v1.0.0-beta.2.md) | Reliability reset, fresh-start boundary, packages, and known limits |
+| [Beta 2 fresh start](docs/migration-v1-beta.md) | Required re-import and no-migration boundary |
+| [Beta 2 contract](docs/roadmap-v1-beta.md) | Completion contract and release evidence |
 | [v0.8 release notes](docs/releases/v0.8.0-alpha.1.md) | New transactional Native storage, SQL, COPY, and operations surface |
 | [v0.7 migration](docs/migration-v0.7.md) | Historical execution-core and benchmark changes |
 | [v0.8 migration](docs/migration-v0.8.md) | WAL format, explicit database migration, and transaction API |

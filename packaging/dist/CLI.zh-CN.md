@@ -74,8 +74,8 @@ rustdb shell --profile analytics -f report.sql --format csv >report.csv
 
 远程边界严格只读，只允许针对 Native/系统表和服务端本地注册源执行查询、元数据与
 Explain 语句；DDL/DML、维护、上传、直接 `read_csv`/`read_parquet` 和远程数据源管理
-都会被拒绝。生命周期和公开 `/v1` 契约见发行包中的 `docs/HTTP-SHELL.zh-CN.md`
-与 `docs/openapi-v1.yaml`。
+都会被拒绝。生命周期和公开 `/v2` 契约见本文件同目录的 `http-shell.zh-CN.md`
+与 `openapi-v2.yaml`。
 
 `serve` 的结果保留控制独立于引擎 Spill 配额：`--result-directory`、
 `--result-ttl-secs`、`--result-global-limit`、`--result-query-limit`。默认已完成结果
@@ -85,6 +85,15 @@ Admin 不会获得隐式优先级。引擎通过 `--spill-engine-limit` 与 `--s
 执行对应 Spill 硬上限。同一命令还支持为服务端本地注册源指定 `--s3-region`、`--s3-endpoint`、
 `--s3-path-style`、`--s3-allow-http` 和 `--s3-anonymous`。HTTP 仅用于可信开发
 endpoint，匿名模式仅用于公开对象。
+
+Beta 2 服务配置必须使用 `schema_version = 2`；旧 schema 会被拒绝，不会原地升级。
+默认 RSS 守护器以物理内存与 Linux cgroup 上限中的较小值为基准：70% 时限制新提交，
+80% 时拒绝新提交，90% 时还会取消 live reservation 最大的运行中 Query。三个阈值与
+采样周期通过 TOML 的 `[server]` 配置。
+
+Query journal、保留结果、凭证与证书的阻塞 I/O 使用有界专用线程池
+（`service_io_threads`，默认 `2`）。服务端按周期检查托管 TLS 叶证书
+（`tls_renew_interval_secs`，默认六小时），临近过期时续签并热加载，不重启 listener。
 
 CSV/Parquet 持久注册只能在服务端主机上、`rustdb serve` 停止时修改：
 
@@ -112,10 +121,10 @@ rustdb --database ./warehouse -c \
   "BEGIN READ ONLY; SELECT count(*) FROM events; COMMIT"
 ```
 
-v0.8 Native 数据库使用带校验和的 WAL 和快照隔离事务。一个事务固定一份
+Beta 2 Native 数据库使用带校验和的 WAL 和快照隔离事务。一个事务固定一份
 Catalog/数据快照；执行 `COMMIT` 前必须消费完或丢弃全部流式结果。mutation 结果
-必须消费到 EOS；若在 staged 后取消或放弃结果，整个事务会回滚，因为 v0.8 不提供
-语句级 savepoint。
+必须消费到 EOS。每条事务语句都有内部 savepoint；失败、取消或放弃只回滚该语句
+staged 变化，事务仍可继续使用。SQL `SAVEPOINT` 仍不支持。
 
 若 `COMMIT` 报告结果未知，不要重复提交；应重新打开数据库并检查恢复后的
 Catalog。post-commit failure 则明确表示 generation 已经持久化，同样不能重试。
@@ -127,35 +136,74 @@ Catalog。post-commit failure 则明确表示 generation 已经持久化，同�
 文件或远端子对象，请检查并删除该未完成目标后再重试；RustDB 不会自动删除 crash
 残留。
 
-v0.7 数据库在显式迁移前只能只读打开：
+Beta 2 创建 Native marker epoch `4`。epoch `1`、`2`、`3` 会在修改权限、加锁、WAL
+恢复或清理前被拒绝。`migrate` 只验证数据库已经使用当前 epoch，不会转换旧数据库：
 
 ```sh
 rustdb migrate ./warehouse
 ```
 
-迁移会先完整校验源数据库，并保留同级 `warehouse.v0.7-backup`；已存在的备份
-必须与当前源 catalog 快照完全一致。普通 open 不会静默升级格式。
+请创建全新的 Beta 2 数据库，再从 CSV 或 Parquet 导入。普通 open 不会静默升级旧
+格式。
 
 使用独立数据库命令创建或恢复经过校验的备份：
 
 ```sh
-rustdb backup ./warehouse ./warehouse-backup
-rustdb restore ./warehouse-backup ./warehouse-restored
+rustdb backup ./warehouse ./warehouse-backup --state-root ./service-state
+rustdb backup-check ./warehouse-backup
+rustdb restore ./warehouse-backup ./warehouse-restored \
+  --state-root ./restored-service-state
 
 rustdb --s3-region us-east-1 \
-  backup ./warehouse s3://analytics/rustdb/warehouse-2026-07-18
+  backup ./warehouse s3://analytics/rustdb/warehouse-2026-07-18 \
+  --state-root ./service-state
 rustdb --s3-region us-east-1 \
-  restore s3://analytics/rustdb/warehouse-2026-07-18 ./warehouse-restored
+  backup-check s3://analytics/rustdb/warehouse-2026-07-18
+rustdb --s3-region us-east-1 \
+  restore s3://analytics/rustdb/warehouse-2026-07-18 ./warehouse-restored \
+  --state-root ./restored-service-state
 ```
 
-远端备份先上传不可变对象，最后发布 manifest。恢复会校验对象大小与哈希，并要求
-目标本地目录尚未存在。S3 endpoint、path-style、HTTP 与匿名参数和查询 Scan
-一致；Secret Key 仍只通过默认凭证链获取。
+这是统一服务备份：存在 HTTP 状态时，除了 Native 数据，还会包含 principal、
+Token/Profile、本地 CA 和托管 TLS identity 等安全控制状态，因此必须按敏感凭证保护。
+备份明确排除 Query journal 与保留结果、审计日志、Spill 与临时数据、锁和 Admin
+socket。`backup-check` 不执行恢复，只校验版本化 manifest、inventory、权限、校验和与
+内嵌 Native 数据库。恢复会再次校验，并要求数据库路径和数据库对应的服务状态目标
+都是全新的。
+
+远端备份先上传不可变对象，最后发布 manifest。S3 endpoint、path-style、HTTP 与
+匿名参数和查询 Scan 一致；Secret Key 仍只通过默认凭证链获取。
 
 嵌入式调用方放弃 backup future 后，Engine-owned worker 仍会继续到 manifest 发布
 成功或未完成对象清理结束。进程或主机崩溃应由 S3 未完成 multipart 生命周期策略
 兜底。若 manifest 前崩溃留下已完成对象，RustDB 会拒绝这个非空目标；检查并删除
 该专用前缀后再重试。
+
+## 服务完整性与本机管理
+
+停止 `serve` 后，可校验服务所有的 principal、Query journal、保留结果 manifest 和
+chunk。`service repair` 默认只生成计划；只有 `--apply` 才写入，而且只处理能由
+RustDB marker 证明归属的未完成或无效 artifact：
+
+```sh
+rustdb service check --database ./warehouse --state-root ./service-state
+rustdb service repair --database ./warehouse --state-root ./service-state
+rustdb service repair --database ./warehouse --state-root ./service-state --apply
+```
+
+`serve` 运行期间，通过私有本机 Unix Admin socket 查看状态、原子重载/轮换/撤销
+凭证，以及请求优雅停服。socket 默认位于数据库对应的服务状态目录，权限为 `0600`；
+`--admin-socket` 可指定其他路径。
+
+```sh
+rustdb service status --database ./warehouse --state-root ./service-state
+rustdb service reload-tokens --database ./warehouse --state-root ./service-state
+rustdb service rotate-token --database ./warehouse --state-root ./service-state \
+  --principal analyst
+rustdb service revoke-token --database ./warehouse --state-root ./service-state \
+  --token-id <UUID>
+rustdb service shutdown --database ./warehouse --state-root ./service-state
+```
 
 ## 数据源
 

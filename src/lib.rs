@@ -15,6 +15,7 @@ mod import;
 mod optimizer;
 mod prepared;
 mod runtime;
+mod service_backup;
 mod sql;
 mod storage;
 mod table_function;
@@ -39,7 +40,11 @@ pub use import::{
     NativeImportFormat, NativeImportOptions, NativeImportReceipt, NativeImportResult,
 };
 pub use prepared::{ParameterValue, PreparedStatement};
-pub use runtime::{OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot, RecordBatchStream};
+pub use runtime::{
+    OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot, RecordBatchStream, RssGuardConfig,
+    RssGuardDecision, RssGuardSnapshot, RssGuardian,
+};
+pub use service_backup::ServiceBackupReport;
 pub use storage::{
     NativeCheckIssue, NativeCheckReport, NativeRepairAction, NativeRepairPlan, NativeRepairReport,
 };

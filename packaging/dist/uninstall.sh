@@ -70,6 +70,27 @@ for file in \
   share/doc/rustdb/README.md \
   share/doc/rustdb/README.zh-CN.md \
   share/doc/rustdb/SHA256SUMS \
+  share/doc/rustdb/docs/CLI.md \
+  share/doc/rustdb/docs/CLI.zh-CN.md \
+  share/doc/rustdb/docs/INSTALL.md \
+  share/doc/rustdb/docs/INSTALL.zh-CN.md \
+  share/doc/rustdb/docs/http-shell.md \
+  share/doc/rustdb/docs/http-shell.zh-CN.md \
+  share/doc/rustdb/docs/operator-guide.md \
+  share/doc/rustdb/docs/operator-guide.zh-CN.md \
+  share/doc/rustdb/docs/diagnostics.md \
+  share/doc/rustdb/docs/diagnostics.zh-CN.md \
+  share/doc/rustdb/docs/native-import.md \
+  share/doc/rustdb/docs/native-repair.md \
+  share/doc/rustdb/docs/compatibility.md \
+  share/doc/rustdb/docs/troubleshooting.md \
+  share/doc/rustdb/docs/migration-v0.5.md \
+  share/doc/rustdb/docs/migration-v1-beta.md \
+  share/doc/rustdb/docs/parquet-pruning.md \
+  share/doc/rustdb/docs/s3.md \
+  share/doc/rustdb/docs/openapi-v2.yaml \
+  share/doc/rustdb/packaging/config/rustdb.example.toml \
+  share/doc/rustdb/RELEASE-NOTES.md \
   share/doc/rustdb/CLI.md \
   share/doc/rustdb/CLI.zh-CN.md \
   share/doc/rustdb/INSTALL.md \
@@ -83,8 +104,8 @@ for file in \
   share/doc/rustdb/NATIVE-IMPORT.md \
   share/doc/rustdb/NATIVE-REPAIR.md \
   share/doc/rustdb/COMPATIBILITY.md \
-  share/doc/rustdb/RELEASE-NOTES.md \
   share/doc/rustdb/openapi-v1.yaml \
+  share/doc/rustdb/openapi-v2.yaml \
   share/rustdb/VERSION \
   share/rustdb/uninstall.sh
 do
@@ -92,6 +113,9 @@ do
 done
 
 if [ "$dry_run" -eq 0 ]; then
+  rmdir "$root/share/doc/rustdb/docs" 2>/dev/null || true
+  rmdir "$root/share/doc/rustdb/packaging/config" 2>/dev/null || true
+  rmdir "$root/share/doc/rustdb/packaging" 2>/dev/null || true
   rmdir "$root/share/doc/rustdb" 2>/dev/null || true
   rmdir "$root/share/rustdb" 2>/dev/null || true
 fi

@@ -5,13 +5,17 @@ resource-heavy performance work as separate gates. This prevents every
 platform job from downloading or generating the same analytical dataset while
 still requiring one real S3-compatible integration run.
 
-## Active v1.0.0-beta.1 release gate
+## Active v1.0.0-beta.2 release gate
 
-The Beta decision is a single, commit-bound acceptance run. It first runs the
-ordinary OrbStack quality gate, then validates the same explicit CSV or Parquet
-workload on local storage and MinIO with 2 GiB and 4 GiB engine budgets, four
-compute threads, and eight concurrent clients. Finally it runs the already
-downloaded ClickBench fixture once:
+The Beta 2 decision is a single, commit-bound acceptance run. It first runs the
+ordinary OrbStack quality gate and TPC-H SF1 once against local and MinIO data.
+It then validates the same explicit CSV or Parquet workload on local storage
+and MinIO with 2 GiB and 4 GiB engine budgets, four compute threads, and eight
+concurrent clients. The already downloaded ClickBench fixture runs once. A
+single 60-minute lifecycle and fault-injection stage covers bounded shutdown,
+restart recovery, `interrupted` Arrow prefixes, state check/repair, backup,
+credential lifecycle, result cleanup, and resource convergence. There is no
+repeated timing or comparative performance requirement:
 
 ```sh
 RUSTDB_BETA_ACCEPTANCE_OUTPUT=/absolute/evidence-directory \
@@ -43,9 +47,10 @@ The four external runs must produce the same checksum and finish without active
 tasks, reservations, or Spill artifacts. The evidence directory is outside the
 repository and is finalized on success, failure, or interruption.
 
-This is a functional and resource-accounting baseline. It is deliberately one
-run, not a repeated timing, soak, dedicated low-memory Spill, or cross-engine
-performance gate. Oracle generation and review use exactly one rowset from a
+This is a functional, recovery, and resource-accounting baseline. It is
+deliberately one acceptance run, not repeated timing, dedicated low-memory
+Spill, or a cross-engine performance gate. The one lifecycle stage is bounded
+to 60 minutes and is not a production soak. Oracle generation and review use exactly one rowset from a
 digest-pinned `clickhouse-local` image; ClickHouse is not executed by this
 release gate and no timing comparison is made. Details and exact environment
 variables are in
@@ -129,8 +134,8 @@ virtualization. Consequently, the Linux x64 job is the single hosted
 live-MinIO integration gate. It runs the core library, CLI, CSV, Parquet, and
 MinIO suites once, while excluding the dedicated low-memory Spill integration
 binaries and the long extreme-memory unit case. The dedicated low-memory case
-remains available through `scripts/ci/orbstack.sh test`, but is not a v0.9
-release blocker. Linux arm64 and
+remains available through `scripts/ci/orbstack.sh test`, but is intentionally
+outside the Beta 2 release gate. Linux arm64 and
 macOS arm64 compile every target natively, while the Distribution workflow
 builds and validates their release packages. This split exercises the
 supported architectures without repeating the same resource-heavy suite on

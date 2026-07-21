@@ -4,15 +4,13 @@ use std::{
 };
 
 use super::{
-    ActiveTask, ManagerInner, journal::DeleteReason, lifecycle::delete_terminal_record,
-    request::now_ms,
+    ManagerInner, journal::DeleteReason, lifecycle::delete_terminal_record, request::now_ms,
 };
 use crate::http_shell::QueryState;
 
 pub(super) fn spawn(inner: Arc<ManagerInner>) {
-    let active = ActiveTask::start(&inner);
-    tokio::spawn(async move {
-        let _active = active;
+    let tasks = Arc::clone(&inner.tasks);
+    tasks.spawn(async move {
         let interval = inner
             .store
             .ttl()
@@ -38,7 +36,10 @@ fn expire_records(inner: &ManagerInner) {
             let state = record.state.read();
             if !matches!(
                 state.phase,
-                QueryState::Succeeded | QueryState::Failed | QueryState::Cancelled
+                QueryState::Succeeded
+                    | QueryState::Failed
+                    | QueryState::Cancelled
+                    | QueryState::Interrupted
             ) {
                 return None;
             }

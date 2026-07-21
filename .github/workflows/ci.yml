@@ -38,7 +38,7 @@ jobs:
             cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Formatting and strict Clippy
         run: scripts/ci/check.sh lint
-      - name: Representative and v0.8 tests with live MinIO
+      - name: Representative, Beta 2 lifecycle, and MinIO tests
         run: scripts/ci/with_minio.sh scripts/ci/check.sh hosted-test
       - name: Release CLI build
         run: scripts/ci/check.sh release-cli

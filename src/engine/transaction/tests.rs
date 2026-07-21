@@ -236,7 +236,7 @@ async fn ambiguous_wal_publication_leaves_transaction_indeterminate_and_recovers
 }
 
 #[tokio::test]
-async fn cancelled_or_abandoned_staged_mutation_rolls_back_the_transaction() {
+async fn failed_cancelled_and_abandoned_mutations_rollback_only_the_statement() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("database");
     let engine = Engine::open(
@@ -264,13 +264,30 @@ async fn cancelled_or_abandoned_staged_mutation_rolls_back_the_transaction() {
     ));
     drop(schema_result);
     wait_for_transaction_results(&schema_transaction.shared).await;
-    assert!(matches!(
-        schema_transaction.commit().unwrap_err(),
-        Error::TransactionClosed {
-            state: "rolled back",
-            ..
-        }
-    ));
+    consume(
+        schema_transaction
+            .execute("CREATE SCHEMA kept_schema")
+            .await
+            .unwrap(),
+    )
+    .await;
+    schema_transaction.commit().unwrap();
+    assert_eq!(
+        query_session_scalar(
+            &session,
+            "SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'cancelled_schema'",
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        query_session_scalar(
+            &session,
+            "SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'kept_schema'",
+        )
+        .await,
+        1
+    );
 
     consume(
         session
@@ -282,6 +299,13 @@ async fn cancelled_or_abandoned_staged_mutation_rolls_back_the_transaction() {
     let mut insert_transaction = session
         .begin_transaction(TransactionOptions::read_write())
         .unwrap();
+    consume(
+        insert_transaction
+            .execute("INSERT INTO events VALUES (10)")
+            .await
+            .unwrap(),
+    )
+    .await;
     let values = (2..=65)
         .map(|value| format!("({value})"))
         .collect::<Vec<_>>()
@@ -300,30 +324,25 @@ async fn cancelled_or_abandoned_staged_mutation_rolls_back_the_transaction() {
             .num_rows(),
         1
     );
-    insert_result.cancel();
-    let mut cancelled = false;
-    while let Some(item) = insert_result.stream().next().await {
-        if matches!(item, Err(Error::Cancelled)) {
-            cancelled = true;
-            break;
-        }
-    }
-    assert!(
-        cancelled,
-        "partial transactional RETURNING must observe cancellation"
-    );
     drop(insert_result);
     wait_for_transaction_results(&insert_transaction.shared).await;
-    assert!(matches!(
-        insert_transaction.commit().unwrap_err(),
-        Error::TransactionClosed {
-            state: "rolled back",
-            ..
-        }
-    ));
+    assert!(
+        insert_transaction
+            .execute("INSERT INTO missing_table VALUES (1)")
+            .await
+            .is_err()
+    );
+    consume(
+        insert_transaction
+            .execute("INSERT INTO events VALUES (99)")
+            .await
+            .unwrap(),
+    )
+    .await;
+    insert_transaction.commit().unwrap();
     assert_eq!(
         query_session_scalar(&session, "SELECT count(*) FROM events").await,
-        1
+        3
     );
     assert_eq!(
         std::fs::read_dir(database.join("staging")).unwrap().count(),

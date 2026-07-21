@@ -20,6 +20,9 @@ CLICKBENCH_SCHEMA = "rustdb-clickbench-v1"
 STEPS = (
     "preflight",
     "orbstack-all",
+    "beta2-lifecycle",
+    "tpch-sf1-local",
+    "tpch-sf1-minio",
     "minio-fixture-verify",
     "runner-build",
     "local-2g",
@@ -73,6 +76,12 @@ def validate_steps(records: list[dict[str, Any]]) -> None:
             completed[name] = record.get("exit_code")
     if tuple(name for name in STEPS if name in completed) != STEPS:
         raise ValueError("not every required Beta acceptance step completed")
+    expected_order = [
+        (name, phase) for name in STEPS for phase in ("started", "finished")
+    ]
+    actual_order = [(record.get("name"), record.get("phase")) for record in records]
+    if actual_order != expected_order:
+        raise ValueError("Beta acceptance steps did not run exactly once in required order")
     failed = [name for name, code in completed.items() if code != 0]
     if failed:
         raise ValueError("Beta acceptance steps failed: " + ", ".join(failed))

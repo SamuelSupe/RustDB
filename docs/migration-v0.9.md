@@ -37,7 +37,7 @@ The remote boundary is intentionally narrower:
 
 Applications built against an earlier, broader v0.9 HTTP proposal must not use
 that unpublished design. The supported protocol is the background-Query API in
-[openapi-v1.yaml](openapi-v1.yaml).
+the historical [OpenAPI v1 contract](https://github.com/SamuelSupe/RustDB/blob/v0.9.0-alpha.1/docs/openapi-v1.yaml).
 
 ## Upgrade procedure
 

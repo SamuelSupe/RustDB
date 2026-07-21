@@ -121,6 +121,22 @@ impl PrincipalStore {
         Ok(Authenticator::required(self.load()?))
     }
 
+    /// Reloads the durable digest directory into a running authenticator.
+    /// The replacement happens only after the complete file has validated.
+    pub fn reload_into(&self, authenticator: &Authenticator) -> Result<()> {
+        let directory = self.load()?;
+        ensure_enabled_admin(&directory)?;
+        authenticator.update_directory(|current| {
+            *current = directory;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn validate_existing(&self) -> Result<()> {
+        let directory = self.load()?;
+        ensure_enabled_admin(&directory)
+    }
+
     pub fn list(&self) -> Result<Vec<PrincipalSummary>> {
         self.ensure_bootstrapped()?;
         let directory = self.load()?;
@@ -195,6 +211,25 @@ impl PrincipalStore {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::io(path, error)),
+        }
+    }
+
+    /// Revokes durably and always reconciles the live authenticator with the
+    /// durable directory, even when removal of the local clear-text profile
+    /// token reports a secondary cleanup error.
+    pub(crate) fn revoke_token_and_reload(
+        &self,
+        token_id: &TokenId,
+        authenticator: &Authenticator,
+    ) -> Result<()> {
+        let revoke = self.revoke_token(token_id);
+        let reload = self.reload_into(authenticator);
+        match (revoke, reload) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(revoke), Err(reload)) => Err(Error::Execution(format!(
+                "{revoke}; additionally failed to reload durable credentials: {reload}"
+            ))),
         }
     }
 
@@ -628,6 +663,37 @@ mod tests {
         assert!(revoked.revoked());
         assert!(!revoked.active());
         assert!(!first.token_path().exists());
+    }
+
+    #[test]
+    fn live_reload_applies_durable_revocation_when_profile_cleanup_fails() {
+        let temporary = private_tempdir();
+        let state =
+            SecurityState::open(temporary.path(), "00000000-0000-0000-0000-000000000004").unwrap();
+        let store = PrincipalStore::new(state);
+        let authenticator = store.load_or_bootstrap().unwrap();
+        let admin = PrincipalId::new("admin").unwrap();
+        let provision = store.rotate_token(&admin).unwrap();
+        let token = fs::read_to_string(provision.token_path()).unwrap();
+        store.reload_into(&authenticator).unwrap();
+        assert!(
+            authenticator
+                .authenticate(Some(token.trim()), Utc::now())
+                .is_ok()
+        );
+
+        fs::remove_file(provision.token_path()).unwrap();
+        fs::create_dir(provision.token_path()).unwrap();
+        assert!(
+            store
+                .revoke_token_and_reload(provision.token_id(), &authenticator)
+                .is_err()
+        );
+        assert!(
+            authenticator
+                .authenticate(Some(token.trim()), Utc::now())
+                .is_err()
+        );
     }
 
     #[test]

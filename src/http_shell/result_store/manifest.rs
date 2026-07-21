@@ -1,6 +1,6 @@
 use std::{
-    fs,
-    io::Cursor,
+    fs::{self, File},
+    io::{Cursor, Read},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -17,15 +17,17 @@ use crate::{Error, Result};
 
 use super::layout::atomic_write_private;
 
-pub(super) const FORMAT_EPOCH: u32 = 1;
+pub(super) const FORMAT_EPOCH: u32 = 2;
 pub(super) const MANIFEST_FILE: &str = "manifest.json";
 pub(super) const PRODUCER_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(super) const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ManifestState {
     Running,
     Completed,
+    Interrupted,
     Failed,
     Invalidated,
 }
@@ -114,15 +116,14 @@ impl Manifest {
         self.updated_at_ms = now_ms();
     }
 
-    pub(super) fn fail(&mut self, message: impl Into<String>) {
-        self.state = ManifestState::Failed;
-        self.clear_batches();
+    pub(super) fn interrupt(&mut self, message: impl Into<String>) {
+        self.state = ManifestState::Interrupted;
         self.error = Some(message.into());
         self.updated_at_ms = now_ms();
     }
 
-    pub(super) fn invalidate(&mut self, message: impl Into<String>) {
-        self.state = ManifestState::Invalidated;
+    pub(super) fn fail(&mut self, message: impl Into<String>) {
+        self.state = ManifestState::Failed;
         self.clear_batches();
         self.error = Some(message.into());
         self.updated_at_ms = now_ms();
@@ -215,7 +216,23 @@ fn valid_sha256(value: &str) -> bool {
 }
 
 pub(super) fn load(path: &Path) -> Result<Manifest> {
-    let bytes = fs::read(path).map_err(|error| Error::io(Some(path.to_owned()), error))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| Error::io(Some(path.to_owned()), error))?;
+    if metadata.len() > MAX_MANIFEST_BYTES as u64 {
+        return Err(manifest_too_large(path));
+    }
+    let file = File::open(path).map_err(|error| Error::io(Some(path.to_owned()), error))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_MANIFEST_BYTES)
+            .min(MAX_MANIFEST_BYTES),
+    );
+    file.take((MAX_MANIFEST_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| Error::io(Some(path.to_owned()), error))?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(manifest_too_large(path));
+    }
     serde_json::from_slice(&bytes).map_err(|error| {
         Error::InvalidArgument(format!(
             "invalid HTTP result manifest {}: {error}",
@@ -228,7 +245,18 @@ pub(super) fn persist(directory: &Path, manifest: &Manifest) -> Result<()> {
     let bytes = serde_json::to_vec(manifest).map_err(|error| {
         Error::Internal(format!("failed to encode HTTP result manifest: {error}"))
     })?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(manifest_too_large(&directory.join(MANIFEST_FILE)));
+    }
     atomic_write_private(&directory.join(MANIFEST_FILE), &bytes)
+}
+
+fn manifest_too_large(path: &Path) -> Error {
+    Error::ResourceExhausted(format!(
+        "HTTP result manifest {} exceeds the {}-byte limit",
+        path.display(),
+        MAX_MANIFEST_BYTES
+    ))
 }
 
 fn encode_schema(schema: &SchemaRef) -> Result<String> {

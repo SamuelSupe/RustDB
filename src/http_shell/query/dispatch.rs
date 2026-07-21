@@ -5,15 +5,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ActiveTask, Job, ManagerInner, QueryJournal, QueryObserver, ResultStore, cancel_and_persist,
-    execution, fail_admission, fail_record, log_terminal, persist_or_log, persist_terminal,
+    Job, ManagerInner, QueryJournal, QueryObserver, ResultStore, cancel_and_persist_async,
+    execution, fail_admission, fail_record, log_terminal, persist_or_log_async,
+    persist_terminal_async,
 };
 use crate::{Engine, Error};
 
 pub(super) fn spawn(inner: Arc<ManagerInner>, engine: Engine, mut receiver: mpsc::Receiver<Job>) {
-    let active = ActiveTask::start(&inner);
-    tokio::spawn(async move {
-        let _active = active;
+    let tasks = Arc::clone(&inner.tasks);
+    tasks.spawn(async move {
         loop {
             let job = tokio::select! {
                 _ = inner.shutdown.cancelled() => break,
@@ -27,10 +27,9 @@ pub(super) fn spawn(inner: Arc<ManagerInner>, engine: Engine, mut receiver: mpsc
                 .expect("query memory limit was validated");
             let observer = inner.observer.clone();
             let shutdown = inner.shutdown.clone();
-            let active = ActiveTask::start(&inner);
             let record = Arc::clone(&job.record);
-            tokio::spawn(async move {
-                let _active = active;
+            let tasks = Arc::clone(&inner.tasks);
+            tasks.spawn(async move {
                 let task = run_admitted(
                     engine,
                     store,
@@ -50,7 +49,7 @@ pub(super) fn spawn(inner: Arc<ManagerInner>, engine: Engine, mut receiver: mpsc
                         &record,
                         Error::Internal("HTTP query task panicked".to_owned()),
                     );
-                    persist_or_log(&journal, &record, "panic terminal state");
+                    persist_or_log_async(&journal, &record, "panic terminal state").await;
                     log_terminal(&record);
                     if let Some(observer) = &observer {
                         observer.terminal(&record, record.state.read().started_at_ms.is_some());
@@ -80,14 +79,14 @@ async fn run_admitted(
     } = job;
     let ticket = tokio::select! {
         _ = shutdown.cancelled() => {
-            if let Err(error) = cancel_and_persist(&record, &journal) {
+            if let Err(error) = cancel_and_persist_async(&record, &journal).await {
                 tracing::error!(%error, query_id = %record.id, "failed to persist queued query cancellation during shutdown");
             }
             log_terminal(&record);
             None
         }
         _ = record.cancel.cancelled() => {
-            if let Err(error) = cancel_and_persist(&record, &journal) {
+            if let Err(error) = cancel_and_persist_async(&record, &journal).await {
                 tracing::error!(%error, query_id = %record.id, "failed to persist queued query cancellation");
             }
             log_terminal(&record);
@@ -97,7 +96,7 @@ async fn run_admitted(
             Ok(ticket) => Some(ticket),
             Err(error) => {
                 fail_admission(&record, error);
-                persist_terminal(&journal, &record);
+                persist_terminal_async(&journal, &record).await;
                 log_terminal(&record);
                 if let Some(observer) = &observer {
                     observer.terminal(&record, false);

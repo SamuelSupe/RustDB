@@ -6,6 +6,7 @@ mod global_scheduler;
 mod local_file;
 mod memory;
 mod metrics;
+mod rss_guard;
 mod scheduler;
 mod spill;
 mod stream;
@@ -24,6 +25,7 @@ pub(crate) use local_file::{QueryLocalFileHandle, QueryLocalFiles};
 pub use memory::{MemoryPool, MemoryReservation};
 pub(crate) use metrics::OperatorHandle;
 pub use metrics::{OperatorMetricsSnapshot, QueryMetrics, QueryMetricsSnapshot};
+pub use rss_guard::{RssGuardConfig, RssGuardDecision, RssGuardSnapshot, RssGuardian};
 pub(crate) use scheduler::QueryScheduler;
 pub(crate) use spill::{
     MAX_ACTIVE_SPILL_FILES, QuerySpillQuota, SpillIoPool, SpillQuotaPool, SpillWriter,

@@ -73,13 +73,13 @@ pub enum Error {
     #[error(
         "unsupported native database format{path}: found version {found_version}, current beta version is {current_version}; {reason}",
         path = display_required_path(.path),
-        reason = native_format_reason(.alpha)
+        reason = native_format_reason(.legacy)
     )]
     NativeFormatUnsupported {
         path: PathBuf,
         found_version: u32,
         current_version: u32,
-        alpha: bool,
+        legacy: bool,
     },
 
     #[error("native repair refused{path}: {message}", path = display_required_path(.path))]
@@ -138,9 +138,9 @@ fn native_quota_scope(table: Option<&str>) -> String {
         .unwrap_or_else(|| "engine".to_owned())
 }
 
-fn native_format_reason(alpha: &bool) -> &'static str {
-    if *alpha {
-        "alpha databases are intentionally not migrated; re-import the source CSV or Parquet data"
+fn native_format_reason(legacy: &bool) -> &'static str {
+    if *legacy {
+        "legacy databases are intentionally not migrated; re-import the source CSV or Parquet data"
     } else {
         "this database must be opened by a compatible RustDB version"
     }

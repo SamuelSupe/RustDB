@@ -9,11 +9,14 @@ use std::{
     time::Duration,
 };
 
-use crate::{Engine, Error, Result};
+use crate::{Engine, Error, Result, RssGuardConfig};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Extension, Path, Request, State, rejection::JsonRejection},
+    extract::{
+        DefaultBodyLimit, Extension, Path, Query as QueryParams, Request, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -31,6 +34,7 @@ use tower_http::timeout::RequestBodyTimeoutLayer;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
 use super::{
+    admin_socket::{AdminContext, AdminSocket},
     error::HttpError,
     metrics::HttpMetrics,
     query::{QueryManager, QueryManagerConfig},
@@ -43,7 +47,7 @@ use super::{
         Permission, PrincipalStore, SecurityState, ServerEndpoint, TlsMaterial, default_state_root,
         write_managed_profile_bundle,
     },
-    types::{InfoResponse, QueryRequest},
+    types::{InfoResponse, QueryListRequest, QueryRequest},
 };
 
 mod results;
@@ -65,6 +69,11 @@ pub struct HttpServerConfig {
     pub result_global_limit_bytes: Option<u64>,
     pub result_query_limit_bytes: Option<u64>,
     pub query: QueryManagerConfig,
+    pub rss_guard: RssGuardConfig,
+    pub rss_sample_interval: Duration,
+    pub service_io_threads: usize,
+    pub admin_socket: Option<PathBuf>,
+    pub tls_renew_interval: Duration,
     pub shutdown_grace: Duration,
     /// Explicit development escape hatch. Authentication is enabled by default.
     pub no_auth: bool,
@@ -83,9 +92,50 @@ impl Default for HttpServerConfig {
             result_global_limit_bytes: Some(10 * 1024 * 1024 * 1024),
             result_query_limit_bytes: Some(2 * 1024 * 1024 * 1024),
             query: QueryManagerConfig::default(),
+            rss_guard: RssGuardConfig::default(),
+            rss_sample_interval: Duration::from_secs(1),
+            service_io_threads: 2,
+            admin_socket: None,
+            tls_renew_interval: Duration::from_secs(6 * 60 * 60),
             shutdown_grace: Duration::from_secs(30),
             no_auth: false,
         }
+    }
+}
+
+impl HttpServerConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.state_root.as_os_str().is_empty() {
+            return Err(Error::InvalidArgument(
+                "server.state_root must not be empty".into(),
+            ));
+        }
+        self.rss_guard.validate()?;
+        if self.rss_sample_interval.is_zero() {
+            return Err(Error::InvalidArgument(
+                "server.rss_sample_interval_ms must be greater than zero".into(),
+            ));
+        }
+        if self.service_io_threads == 0 {
+            return Err(Error::InvalidArgument(
+                "server.service_io_threads must be greater than zero".into(),
+            ));
+        }
+        if self.tls_renew_interval.is_zero() {
+            return Err(Error::InvalidArgument(
+                "server.tls_renew_interval_secs must be greater than zero".into(),
+            ));
+        }
+        if self
+            .admin_socket
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(Error::InvalidArgument(
+                "server.admin_socket must not be empty".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -125,11 +175,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     install_crypto_provider();
-    if config.state_root.as_os_str().is_empty() {
-        return Err(Error::InvalidArgument(
-            "HOME is not set; configure an explicit HTTP state root".into(),
-        ));
-    }
+    config.validate()?;
     let database = engine.database_path().ok_or_else(|| {
         Error::InvalidArgument("rustdb serve requires a persistent Native database".into())
     })?;
@@ -137,8 +183,8 @@ where
     let security = SecurityState::for_native_database(&config.state_root, database)?;
     let _state_lock = security.acquire_server_lock()?;
     let tls = TlsMaterial::load_or_create(&security, &endpoint)?;
-    let (authenticator, bundle) = if config.no_auth {
-        (Authenticator::explicitly_disabled(), None)
+    let (authenticator, bundle, principal_store) = if config.no_auth {
+        (Authenticator::explicitly_disabled(), None, None)
     } else {
         let principal_store = PrincipalStore::new(security.clone());
         let authenticator = principal_store.load_or_bootstrap()?;
@@ -149,7 +195,7 @@ where
             tls.ca_certificate_path(),
             &principal_store.connection_token_path()?,
         )?;
-        (authenticator, Some(bundle))
+        (authenticator, Some(bundle), Some(principal_store))
     };
     let result_directory = config
         .result_directory
@@ -159,6 +205,7 @@ where
     result_config.ttl = config.result_ttl;
     result_config.global_limit_bytes = config.result_global_limit_bytes;
     result_config.query_limit_bytes = config.result_query_limit_bytes;
+    result_config.service_io_threads = config.service_io_threads;
     let mut query_config = config.query.clone();
     if let Some(limit) = result_config.query_limit_bytes {
         query_config.query_result_limit_bytes = query_config.query_result_limit_bytes.min(limit);
@@ -188,11 +235,59 @@ where
         metrics: Arc::clone(&metrics),
         audit: audit.clone(),
     };
-    let app = router(state);
+    let app = router(state.clone());
     let tls_config =
         RustlsConfig::from_pem_file(tls.server_certificate_path(), tls.server_private_key_path())
             .await
             .map_err(|error| Error::io(tls.server_identity_path().to_owned(), error))?;
+    let tls_reloader = super::tls_reload::TlsReloader::start(
+        config.tls_renew_interval,
+        security.clone(),
+        endpoint.clone(),
+        tls_config.clone(),
+        tls.leaf_not_after_unix(),
+        queries.service_io(),
+    )?;
+    let admin_shutdown = CancellationToken::new();
+    let admin_path = config
+        .admin_socket
+        .clone()
+        .unwrap_or_else(|| security.admin_socket_path());
+    let admin_socket = match AdminSocket::start(
+        admin_path.clone(),
+        AdminContext {
+            queries: queries.clone(),
+            authenticator: state.authenticator.clone(),
+            principals: principal_store,
+            shutdown: admin_shutdown.clone(),
+            mutations: Arc::new(tokio::sync::Mutex::new(())),
+            io: queries.service_io(),
+        },
+    )
+    .await
+    {
+        Ok(socket) => socket,
+        Err(error) => {
+            let _ = tls_reloader.stop().await;
+            return Err(error);
+        }
+    };
+    let rss_guard_stop = CancellationToken::new();
+    let rss_guard_task = match super::rss_guard::spawn(
+        config.rss_guard,
+        config.rss_sample_interval,
+        queries.rss_pressure(),
+        queries.clone(),
+        Arc::clone(&metrics),
+        rss_guard_stop.clone(),
+    ) {
+        Ok(task) => task,
+        Err(error) => {
+            let _ = admin_socket.stop().await;
+            let _ = tls_reloader.stop().await;
+            return Err(error);
+        }
+    };
     let handle = Handle::new();
     let shutdown_handle = handle.clone();
     let grace = config.shutdown_grace;
@@ -203,15 +298,77 @@ where
     let shutdown_task = tokio::spawn(async move {
         tokio::select! {
             _ = shutdown => {}
+            _ = admin_shutdown.cancelled() => {}
             _ = stop_cleanup.cancelled() => {}
         }
         ready.store(false, Ordering::Release);
+        rss_guard_stop.cancel();
         result_read_slots.close();
         result_reads.close();
         queries.begin_shutdown();
         shutdown_handle.graceful_shutdown(Some(grace));
-        result_reads.wait_idle().await;
-        let outcome = queries.shutdown().await;
+        let deadline = tokio::time::Instant::now() + grace;
+        let admin_stop = async move {
+            tokio::time::timeout_at(deadline, admin_socket.stop())
+                .await
+                .map_err(|_| {
+                    Error::Execution(
+                        "HTTP shutdown deadline elapsed while stopping the local admin socket"
+                            .into(),
+                    )
+                })?
+        };
+        let tls_stop = async move {
+            tokio::time::timeout_at(deadline, tls_reloader.stop())
+                .await
+                .map_err(|_| {
+                    Error::Execution(
+                        "HTTP shutdown deadline elapsed while stopping TLS renewal".into(),
+                    )
+                })?
+        };
+        let result_wait = tokio::time::timeout_at(deadline, result_reads.wait_idle());
+        let query_wait = queries.shutdown_until(deadline);
+        let rss_guard_wait = async move {
+            match tokio::time::timeout_at(deadline, rss_guard_task).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(Error::Internal(format!(
+                    "HTTP RSS guardian task panicked: {error}"
+                ))),
+                Err(_) => Err(Error::Execution(
+                    "HTTP shutdown deadline elapsed while stopping the RSS guardian".into(),
+                )),
+            }
+        };
+        let (result_outcome, query_outcome, rss_guard_outcome, admin_outcome, tls_outcome) = tokio::join!(
+            result_wait,
+            query_wait,
+            rss_guard_wait,
+            admin_stop,
+            tls_stop
+        );
+        let result_outcome = result_outcome.map_err(|_| {
+            Error::Execution(format!(
+                "HTTP shutdown deadline elapsed with {} active result readers",
+                result_reads.active()
+            ))
+        });
+        let query_outcome = match (result_outcome, query_outcome) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(reads), Err(queries)) => Err(Error::Execution(format!(
+                "{reads}; query shutdown also failed: {queries}"
+            ))),
+        };
+        let outcome = match (query_outcome, rss_guard_outcome) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(shutdown), Err(guardian)) => Err(Error::Execution(format!(
+                "{shutdown}; RSS guardian shutdown also failed: {guardian}"
+            ))),
+        };
+        let outcome = combine_shutdown(outcome, admin_outcome, "local admin socket");
+        let outcome = combine_shutdown(outcome, tls_outcome, "TLS renewal");
         record_audit(
             &shutdown_audit,
             AuditEvent {
@@ -234,6 +391,7 @@ where
         outcome: "ready",
     })?;
     eprintln!("RustDB HTTP Shell listening at {}", tls.public_url());
+    eprintln!("local admin socket: {}", admin_path.display());
     if let Some(bundle) = &bundle {
         eprintln!("connection profile bundle: {}", bundle.display());
     } else {
@@ -264,18 +422,33 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+fn combine_shutdown(
+    current: Result<()>,
+    component: Result<()>,
+    component_name: &str,
+) -> Result<()> {
+    match (current, component) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(shutdown), Err(component)) => Err(Error::Execution(format!(
+            "{shutdown}; {component_name} shutdown also failed: {component}"
+        ))),
+    }
+}
+
 fn router(state: ServerState) -> Router {
     let protected = Router::new()
-        .route("/v1/info", get(info))
+        .route("/v2/info", get(info))
         .route("/metrics", get(prometheus_metrics))
-        .route("/v1/queries", post(submit_query))
+        .route("/v2/queries", get(list_queries).post(submit_query))
         .route(
-            "/v1/queries/{query_id}",
+            "/v2/queries/{query_id}",
             get(query_status).delete(delete_query),
         )
-        .route("/v1/queries/{query_id}/cancel", post(cancel_query))
+        .route("/v2/queries/{query_id}/cancel", post(cancel_query))
         .route(
-            "/v1/queries/{query_id}/results",
+            "/v2/queries/{query_id}/results",
             get(results::query_results),
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -424,7 +597,7 @@ async fn info(
 ) -> std::result::Result<Response, HttpError> {
     let request_id = context.request_id();
     let response = Json(InfoResponse {
-        protocol_version: "v1",
+        protocol_version: "v2",
         server_version: env!("CARGO_PKG_VERSION"),
         read_only: true,
         capabilities: &[
@@ -436,6 +609,8 @@ async fn info(
             "json_results",
             "ndjson_results",
             "typed_parameters",
+            "query_listing",
+            "structured_remote_errors",
         ],
     })
     .into_response();
@@ -517,6 +692,17 @@ async fn query_status(
     Ok(with_request_id(Json(status).into_response(), &request_id))
 }
 
+async fn list_queries(
+    State(state): State<ServerState>,
+    Extension(context): Extension<RequestContext>,
+    request: std::result::Result<QueryParams<QueryListRequest>, QueryRejection>,
+) -> std::result::Result<Response, HttpError> {
+    let request_id = context.request_id().to_owned();
+    let QueryParams(request) = request.map_err(|error| rejection::query(error, &request_id))?;
+    let response = state.queries.list(context.actor(), request, &request_id)?;
+    Ok(with_request_id(Json(response).into_response(), &request_id))
+}
+
 async fn cancel_query(
     State(state): State<ServerState>,
     Extension(context): Extension<RequestContext>,
@@ -525,7 +711,8 @@ async fn cancel_query(
     let request_id = context.request_id().to_owned();
     let status = state
         .queries
-        .cancel(context.actor(), &query_id, &request_id)?;
+        .cancel(context.actor(), &query_id, &request_id)
+        .await?;
     record_audit(
         &state.audit,
         AuditEvent {

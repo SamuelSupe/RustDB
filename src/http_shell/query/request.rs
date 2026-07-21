@@ -37,8 +37,8 @@ pub(super) fn submit_response(record: &QueryRecord, replayed: bool) -> SubmitRes
         query_id: record.id.clone(),
         state: record.state.read().phase,
         replayed,
-        status_url: format!("/v1/queries/{}", record.id),
-        results_url: format!("/v1/queries/{}/results", record.id),
+        status_url: format!("/v2/queries/{}", record.id),
+        results_url: format!("/v2/queries/{}/results", record.id),
     }
 }
 

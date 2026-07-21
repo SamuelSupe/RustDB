@@ -1,11 +1,12 @@
-use std::{net::TcpListener, path::PathBuf, time::Duration};
+use std::{io::Write, net::TcpListener, path::PathBuf, time::Duration};
 
 use futures::StreamExt;
 use rustdb::{
     Engine, EngineConfig,
     http_shell::{
-        ArrowResultPoll, HttpServerConfig, QueryRequest, QueryState, RemoteClient, TypedParameter,
-        security::import_profile_bundle, serve_with_shutdown,
+        AdminCommand, ArrowResultPoll, HttpServerConfig, QueryListRequest, QueryRequest,
+        QueryState, RemoteClient, TypedParameter, check_service_state, repair_service_state,
+        security::import_profile_bundle, send_admin_command, serve_with_shutdown,
     },
 };
 use serde_json::json;
@@ -30,7 +31,7 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     config.state_root = state_root.clone();
     config.result_global_limit_bytes = Some(1024 * 1024);
     config.result_query_limit_bytes = Some(64 * 1024);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(serve_with_shutdown(engine, config, async move {
         let _ = shutdown_rx.await;
     }));
@@ -39,6 +40,49 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     let profile = import_profile_bundle(&profile_root, "test", &bundle).unwrap();
     let client = RemoteClient::from_profile(&profile).unwrap();
     wait_for_server(&client, &server).await;
+    let admin_socket = bundle.parent().unwrap().join("admin.sock");
+    let admin_status = send_admin_command(&admin_socket, AdminCommand::Status)
+        .await
+        .unwrap();
+    assert!(admin_status.ok);
+    assert_eq!(admin_status.data.unwrap()["running_queries"], 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&admin_socket)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let rotated = send_admin_command(
+        &admin_socket,
+        AdminCommand::RotateToken {
+            principal: "admin".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(rotated.ok);
+    let token_id = rotated.data.unwrap()["token_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        send_admin_command(&admin_socket, AdminCommand::ReloadTokens)
+            .await
+            .unwrap()
+            .ok
+    );
+    assert!(
+        send_admin_command(&admin_socket, AdminCommand::RevokeToken { token_id })
+            .await
+            .unwrap()
+            .ok
+    );
 
     let ca = reqwest::Certificate::from_pem(&std::fs::read(profile.ca_path()).unwrap()).unwrap();
     let raw = reqwest::Client::builder()
@@ -47,7 +91,7 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let info_url = profile.server_url().join("v1/info").unwrap();
+    let info_url = profile.server_url().join("v2/info").unwrap();
     let unauthorized = raw
         .get(info_url)
         .bearer_auth("0".repeat(64))
@@ -57,7 +101,7 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let token = std::fs::read_to_string(profile.token_path()).unwrap();
-    let submit_url = profile.server_url().join("v1/queries").unwrap();
+    let submit_url = profile.server_url().join("v2/queries").unwrap();
     let replay_request = QueryRequest {
         sql: "SELECT 7 AS replay_value".into(),
         parameters: Vec::new(),
@@ -104,6 +148,27 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     assert_eq!(replay_status.state, QueryState::Succeeded);
     client.delete(&first.query_id).await.unwrap();
 
+    let first = client
+        .submit_with_key(&replay_request, "client-owned-key-0001")
+        .await
+        .unwrap();
+    let replay = client
+        .submit_with_key(&replay_request, "client-owned-key-0001")
+        .await
+        .unwrap();
+    assert_eq!(replay.query_id, first.query_id);
+    assert!(replay.replayed);
+    let replay_handle = client.query(first.query_id);
+    assert_eq!(
+        replay_handle
+            .wait(Duration::from_millis(10))
+            .await
+            .unwrap()
+            .state,
+        QueryState::Succeeded
+    );
+    replay_handle.delete().await.unwrap();
+
     let paged = client
         .submit(&QueryRequest {
             sql: "VALUES (1), (2), (3)".into(),
@@ -121,9 +186,21 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
             .state,
         QueryState::Succeeded
     );
+    let handle = client.query(paged_id.clone());
+    let preview = handle.results(None, 1).await.unwrap();
+    assert_eq!(preview.rows.len(), 1);
+    let mut list_request = QueryListRequest::default();
+    list_request.limit = Some(100);
+    let listed = client.list_queries(&list_request).await.unwrap();
+    assert!(
+        listed
+            .queries
+            .iter()
+            .any(|query| query.query_id == paged_id)
+    );
     let mut first_page_url = profile
         .server_url()
-        .join(&format!("v1/queries/{paged_id}/results"))
+        .join(&format!("v2/queries/{paged_id}/results"))
         .unwrap();
     first_page_url.query_pairs_mut().append_pair("limit", "1");
     let first_page: serde_json::Value = raw
@@ -148,7 +225,7 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     let cursor = first_page["page"]["next_cursor"].as_str().unwrap();
     let mut next_url = profile
         .server_url()
-        .join(&format!("v1/queries/{paged_id}/results"))
+        .join(&format!("v2/queries/{paged_id}/results"))
         .unwrap();
     next_url
         .query_pairs_mut()
@@ -166,7 +243,7 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     assert_eq!(next["page"]["offset"], 1);
     let mut ndjson_url = profile
         .server_url()
-        .join(&format!("v1/queries/{paged_id}/results"))
+        .join(&format!("v2/queries/{paged_id}/results"))
         .unwrap();
     ndjson_url
         .query_pairs_mut()
@@ -199,9 +276,11 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
             ArrowResultPoll::Complete {
                 next_batch_seq,
                 schema,
+                state,
             } => {
                 assert_eq!(next_batch_seq, batch_seq);
                 assert_eq!(schema.fields().len(), 1);
+                assert_eq!(state, rustdb::http_shell::ArrowResultState::Completed);
                 break;
             }
             ArrowResultPoll::Pending { .. } => {
@@ -247,7 +326,10 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
         })
         .await
         .unwrap_err();
-    assert!(forbidden.to_string().contains("sql.unsupported"));
+    assert_eq!(forbidden.http_status, Some(422));
+    assert_eq!(forbidden.code.as_ref(), "sql.unsupported");
+    assert_eq!(forbidden.retry_class, rustdb::RetryClass::Never);
+    assert!(forbidden.request_id.is_some());
 
     let hidden = client
         .submit(&QueryRequest {
@@ -288,12 +370,46 @@ async fn remote_shell_executes_typed_read_only_queries_over_tls() {
     assert_eq!(oversized.error.unwrap().error, "query.resource_exhausted");
     client.delete(&oversized_id).await.unwrap();
 
-    let _ = shutdown_tx.send(());
+    assert!(
+        send_admin_command(&admin_socket, AdminCommand::Shutdown)
+            .await
+            .unwrap()
+            .ok
+    );
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(10), server)
         .await
         .expect("server stopped")
         .expect("server task joined")
         .expect("server shutdown succeeded");
+    let report = check_service_state(&database, &state_root, None).unwrap();
+    assert!(report.healthy, "{:#?}", report.issues);
+    let journal = bundle
+        .parent()
+        .unwrap()
+        .join("results/query-journal/journal.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal)
+        .unwrap();
+    file.write_all(br#"{"incomplete"#).unwrap();
+    file.sync_all().unwrap();
+    assert!(
+        !check_service_state(&database, &state_root, None)
+            .unwrap()
+            .healthy
+    );
+    let repaired = repair_service_state(&database, &state_root, None, true).unwrap();
+    assert!(repaired.healthy, "{:#?}", repaired.issues);
+    assert!(repaired.repaired_actions >= 1);
+    let result_root = bundle.parent().unwrap().join("results");
+    assert!(
+        std::fs::read_dir(&result_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("q-")),
+        "HTTP shutdown retained a per-query result directory"
+    );
 }
 
 async fn drain(mut result: rustdb::QueryResult) {

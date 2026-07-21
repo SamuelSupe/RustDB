@@ -1,7 +1,18 @@
 use super::*;
 
+#[test]
+fn copy_to_is_rejected_when_its_external_side_effect_cannot_be_rolled_back() {
+    let result = classify_transaction_statement(
+        "COPY (SELECT 1) TO '/tmp/rustdb-copy.parquet' (FORMAT PARQUET)",
+        TransactionAccessMode::ReadWrite,
+    );
+    assert!(
+        matches!(result, Err(Error::Unsupported(message)) if message.contains("cannot be rolled back"))
+    );
+}
+
 #[tokio::test]
-async fn rollback_clears_an_automatically_rolled_back_transaction() {
+async fn abandoned_statement_keeps_sql_transaction_usable() {
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::open(directory.path().join("database"), EngineConfig::default()).unwrap();
     let session = engine.session();
@@ -31,22 +42,22 @@ async fn rollback_clears_an_automatically_rolled_back_transaction() {
     drop(result);
     wait_for_transaction_results(&shared).await;
 
-    let error = match session.execute("ROLLBACK").await {
-        Ok(_) => panic!("automatically rolled back transaction accepted ROLLBACK"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, Error::TransactionClosed { .. }));
-
-    consume(session.execute("BEGIN").await.unwrap()).await;
-    consume(session.execute("ROLLBACK").await.unwrap()).await;
+    consume(
+        session
+            .execute("INSERT INTO events VALUES (3)")
+            .await
+            .unwrap(),
+    )
+    .await;
+    consume(session.execute("COMMIT").await.unwrap()).await;
     assert_eq!(
         query_session_scalar(&session, "SELECT count(*) FROM events").await,
-        1
+        2
     );
 }
 
 #[tokio::test]
-async fn terminal_transaction_retains_session_until_sibling_result_quiesces() {
+async fn active_mutation_result_blocks_sibling_statement_until_rollback_finishes() {
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::open(
         directory.path().join("database"),
@@ -68,7 +79,11 @@ async fn terminal_transaction_retains_session_until_sibling_result_quiesces() {
         .await
         .unwrap();
     mutation.stream().next().await.unwrap().unwrap();
-    let sibling = session.execute("SELECT 1").await.unwrap();
+    let error = match session.execute("SELECT count(*) FROM events").await {
+        Ok(_) => panic!("transaction allowed a sibling read of staged mutation data"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("active statement result"));
     let shared = Arc::clone(
         &session
             .sql_transaction
@@ -80,41 +95,17 @@ async fn terminal_transaction_retains_session_until_sibling_result_quiesces() {
     );
     drop(mutation);
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let ready = {
-                let state = shared.state.lock();
-                state.lifecycle == Lifecycle::RolledBack
-                    && state.active_results == 1
-                    && state.rollback_pending
-            };
-            if ready {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("mutation abandonment did not enter deferred rollback");
-
-    let error = match session.execute("ROLLBACK").await {
-        Ok(_) => panic!("terminal transaction accepted ROLLBACK with a live sibling result"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, Error::TransactionClosed { .. }));
-    assert!(session.sql_transaction.lock().await.is_some());
-    let error = match session.execute("BEGIN").await {
-        Ok(_) => panic!("terminal transaction released its live sibling result"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("already active"));
-
-    drop(sibling);
     wait_for_transaction_results(&shared).await;
-    consume(session.execute("BEGIN").await.unwrap()).await;
-    consume(session.execute("ROLLBACK").await.unwrap()).await;
+    consume(
+        session
+            .execute("INSERT INTO events VALUES (3)")
+            .await
+            .unwrap(),
+    )
+    .await;
+    consume(session.execute("COMMIT").await.unwrap()).await;
     assert_eq!(
         query_session_scalar(&session, "SELECT count(*) FROM events").await,
-        1
+        2
     );
 }

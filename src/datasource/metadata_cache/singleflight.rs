@@ -145,7 +145,7 @@ pub(super) enum SharedLoadError {
         path: PathBuf,
         found_version: u32,
         current_version: u32,
-        alpha: bool,
+        legacy: bool,
     },
     NativeImportConflict {
         import_id: String,
@@ -223,12 +223,12 @@ impl SharedLoadError {
                 path,
                 found_version,
                 current_version,
-                alpha,
+                legacy,
             } => Self::NativeFormatUnsupported {
                 path: path.clone(),
                 found_version: *found_version,
                 current_version: *current_version,
-                alpha: *alpha,
+                legacy: *legacy,
             },
             Error::NativeImportConflict { import_id } => Self::NativeImportConflict {
                 import_id: import_id.clone(),
@@ -323,12 +323,12 @@ impl SharedLoadError {
                 path,
                 found_version,
                 current_version,
-                alpha,
+                legacy,
             } => Error::NativeFormatUnsupported {
                 path,
                 found_version,
                 current_version,
-                alpha,
+                legacy,
             },
             Self::NativeImportConflict { import_id } => Error::NativeImportConflict { import_id },
             Self::CommitOutcomeUnknown {

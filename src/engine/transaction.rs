@@ -95,7 +95,7 @@ struct Shared {
 
 #[path = "transaction/workspace.rs"]
 mod workspace;
-pub(super) use workspace::{MutationLease, TransactionWorkspace};
+pub(super) use workspace::{MutationLease, StatementSavepoint, TransactionWorkspace};
 
 struct State {
     lifecycle: Lifecycle,
@@ -115,6 +115,7 @@ struct ResultGuard {
     shared: Arc<Shared>,
     engine: super::Engine,
     context: Option<Arc<crate::runtime::QueryContext>>,
+    statement: Option<StatementSavepoint>,
     completed: bool,
 }
 
@@ -219,8 +220,15 @@ impl Transaction {
     }
 
     pub async fn execute(&self, sql: &str) -> Result<QueryResult> {
-        reject_non_query_command(sql, self.shared.access_mode)?;
-        let guard = self.shared.begin_result(&self.session.engine)?;
+        let statement = classify_transaction_statement(sql, self.shared.access_mode)?;
+        let mut guard = self.shared.begin_result(&self.session.engine)?;
+        if statement == TransactionStatement::Mutation {
+            guard.statement = Some(
+                self.shared
+                    .workspace
+                    .begin_statement(self.session.engine.clone(), self.session.catalog.clone())?,
+            );
+        }
         match self.session.execute_direct(sql).await {
             Ok(result) => Ok(attach_guard(result, guard)),
             Err(error) => Err(error),
@@ -313,6 +321,12 @@ impl Shared {
     fn begin_result(self: &Arc<Self>, engine: &super::Engine) -> Result<ResultGuard> {
         let mut state = self.state.lock();
         ensure_lifecycle(self, state.lifecycle)?;
+        if state.active_results != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "transaction {} already has an active statement result; consume it to end-of-stream, or drop it and wait for query cleanup before starting another statement",
+                self.transaction_id
+            )));
+        }
         state.active_results = state.active_results.checked_add(1).ok_or_else(|| {
             Error::ResourceExhausted("transaction active-result counter overflowed".to_owned())
         })?;
@@ -320,6 +334,7 @@ impl Shared {
             shared: Arc::clone(self),
             engine: engine.clone(),
             context: None,
+            statement: None,
             completed: false,
         })
     }
@@ -338,11 +353,11 @@ impl Shared {
         Ok(())
     }
 
-    fn finish_result(&self, engine: &super::Engine, rollback_mutation: bool) {
+    fn finish_result(&self, engine: &super::Engine, rollback_transaction: bool) {
         let rollback = {
             let mut state = self.state.lock();
             state.active_results = state.active_results.saturating_sub(1);
-            if rollback_mutation && state.lifecycle == Lifecycle::Active {
+            if rollback_transaction && state.lifecycle == Lifecycle::Active {
                 state.lifecycle = Lifecycle::RolledBack;
                 state.rollback_pending = true;
             }
@@ -381,12 +396,26 @@ impl Drop for Transaction {
 
 impl Drop for ResultGuard {
     fn drop(&mut self) {
-        let rollback_mutation = !self.completed
+        let mutation_applied = !self.completed
             && self
                 .context
                 .as_ref()
                 .is_some_and(|context| context.transaction_mutation_was_applied());
-        self.shared.finish_result(&self.engine, rollback_mutation);
+        let mut rollback_transaction = mutation_applied && self.statement.is_none();
+        if let Some(statement) = self.statement.take() {
+            if self.completed {
+                statement.commit();
+            } else if let Err(error) = statement.rollback() {
+                rollback_transaction = true;
+                tracing::error!(
+                    %error,
+                    transaction_id = %self.shared.transaction_id,
+                    "failed to rollback transaction statement"
+                );
+            }
+        }
+        self.shared
+            .finish_result(&self.engine, rollback_transaction);
     }
 }
 
@@ -443,15 +472,23 @@ fn ensure_lifecycle(shared: &Shared, lifecycle: Lifecycle) -> Result<()> {
     })
 }
 
-fn reject_non_query_command(sql: &str, mode: TransactionAccessMode) -> Result<()> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TransactionStatement {
+    ReadOnly,
+    Mutation,
+}
+
+fn classify_transaction_statement(
+    sql: &str,
+    mode: TransactionAccessMode,
+) -> Result<TransactionStatement> {
     match crate::command::parse(sql)? {
         ParsedStatement::Query(_)
         | ParsedStatement::Command(
             SessionCommand::ShowTables
             | SessionCommand::ShowSchemas
-            | SessionCommand::Describe { .. }
-            | SessionCommand::CopyTo(_),
-        ) => Ok(()),
+            | SessionCommand::Describe { .. },
+        ) => Ok(TransactionStatement::ReadOnly),
         ParsedStatement::Command(
             SessionCommand::NativeWrite(_)
             | SessionCommand::NativeAlter(_)
@@ -471,7 +508,7 @@ fn reject_non_query_command(sql: &str, mode: TransactionAccessMode) -> Result<()
             | SessionCommand::NativeSchema(_)
             | SessionCommand::NativeUpdate(_)
             | SessionCommand::NativeTruncate(_),
-        ) => Ok(()),
+        ) => Ok(TransactionStatement::Mutation),
         ParsedStatement::Command(SessionCommand::CreatePersistentView { .. })
             if mode == TransactionAccessMode::ReadOnly =>
         {
@@ -479,7 +516,9 @@ fn reject_non_query_command(sql: &str, mode: TransactionAccessMode) -> Result<()
                 "read-only transactions cannot execute persistent DDL".to_owned(),
             ))
         }
-        ParsedStatement::Command(SessionCommand::CreatePersistentView { .. }) => Ok(()),
+        ParsedStatement::Command(SessionCommand::CreatePersistentView { .. }) => {
+            Ok(TransactionStatement::Mutation)
+        }
         ParsedStatement::Command(SessionCommand::DropView { .. })
             if mode == TransactionAccessMode::ReadOnly =>
         {
@@ -487,15 +526,20 @@ fn reject_non_query_command(sql: &str, mode: TransactionAccessMode) -> Result<()
                 "read-only transactions cannot execute persistent DDL".to_owned(),
             ))
         }
-        ParsedStatement::Command(SessionCommand::DropView { .. }) => Ok(()),
+        ParsedStatement::Command(SessionCommand::DropView { .. }) => {
+            Ok(TransactionStatement::Mutation)
+        }
+        ParsedStatement::Command(SessionCommand::CopyTo(_)) => Err(Error::Unsupported(
+            "COPY TO is not supported inside explicit transactions because its external side effect cannot be rolled back"
+                .to_owned(),
+        )),
         ParsedStatement::Command(_) if mode == TransactionAccessMode::ReadOnly => {
             Err(Error::Unsupported(
                 "read-only transactions cannot execute session mutations".to_owned(),
             ))
         }
         ParsedStatement::Command(_) => Err(Error::Unsupported(
-            "session mutations inside explicit transactions are introduced in v0.8 alpha.2"
-                .to_owned(),
+            "this session mutation is not supported inside explicit transactions".to_owned(),
         )),
     }
 }

@@ -20,13 +20,29 @@ pub enum Operation {
     Migrate { database: PathBuf },
     /// Idempotently import CSV or Parquet into a new persistent Native table.
     Import(ImportArgs),
-    /// Create a verified Native backup in a local directory or S3 prefix.
+    /// Create a verified Native plus HTTP-control-state bundle.
     Backup {
         database: PathBuf,
         destination: String,
+        /// HTTP service state root. Defaults to the platform RustDB state root.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
     },
-    /// Restore a verified local or S3 Native backup into a new database.
-    Restore { backup: String, database: PathBuf },
+    /// Validate a local or S3 service backup without restoring it.
+    BackupCheck {
+        backup: String,
+        /// Emit the validation summary as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a verified service backup into fresh database and state targets.
+    Restore {
+        backup: String,
+        database: PathBuf,
+        /// Fresh HTTP service state root. Defaults to the platform RustDB state root.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Produce a redacted, versioned local diagnostics report.
     Diagnostics {
         #[arg(long)]
@@ -37,6 +53,11 @@ pub enum Operation {
     },
     /// Serve one Native database through the read-only HTTPS shell protocol.
     Serve(Box<ServeArgs>),
+    /// Check, repair, or administer local HTTP service state.
+    Service {
+        #[command(subcommand)]
+        command: ServiceOperation,
+    },
     /// Connect the CLI to a named remote HTTPS shell profile.
     Shell(ShellArgs),
     /// Import, export, or rotate HTTPS shell connection material.
@@ -196,9 +217,88 @@ pub struct ServeArgs {
     pub s3_allow_http: bool,
     #[arg(long)]
     pub s3_anonymous: bool,
+    /// Fixed thread count for blocking HTTP service-state and result I/O.
+    #[arg(long)]
+    pub service_io_threads: Option<usize>,
+    /// Local-only administration socket. Defaults inside the service state directory.
+    #[arg(long)]
+    pub admin_socket: Option<PathBuf>,
+    /// Interval for checking and hot-reloading near-expiry TLS leaves.
+    #[arg(long)]
+    pub tls_renew_interval_secs: Option<u64>,
     /// Explicitly disable HTTP authentication (development only).
     #[arg(long)]
     pub no_auth: bool,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ServiceStateArgs {
+    #[arg(long)]
+    pub database: PathBuf,
+    #[arg(long)]
+    pub state_root: Option<PathBuf>,
+    #[arg(long)]
+    pub result_directory: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+pub struct ServiceAdminArgs {
+    #[arg(long)]
+    pub database: PathBuf,
+    #[arg(long)]
+    pub state_root: Option<PathBuf>,
+    #[arg(long)]
+    pub admin_socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceOperation {
+    /// Read-only verification of principals, query journal, and stored results.
+    Check {
+        #[command(flatten)]
+        paths: ServiceStateArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Conservatively repair marker-owned service artifacts.
+    Repair {
+        #[command(flatten)]
+        paths: ServiceStateArgs,
+        /// Apply repairs. Without this flag the command is read-only.
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read local server and query counts.
+    Status {
+        #[command(flatten)]
+        server: ServiceAdminArgs,
+    },
+    /// Atomically reload the durable principal/token directory.
+    ReloadTokens {
+        #[command(flatten)]
+        server: ServiceAdminArgs,
+    },
+    /// Add an overlapping token and reload it into the running server.
+    RotateToken {
+        #[command(flatten)]
+        server: ServiceAdminArgs,
+        #[arg(long)]
+        principal: String,
+    },
+    /// Revoke one token and reload the running server.
+    RevokeToken {
+        #[command(flatten)]
+        server: ServiceAdminArgs,
+        #[arg(long)]
+        token_id: String,
+    },
+    /// Request bounded graceful shutdown through the local socket.
+    Shutdown {
+        #[command(flatten)]
+        server: ServiceAdminArgs,
+    },
 }
 
 #[derive(Debug, ClapArgs)]

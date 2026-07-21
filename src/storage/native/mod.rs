@@ -226,7 +226,7 @@ impl NativeDatabase {
             ));
         }
         // Existing format markers are inspected before chmod, lock-file
-        // creation, temporary cleanup, or any other recovery write. Alpha and
+        // creation, temporary cleanup, or any other recovery write. Legacy and
         // future databases must be rejected without changing their directory.
         marker::preflight_if_present(&root.join(MARKER_FILE))?;
         marker::preflight_if_present(&root.join(INIT_FILE))?;

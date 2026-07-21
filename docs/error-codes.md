@@ -50,8 +50,10 @@ Beta 版本的弃用周期。
 | `admission.queue_full` | Engine or principal admission queue is full; retry after the advertised delay |
 | `admission.resource_limit` | One Query's configured resource reservation exceeds an admission layer |
 | `admission.unavailable` | A queued admission decision could not be completed safely |
-| `query.server_restarted` | An active durable Query was interrupted by server restart |
-| `query.result_invalidated` | A persisted result belongs to an incompatible producer version |
+| `admission.rss_throttled` | Process RSS crossed the warning watermark; retry after the advertised delay |
+| `admission.rss_rejected` | Process RSS crossed the high or critical watermark; new work is rejected while pressure remains |
+| `query.interrupted` | Shutdown or restart interrupted an active durable Query; committed Arrow batches may remain readable |
+| `query.result_invalidated` | A persisted result belongs to an incompatible result-format epoch or failed integrity validation |
 | `query.result_unavailable` | Durable Query metadata references a missing result |
 | `query.state_conflict` | Journal, ownership, idempotency, or result state is contradictory |
 | `query.journal_failed` | A Query state transition could not be journaled durably |
@@ -64,7 +66,7 @@ Beta 版本的弃用周期。
 | `execution.failed` | Physical query execution failed |
 | `native.disk_quota_exceeded` | Native engine or table disk quota rejected a write |
 | `native.storage` | Native storage validation or I/O invariant failed |
-| `native.format_unsupported` | The database belongs to an alpha or unsupported Beta format epoch |
+| `native.format_unsupported` | The database belongs to a legacy or unsupported Native format epoch |
 | `native.repair_refused` | Conservative Native repair could not prove that the requested mutation is safe |
 | `native.import_conflict` | An import id was reused with a different table, source, format, or CSV option |
 | `transaction.conflict` | Snapshot-isolation write conflict |

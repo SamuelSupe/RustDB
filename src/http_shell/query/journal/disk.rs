@@ -9,9 +9,9 @@ use crate::{Error, Result};
 use super::codec::{MAX_EVENT_BYTES, MAX_SNAPSHOT_BYTES};
 
 const ROOT_MARKER_FILE: &str = "OWNER";
-const ROOT_MARKER: &[u8] = b"rustdb-query-journal-v1\n";
+const ROOT_MARKER: &[u8] = b"rustdb-query-journal-v2\n";
 const LOCK_FILE: &str = ".lock";
-const LOCK_MARKER: &[u8] = b"rustdb-query-journal-lock-v1\n";
+const LOCK_MARKER: &[u8] = b"rustdb-query-journal-lock-v2\n";
 pub(super) const SNAPSHOT_FILE: &str = "snapshot.json";
 pub(super) const JOURNAL_FILE: &str = "journal.jsonl";
 const MAX_JOURNAL_BYTES: usize = 256 * 1024 * 1024;
@@ -24,6 +24,62 @@ pub(super) fn open_root(root: &Path) -> Result<File> {
     let _ = private_file_exists(&root.join(SNAPSHOT_FILE))?;
     let _ = private_file_exists(&root.join(JOURNAL_FILE))?;
     Ok(lock)
+}
+
+pub(super) fn check_root(root: &Path) -> Result<()> {
+    let metadata = root
+        .symlink_metadata()
+        .map_err(|error| Error::io(Some(root.to_owned()), error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::InvalidArgument(format!(
+            "query journal root is not a real directory: {}",
+            root.display()
+        )));
+    }
+    set_private_directory_mode(root, false, &metadata)?;
+    let marker = root.join(ROOT_MARKER_FILE);
+    require_private_file(&marker)?;
+    if read_bounded(&marker, 128)? != ROOT_MARKER {
+        return Err(Error::InvalidArgument(format!(
+            "query journal root has an unknown format marker: {}",
+            root.display()
+        )));
+    }
+    if private_file_exists(&root.join(LOCK_FILE))?
+        && read_bounded(&root.join(LOCK_FILE), 128)? != LOCK_MARKER
+    {
+        return Err(Error::InvalidArgument(format!(
+            "query journal lock has an unknown marker: {}",
+            root.join(LOCK_FILE).display()
+        )));
+    }
+    let _ = private_file_exists(&root.join(SNAPSHOT_FILE))?;
+    let _ = private_file_exists(&root.join(JOURNAL_FILE))?;
+    Ok(())
+}
+
+pub(super) fn acquire_existing_lock(root: &Path) -> Result<File> {
+    check_root(root)?;
+    let path = root.join(LOCK_FILE);
+    let mut file = open_private_append(&path, false)?;
+    require_private_file(&path)?;
+    file.try_lock().map_err(|error| {
+        Error::InvalidArgument(format!(
+            "query journal directory {} is already in use: {error}",
+            root.display()
+        ))
+    })?;
+    let mut marker = Vec::new();
+    file.rewind()
+        .and_then(|_| file.read_to_end(&mut marker))
+        .map_err(|error| Error::io(Some(path.clone()), error))?;
+    if marker != LOCK_MARKER {
+        return Err(Error::InvalidArgument(format!(
+            "query journal lock has an unknown marker: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 pub(super) fn open_journal(root: &Path) -> Result<File> {
@@ -82,6 +138,65 @@ pub(super) fn read_journal(root: &Path) -> Result<Vec<Vec<u8>>> {
         truncate_journal(&path, valid)?;
         bytes.truncate(valid);
     }
+    let mut records = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() >= MAX_EVENT_BYTES {
+            return Err(Error::InvalidArgument(
+                "query journal record exceeds its size limit".into(),
+            ));
+        }
+        records.push(line.to_vec());
+    }
+    Ok(records)
+}
+
+pub(super) fn read_journal_strict(root: &Path) -> Result<Vec<Vec<u8>>> {
+    let path = root.join(JOURNAL_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    require_private_file(&path)?;
+    let bytes = read_bounded(&path, MAX_JOURNAL_BYTES)?;
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        return Err(Error::InvalidArgument(format!(
+            "query journal has an incomplete final record: {}",
+            path.display()
+        )));
+    }
+    split_records(&bytes)
+}
+
+pub(super) fn repair_temporary_and_tail(root: &Path) -> Result<usize> {
+    check_root(root)?;
+    let temporary_before = [
+        root.join(format!(".{SNAPSHOT_FILE}.tmp")),
+        root.join(format!(".{JOURNAL_FILE}.tmp")),
+    ]
+    .iter()
+    .filter(|path| path.exists())
+    .count();
+    clean_temporary(root)?;
+    let path = root.join(JOURNAL_FILE);
+    if !path.exists() {
+        return Ok(temporary_before);
+    }
+    require_private_file(&path)?;
+    let bytes = read_bounded(&path, MAX_JOURNAL_BYTES)?;
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(temporary_before);
+    }
+    let valid = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    truncate_journal(&path, valid)?;
+    Ok(temporary_before + 1)
+}
+
+fn split_records(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut records = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {

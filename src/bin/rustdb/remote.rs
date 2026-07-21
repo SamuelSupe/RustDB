@@ -5,7 +5,7 @@ use arrow::record_batch::RecordBatch;
 use rustdb::{
     Error, Result,
     http_shell::{
-        ArrowResultPoll, QueryRequest, QueryState, RemoteClient,
+        ArrowResultPoll, ArrowResultState, QueryRequest, QueryState, RemoteClient,
         security::{default_profile_root, load_profile},
     },
 };
@@ -78,13 +78,16 @@ async fn execute(client: &RemoteClient, sql: &str, args: &ShellArgs) -> Result<(
             metrics.spill_write_bytes,
         );
     }
-    client.delete(&query_id).await
+    client.delete(&query_id).await.map_err(Into::into)
 }
 
 fn terminal_status(status: &rustdb::http_shell::QueryStatusResponse, query_id: &str) -> Result<()> {
     match status.state {
         QueryState::Succeeded => Ok(()),
         QueryState::Cancelled => Err(Error::Cancelled),
+        QueryState::Interrupted => Err(Error::Execution(format!(
+            "remote query was interrupted before completion [query {query_id}]"
+        ))),
         QueryState::Failed => {
             let message = status
                 .error
@@ -117,7 +120,10 @@ async fn wait_or_cancel(
         };
         if matches!(
             status.state,
-            QueryState::Succeeded | QueryState::Failed | QueryState::Cancelled
+            QueryState::Succeeded
+                | QueryState::Failed
+                | QueryState::Cancelled
+                | QueryState::Interrupted
         ) {
             return Ok(status);
         }
@@ -166,8 +172,14 @@ async fn fetch_arrow_batches(
                     return Ok(());
                 }
             }
-            ArrowResultPoll::Pending { .. } => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            ArrowResultPoll::Pending { state, .. } => {
+                if matches!(state, ArrowResultState::Queued | ArrowResultState::Running) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                } else {
+                    return Err(Error::Execution(format!(
+                        "remote result entered terminal state {state:?} before another batch"
+                    )));
+                }
             }
             ArrowResultPoll::Complete { schema, .. } => {
                 if first {

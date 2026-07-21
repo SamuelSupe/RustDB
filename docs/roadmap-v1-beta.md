@@ -1,30 +1,27 @@
 # RustDB v1.0 Beta contract
 
-`v1.0.0-beta.1` is the first compatibility-bearing RustDB release. It turns the
-existing single-node OLAP engine into a feature-complete Beta without expanding
-the supported data-format or SQL surface.
+`v1.0.0-beta.2` is a reliability reset for the existing single-node OLAP
+engine. It does not expand the supported data-format or SQL surface and does
+not provide migration compatibility with Beta 1.
 
-`v1.0.0-beta.1` 是首个承担兼容性承诺的 RustDB 版本。它把现有单机 OLAP
-引擎提升为功能完整的 Beta，但不新增数据格式或 SQL 范围。
+`v1.0.0-beta.2` 是现有单机 OLAP 引擎的可靠性重置版本，不新增数据格式或 SQL
+范围，也不提供从 Beta 1 迁移的兼容承诺。
 
 This document is the Beta completion contract, not evidence that the release
 gate has passed. Operational procedures live in the
 [operator guide](operator-guide.md) and [中文运维指南](operator-guide.zh-CN.md);
 the tag-specific outcome belongs in the
-[beta.1 release notes](releases/v1.0.0-beta.1.md).
+[Beta 2 release notes](releases/v1.0.0-beta.2.md).
 
 ## Compatibility epoch
 
-- The Beta Native database marker is epoch `3`. Alpha epochs `1` and `2` are
+- The Beta 2 Native database marker is epoch `4`. Earlier epochs `1`, `2`, and `3` are
   rejected before RustDB changes permissions, acquires a database lock, replays
-  WAL, or removes temporary files. Alpha data must be imported into a fresh Beta
-  database.
-- Compatibility starts at beta.1. During the Beta series RustDB supports the
-  current and previous two Beta format/API revisions. A removal requires at
-  least two Beta releases of deprecation notice.
-- `/v1`, the CLI, the versioned configuration file, stable error codes, retry
-  classes, and the outer Rust API are compatibility surfaces. Internal plans,
-  operators, and on-disk implementation details remain private.
+  WAL, or removes temporary files. Earlier data must be imported into a fresh
+  Beta 2 database.
+- Beta 2 intentionally provides no Beta 1 migration or rollback contract. Its
+  Native format, service config, and HTTP contract are versioned explicitly so
+  old artifacts fail before mutation instead of being guessed compatible.
 
 ## Beta completion gates
 
@@ -53,7 +50,7 @@ the tag-specific outcome belongs in the
    8192, and I/O concurrency 16. Canonical official queries remain the pinned
    source/full profile; functional acceptance runs a versioned deterministic
    derivative with complete tie-breakers and binds both SHA-256 identities.
-   beta.1 records a functional baseline and makes no cross-engine performance
+   Beta 2 records a functional baseline and makes no cross-engine performance
    claim. A digest-pinned `clickhouse-local` rowset is used only for correctness
    oracle generation and review, not during release acceptance.
 
@@ -91,6 +88,6 @@ RustDB-Acceptance-Status: passed
 ```
 
 The tag assertion is commit-bound but remains Beta acceptance evidence, not a
-production warranty or SLA. Alpha-to-Beta handling is documented in
+production warranty or SLA. The Beta 2 fresh-start boundary is documented in
 [migration-v1-beta.md](migration-v1-beta.md), and the authoritative SQL,
 platform, and object-store boundary is in [compatibility.md](compatibility.md).

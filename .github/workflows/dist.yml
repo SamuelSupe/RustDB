@@ -230,10 +230,10 @@ jobs:
           for archive in release-assets/*.tar.gz; do
             RUSTDB_DIST_SKIP_EXEC=1 scripts/dist/check.sh "$archive"
           done
-          install -m 0644 docs/openapi-v1.yaml release-assets/rustdb-openapi-v1.yaml
+          install -m 0644 docs/openapi-v2.yaml release-assets/rustdb-openapi-v2.yaml
           (
             cd release-assets
-            sha256sum rustdb-openapi-v1.yaml >rustdb-openapi-v1.yaml.sha256
+            sha256sum rustdb-openapi-v2.yaml >rustdb-openapi-v2.yaml.sha256
           )
       - name: Generate release SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0

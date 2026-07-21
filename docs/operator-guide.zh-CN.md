@@ -1,8 +1,12 @@
 # RustDB Beta 运维指南
 
-本文适用于 `v1.0.0-beta.1`。RustDB Beta 已定义兼容和运维契约，但仍属于预生产
+本文适用于 `v1.0.0-beta.2`。RustDB Beta 已定义兼容和运维契约，但仍属于预生产
 软件，不提供生产 SLA。请把它作为单节点服务运行，并始终保留可恢复的源数据和已验证
 备份。
+
+Beta 2 必须全新部署：不要让它打开 Beta 1 Native 数据库，也不要复用 Beta 1 HTTP
+状态。切流前请把源数据重新导入 Native epoch 4，并创建 schema-version 2 服务状态；
+本版本不提供原地迁移。
 
 ## 支持矩阵
 
@@ -34,7 +38,9 @@ Native 数据库必须位于本地块存储。锁、rename 或持久化语义不
 ```
 
 数据库、安全状态、结果和 Spill 目录应为 `0700`，敏感文件为 `0600`。不要手工
-修改 Native 目录。Native backup 不包含 HTTP 安全状态、审计日志和保留结果。
+修改 Native 目录。Beta 2 服务备份包含 Native 数据和安全 HTTP 控制状态
+（principal、Token/Profile 材料、CA、TLS 身份和连接 Profile）；它刻意排除 Query
+journal 与保留结果、审计日志、Spill/临时数据、锁和 Admin socket。
 
 磁盘预算需覆盖保留数据库、发布过程 headroom、结果、Spill 和一份备份。Native 与
 Spill 默认各自保留至少 10% 和 1 GiB 空闲空间；结果配额独立计算。必须监控全部相关
@@ -56,21 +62,25 @@ docker run --rm --init --read-only \
   -p 7400:7400 \
   -v /srv/rustdb:/var/lib/rustdb \
   -v /etc/rustdb:/etc/rustdb:ro \
-  ghcr.io/samuelsupe/rustdb:v1.0.0-beta.1 \
+  ghcr.io/samuelsupe/rustdb:v1.0.0-beta.2 \
   --spill-directory /var/lib/rustdb/spill \
   serve \
   --database /var/lib/rustdb/database \
-  --config /etc/rustdb/rustdb.toml
+  --config /etc/rustdb/rustdb.toml \
+  --listen 0.0.0.0:7400 \
+  --advertise-url https://analytics.example.com:7400
 ```
 
 启动前创建宿主机目录并设置 owner。根文件系统保持只读，只挂载四个可写数据目录。
-正常停止时发送 `SIGTERM`，至少等待固定的 30 秒 graceful shutdown；不要使用
-`SIGKILL`。
+请把 `analytics.example.com` 替换为客户端实际访问的 HTTPS 主机名。
+正常停止时发送 `SIGTERM`，至少等待配置的 shutdown grace（默认 30 秒）；不要使用
+`SIGKILL`。服务会先退出 ready，随后在 deadline 前排空结果 reader 和 Query task，
+最后把剩余任务持久化为 `interrupted`，再清理受管文件。
 
 ## 配置
 
 从 [`packaging/config/rustdb.example.toml`](../packaging/config/rustdb.example.toml)
-开始。顶层 `schema_version = 1` 必填，未知字段会被拒绝。
+开始。顶层 `schema_version = 2` 必填，未知字段会被拒绝。
 
 ```sh
 rustdb config validate /etc/rustdb/rustdb.toml
@@ -87,13 +97,19 @@ URL 或 CLI 参数，只能使用 AWS 默认凭证链。明文 S3 endpoint 仅�
 4 核 16 GiB 主机可从 4 个计算线程和 2–4 GiB Engine 内存上限开始，并设置明确的
 结果与 Native 配额。只有在观察真实负载下的排队、结果盘增长和峰值内存后再提高并发。
 
+服务会以物理内存与 Linux cgroup 上限中的较小者为基准采样进程 RSS。默认在 70%
+暂停接收新 Query、80% 拒绝新 Query、90% 取消当前内存占用最大的 Query；这些比例
+只在 schema-version 2 TOML 中配置。结果和服务状态的阻塞 I/O 使用独立有界线程池
+（`service_io_threads = 2`），不会占用计算 lane。Admin socket 默认位于每数据库
+服务状态目录中；自定义路径也必须放在私有本地文件系统。
+
 ## 认证和授权
 
 默认启用认证。首次启动创建 `admin` principal 和随机 Profile Token。
 `principals.json` 只保存 SHA-256 digest；明文 Profile Token 位于独立私有文件且
 不会写入日志。
 
-本地管理身份前必须停止服务：
+离线身份管理仍要求先停止服务：
 
 ```sh
 rustdb principal list --database /srv/rustdb/database --state-root /srv/rustdb/state
@@ -116,12 +132,31 @@ rustdb token revoke --database /srv/rustdb/database \
 只能访问自己的 Query ID，Admin 可以访问全部 Query 和 `/metrics`。最后一个已启用
 Admin 不能被禁用或降级。
 
+Beta 2 还提供安全轮换所需的窄范围在线操作。它们只通过私有 Unix-domain Admin
+socket 执行，绝不暴露在网络 HTTP listener 上：
+
+```sh
+rustdb service status --database /srv/rustdb/database --state-root /srv/rustdb/state
+rustdb service rotate-token --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --principal reporting
+rustdb service revoke-token --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --token-id OLD_TOKEN_ID
+rustdb service reload-tokens --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state
+```
+
+socket 使用严格的本地 JSON Lines 协议，位于 `0700` 状态目录内且自身权限为 `0600`。
+角色与 principal 变更仍使用离线命令。TLS 叶证书会定期检查并热加载，长期本地 CA
+保持不变。
+
 `--no-auth` 只用于开发。它只授予 Query 权限，没有 Admin 身份，因此 `/metrics` 仍会
 返回 forbidden。不要在非回环监听或不可信主机上使用。
 
 ## 健康、指标、日志和审计
 
 - `GET /healthz` 报告进程存活，`GET /readyz` 报告就绪；两者无需认证且只泄露最小状态。
+- `GET /v2/info` 报告协议和能力，`GET /v2/queries` 列出当前身份可见的 Query；Admin
+  可以跨 principal 列表。
 - `GET /metrics` 输出 Prometheus 文本，必须使用 Admin Bearer Token。
 - `--log-format json` 向 stderr 输出结构化事件；用 `RUST_LOG` 过滤。日志只记录 SQL
   fingerprint，不记录 SQL 原文。
@@ -136,9 +171,11 @@ curl --fail --cacert /secure/ca.pem \
   https://analytics.example.com:7400/metrics
 ```
 
-建议对 ready 失败、Query 拒绝/失败、running Query 持续增长、结果盘/数据库盘压力以及
-服务日志中的审计写入错误告警。指标使用低基数进程级 counter/gauge，不包含 principal
-或 Query ID label。Beta 审计日志是运维证据，不是合规级不可变账本。
+建议对 ready 失败、Query 拒绝/失败/中断、running Query 持续增长、结果盘/数据库盘压力
+以及服务日志中的审计写入错误告警。中断 Query 可能只保留已提交 Arrow 前缀，需要完整
+答案时必须重新提交。指标使用低基数进程级 counter/gauge，不包含 principal
+或 Query ID label；RSS 指标会暴露当前压力比例/决策以及累计暂停、拒绝和取消数。
+Beta 审计日志是运维证据，不是合规级不可变账本。
 
 ## Check、诊断、修复和备份
 
@@ -149,6 +186,8 @@ rustdb native check /srv/rustdb/database
 rustdb native check /srv/rustdb/database --json
 rustdb diagnostics --database /srv/rustdb/database \
   --output /secure/rustdb-diagnostics.json
+rustdb service check --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --result-directory /srv/rustdb/results
 ```
 
 `native check` 严格只读。diagnostics 生成版本化、脱敏 JSON：数据库路径会哈希，凭证、
@@ -166,25 +205,43 @@ rustdb native check /srv/rustdb/database
 会在数据库锁下重新验证计划，且绝不会猜测重建缺失用户数据。详见
 [Native 检查与修复](native-repair.md)。
 
+服务状态修复同样先计划，并只处理由 marker 证明归属的内容：
+
+```sh
+rustdb service repair --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --result-directory /srv/rustdb/results --json
+rustdb service repair --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --result-directory /srv/rustdb/results --apply --json
+```
+
+它只能清理受管的不完整 journal tail/临时文件与无效结果产物，不会猜测删除未知目录
+或不属于 RustDB 的文件。
+
 备份应恢复到新的空目录：
 
 ```sh
-rustdb backup /srv/rustdb/database /backup/rustdb-2026-07-19
+rustdb backup /srv/rustdb/database /backup/rustdb-2026-07-19 \
+  --state-root /srv/rustdb/state
+rustdb backup-check /backup/rustdb-2026-07-19
 rustdb --s3-region us-east-1 backup \
-  /srv/rustdb/database s3://backup-bucket/rustdb/2026-07-19
-rustdb restore /backup/rustdb-2026-07-19 /srv/rustdb/restore-check
+  /srv/rustdb/database s3://backup-bucket/rustdb/2026-07-19 \
+  --state-root /srv/rustdb/state
+rustdb restore /backup/rustdb-2026-07-19 /srv/rustdb/restore-check \
+  --state-root /srv/rustdb/restore-state
 rustdb native check /srv/rustdb/restore-check
 ```
 
-只有验证完成后才发布 backup manifest；restore 不会覆盖已有目标。应定期完成一次完整
-恢复和查询 checksum 校验。S3 必须配置 incomplete-multipart 生命周期策略，每份备份
-使用独立空 prefix。
+版本化、自校验 manifest 只有在验证完成后才发布；restore 不会覆盖已有数据库目标或
+该数据库已有的服务状态目标。备份会持有服务状态锁并包含敏感控制材料，必须按凭证级别
+保护。应定期完成一次完整恢复和查询 checksum 校验。S3 必须配置 incomplete-multipart
+生命周期策略，每份备份使用独立空 prefix。
 
 ## 故障处理顺序
 
 1. 停止新流量，保留第一条稳定 error code、request ID、Query ID；不要收集凭证或原始
    Profile 包。
-2. 发送 `SIGTERM` 并等待退出，复制日志和私有审计文件。
+2. 优先执行 `rustdb service shutdown --database ...`，也可发送 `SIGTERM`；等待有界停服
+   完成后复制日志和私有审计文件。
 3. 在不以写模式打开数据库的情况下执行 `native check --json` 和 `diagnostics`。
 4. 把最近备份恢复到新路径，绝不覆盖故障源目录。
 5. 只有理解只读 repair plan 且已有完整备份时才 apply；repair 拒绝的损坏必须升级处理。
@@ -226,10 +283,13 @@ URI、size、ETag 都与 manifest 一致；每条查询还必须发现 manifest 
 ClickBench 目录必须预先放好 SHA-256 固定的 functional 数据文件和规范 `queries.sql`；
 仓库提供实际执行所用的版本化确定性派生查询。门禁同时绑定两份查询的身份，并以
 4 CPU、12 GiB 容器上限、4 GiB Engine 上限、batch 8192、I/O 并发 16 运行一次
-ClickBench。门禁只运行一次 `scripts/ci/orbstack.sh all`、四次外部数据路径和一次
-ClickBench，并把 commit、主机/profile、规范化输入清单、命令、
+ClickBench。门禁只运行一次 `scripts/ci/orbstack.sh all`、TPC-H SF1 本地/MinIO、
+四次外部数据路径、一次 ClickBench 和一次最长 60 分钟的生命周期/故障注入，并把
+commit、主机/profile、规范化输入清单、命令、
 日志、runner build ID、资源摘要和结果写入 `<输出>/evidence.json`。失败或中断也会生成
-failed 证据，且该目录不可复用。不重复运行专用低内存 Spill 压力测试。
+failed 证据，且该目录不可复用。生命周期阶段覆盖有界停服、中断 Arrow 恢复、状态
+check/repair、备份、清理与资源归零，但不是生产 soak。不重复运行专用低内存 Spill
+压力测试。
 
 100 GiB 的 `count(*)` 路径负责发现、快照、元数据、并发和内存记账；functional
 ClickBench 则通过固定的 43 组行数与 typed checksum oracle 验证真实 Parquet 数据页和

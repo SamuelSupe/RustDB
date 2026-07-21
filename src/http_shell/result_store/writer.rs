@@ -12,7 +12,6 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
 
 use crate::{Error, Result};
 
@@ -24,6 +23,7 @@ use super::{
     reader::{chunk_path, schema_matches},
 };
 use crate::http_shell::result_read::ResultAccess;
+use crate::http_shell::service_io::ServiceIoPool;
 
 const MAX_STORED_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_BATCH_BYTES: usize = 256 * 1024 * 1024;
@@ -31,34 +31,13 @@ const MAX_SOURCE_BATCH_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) struct ResultWriter {
     directory: PathBuf,
     schema: SchemaRef,
-    sender: Option<mpsc::Sender<WriteRequest>>,
-    worker: Option<tokio::task::JoinHandle<Result<()>>>,
     lease: Arc<QuotaLease>,
     access: Arc<ResultAccess>,
     rejected: Arc<AtomicBool>,
-    terminal: Arc<Mutex<Option<WriteFailure>>>,
     manifest: Arc<Mutex<Manifest>>,
+    io: ServiceIoPool,
     owns_directory: bool,
-}
-
-struct WriteRequest {
-    batch: RecordBatch,
-    completed: oneshot::Sender<std::result::Result<(), WriteFailure>>,
-}
-
-#[derive(Clone)]
-enum WriteFailure {
-    ResourceExhausted(String),
-    Execution(String),
-}
-
-impl WriteFailure {
-    fn into_error(self) -> Error {
-        match self {
-            Self::ResourceExhausted(message) => Error::ResourceExhausted(message),
-            Self::Execution(message) => Error::Execution(message),
-        }
-    }
+    preserve_on_drop: Option<Arc<AtomicBool>>,
 }
 
 impl ResultWriter {
@@ -68,68 +47,57 @@ impl ResultWriter {
         lease: Arc<QuotaLease>,
         access: Arc<ResultAccess>,
         manifest: Manifest,
+        io: ServiceIoPool,
     ) -> Self {
         let rejected = Arc::new(AtomicBool::new(false));
-        let terminal = Arc::new(Mutex::new(None));
         let manifest = Arc::new(Mutex::new(manifest));
-        let (sender, receiver) = mpsc::channel(1);
-        let worker_directory = directory.clone();
-        let worker_schema = Arc::clone(&schema);
-        let worker_lease = Arc::clone(&lease);
-        let worker_rejected = Arc::clone(&rejected);
-        let worker_terminal = Arc::clone(&terminal);
-        let worker_manifest = Arc::clone(&manifest);
-        let worker = tokio::task::spawn_blocking(move || {
-            write_batches(
-                &worker_directory,
-                worker_schema,
-                receiver,
-                worker_lease,
-                worker_rejected,
-                worker_terminal,
-                worker_manifest,
-            )
-        });
         Self {
             directory,
             schema,
-            sender: Some(sender),
-            worker: Some(worker),
             lease,
             access,
             rejected,
-            terminal,
             manifest,
+            io,
             owns_directory: true,
+            preserve_on_drop: None,
         }
+    }
+
+    pub(crate) fn preserve_on_drop_when(mut self, interrupted: Arc<AtomicBool>) -> Self {
+        self.preserve_on_drop = Some(interrupted);
+        self
     }
 
     pub(crate) async fn write(&self, batch: RecordBatch) -> Result<()> {
-        let (completed, completion) = oneshot::channel();
-        self.sender
-            .as_ref()
-            .ok_or_else(|| Error::Internal("HTTP result writer is closed".into()))?
-            .send(WriteRequest { batch, completed })
+        let directory = self.directory.clone();
+        let schema = Arc::clone(&self.schema);
+        let lease = Arc::clone(&self.lease);
+        let rejected = Arc::clone(&self.rejected);
+        let rejection_state = Arc::clone(&rejected);
+        let manifest = Arc::clone(&self.manifest);
+        self.io
+            .run_async(move || {
+                write_request(&directory, &schema, &batch, &lease, &rejected, &manifest)
+            })
             .await
-            .map_err(|_| self.terminal_error())?;
-        completion
-            .await
-            .map_err(|_| self.terminal_error())?
-            .map_err(WriteFailure::into_error)
+            .map_err(|error| normalize_write_error(error, rejection_state.load(Ordering::Acquire)))
     }
 
     pub(crate) async fn finish(mut self) -> Result<StoredResult> {
-        self.sender.take();
-        if let Err(error) = self.join_worker().await {
-            return self.fail_finish(error);
-        }
         let completed = {
             let mut current = self.manifest.lock();
             current.complete();
             current.clone()
         };
-        if let Err(error) = manifest::persist(&self.directory, &completed) {
-            return self.fail_finish(error);
+        let directory = self.directory.clone();
+        let persisted = completed.clone();
+        if let Err(error) = self
+            .io
+            .run_async(move || manifest::persist(&directory, &persisted))
+            .await
+        {
+            return self.fail_finish(error).await;
         }
         let result = StoredResult::completed(
             self.directory.clone(),
@@ -137,43 +105,70 @@ impl ResultWriter {
             &completed,
             Arc::clone(&self.lease),
             Arc::clone(&self.access),
+            self.io.clone(),
         );
         self.owns_directory = false;
         Ok(result)
     }
 
     pub(crate) async fn abort(mut self) -> Result<()> {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.await;
-        }
-        let result = mark_failed(
-            &self.directory,
-            &self.manifest,
-            &self.lease,
-            "query producer aborted before completion",
-        );
+        let directory = self.directory.clone();
+        let manifest = Arc::clone(&self.manifest);
+        let lease = Arc::clone(&self.lease);
+        let result = self
+            .io
+            .run_async(move || {
+                mark_failed(
+                    &directory,
+                    &manifest,
+                    &lease,
+                    "query producer aborted before completion",
+                )
+            })
+            .await;
         if result.is_ok() {
             self.owns_directory = false;
         }
         result
     }
 
-    async fn join_worker(&mut self) -> Result<()> {
-        self.worker
-            .take()
-            .ok_or_else(|| Error::Internal("HTTP result writer worker is missing".into()))?
+    pub(crate) async fn interrupt(mut self, message: &str) -> Result<StoredResult> {
+        let interrupted = {
+            let mut current = self.manifest.lock();
+            current.interrupt(message);
+            current.clone()
+        };
+        let directory = self.directory.clone();
+        let persisted = interrupted.clone();
+        if let Err(error) = self
+            .io
+            .run_async(move || manifest::persist(&directory, &persisted))
             .await
-            .map_err(|error| Error::Internal(format!("HTTP result writer panicked: {error}")))?
+        {
+            return self.fail_finish(error).await;
+        }
+        let result = StoredResult::completed(
+            self.directory.clone(),
+            Arc::clone(&self.schema),
+            &interrupted,
+            Arc::clone(&self.lease),
+            Arc::clone(&self.access),
+            self.io.clone(),
+        );
+        self.owns_directory = false;
+        Ok(result)
     }
 
-    fn fail_finish<T>(&mut self, error: Error) -> Result<T> {
-        match mark_failed(
-            &self.directory,
-            &self.manifest,
-            &self.lease,
-            &format!("result producer failed: {error}"),
-        ) {
+    async fn fail_finish<T>(&mut self, error: Error) -> Result<T> {
+        let directory = self.directory.clone();
+        let manifest = Arc::clone(&self.manifest);
+        let lease = Arc::clone(&self.lease);
+        let message = format!("result producer failed: {error}");
+        match self
+            .io
+            .run_async(move || mark_failed(&directory, &manifest, &lease, &message))
+            .await
+        {
             Ok(()) => {
                 self.owns_directory = false;
                 Err(error)
@@ -183,77 +178,36 @@ impl ResultWriter {
             ))),
         }
     }
-
-    fn terminal_error(&self) -> Error {
-        self.terminal
-            .lock()
-            .clone()
-            .map(WriteFailure::into_error)
-            .unwrap_or_else(|| Error::Internal("HTTP result writer stopped unexpectedly".into()))
-    }
 }
 
 impl Drop for ResultWriter {
     fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            match futures::executor::block_on(worker) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::error!(
-                    %error,
-                    path = %self.directory.display(),
-                    "HTTP result writer failed"
-                ),
-                Err(error) => tracing::error!(
-                    %error,
-                    path = %self.directory.display(),
-                    "HTTP result writer panicked"
-                ),
+        if self.owns_directory {
+            // A dropped async task must never block a runtime worker on the
+            // service I/O pool. Keep quota accounting conservative until the
+            // shutdown sealing, detached cleanup, or restart recovery sees
+            // the files.
+            self.lease.retain_on_drop();
+            let preserve = self
+                .preserve_on_drop
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire));
+            if !preserve {
+                let directory = self.directory.clone();
+                let manifest = Arc::clone(&self.manifest);
+                let lease = Arc::clone(&self.lease);
+                let operation = move || {
+                    mark_failed(&directory, &manifest, &lease, "result writer was abandoned")
+                };
+                if let Err(error) = self.io.run_detached(operation) {
+                    tracing::error!(%error, path = %self.directory.display(), "failed to schedule abandoned HTTP result cleanup");
+                }
             }
-        }
-        if self.owns_directory
-            && let Err(error) = mark_failed(
-                &self.directory,
-                &self.manifest,
-                &self.lease,
-                "result writer was abandoned",
-            )
-        {
-            tracing::error!(%error, path = %self.directory.display(), "failed to persist abandoned HTTP result");
         }
         if self.rejected.load(Ordering::Acquire) {
             tracing::warn!(path = %self.directory.display(), "HTTP result quota rejected a write");
         }
     }
-}
-
-fn write_batches(
-    directory: &Path,
-    schema: SchemaRef,
-    mut receiver: mpsc::Receiver<WriteRequest>,
-    lease: Arc<QuotaLease>,
-    rejected: Arc<AtomicBool>,
-    terminal: Arc<Mutex<Option<WriteFailure>>>,
-    manifest: Arc<Mutex<Manifest>>,
-) -> Result<()> {
-    while let Some(request) = receiver.blocking_recv() {
-        let outcome = write_request(
-            directory,
-            &schema,
-            &request.batch,
-            &lease,
-            &rejected,
-            &manifest,
-        );
-        if let Err(error) = outcome {
-            let failure = write_failure(&error, rejected.load(Ordering::Acquire));
-            *terminal.lock() = Some(failure.clone());
-            let _ = request.completed.send(Err(failure));
-            return Err(error);
-        }
-        let _ = request.completed.send(Ok(()));
-    }
-    Ok(())
 }
 
 fn write_request(
@@ -414,18 +368,15 @@ fn mark_failed(
     manifest::persist(directory, &failed)
 }
 
-fn write_failure(error: &Error, exhausted: bool) -> WriteFailure {
-    if exhausted
-        || matches!(
-            error,
-            Error::ResourceExhausted(_) | Error::NativeDiskQuotaExceeded { .. }
-        )
-        || matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::StorageFull)
+fn normalize_write_error(error: Error, quota_rejected: bool) -> Error {
+    if quota_rejected
+        || matches!(&error, Error::NativeDiskQuotaExceeded { .. })
+        || matches!(&error, Error::Io { source, .. } if source.kind() == io::ErrorKind::StorageFull)
     {
-        WriteFailure::ResourceExhausted(
+        Error::ResourceExhausted(
             "HTTP query result exceeded its disk quota or free-space reserve".into(),
         )
     } else {
-        WriteFailure::Execution(format!("failed to persist HTTP query result: {error}"))
+        error
     }
 }

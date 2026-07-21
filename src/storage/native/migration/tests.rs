@@ -30,8 +30,8 @@ fn migrate_is_a_no_op_for_the_current_beta_format() {
 }
 
 #[test]
-fn alpha_formats_are_rejected_without_modifying_contents_or_permissions() {
-    for version in [1, 2] {
+fn legacy_formats_are_rejected_without_modifying_contents_or_permissions() {
+    for version in [1, 2, 3] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(format!("database-v{version}"));
         drop(NativeDatabase::open(&path).unwrap());
@@ -41,11 +41,28 @@ fn alpha_formats_are_rejected_without_modifying_contents_or_permissions() {
         let before = snapshot(&path);
 
         assert_unsupported(NativeDatabase::open(&path).unwrap_err(), version, true);
-        assert_eq!(snapshot(&path), before, "open changed alpha v{version}");
+        assert_eq!(snapshot(&path), before, "open changed legacy v{version}");
 
         assert_unsupported(crate::Engine::migrate(&path).unwrap_err(), version, true);
-        assert_eq!(snapshot(&path), before, "migrate changed alpha v{version}");
+        assert_eq!(snapshot(&path), before, "migrate changed legacy v{version}");
     }
+}
+
+#[test]
+fn legacy_interrupted_initialization_is_rejected_without_modification() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("initializing-v3");
+    fs::create_dir(&path).unwrap();
+    let marker_path = path.join(super::super::INIT_FILE);
+    super::super::marker::write_new(&marker_path, &super::super::marker::DatabaseMarker::new())
+        .unwrap();
+    rewrite_marker_file_version(&marker_path, 3, false);
+    add_recovery_candidate(&path);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let before = snapshot(&path);
+
+    assert_unsupported(NativeDatabase::open(&path).unwrap_err(), 3, true);
+    assert_eq!(snapshot(&path), before);
 }
 
 #[test]
@@ -63,25 +80,28 @@ fn future_format_with_unknown_fields_is_rejected_without_modification() {
     assert_eq!(snapshot(&path), before);
 }
 
-fn assert_unsupported(error: Error, found_version: u32, alpha: bool) {
+fn assert_unsupported(error: Error, found_version: u32, legacy: bool) {
     assert!(
         matches!(
             error,
             Error::NativeFormatUnsupported {
                 found_version: found,
                 current_version: format::CURRENT_DATABASE_VERSION,
-                alpha: actual_alpha,
+                legacy: actual_legacy,
                 ..
-            } if found == found_version && actual_alpha == alpha
+            } if found == found_version && actual_legacy == legacy
         ),
         "unexpected format error: {error}"
     );
 }
 
 fn rewrite_marker_version(path: &Path, version: u32, future_field: bool) {
-    let marker_path = path.join(super::super::MARKER_FILE);
+    rewrite_marker_file_version(&path.join(super::super::MARKER_FILE), version, future_field);
+}
+
+fn rewrite_marker_file_version(marker_path: &Path, version: u32, future_field: bool) {
     let mut value: serde_json::Value =
-        serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(marker_path).unwrap()).unwrap();
     value["version"] = serde_json::Value::from(version);
     if future_field {
         value["future_field"] = serde_json::Value::Bool(true);

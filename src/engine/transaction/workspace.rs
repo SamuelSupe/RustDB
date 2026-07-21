@@ -18,6 +18,10 @@ use crate::{
 use parking_lot::Mutex;
 use uuid::Uuid;
 
+#[path = "workspace/savepoint.rs"]
+mod savepoint;
+pub(in crate::engine) use savepoint::StatementSavepoint;
+
 pub(in crate::engine) struct TransactionWorkspace {
     transaction_id: Uuid,
     snapshot_generation: u64,
@@ -25,6 +29,7 @@ pub(in crate::engine) struct TransactionWorkspace {
     base_tables: BTreeMap<String, Arc<NativeTableSnapshot>>,
     base_views: BTreeMap<String, Arc<crate::storage::NativeView>>,
     mutation_active: AtomicBool,
+    statement_active: AtomicBool,
     state: Mutex<State>,
 }
 
@@ -61,6 +66,7 @@ impl TransactionWorkspace {
             base_tables: tables.clone(),
             base_views: views.clone(),
             mutation_active: AtomicBool::new(false),
+            statement_active: AtomicBool::new(false),
             state: Mutex::new(State {
                 expected_schemas: BTreeMap::new(),
                 working_schemas: schemas,

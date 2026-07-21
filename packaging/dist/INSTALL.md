@@ -8,9 +8,9 @@ The adjacent `.sha256` file authenticates accidental corruption when obtained
 through a trusted channel:
 
 ```sh
-sha256sum -c rustdb-v1.0.0-beta.1-linux-aarch64.tar.gz.sha256
+sha256sum -c rustdb-v1.0.0-beta.2-linux-aarch64.tar.gz.sha256
 # macOS:
-shasum -a 256 -c rustdb-v1.0.0-beta.1-macos-aarch64.tar.gz.sha256
+shasum -a 256 -c rustdb-v1.0.0-beta.2-macos-aarch64.tar.gz.sha256
 ```
 
 After extraction, `SHA256SUMS` covers every installable payload.
@@ -18,8 +18,8 @@ After extraction, `SHA256SUMS` covers every installable payload.
 ## Install
 
 ```sh
-tar -xzf rustdb-v1.0.0-beta.1-linux-aarch64.tar.gz
-cd rustdb-v1.0.0-beta.1-linux-aarch64
+tar -xzf rustdb-v1.0.0-beta.2-linux-aarch64.tar.gz
+cd rustdb-v1.0.0-beta.2-linux-aarch64
 ./install.sh
 ```
 
@@ -42,10 +42,18 @@ DESTDIR=/tmp/package-root ./install.sh --prefix /usr
 
 Extract the new archive, verify it, and run its `install.sh` with the same
 prefix. The known RustDB files are replaced; databases and query data are not
-touched.
+touched. The installer also removes the obsolete Beta 1 `openapi-v1.yaml`
+contract from that prefix.
 
-Imported HTTP Shell Profiles and server TLS/Token state live in the operating
-system user state directory and are not removed or replaced by `install.sh`.
+Beta 2 is not an in-place data/config migration. It opens only Native marker
+epoch `4` and accepts only service configuration `schema_version = 2`. Before
+replacing an older binary, retain the original source CSV/Parquet (or export it
+with that binary), then create a fresh Beta 2 database and configuration. The
+`migrate` command validates the current epoch; it does not convert old data.
+
+Imported HTTP Shell Profiles and server TLS/Token/Admin-socket state live in the
+operating-system user state directory and are not removed or replaced by
+`install.sh`.
 
 ## Uninstall
 
@@ -61,9 +69,11 @@ An installed copy is also available at
 and documentation files. It never removes database, input, Spill, or user
 configuration directories.
 
-The installed documentation also includes bilingual HTTP Shell, operator, and
-diagnostics guides, Native import/repair and compatibility references, release
-notes, and the public `openapi-v1.yaml` contract.
+The installed tree under `PREFIX/share/doc/rustdb` preserves the archive's
+relative links. It includes bilingual HTTP Shell, operator, and diagnostics
+guides, Native import/repair and compatibility references, the validated
+`packaging/config/rustdb.example.toml`, release notes, and the public
+`docs/openapi-v2.yaml` contract.
 
 ## Platforms
 

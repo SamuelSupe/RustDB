@@ -16,6 +16,8 @@ mod remote;
 mod repl;
 #[path = "rustdb/server_config.rs"]
 mod server_config;
+#[path = "rustdb/service_admin.rs"]
+mod service_admin;
 #[path = "rustdb/sql_input.rs"]
 mod sql_input;
 
@@ -165,9 +167,6 @@ async fn run_operation(operation: &Operation, global: &Args, config: EngineConfi
                     migration.from_version(),
                     migration.to_version()
                 );
-                if let Some(backup) = migration.backup_path() {
-                    println!("v0.7 backup: {}", backup.display());
-                }
             } else {
                 println!(
                     "Native database is already at format {}",
@@ -293,14 +292,46 @@ async fn run_operation(operation: &Operation, global: &Args, config: EngineConfi
         Operation::Backup {
             database,
             destination,
+            state_root,
         } => {
+            let state_root = state_root
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(rustdb::http_shell::security::default_state_root)?;
             Engine::open(database, config)?
-                .backup_to_location(destination)
+                .backup_service_to_location(state_root, destination)
                 .await?;
             println!("backup published: {destination}");
         }
-        Operation::Restore { backup, database } => {
-            Engine::restore_from_location(backup, database, config).await?;
+        Operation::BackupCheck { backup, json } => {
+            let report = Engine::check_service_backup_location(backup, config).await?;
+            if *json {
+                print_json(&report, "service backup check report")?;
+            } else {
+                println!(
+                    "service backup {}: OK (database_id={} files={} bytes={} http_state={})",
+                    report.location(),
+                    report.database_id(),
+                    report.files(),
+                    report.bytes(),
+                    if report.service_state_included() {
+                        "included"
+                    } else {
+                        "absent"
+                    }
+                );
+            }
+        }
+        Operation::Restore {
+            backup,
+            database,
+            state_root,
+        } => {
+            let state_root = state_root
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(rustdb::http_shell::security::default_state_root)?;
+            Engine::restore_service_from_location(backup, database, state_root, config).await?;
             println!("database restored: {}", database.display());
         }
         Operation::Diagnostics { database, output } => {
@@ -313,6 +344,7 @@ async fn run_operation(operation: &Operation, global: &Args, config: EngineConfi
             }
         },
         Operation::Serve(args) => return admin::serve_database(args.as_ref(), global).await,
+        Operation::Service { command } => return service_admin::run(command).await,
         Operation::Shell(args) => return remote::run(args).await,
         Operation::Profile { command } => return admin::profile(command),
         Operation::Principal { command } => return admin::principal(command),

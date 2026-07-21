@@ -7,9 +7,9 @@
 从可信渠道获取文件后，可用相邻的 `.sha256` 检查意外损坏：
 
 ```sh
-sha256sum -c rustdb-v1.0.0-beta.1-linux-aarch64.tar.gz.sha256
+sha256sum -c rustdb-v1.0.0-beta.2-linux-aarch64.tar.gz.sha256
 # macOS：
-shasum -a 256 -c rustdb-v1.0.0-beta.1-macos-aarch64.tar.gz.sha256
+shasum -a 256 -c rustdb-v1.0.0-beta.2-macos-aarch64.tar.gz.sha256
 ```
 
 解压后的 `SHA256SUMS` 覆盖所有可安装文件。
@@ -17,8 +17,8 @@ shasum -a 256 -c rustdb-v1.0.0-beta.1-macos-aarch64.tar.gz.sha256
 ## 安装
 
 ```sh
-tar -xzf rustdb-v1.0.0-beta.1-linux-aarch64.tar.gz
-cd rustdb-v1.0.0-beta.1-linux-aarch64
+tar -xzf rustdb-v1.0.0-beta.2-linux-aarch64.tar.gz
+cd rustdb-v1.0.0-beta.2-linux-aarch64
 ./install.sh
 ```
 
@@ -39,10 +39,16 @@ DESTDIR=/tmp/package-root ./install.sh --prefix /usr
 ## 升级
 
 解压并校验新版本，然后使用相同 prefix 运行新包中的 `install.sh`。脚本只替换已知
-RustDB 文件，不会修改数据库或查询数据。
+RustDB 文件，不会修改数据库或查询数据；同时会清理该 prefix 中 Beta 1 遗留的
+`openapi-v1.yaml` 契约。
 
-HTTP Shell Profile 与服务端 TLS/Token 状态位于操作系统用户级状态目录，
-`install.sh` 不会删除或替换它们。
+Beta 2 不提供原地数据或配置迁移：它只打开 Native marker epoch `4`，并且只接受
+`schema_version = 2` 的服务配置。替换旧二进制前，请保留原始 CSV/Parquet（或使用
+旧二进制导出），再新建 Beta 2 数据库和配置。`migrate` 只验证当前 epoch，不转换
+旧数据。
+
+HTTP Shell Profile 与服务端 TLS/Token/Admin-socket 状态位于操作系统用户级状态
+目录，`install.sh` 不会删除或替换它们。
 
 ## 卸载
 
@@ -56,8 +62,10 @@ HTTP Shell Profile 与服务端 TLS/Token 状态位于操作系统用户级状�
 安装后也可运行 `PREFIX/share/rustdb/uninstall.sh`。卸载只删除已知 CLI 和文档文件，
 不会删除数据库、输入数据、Spill 或用户配置目录。
 
-安装后的文档还包含中英文 HTTP Shell、运维和诊断指南，Native 导入/修复与兼容参考、
-发行说明，以及公开的 `openapi-v1.yaml` 协议。
+`PREFIX/share/doc/rustdb` 中的安装树会保留发行包的相对链接，并包含中英文 HTTP
+Shell、运维和诊断指南，Native 导入/修复与兼容参考、已校验的
+`packaging/config/rustdb.example.toml`、发行说明，以及公开的
+`docs/openapi-v2.yaml` 协议。
 
 ## 平台
 

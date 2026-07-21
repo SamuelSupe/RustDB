@@ -1,25 +1,23 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Instant,
-};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use axum::http::StatusCode;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Engine, Error, HttpReadOnlyPolicy, QueryMetricsSnapshot, Result};
+use crate::{Engine, Error, HttpReadOnlyPolicy, QueryMetricsSnapshot, Result, RssGuardDecision};
 
 use super::{
     error::HttpError,
     metrics::HttpMetrics,
     result_store::{ResultSnapshot, ResultStore, ResultStoreConfig, StoredResult},
+    rss_guard::RssPressure,
     security::{AuditLog, AuthenticatedActor},
-    types::{HttpQueryMetrics, QueryRequest, QueryState, QueryStatusResponse, SubmitResponse},
+    service_io::ServiceIoPool,
+    types::{
+        HttpQueryMetrics, QueryListRequest, QueryListResponse, QueryRequest, QueryState,
+        QueryStatusResponse, SubmitResponse,
+    },
 };
 
 pub(super) mod admission;
@@ -29,23 +27,42 @@ mod execution;
 mod expiration;
 mod journal;
 mod lifecycle;
+mod list;
 mod observer;
+mod pressure;
 mod record;
 mod recovery;
 mod request;
+mod shutdown;
+mod task_registry;
 
 pub use config::QueryManagerConfig;
 
 use admission::{AdmissionController, AdmissionError, AdmissionPrincipal, AdmissionWaiter};
 use journal::{DeleteReason, QueryJournal, QueryJournalConfig, scoped_idempotency_digest};
+#[cfg(test)]
+use lifecycle::cancel_and_persist;
 use lifecycle::{
-    cancel_and_persist, delete_terminal_record, fail_record, log_terminal, persist_or_log,
-    persist_terminal,
+    cancel_and_persist_async, delete_terminal_record, fail_record, log_terminal,
+    persist_or_log_async, persist_terminal_async,
 };
 use observer::QueryObserver;
 use record::QueryRecord;
 use recovery::recover_records;
 use request::{now_ms, request_hash, submit_response, terminal_error, validate_idempotency_key};
+use task_registry::TaskRegistry;
+
+pub(super) fn check_journal_state(root: &std::path::Path) -> Result<usize> {
+    journal::check_state(root)
+}
+
+pub(super) fn repair_journal_state(root: &std::path::Path) -> Result<usize> {
+    journal::repair_state(root)
+}
+
+pub(super) fn lock_journal_state(root: &std::path::Path) -> Result<std::fs::File> {
+    journal::lock_state(root)
+}
 
 #[derive(Clone)]
 pub(crate) struct QueryManager {
@@ -62,9 +79,10 @@ struct ManagerInner {
     journal: Arc<QueryJournal>,
     admission: AdmissionController,
     observer: Option<QueryObserver>,
+    rss_pressure: Arc<RssPressure>,
+    service_io: ServiceIoPool,
     config: QueryManagerConfig,
-    active_tasks: AtomicUsize,
-    tasks_idle: Notify,
+    tasks: Arc<TaskRegistry>,
     accepting: Mutex<bool>,
 }
 
@@ -78,27 +96,6 @@ struct Job {
 struct IdempotencyRecord {
     request_hash: String,
     query_id: String,
-}
-
-struct ActiveTask {
-    inner: Arc<ManagerInner>,
-}
-
-impl ActiveTask {
-    fn start(inner: &Arc<ManagerInner>) -> Self {
-        inner.active_tasks.fetch_add(1, Ordering::AcqRel);
-        Self {
-            inner: Arc::clone(inner),
-        }
-    }
-}
-
-impl Drop for ActiveTask {
-    fn drop(&mut self) {
-        if self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.inner.tasks_idle.notify_waiters();
-        }
-    }
 }
 
 impl QueryManager {
@@ -144,8 +141,15 @@ impl QueryManager {
                     .saturating_mul(u64::try_from(config.max_running).unwrap_or(u64::MAX))
             }));
         let journal_directory = result_config.directory.join("query-journal");
-        let store = Arc::new(ResultStore::open(result_config)?);
-        let journal = QueryJournal::open(QueryJournalConfig::new(journal_directory))?;
+        let service_io = ServiceIoPool::new(result_config.service_io_threads)?;
+        let store = Arc::new(ResultStore::open_with_io(
+            result_config,
+            service_io.clone(),
+        )?);
+        let journal = QueryJournal::open_with_io(
+            QueryJournalConfig::new(journal_directory),
+            service_io.clone(),
+        )?;
         let (records, idempotency) = recover_records(&store, &journal);
         if let Some(observer) = &observer {
             observer.recovered(records.len());
@@ -161,9 +165,10 @@ impl QueryManager {
             journal,
             admission,
             observer,
+            rss_pressure: Arc::new(RssPressure::default()),
+            service_io,
             config: config.clone(),
-            active_tasks: AtomicUsize::new(0),
-            tasks_idle: Notify::new(),
+            tasks: TaskRegistry::new(),
             accepting: Mutex::new(true),
         });
         dispatch::spawn(Arc::clone(&inner), engine, receiver);
@@ -172,6 +177,10 @@ impl QueryManager {
             inner,
             owner: Arc::new(()),
         })
+    }
+
+    pub(super) fn service_io(&self) -> ServiceIoPool {
+        self.inner.service_io.clone()
     }
 
     pub(crate) fn submit(
@@ -232,6 +241,17 @@ impl QueryManager {
                 request_id.to_owned(),
             )
             .retry_after(1));
+        }
+        let pressure = self.inner.rss_pressure.decision();
+        if pressure != RssGuardDecision::Normal {
+            if let Some(observer) = &self.inner.observer {
+                observer.rss_submission_blocked(pressure);
+            }
+            return Err(rss_pressure_http_error(
+                pressure,
+                self.inner.rss_pressure.retry_after_secs(),
+                request_id,
+            ));
         }
         let permit = self.inner.sender.try_reserve().map_err(|_| {
             HttpError::new(
@@ -294,7 +314,22 @@ impl QueryManager {
         request_id: &str,
     ) -> std::result::Result<QueryStatusResponse, HttpError> {
         let record = self.record(actor, query_id, request_id)?;
-        Ok(record.status())
+        Ok(record.status_with_ttl(self.inner.store.ttl()))
+    }
+
+    pub(crate) fn list(
+        &self,
+        actor: &AuthenticatedActor,
+        request: QueryListRequest,
+        request_id: &str,
+    ) -> std::result::Result<QueryListResponse, HttpError> {
+        list::execute(
+            &self.inner.records.read(),
+            actor,
+            request,
+            self.inner.store.ttl(),
+            request_id,
+        )
     }
 
     pub(crate) fn completed_result(
@@ -322,13 +357,15 @@ impl QueryManager {
                 request_id.to_owned(),
             )
             .query(query_id)),
-            QueryState::Failed | QueryState::Cancelled => Err(HttpError::new(
-                StatusCode::CONFLICT,
-                "query.no_result",
-                "the query did not produce a result",
-                request_id.to_owned(),
-            )
-            .query(query_id)),
+            QueryState::Failed | QueryState::Cancelled | QueryState::Interrupted => {
+                Err(HttpError::new(
+                    StatusCode::CONFLICT,
+                    "query.no_result",
+                    "the query did not produce a complete result",
+                    request_id.to_owned(),
+                )
+                .query(query_id))
+            }
         }
     }
 
@@ -369,17 +406,19 @@ impl QueryManager {
         Ok(snapshot)
     }
 
-    pub(crate) fn cancel(
+    pub(crate) async fn cancel(
         &self,
         actor: &AuthenticatedActor,
         query_id: &str,
         request_id: &str,
     ) -> std::result::Result<QueryStatusResponse, HttpError> {
         let record = self.record(actor, query_id, request_id)?;
-        cancel_and_persist(&record, &self.inner.journal).map_err(|error| {
-            HttpError::from_engine(&error, request_id.to_owned()).query(query_id)
-        })?;
-        Ok(record.status())
+        cancel_and_persist_async(&record, &self.inner.journal)
+            .await
+            .map_err(|error| {
+                HttpError::from_engine(&error, request_id.to_owned()).query(query_id)
+            })?;
+        Ok(record.status_with_ttl(self.inner.store.ttl()))
     }
 
     pub(crate) fn delete(
@@ -410,42 +449,21 @@ impl QueryManager {
             .map_err(|error| HttpError::from_engine(&error, request_id.to_owned()).query(query_id))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.shutdown_with_deadline(std::time::Duration::from_secs(30))
+            .await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn shutdown_with_deadline(&self, grace: std::time::Duration) -> Result<()> {
+        self.shutdown_until(tokio::time::Instant::now() + grace)
+            .await
+    }
+
+    pub(crate) async fn shutdown_until(&self, deadline: tokio::time::Instant) -> Result<()> {
         self.begin_shutdown();
-        let records = self
-            .inner
-            .records
-            .read()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut failures = Vec::new();
-        for record in &records {
-            if !matches!(
-                record.state.read().phase,
-                QueryState::Queued | QueryState::Running
-            ) {
-                continue;
-            }
-            if let Err(error) = cancel_and_persist(record, &self.inner.journal) {
-                failures.push(format!("{}: {error}", record.id));
-            }
-        }
-        loop {
-            let idle = self.inner.tasks_idle.notified();
-            if self.inner.active_tasks.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            idle.await;
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::Execution(format!(
-                "failed to persist cancelled HTTP queries during shutdown: {}",
-                failures.join("; ")
-            )))
-        }
+        shutdown::execute(&self.inner, deadline).await
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -457,6 +475,29 @@ impl QueryManager {
         let mut snapshot = self.inner.admission.snapshot();
         snapshot.principals.clear();
         snapshot
+    }
+
+    pub(super) fn admin_counts(&self) -> (usize, usize, usize) {
+        let records = self.inner.records.read();
+        let mut queued = 0;
+        let mut running = 0;
+        let mut terminal = 0;
+        for record in records.values() {
+            match record.state.read().phase {
+                QueryState::Queued => queued += 1,
+                QueryState::Running => running += 1,
+                _ => terminal += 1,
+            }
+        }
+        (queued, running, terminal)
+    }
+
+    pub(super) fn rss_pressure(&self) -> Arc<RssPressure> {
+        Arc::clone(&self.inner.rss_pressure)
+    }
+
+    pub(super) fn cancel_largest_for_rss_pressure(&self) -> Option<String> {
+        pressure::cancel_largest(&self.inner.records.read())
     }
 
     fn record(
@@ -521,6 +562,27 @@ fn admission_http_error(error: AdmissionError, request_id: &str) -> HttpError {
         )
         .retry_after(1),
     }
+}
+
+fn rss_pressure_http_error(
+    decision: RssGuardDecision,
+    retry_after_secs: u64,
+    request_id: &str,
+) -> HttpError {
+    let (status, code, message) = match decision {
+        RssGuardDecision::Throttle => (
+            StatusCode::TOO_MANY_REQUESTS,
+            crate::ErrorCode::AdmissionRssThrottled.as_str(),
+            "new queries are throttled while process memory is under warning pressure",
+        ),
+        RssGuardDecision::Reject | RssGuardDecision::CancelLargest => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::ErrorCode::AdmissionRssRejected.as_str(),
+            "new queries are rejected while process memory is under high pressure",
+        ),
+        RssGuardDecision::Normal => unreachable!("normal pressure does not reject admission"),
+    };
+    HttpError::new(status, code, message, request_id.to_owned()).retry_after(retry_after_secs)
 }
 
 fn fail_admission(record: &QueryRecord, error: AdmissionError) {

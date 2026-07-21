@@ -10,18 +10,23 @@ use crate::{Error, Result};
 
 use super::{
     AccessRegistry, RecoveredResult, StoredResult, access_for,
-    layout::{owned_query_directories, remove_owned_query, secure_directory, sync_directory},
-    manifest::{self, MANIFEST_FILE, ManifestState, PRODUCER_VERSION},
+    layout::{
+        owned_query_directories, remove_owned_query, secure_directory, sync_directory,
+        validate_root, validate_secure_directory,
+    },
+    manifest::{self, MANIFEST_FILE, ManifestState},
     quota::{QuotaLease, QuotaPool},
     reader::{self, chunk_path},
     writer::clear_batch_files,
 };
+use crate::http_shell::service_io::ServiceIoPool;
 
 pub(super) fn recover(
     root: &Path,
     ttl: Duration,
     quota: &Arc<QuotaPool>,
     accesses: &AccessRegistry,
+    io: &ServiceIoPool,
 ) -> Result<Vec<RecoveredResult>> {
     let now = SystemTime::now();
     let mut recovered = Vec::new();
@@ -50,34 +55,9 @@ pub(super) fn recover(
             continue;
         }
         secure_directory(&directory.join("batches"))?;
-        if value.producer_version != PRODUCER_VERSION {
-            clear_batch_files(&directory, None)?;
-            if value.state != ManifestState::Invalidated {
-                value.invalidate(format!(
-                    "result producer {} differs from server {}",
-                    value.producer_version, PRODUCER_VERSION
-                ));
-                manifest::persist(&directory, &value)?;
-            }
-            recovered.push(RecoveredResult::terminal(
-                query_id,
-                ManifestState::Invalidated,
-                value.error.clone(),
-                access_for(accesses, &value.query_id),
-            ));
-            continue;
-        }
         if value.state == ManifestState::Running {
-            clear_batch_files(&directory, None)?;
-            value.fail("server_restarted");
+            value.interrupt("server_restarted");
             manifest::persist(&directory, &value)?;
-            recovered.push(RecoveredResult::terminal(
-                query_id,
-                ManifestState::Failed,
-                value.error.clone(),
-                access_for(accesses, &value.query_id),
-            ));
-            continue;
         }
         if let Err(error) = clean_and_validate_chunks(&directory, &value.batches) {
             tracing::warn!(%error, query_id, "invalidating corrupt HTTP result chunks");
@@ -86,14 +66,13 @@ pub(super) fn recover(
             manifest::persist(&directory, &value)?;
             recovered.push(RecoveredResult::terminal(
                 query_id,
-                ManifestState::Failed,
-                value.error.clone(),
+                &value,
                 access_for(accesses, &value.query_id),
             ));
             continue;
         }
         match value.state {
-            ManifestState::Completed => {
+            ManifestState::Completed | ManifestState::Interrupted => {
                 let access = access_for(accesses, &query_id);
                 let lease = Arc::new(QuotaLease::new(Arc::clone(quota)));
                 lease.reserve_existing(value.bytes).map_err(|error| {
@@ -108,22 +87,110 @@ pub(super) fn recover(
                     &value,
                     lease,
                     Arc::clone(&access),
+                    io.clone(),
                 ));
-                recovered.push(RecoveredResult::completed(query_id, result, access));
+                if value.state == ManifestState::Interrupted {
+                    recovered.push(RecoveredResult::interrupted(
+                        query_id,
+                        result,
+                        value.error.clone(),
+                        access,
+                    ));
+                } else {
+                    recovered.push(RecoveredResult::completed(query_id, result, access));
+                }
             }
             ManifestState::Failed | ManifestState::Invalidated => {
                 let access = access_for(accesses, &query_id);
-                recovered.push(RecoveredResult::terminal(
-                    query_id,
-                    value.state,
-                    value.error.clone(),
-                    access,
-                ));
+                recovered.push(RecoveredResult::terminal(query_id, &value, access));
             }
-            ManifestState::Running => unreachable!("running state handled above"),
+            ManifestState::Running => unreachable!("running state normalized above"),
         }
     }
     Ok(recovered)
+}
+
+pub(super) fn check(root: &Path) -> Result<usize> {
+    validate_root(root)?;
+    let mut checked = 0;
+    for directory in owned_query_directories(root)? {
+        validate_result_directory(&directory)?;
+        checked += 1;
+    }
+    Ok(checked)
+}
+
+pub(super) fn repair(root: &Path) -> Result<usize> {
+    validate_root(root)?;
+    let mut repaired = 0;
+    for directory in owned_query_directories(root)? {
+        if validate_result_directory(&directory).is_ok() {
+            continue;
+        }
+        let Some(query_id) = query_id(&directory) else {
+            remove_owned_query(&directory)?;
+            repaired += 1;
+            continue;
+        };
+        let manifest_path = directory.join(MANIFEST_FILE);
+        let mut value = match manifest::load(&manifest_path)
+            .and_then(|value| value.validate(&query_id).map(|_| value))
+        {
+            Ok(value) => value,
+            Err(_) => {
+                remove_owned_query(&directory)?;
+                repaired += 1;
+                continue;
+            }
+        };
+        clean_temporary_files(&directory)?;
+        secure_directory(&directory.join("batches"))?;
+        if let Err(error) = clean_and_validate_chunks(&directory, &value.batches) {
+            clear_batch_files(&directory, None)?;
+            value.fail(format!("result_corrupt: {error}"));
+            manifest::persist(&directory, &value)?;
+        }
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
+fn validate_result_directory(directory: &Path) -> Result<()> {
+    let query_id = query_id(directory).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "owned HTTP result directory has an invalid query id: {}",
+            directory.display()
+        ))
+    })?;
+    let value = manifest::load(&directory.join(MANIFEST_FILE))?;
+    value.validate(&query_id)?;
+    let batches = directory.join("batches");
+    validate_secure_directory(&batches)?;
+    let expected = value
+        .batches
+        .iter()
+        .map(|entry| chunk_path(directory, entry.seq))
+        .collect::<HashSet<_>>();
+    for entry in fs::read_dir(&batches).map_err(|error| Error::io(Some(batches.clone()), error))? {
+        let entry = entry.map_err(|error| Error::io(Some(batches.clone()), error))?;
+        let path = entry.path();
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|error| Error::io(Some(path.clone()), error))?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || !expected.contains(&path)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "unexpected HTTP result batch path: {}",
+                path.display()
+            )));
+        }
+    }
+    for entry in &value.batches {
+        let _ = reader::read_chunk_bytes(directory, entry)?;
+    }
+    Ok(())
 }
 
 fn clean_temporary_files(directory: &Path) -> Result<()> {

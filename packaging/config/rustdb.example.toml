@@ -1,5 +1,5 @@
 # RustDB service configuration schema. This field is required.
-schema_version = 1
+schema_version = 2
 
 [server]
 listen = "127.0.0.1:7400"
@@ -20,6 +20,14 @@ principal_memory_limit = "2GiB"
 principal_spill_limit = "16GiB"
 principal_result_limit = "8GiB"
 principal_weight = 1
+rss_warning_ratio = 0.70
+rss_high_ratio = 0.80
+rss_critical_ratio = 0.90
+rss_sample_interval_ms = 1000
+service_io_threads = 2
+# Defaults to <state-root>/<database-id>/admin.sock.
+# admin_socket = "/run/rustdb/admin.sock"
+tls_renew_interval_secs = 21600
 no_auth = false
 
 [engine]

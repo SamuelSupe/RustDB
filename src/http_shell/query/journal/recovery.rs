@@ -16,7 +16,17 @@ pub(super) struct Recovered {
     pub(super) normalized: Vec<PersistedQuery>,
 }
 
-pub(super) fn load(root: &Path, producer_version: &str) -> Result<Recovered> {
+pub(super) fn load(root: &Path, _producer_version: &str) -> Result<Recovered> {
+    load_from_records(root, disk::read_journal(root)?)
+}
+
+pub(super) fn check(root: &Path) -> Result<usize> {
+    disk::check_root(root)?;
+    let recovered = load_from_records(root, disk::read_journal_strict(root)?)?;
+    Ok(recovered.queries.len())
+}
+
+fn load_from_records(root: &Path, records: Vec<Vec<u8>>) -> Result<Recovered> {
     let snapshot = disk::read_snapshot(root)?
         .map(|bytes| codec::decode_snapshot(&bytes))
         .transpose()?;
@@ -36,7 +46,6 @@ pub(super) fn load(root: &Path, producer_version: &str) -> Result<Recovered> {
         }
     }
 
-    let records = disk::read_journal(root)?;
     let mut physical_previous: Option<u64> = None;
     let mut last_seq = snapshot_seq;
     let mut events_since_snapshot = 0_u64;
@@ -73,11 +82,9 @@ pub(super) fn load(root: &Path, producer_version: &str) -> Result<Recovered> {
     }
 
     let mut normalized = Vec::new();
-    for (query, producer) in queries.values() {
+    for (query, _producer) in queries.values() {
         if matches!(query.state, QueryState::Queued | QueryState::Running) {
-            normalized.push(query.fail_for_restart());
-        } else if query.state == QueryState::Succeeded && producer != producer_version {
-            normalized.push(query.invalidate_result());
+            normalized.push(query.interrupt_for_restart());
         }
     }
     Ok(Recovered {

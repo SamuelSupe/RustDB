@@ -5,7 +5,7 @@ database-file-compatible with DuckDB.
 
 ## SQL support
 
-| Area | v1.0.0-beta.1 support |
+| Area | v1.0.0-beta.2 support |
 | --- | --- |
 | Query shape | `SELECT`, non-recursive CTEs, non-LATERAL derived tables, recursive parenthesized set-expression trees |
 | Filtering | `WHERE`, three-valued Boolean logic, comparisons, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`, `LIKE`/`NOT LIKE` with `ESCAPE`, `IN` lists |
@@ -161,15 +161,18 @@ These values are additive diagnostics, not performance guarantees.
 delete vectors, schemas, tables, and views in a versioned Catalog. CTAS,
 INSERT, UPDATE, DELETE, TRUNCATE, and transactional DDL publish atomically at a
 Catalog generation boundary. `Engine::new` remains ephemeral. Local and
-S3/MinIO backup publish a validated manifest last; restore refuses to replace
-an existing destination. The CLI exposes `backup` and `restore` subcommands.
+S3/MinIO service backup publishes a validated manifest last; restore refuses to
+replace an existing database or per-database service-state destination. The CLI
+exposes `backup`, `backup-check`, and `restore` subcommands.
 
-Beta Native databases use marker epoch `3`. Alpha epochs `1` and `2` are
-rejected before permission changes, locking, WAL recovery, or cleanup; import
-CSV/Parquet into a fresh Beta database instead. The checksummed contiguous-LSN
-WAL syncs commit intent before Catalog `CURRENT` publication. Open replays a
-durable unpublished generation and rejects corrupt records or generation gaps.
-See [migration-v1-beta.md](migration-v1-beta.md).
+Beta 2 Native databases use marker epoch `4`. All earlier epochs `1`, `2`, and
+`3` are rejected before permission changes, locking, WAL recovery, or cleanup;
+import CSV/Parquet into a fresh Beta 2 database instead. `rustdb migrate` only
+validates that epoch `4` is already present; there is no format converter. The
+checksummed contiguous-LSN WAL syncs commit intent before Catalog `CURRENT`
+publication. Open replays a durable unpublished generation and rejects corrupt
+records or generation gaps. See the fresh-start notes in
+[migration-v1-beta.md](migration-v1-beta.md).
 
 Transactions use optimistic multi-writer snapshot isolation. Read-only and
 read-write handles, prepared statements, SQL transaction control, read-your-
@@ -189,9 +192,10 @@ Persistent schema namespaces are catalog state. `main` is the default;
 `information_schema.schemata` are supported, and qualified names are accepted
 by query, DML, DDL, COPY, maintenance, temporary-view, and
 external-registration paths. Catalog manifest v1 is read as `main`; new
-generations use manifest v2. Cancelling, abandoning, or failing a transaction
-result after it staged a mutation rolls back the whole transaction because
-statement savepoints are not implemented.
+generations use manifest v2. Each transactional statement has an internal
+workspace and Catalog savepoint. Failure, cancellation, or result abandonment
+rolls back only that statement's staged changes and leaves the transaction
+active; user-visible SQL `SAVEPOINT` and `ROLLBACK TO` remain unsupported.
 
 `NativeStorageConfig` exposes optional hard limits for the complete Native
 database directory, a default per-table limit, and named table overrides. The
@@ -208,17 +212,27 @@ child object before publication. RustDB never deletes those objects
 automatically and refuses to append another attempt to the same destination;
 inspect and remove the incomplete output before retrying.
 
-Remote backup work is Engine-owned once its consistent local snapshot has been
-created. Dropping the public future does not strand an in-process upload: the
-worker finishes a valid manifest or aborts multipart uploads and removes
-unmanifested keys. Abrupt process loss is outside in-process cleanup and should
-be covered by the bucket's incomplete-multipart lifecycle policy. That policy
-does not cover an object completed immediately before a manifest-less crash;
-RustDB refuses to reuse a non-empty destination without a manifest so retries
-cannot amplify the orphan. Operators must inspect and remove that dedicated
-prefix before retrying. Local snapshot/download temporaries are independently
-owned and locked; expired crash orphans are reclaimed conservatively at Engine
-startup (and before remote restore), while unknown or active paths are kept.
+A service bundle contains the Native snapshot and, when present, the safe HTTP
+control-state allowlist: principals, Token/Profile material, the local CA, and
+the managed TLS identity. The bundle contains credentials and must be protected
+as sensitive data. Query journals and retained results, audit logs, Spill and
+temporary data, locks, and Admin sockets are deliberately excluded. Validation
+checks the versioned manifest, exact inventory, private permissions, per-file
+size and SHA-256, and the embedded Native database before restore. Restore
+requires fresh database and service-state targets.
+
+Remote service-backup work is Engine-owned once its consistent local snapshot
+has been created. Dropping the public future does not strand an in-process
+upload: the worker finishes a valid manifest or aborts multipart uploads and
+removes unmanifested keys. Abrupt process loss is outside in-process cleanup and
+should be covered by the bucket's incomplete-multipart lifecycle policy. That
+policy does not cover an object completed immediately before a manifest-less
+crash; RustDB refuses to reuse a non-empty destination without a manifest so
+retries cannot amplify the orphan. Operators must inspect and remove that
+dedicated prefix before retrying. Local snapshot/download temporaries are
+independently owned and locked; expired crash orphans are reclaimed
+conservatively at Engine startup (and before remote restore), while unknown or
+active paths are kept.
 
 Native table-manifest v3 retains the optional v2 `.rdbpred` companion and adds
 stable physical row identity plus versioned, checksummed `.rdbdel` delete
@@ -274,17 +288,18 @@ validation. HTTPS is required by default. See [operator-guide.md](operator-guide
 
 ## Deliberate exclusions
 
-Serializable isolation, predicate locks, savepoints, public time travel,
+Serializable isolation, predicate locks, user-visible SQL savepoints, public time travel,
 `MERGE`/upsert, relational constraints, secondary indexes, recursive CTEs,
 LATERAL/UNNEST, nested LIST/STRUCT/MAP/JSON execution, replication, and
 distributed execution are excluded from Beta. ORC, Iceberg, JSON scan and
 persistent data-page caching are also outside this release.
 
-## Read-only HTTPS Shell (Beta)
+## Read-only HTTPS Shell (Beta 2)
 
-The optional `/v1` HTTP surface is a remote CLI Shell, not the embedded/local
+The optional `/v2` HTTP surface is a remote CLI Shell, not the embedded/local
 SQL API over HTTP. It supports authenticated capability negotiation,
-background read-only Queries, status, immutable JSON/NDJSON result pages,
+background read-only Queries, principal-scoped listing, status, immutable
+JSON/NDJSON result pages, sequenced Arrow prefixes after interruption,
 cancellation, and terminal deletion. Query-role principals can access only
 their own Query IDs; Admin principals can access every Query and `/metrics`.
 Only `SELECT`/non-recursive `WITH`,
@@ -292,10 +307,28 @@ Only `SELECT`/non-recursive `WITH`,
 the server reads Native/system tables and server-local registered CSV/Parquet
 sources only. Authentication occurs before body or query-parameter parsing.
 
+Beta 2 service configuration requires `schema_version = 2`; earlier schemas
+are rejected without migration. Query-journal, retained-result, credential,
+and certificate filesystem work uses a fixed, bounded service I/O pool
+(`service_io_threads`, default `2`). The process RSS guardian compares RSS with
+the smaller of physical memory and the active Linux cgroup limit. Its default
+70/80/90% watermarks respectively throttle new submissions, reject new
+submissions, and cancel the running query with the largest live reservation.
+The thresholds and sample interval are configurable.
+
+The managed TLS leaf is checked periodically (six hours by default); a
+near-expiry renewal is hot-loaded without restarting the listener. A private
+mode-`0600` Unix Admin socket provides local status, atomic Token reload,
+rotation/revocation, and bounded graceful shutdown. Offline `service check`
+validates principals, query journal, and retained results while holding the
+server lock. `service repair` is a dry run unless `--apply` is present and may
+alter only incomplete or invalid artifacts whose RustDB markers prove
+ownership.
+
 Remote DDL/DML, transactions, maintenance, uploads, direct file functions,
 source administration, browser UI/CORS, remote Sessions, and a general full
 HTTP database API are deliberately excluded. See
-[http-shell.md](http-shell.md) and [openapi-v1.yaml](openapi-v1.yaml) for the
+[http-shell.md](http-shell.md) and [openapi-v2.yaml](openapi-v2.yaml) for the
 complete operational and wire contract.
 
 S3 credentials come from the default credential chain or an application-owned

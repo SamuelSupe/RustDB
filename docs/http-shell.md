@@ -4,7 +4,7 @@ RustDB Beta can expose one Native database to the existing command-line query
 experience over HTTPS. The server executes only read-only SQL. It is not a
 browser shell, a write API, or a remote administration service.
 
-For the exact wire contract, see [OpenAPI v1](openapi-v1.yaml). For deployment,
+For the exact wire contract, see [OpenAPI v2](openapi-v2.yaml). For deployment,
 monitoring, and recovery, see the [Beta operator guide](operator-guide.md). A Simplified
 Chinese version of this guide is available in
 [http-shell.zh-CN.md](http-shell.zh-CN.md).
@@ -172,7 +172,7 @@ curl --cacert ca.pem \
     ],
     "timeout_ms": 60000
   }' \
-  https://analytics.example.com:7400/v1/queries
+  https://analytics.example.com:7400/v2/queries
 ```
 
 Parameters can replace expression values only. They cannot be table names,
@@ -194,7 +194,7 @@ QUERY_ID=$(
     -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: example-query-0001' \
     --data '{"sql":"SELECT count(*) AS rows FROM sales"}' \
-    https://analytics.example.com:7400/v1/queries |
+    https://analytics.example.com:7400/v2/queries |
   jq -r .query_id
 )
 ```
@@ -209,13 +209,26 @@ Poll status until it is terminal:
 ```sh
 curl --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}"
 ```
 
 Status timestamps are Unix-epoch milliseconds in `created_at_ms`, optional
-`started_at_ms`, and optional `finished_at_ms`. Successful Queries include the
-bounded `metrics` object; failed or cancelled Queries instead include `error`.
-Absent optional fields are omitted rather than encoded as JSON `null`.
+`started_at_ms`, and optional `finished_at_ms`. Every status includes
+`result_available`; retained results also expose `result_expires_at_ms`,
+`result_rows`, `result_bytes`, and `result_batches`. Successful Queries include
+the bounded `metrics` object; failed, cancelled, or interrupted Queries include
+`error`. Absent optional fields are omitted rather than encoded as JSON `null`.
+
+List visible Queries in stable newest-first order with optional state and
+creation-time filters. Query principals see their own work; Admin sees all
+principals. The default page is 50 and the maximum is 200; pass the opaque
+`next_cursor` unchanged to fetch the following page:
+
+```sh
+curl --cacert ca.pem \
+  -H "Authorization: Bearer $(<token)" \
+  "https://analytics.example.com:7400/v2/queries?state=interrupted&created_after_ms=1784500000000&limit=50"
+```
 
 Fetch JSON by offset:
 
@@ -223,7 +236,7 @@ Fetch JSON by offset:
 curl --compressed --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
   -H 'Accept: application/json' \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?offset=0&limit=1000"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}/results?offset=0&limit=1000"
 ```
 
 Or fetch NDJSON with an opaque Cursor returned by the previous page:
@@ -232,7 +245,7 @@ Or fetch NDJSON with an opaque Cursor returned by the previous page:
 curl --compressed --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
   -H 'Accept: application/x-ndjson' \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?cursor=${CURSOR}&limit=1000"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}/results?cursor=${CURSOR}&limit=1000"
 ```
 
 JSON/NDJSON require successful completion. Cursor and offset are mutually
@@ -246,12 +259,16 @@ Arrow batch sequence at a time:
 curl --dump-header batch.headers --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
   -H 'Accept: application/vnd.apache.arrow.file' \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/results?batch_seq=0" \
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}/results?batch_seq=0" \
   --output batch-000.arrow
 ```
 
 An Arrow `200` is an independent IPC file containing exactly one RecordBatch.
 A schema-only IPC file with `X-RustDB-Result-Complete: true` marks completion.
+If shutdown interrupts execution, committed batches remain readable and the
+last response reports `X-RustDB-Result-State: interrupted` with completion
+true. That stream is an explicit result prefix, never a successful full result;
+JSON/NDJSON remain unavailable for it.
 If the requested sequence is not committed yet, `204` has no body and includes
 `Retry-After: 1`. Advance only to the exact `X-RustDB-Next-Batch-Seq`; do not mix
 `batch_seq` with `cursor`, `offset`, or `limit`.
@@ -261,11 +278,11 @@ Cancel queued or running work, then delete terminal state:
 ```sh
 curl -X POST --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}/cancel"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}/cancel"
 
 curl -X DELETE --cacert ca.pem \
   -H "Authorization: Bearer $(<token)" \
-  "https://analytics.example.com:7400/v1/queries/${QUERY_ID}"
+  "https://analytics.example.com:7400/v2/queries/${QUERY_ID}"
 ```
 
 ## Result encoding
@@ -337,6 +354,10 @@ Use these `serve` options when the defaults do not fit the deployment:
 | Principal running/queue limits | `--principal-max-running`, `--principal-max-queued` | `principal_max_running`, `principal_max_queued` | `RUSTDB_HTTP_PRINCIPAL_MAX_RUNNING`, `RUSTDB_HTTP_PRINCIPAL_MAX_QUEUED` |
 | Principal resource reservation | `--principal-memory-limit`, `--principal-spill-limit`, `--principal-result-limit` | `principal_memory_limit`, `principal_spill_limit`, `principal_result_limit` | `RUSTDB_HTTP_PRINCIPAL_MEMORY_LIMIT`, `RUSTDB_HTTP_PRINCIPAL_SPILL_LIMIT`, `RUSTDB_HTTP_PRINCIPAL_RESULT_LIMIT` |
 | Principal fair-share weight | `--principal-weight` | `principal_weight` | `RUSTDB_HTTP_PRINCIPAL_WEIGHT` |
+| RSS pressure guard | TOML only | `rss_warning_ratio`, `rss_high_ratio`, `rss_critical_ratio`, `rss_sample_interval_ms` | — |
+| Blocking service I/O pool | `--service-io-threads` | `service_io_threads` | `RUSTDB_SERVICE_IO_THREADS` |
+| Local Admin socket | `--admin-socket` | `admin_socket` | `RUSTDB_ADMIN_SOCKET` |
+| TLS renewal check | `--tls-renew-interval-secs` | `tls_renew_interval_secs` | `RUSTDB_TLS_RENEW_INTERVAL_SECS` |
 | Spill hard limits | `--spill-engine-limit`, `--spill-query-limit` | `spill_engine_limit`, `spill_query_limit` | `RUSTDB_SPILL_ENGINE_LIMIT`, `RUSTDB_SPILL_QUERY_LIMIT` |
 | Authentication escape hatch | `--no-auth` | `no_auth` | `RUSTDB_NO_AUTH` |
 | AWS region and endpoint | `--s3-region`, `--s3-endpoint` | `s3_region`, `s3_endpoint` | `RUSTDB_S3_REGION`, `RUSTDB_S3_ENDPOINT` |
@@ -348,16 +369,35 @@ objects; credentials otherwise come from the server process's default provider
 chain.
 
 `/healthz` and `/readyz` are unauthenticated but disclose only `ok`, `ready`, or
-`not_ready`. Unless explicit no-auth development mode is enabled, every `/v1`
+`not_ready`. Unless explicit no-auth development mode is enabled, every `/v2`
 request is authenticated before its body or query parameters are parsed. The
 Prometheus `/metrics` endpoint also requires authentication and Admin
 permission. CORS is disabled. Access logs do not include request bodies or SQL
 text; private rotating JSONL audit records contain identity and SQL fingerprints.
 
-Manage credentials only while the server is stopped. Rotation adds a new
-overlapping Token; export or distribute it, verify clients, and then explicitly
-revoke the old Token. The long-lived CA remains unchanged; the server renews
-its short-lived leaf certificate at startup.
+The RSS guard samples the process against the smaller of physical memory and
+the active Linux cgroup limit. Its default 70/80/90% watermarks throttle new
+submissions, reject new submissions, and cancel the largest live Query. HTTP
+rejections include `Retry-After`; idempotent replays are resolved before this
+admission check. Blocking result and service-state work uses a separate bounded
+pool rather than compute lanes.
+
+Offline principal and role changes still require the server to be stopped.
+Running servers accept only a narrow local Admin-socket protocol for status,
+token reload/rotation/revocation, and bounded shutdown:
+
+```sh
+rustdb service status --database /srv/rustdb/analytics
+rustdb service rotate-token --database /srv/rustdb/analytics --principal analyst
+rustdb service revoke-token --database /srv/rustdb/analytics --token-id <UUID>
+rustdb service shutdown --database /srv/rustdb/analytics
+```
+
+The socket is a mode-`0600` Unix socket inside the private per-database state
+directory unless explicitly overridden. Rotation adds an overlapping Token;
+export or distribute it, verify clients, then revoke the old Token. The
+long-lived CA remains unchanged. RustDB periodically renews a near-expiry leaf
+certificate and hot-reloads it without stopping the listener.
 
 ## Common failures
 
@@ -367,10 +407,12 @@ its short-lived leaf certificate at startup.
 | `401` | Import the current profile or redistribute it after Token rotation. |
 | `409 idempotency.key_conflict` | Generate a new key, or retry with the same decoded request envelope. |
 | `409 query.not_complete` | Poll status before requesting JSON/NDJSON; use sequenced Arrow IPC for committed running output. |
-| `429` | The 64-entry queue is full; wait for `Retry-After`. |
+| `429 admission.queue_full` | The admission queue is full; wait for `Retry-After`. |
+| `429 admission.rss_throttled` | Process RSS crossed the warning watermark; wait for `Retry-After` and reduce concurrency. |
+| `503 admission.rss_rejected` | Process RSS crossed the high/critical watermark; stop submitting work and investigate memory pressure. |
 | `422 sql.unsupported` | Use an allowed read-only statement and only registered relations. |
 | `query.resource_exhausted` | Reduce the result, consume/delete retained results, or move `--result-directory` to a suitable filesystem. |
-| Query was active during restart | Queued/running work is recovered as failed with `query.server_restarted` and a safe retry class; submit a new request. |
+| Query was active during restart | Queued/running work becomes terminal `interrupted` with `query.interrupted`. Any committed Arrow batches remain readable as an explicitly incomplete prefix; submit a new request for a full result. |
 | Completed Query missing after restart | It expired, was deleted, failed validation, or is owned by another principal. Review service logs before resubmitting. |
 
 Errors use a stable string `error` code, human-readable `message`, mandatory

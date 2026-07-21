@@ -8,15 +8,16 @@
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-1.0.0--beta.1-blue)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.0.0--beta.2-blue)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 </div>
 
 > [!WARNING]
-> RustDB Beta 仍是预生产软件，适合功能评估、开发与可复现的引擎研究。兼容性
-> 从 beta.1 开始建立；alpha Native 数据库必须重新导入。当前尚不提供生产 SLA。
+> RustDB Beta 仍是预生产软件，适合功能评估、开发与可复现的引擎研究。Beta 2
+> 会重置格式、配置和 HTTP 协议；请新建数据库与服务状态，不要迁移 Beta 1 产物。
+> 当前尚不提供生产 SLA。
 
 RustDB 可以直接查询本地磁盘或 S3-compatible 对象存储中的 CSV 和
 Parquet，也可以把数据批量导入不可变分段的 Native 数据库，用于重复的本地分析。
@@ -36,7 +37,8 @@ SQL Binder、优化器、向量化算子、调度器、内存记账、Native 存
 - **高速 CSV**：支持原始、gzip、zstd 输入，并以 quote-aware framing
   安全地并行解析单个大文件。
 - **Native 持久化分析**：支持事务 DML/DDL、稳定行版本、带校验和的 WAL
-  恢复、快照隔离、维护，以及经过校验的本地/S3 备份与恢复。
+  恢复、快照隔离、维护，以及包含 Native 数据和安全 HTTP 控制状态的本地/S3
+  服务备份包。
 - **资源受控执行**：多 lane pipeline、引擎/查询内存预算、有界队列、取消，
   以及受配额和磁盘余量治理的 Spill。
 - **默认嵌入，按需远程**：既可使用精简 Rust API 和本地流式 CLI，也可通过认证的
@@ -170,7 +172,7 @@ Query 角色只能访问自己的 Query ID，Admin 可以访问所有 Query。
 `--result-directory`、`--result-ttl-secs`、`--result-global-limit`、
 `--result-query-limit`；服务端本地注册源还可使用 `--s3-region`、`--s3-endpoint`、
 `--s3-path-style`、`--s3-allow-http`、`--s3-anonymous`。详见
-[HTTP Shell 中文指南](docs/http-shell.zh-CN.md)和 [OpenAPI 3.1 协议](docs/openapi-v1.yaml)。
+[HTTP Shell 中文指南](docs/http-shell.zh-CN.md)和 [OpenAPI 3.1 协议](docs/openapi-v2.yaml)。
 
 需要生成脱敏、只读的支持快照时，可运行
 `rustdb diagnostics --database 路径 [--output 文件]`，详见
@@ -290,13 +292,17 @@ CLI 使用 `rustdb --database ./warehouse` 打开数据库。Beta 启用新的 N
 新的 Beta 目录；`rustdb migrate PATH` 现在只负责格式校验，不做 alpha 原地迁移。
 详见 [Beta 迁移指南](docs/migration-v1-beta.md)。
 
-本地目录和 S3 都支持一致性备份与恢复：
+本地目录和 S3 都支持一致性服务备份与恢复。备份包包含 Native 数据和安全的 HTTP
+控制状态；若 `serve` 未使用平台默认状态根目录，必须传入同一个 `--state-root`：
 
 ```sh
-rustdb backup ./warehouse ./warehouse-backup
-rustdb --s3-region us-east-1 backup ./warehouse s3://bucket/rustdb/snapshot
-rustdb restore ./warehouse-backup ./warehouse-restored
+rustdb backup ./warehouse ./warehouse-backup --state-root ./service-state
+rustdb backup-check ./warehouse-backup
+rustdb restore ./warehouse-backup ./warehouse-restored --state-root ./restored-state
 ```
+
+备份刻意排除 Query 结果与 journal、Spill、临时文件、审计日志、锁和 Admin socket。
+恢复要求数据库目标以及该数据库对应的服务状态目标均为全新路径。
 
 嵌入式调用方若放弃进行中的远程备份 future，RustDB 会由 Engine 后台继续收敛：
 要么发布完整 manifest，要么中止 multipart 并删除未被 manifest 引用的对象。
@@ -312,7 +318,7 @@ Engine 启动时只回收超过 TTL 且可验证、未被锁定的崩溃残留�
 
 ```mermaid
 flowchart LR
-    Remote["远程 CLI / HTTPS v1"] --> Guard["TLS + Token + 只读策略"]
+    Remote["远程 CLI / HTTPS v2"] --> Guard["TLS + Token + 只读策略"]
     Guard --> SQL["SQL / 参数"]
     SQL --> Binder["Binder + Session Catalog"]
     Binder --> Optimizer["规则优化器 + 统计信息"]
@@ -364,7 +370,7 @@ Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` �
 | [运维指南](docs/operator-guide.zh-CN.md) / [English](docs/operator-guide.md) | 支持平台、部署、认证、指标、审计、恢复和 Beta 门禁 |
 | [CLI 中文帮助](packaging/dist/CLI.zh-CN.md) / [English](packaging/dist/CLI.md) | 命令、输出、资源和 S3 参数 |
 | [HTTP Shell 中文指南](docs/http-shell.zh-CN.md) / [English](docs/http-shell.md) | TLS、Profile、只读 SQL、Query 生命周期和运维 |
-| [OpenAPI v1](docs/openapi-v1.yaml) | 公开、版本化 HTTP 协议 |
+| [OpenAPI v2](docs/openapi-v2.yaml) | 公开、版本化 HTTP 协议 |
 | [安装中文说明](packaging/dist/INSTALL.zh-CN.md) / [English](packaging/dist/INSTALL.md) | 二进制包安装与卸载 |
 | [S3 与 MinIO](docs/s3.md) | 凭证、endpoint 和对象存储行为 |
 | [故障排查](docs/troubleshooting.md) | 资源、Spill、损坏和输入错误 |
@@ -372,9 +378,9 @@ Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` �
 | [幂等 Native 导入](docs/native-import.md) | CSV/Parquet 导入回执、重放与冲突处理 |
 | [Native 检查与修复](docs/native-repair.md) | 只读完整性检查和保守修复 |
 | [验收说明](docs/acceptance.md) | 正确性与版本发布检查 |
-| [v1.0 Beta 发行说明](docs/releases/v1.0.0-beta.1.md) | 兼容 epoch、安装包、供应链与已知边界 |
-| [Alpha 到 Beta 迁移](docs/migration-v1-beta.md) | 强制重新导入与回滚边界 |
-| [v1.0 Beta 路线图](docs/roadmap-v1-beta.md) | 完成契约与发行证据 |
+| [Beta 2 发行说明](docs/releases/v1.0.0-beta.2.md) | 可靠性重置、全新部署边界、安装包与已知限制 |
+| [Beta 2 全新部署](docs/migration-v1-beta.md) | 强制重新导入与不提供迁移的边界 |
+| [Beta 2 契约](docs/roadmap-v1-beta.md) | 完成契约与发行证据 |
 | [v0.8 发行说明](docs/releases/v0.8.0-alpha.1.md) | 新增事务 Native 存储、SQL、COPY 与运维能力 |
 | [v0.7 迁移](docs/migration-v0.7.md) | 历史执行内核和 benchmark 变化 |
 | [v0.8 迁移](docs/migration-v0.8.md) | WAL 格式、显式数据库迁移与事务 API |

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -76,12 +76,18 @@ impl QuotaPool {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn used_bytes(&self) -> u64 {
+        *self.used.lock()
+    }
 }
 
 pub(super) struct QuotaLease {
     pool: Arc<QuotaPool>,
     bytes: AtomicU64,
     next_space_check: AtomicU64,
+    release_on_drop: AtomicBool,
 }
 
 impl QuotaLease {
@@ -90,6 +96,7 @@ impl QuotaLease {
             pool,
             bytes: AtomicU64::new(0),
             next_space_check: AtomicU64::new(0),
+            release_on_drop: AtomicBool::new(true),
         }
     }
 
@@ -138,13 +145,25 @@ impl QuotaLease {
         let mut global = self.pool.used.lock();
         *global = global.saturating_sub(released);
     }
+
+    pub(super) fn release_all(&self) {
+        let bytes = self.bytes.swap(0, Ordering::AcqRel);
+        let mut global = self.pool.used.lock();
+        *global = global.saturating_sub(bytes);
+    }
+
+    /// Keeps accounting conservative when physical deletion failed and no
+    /// reachable result handle remains to retry cleanup in this process.
+    pub(super) fn retain_on_drop(&self) {
+        self.release_on_drop.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for QuotaLease {
     fn drop(&mut self) {
-        let bytes = self.bytes.swap(0, Ordering::AcqRel);
-        let mut global = self.pool.used.lock();
-        *global = global.saturating_sub(bytes);
+        if self.release_on_drop.load(Ordering::Acquire) {
+            self.release_all();
+        }
     }
 }
 

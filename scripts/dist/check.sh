@@ -64,11 +64,14 @@ for file in \
   LICENSE README.md README.zh-CN.md SHA256SUMS VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
   docs/INSTALL.md docs/INSTALL.zh-CN.md \
-  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md \
-  docs/OPERATOR-GUIDE.md docs/OPERATOR-GUIDE.zh-CN.md \
-  docs/DIAGNOSTICS.md docs/DIAGNOSTICS.zh-CN.md \
-  docs/NATIVE-IMPORT.md docs/NATIVE-REPAIR.md docs/COMPATIBILITY.md \
-  docs/openapi-v1.yaml RELEASE-NOTES.md \
+  docs/http-shell.md docs/http-shell.zh-CN.md \
+  docs/operator-guide.md docs/operator-guide.zh-CN.md \
+  docs/diagnostics.md docs/diagnostics.zh-CN.md \
+  docs/native-import.md docs/native-repair.md docs/compatibility.md \
+  docs/troubleshooting.md docs/migration-v0.5.md docs/migration-v1-beta.md \
+  docs/parquet-pruning.md docs/s3.md \
+  packaging/config/rustdb.example.toml \
+  docs/openapi-v2.yaml RELEASE-NOTES.md \
   install.sh uninstall.sh
 do
   [ -f "$package/$file" ] || { echo "missing package file / 缺少文件: $file" >&2; exit 1; }
@@ -78,7 +81,7 @@ done
 [ -x "$package/uninstall.sh" ]
 
 checksum_entries=$(awk 'NF { entries += 1 } END { print entries + 0 }' "$package/SHA256SUMS")
-[ "$checksum_entries" -eq 22 ] || {
+[ "$checksum_entries" -eq 28 ] || {
   echo "incomplete package checksum manifest / 包内校验清单不完整" >&2
   exit 1
 }
@@ -100,11 +103,14 @@ for file in \
   LICENSE README.md README.zh-CN.md VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
   docs/INSTALL.md docs/INSTALL.zh-CN.md \
-  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md \
-  docs/OPERATOR-GUIDE.md docs/OPERATOR-GUIDE.zh-CN.md \
-  docs/DIAGNOSTICS.md docs/DIAGNOSTICS.zh-CN.md \
-  docs/NATIVE-IMPORT.md docs/NATIVE-REPAIR.md docs/COMPATIBILITY.md \
-  docs/openapi-v1.yaml RELEASE-NOTES.md \
+  docs/http-shell.md docs/http-shell.zh-CN.md \
+  docs/operator-guide.md docs/operator-guide.zh-CN.md \
+  docs/diagnostics.md docs/diagnostics.zh-CN.md \
+  docs/native-import.md docs/native-repair.md docs/compatibility.md \
+  docs/troubleshooting.md docs/migration-v0.5.md docs/migration-v1-beta.md \
+  docs/parquet-pruning.md docs/s3.md \
+  packaging/config/rustdb.example.toml \
+  docs/openapi-v2.yaml RELEASE-NOTES.md \
   install.sh uninstall.sh
 do
   matches=$(awk -v file="$file" '$2 == file { matches += 1 } END { print matches + 0 }' "$package/SHA256SUMS")
@@ -114,26 +120,39 @@ do
   }
 done
 
+python3 -B "$(dirname -- "$0")/check_links.py" "$package"
+
 if [ "${RUSTDB_DIST_SKIP_EXEC:-0}" != "1" ]; then
   "$package/bin/rustdb" --version >/dev/null
   "$package/bin/rustdb" --help | grep -q 'Usage:'
   "$package/bin/rustdb" --help-zh | grep -q '使用方法'
 
   install_root="$temporary/install-root"
+  mkdir -p "$install_root/usr/share/doc/rustdb"
+  printf '%s\n' 'legacy Beta 1 contract' \
+    >"$install_root/usr/share/doc/rustdb/openapi-v1.yaml"
   DESTDIR="$install_root" RUSTDB_LANG=en "$package/install.sh" --prefix /usr >/dev/null
   "$install_root/usr/bin/rustdb" --version >/dev/null
   [ -f "$install_root/usr/share/doc/rustdb/README.zh-CN.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/HTTP-SHELL.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/HTTP-SHELL.zh-CN.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/OPERATOR-GUIDE.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/OPERATOR-GUIDE.zh-CN.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/DIAGNOSTICS.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/DIAGNOSTICS.zh-CN.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/NATIVE-IMPORT.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/NATIVE-REPAIR.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/COMPATIBILITY.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/http-shell.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/http-shell.zh-CN.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/operator-guide.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/operator-guide.zh-CN.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/diagnostics.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/diagnostics.zh-CN.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/native-import.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/native-repair.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/compatibility.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/troubleshooting.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/migration-v1-beta.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/parquet-pruning.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/s3.md" ]
+  [ -f "$install_root/usr/share/doc/rustdb/packaging/config/rustdb.example.toml" ]
   [ -f "$install_root/usr/share/doc/rustdb/RELEASE-NOTES.md" ]
-  [ -f "$install_root/usr/share/doc/rustdb/openapi-v1.yaml" ]
+  [ -f "$install_root/usr/share/doc/rustdb/docs/openapi-v2.yaml" ]
+  [ ! -e "$install_root/usr/share/doc/rustdb/openapi-v1.yaml" ]
+  printf '%s\n' 'legacy Beta 1 contract' \
+    >"$install_root/usr/share/doc/rustdb/openapi-v1.yaml"
   DESTDIR="$install_root" RUSTDB_LANG=zh-CN \
     "$package/uninstall.sh" --prefix /usr >/dev/null
   [ ! -e "$install_root/usr/bin/rustdb" ]

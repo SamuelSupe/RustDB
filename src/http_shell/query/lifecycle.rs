@@ -4,7 +4,7 @@ use crate::{Error, Result};
 
 use super::{
     ManagerInner, QueryRecord,
-    journal::{DeleteReason, QueryJournal},
+    journal::{DeleteReason, PersistedQuery, QueryJournal},
     request::now_ms,
 };
 use crate::http_shell::{QueryState, error::HttpError};
@@ -41,7 +41,12 @@ pub(super) fn delete_terminal_record(
         restore_record(inner, record);
         return Err(error);
     }
-    record.state.write().result.take();
+    {
+        let mut state = record.state.write();
+        state.result.take();
+        state.result_available = false;
+        state.result_summary = None;
+    }
 
     match inner.journal.delete(query_id, reason) {
         Ok(true) => {
@@ -97,6 +102,8 @@ pub(super) fn fail_record(record: &QueryRecord, error: Error) {
     };
     state.finished_at_ms = Some(now_ms());
     state.error = Some(body);
+    state.result_available = false;
+    state.result_summary = None;
     tracing::warn!(
         query_id = %record.id,
         principal_id = record.owner.audit_id(),
@@ -105,23 +112,45 @@ pub(super) fn fail_record(record: &QueryRecord, error: Error) {
     );
 }
 
-pub(super) fn persist_terminal(journal: &QueryJournal, record: &QueryRecord) {
-    if let Err(error) = journal.upsert(record.persisted()) {
-        tracing::error!(%error, query_id = %record.id, "failed to persist terminal HTTP query state");
-        discard_record_result(record);
-        record.fail_stably(
-            "query.journal_failed",
-            "query terminal state could not be persisted",
-            crate::RetryClass::Unknown,
-        );
-        persist_or_log(journal, record, "journal-failure terminal state");
-    }
-}
-
+#[cfg(test)]
 pub(super) fn cancel_and_persist(record: &QueryRecord, journal: &QueryJournal) -> Result<()> {
-    let _transition = record.lock_transition();
+    let _transition = record.blocking_lock_transition();
+    if record.terminal() {
+        return Ok(());
+    }
     record.cancel();
     journal.upsert(record.persisted()).map(|_| ())
+}
+
+pub(super) async fn cancel_and_persist_async(
+    record: &QueryRecord,
+    journal: &QueryJournal,
+) -> Result<()> {
+    let persisted = {
+        let _transition = record.lock_transition().await;
+        if record.terminal() {
+            return Ok(());
+        }
+        record.cancel();
+        record.persisted()
+    };
+    journal.upsert_async(persisted).await.map(|_| ())
+}
+
+pub(super) async fn cancel_for_shutdown(record: &QueryRecord) -> Option<PersistedQuery> {
+    let _transition = record.lock_transition().await;
+    if record.state.read().phase != QueryState::Queued {
+        return None;
+    }
+    record.cancel();
+    Some(record.persisted())
+}
+
+pub(super) async fn interrupt_for_shutdown(record: &QueryRecord) -> Option<PersistedQuery> {
+    let _transition = record.lock_transition().await;
+    record.interrupt();
+    let interrupted = record.state.read().phase == QueryState::Interrupted;
+    interrupted.then(|| record.persisted())
 }
 
 pub(super) fn persist_or_log(journal: &QueryJournal, record: &QueryRecord, context: &str) {
@@ -130,10 +159,38 @@ pub(super) fn persist_or_log(journal: &QueryJournal, record: &QueryRecord, conte
     }
 }
 
-fn discard_record_result(record: &QueryRecord) {
-    let result = record.state.write().result.take();
+pub(super) async fn persist_or_log_async(
+    journal: &QueryJournal,
+    record: &QueryRecord,
+    context: &str,
+) {
+    if let Err(error) = journal.upsert_async(record.persisted()).await {
+        tracing::error!(%error, query_id = %record.id, context, "failed to persist HTTP query state");
+    }
+}
+
+pub(super) async fn persist_terminal_async(journal: &QueryJournal, record: &QueryRecord) {
+    if let Err(error) = journal.upsert_async(record.persisted()).await {
+        tracing::error!(%error, query_id = %record.id, "failed to persist terminal HTTP query state");
+        discard_record_result_async(record).await;
+        record.fail_stably(
+            "query.journal_failed",
+            "query terminal state could not be persisted",
+            crate::RetryClass::Unknown,
+        );
+        persist_or_log_async(journal, record, "journal-failure terminal state").await;
+    }
+}
+
+async fn discard_record_result_async(record: &QueryRecord) {
+    let result = {
+        let mut state = record.state.write();
+        state.result_available = false;
+        state.result_summary = None;
+        state.result.take()
+    };
     if let Some(result) = result
-        && let Err(error) = result.delete()
+        && let Err(error) = result.delete_async().await
     {
         tracing::error!(%error, query_id = %record.id, "failed to discard inaccessible HTTP result");
     }

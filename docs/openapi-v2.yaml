@@ -1,18 +1,19 @@
 openapi: 3.1.0
 info:
   title: RustDB Read-only HTTP Shell API
-  version: 1.0.0-beta.1
+  version: 1.0.0-beta.2
   summary: Versioned background-query API used by the RustDB remote CLI.
   description: |
-    RustDB v1 exposes one read-only SQL statement per background Query. Committed
+    RustDB v2 exposes one read-only SQL statement per background Query. Committed
     Arrow batches may be polled while execution runs; JSON/NDJSON pages become
-    readable only after successful completion. Every `/v1`
+    readable only after successful completion. If shutdown interrupts a Query,
+    every batch committed before interruption remains available through the
+    Arrow sequence API. Every `/v2`
     operation requires TLS and a principal Bearer Token; authentication runs
     before request-body or query-parameter parsing. Query-role principals can
     access only their own Query IDs, Admin principals can access every Query,
     and Idempotency Keys are scoped to the submitting principal. This specification deliberately
-    excludes write SQL, Sessions, source administration, uploads, and a query
-    listing operation.
+    excludes write SQL, Sessions, source administration, and uploads.
 servers:
   - url: https://127.0.0.1:7400
     description: Default loopback listener
@@ -84,7 +85,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Problem"
-  /v1/info:
+  /v2/info:
     get:
       tags: [Protocol]
       operationId: serverInfo
@@ -101,7 +102,60 @@ paths:
                 $ref: "#/components/schemas/ServerInfo"
         "401":
           $ref: "#/components/responses/Unauthorized"
-  /v1/queries:
+  /v2/queries:
+    get:
+      tags: [Queries]
+      operationId: listQueries
+      summary: List visible Queries in stable newest-first order
+      description: |
+        Query principals see only their own Queries; Admin principals see every
+        Query. The cursor is opaque and follows the immutable creation order.
+      parameters:
+        - name: state
+          in: query
+          description: Return only Queries in this state.
+          schema:
+            $ref: "#/components/schemas/QueryState"
+        - name: created_after_ms
+          in: query
+          description: Return only Queries created strictly after this Unix epoch millisecond.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: cursor
+          in: query
+          description: Opaque cursor returned by the preceding list page.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+        - name: limit
+          in: query
+          description: Maximum Queries returned in this page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: One page of visible Query status records.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryList"
+        "400":
+          description: A filter, limit, or cursor is invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
     post:
       tags: [Queries]
       operationId: submitQuery
@@ -181,7 +235,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Problem"
-  /v1/queries/{query_id}:
+  /v2/queries/{query_id}:
     parameters:
       - $ref: "#/components/parameters/QueryId"
     get:
@@ -221,7 +275,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Problem"
-  /v1/queries/{query_id}/cancel:
+  /v2/queries/{query_id}/cancel:
     parameters:
       - $ref: "#/components/parameters/QueryId"
     post:
@@ -242,7 +296,7 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/QueryNotFound"
-  /v1/queries/{query_id}/results:
+  /v2/queries/{query_id}/results:
     parameters:
       - $ref: "#/components/parameters/QueryId"
       - name: cursor
@@ -290,7 +344,11 @@ paths:
         is still running, send `Accept: application/vnd.apache.arrow.file` and
         only `batch_seq`. Each Arrow 200 response is one independent Arrow IPC
         file containing exactly one RecordBatch. A completed zero-row result,
-        or a poll after the final batch, returns a schema-only Arrow IPC file.
+        a poll after the final batch, or a retained interrupted result with no
+        further committed batches returns a schema-only Arrow IPC file. A
+        retained interrupted result reports `X-RustDB-Result-State: interrupted`
+        and ends at its last committed batch; it is a readable prefix, not a
+        successful full result. Check status `result_available` before reading.
         Reads are immutable and repeatable; clients advance only to the exact
         `X-RustDB-Next-Batch-Seq` returned by the server.
       responses:
@@ -418,7 +476,7 @@ components:
       description: Query/result state observed while serving the Arrow response.
       schema:
         type: string
-        enum: [queued, running, succeeded, failed, cancelled, invalidated]
+        enum: [queued, running, succeeded, failed, cancelled, interrupted, invalidated]
     ResultComplete:
       description: True only when no batch follows `X-RustDB-Next-Batch-Seq`.
       schema:
@@ -507,10 +565,10 @@ components:
       properties:
         protocol_version:
           type: string
-          const: v1
+          const: v2
         server_version:
           type: string
-          examples: [1.0.0-beta.1]
+          examples: [1.0.0-beta.2]
         read_only:
           type: boolean
           const: true
@@ -528,6 +586,8 @@ components:
               - offset_pagination
               - json_results
               - ndjson_results
+              - query_listing
+              - structured_remote_errors
     QueryRequest:
       type: object
       additionalProperties: false
@@ -599,7 +659,7 @@ components:
           type: string
     QueryState:
       type: string
-      enum: [queued, running, succeeded, failed, cancelled]
+      enum: [queued, running, succeeded, failed, cancelled, interrupted]
     QueryStatus:
       type: object
       additionalProperties: false
@@ -607,6 +667,7 @@ components:
         - query_id
         - state
         - created_at_ms
+        - result_available
       properties:
         query_id:
           type: string
@@ -632,7 +693,44 @@ components:
           description: Present after successful execution; otherwise omitted.
         error:
           $ref: "#/components/schemas/Problem"
-          description: Present for failed or cancelled Queries; otherwise omitted.
+          description: Present for failed, cancelled, or interrupted Queries; otherwise omitted.
+        result_available:
+          type: boolean
+          description: True when a retained result can be read in at least one supported mode.
+        result_expires_at_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Result retention deadline in Unix epoch milliseconds; omitted when unavailable.
+        result_rows:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Rows committed to retained storage; may be a prefix for an interrupted Query.
+        result_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Bytes occupied by committed retained result batches.
+        result_batches:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of committed Arrow RecordBatches.
+    QueryList:
+      type: object
+      additionalProperties: false
+      required: [queries]
+      properties:
+        queries:
+          type: array
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/QueryStatus"
+        next_cursor:
+          type: string
+          maxLength: 256
+          description: Omitted when there is no following page.
     QueryMetrics:
       type: object
       additionalProperties: false

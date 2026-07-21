@@ -1,8 +1,12 @@
 # RustDB Beta operator guide
 
-This guide covers `v1.0.0-beta.1`. RustDB Beta is pre-production software: it
+This guide covers `v1.0.0-beta.2`. RustDB Beta is pre-production software: it
 has a defined compatibility and operations contract, but no production SLA.
 Run it as a single-node service with recoverable source data and tested backups.
+
+Beta 2 is a fresh-start release: do not point it at a Beta 1 Native database or
+reuse Beta 1 HTTP state. Re-import into Native epoch 4 and create schema-version
+2 service state before changing traffic. There is no in-place migration path.
 
 ## Support matrix
 
@@ -35,8 +39,10 @@ Use a dedicated operating-system account and separate capacity budgets:
 
 Directories containing database, security state, results, or Spill should be
 mode `0700`; sensitive files are mode `0600`. Do not edit files inside a Native
-database. Native backup does not include HTTP security state, audit records, or
-retained query results.
+database. A Beta 2 service bundle includes Native data and safe HTTP control
+state (principals, token/profile material, CA, TLS identity, and connection
+profile). It deliberately excludes Query journals and retained results, audit
+records, Spill/temporary data, locks, and the Admin socket.
 
 Plan capacity for the retained database plus publication headroom, results,
 Spill, and a backup. Native and Spill admission each retain at least 10% and
@@ -59,22 +65,27 @@ docker run --rm --init --read-only \
   -p 7400:7400 \
   -v /srv/rustdb:/var/lib/rustdb \
   -v /etc/rustdb:/etc/rustdb:ro \
-  ghcr.io/samuelsupe/rustdb:v1.0.0-beta.1 \
+  ghcr.io/samuelsupe/rustdb:v1.0.0-beta.2 \
   --spill-directory /var/lib/rustdb/spill \
   serve \
   --database /var/lib/rustdb/database \
-  --config /etc/rustdb/rustdb.toml
+  --config /etc/rustdb/rustdb.toml \
+  --listen 0.0.0.0:7400 \
+  --advertise-url https://analytics.example.com:7400
 ```
 
 Create and chown the host directories before starting the container. Keep the
 root filesystem read-only and mount only the four writable data directories.
-Send `SIGTERM` and allow at least the fixed 30-second shutdown grace; do not use
-`SIGKILL` during normal operation.
+Replace `analytics.example.com` with the client-visible HTTPS hostname.
+Send `SIGTERM` and allow at least the configured shutdown grace (30 seconds by
+default); do not use `SIGKILL` during normal operation. The server stops
+readiness first, drains result readers and Query tasks to the deadline, then
+persists remaining work as `interrupted` before cleaning managed files.
 
 ## Configuration
 
 Start from [`packaging/config/rustdb.example.toml`](../packaging/config/rustdb.example.toml).
-The top-level `schema_version = 1` is mandatory and unknown fields are rejected.
+The top-level `schema_version = 2` is mandatory and unknown fields are rejected.
 
 ```sh
 rustdb config validate /etc/rustdb/rustdb.toml
@@ -94,13 +105,21 @@ memory limit. Set explicit result and Native quotas. Increase concurrency only
 after observing queueing, result-disk growth, and peak memory under the actual
 query mix.
 
+The service samples process RSS against the smaller of physical memory and the
+active Linux cgroup limit. Defaults throttle new submissions at 70%, reject at
+80%, and cancel the largest live Query at 90%. Configure these ratios only in
+schema-version 2 TOML. Blocking result and service-state I/O uses a separate
+bounded pool (`service_io_threads = 2` by default), so it does not occupy
+compute lanes. The local Admin socket defaults inside the per-database state
+directory; an override must remain on a private local filesystem.
+
 ## Authentication and authorization
 
 Authentication is enabled by default. First start creates an `admin` principal
 and one random profile token. `principals.json` stores SHA-256 digests only;
 clear-text profile tokens are separate private files and are never logged.
 
-Stop the server before local identity administration:
+Offline identity administration still requires the server to be stopped:
 
 ```sh
 rustdb principal list --database /srv/rustdb/database --state-root /srv/rustdb/state
@@ -125,6 +144,24 @@ explicit HTTPS origin is required. Query principals can access only their own
 query IDs. Admin principals can access every query and `/metrics`. The final
 enabled Admin cannot be disabled or demoted.
 
+Beta 2 also supports the narrow online operations required for safe rotation.
+They use a private Unix-domain Admin socket, never the network HTTP listener:
+
+```sh
+rustdb service status --database /srv/rustdb/database --state-root /srv/rustdb/state
+rustdb service rotate-token --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --principal reporting
+rustdb service revoke-token --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --token-id OLD_TOKEN_ID
+rustdb service reload-tokens --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state
+```
+
+The socket protocol is strict, local-only JSON Lines; the socket is mode `0600`
+inside a mode `0700` state directory. Keep offline commands for role or
+principal changes. TLS leaf certificates are checked periodically and reloaded
+without restarting while the long-lived local CA remains unchanged.
+
 `--no-auth` is a development-only escape hatch. It grants query access but no
 Admin identity, so `/metrics` remains forbidden. Never use it on a non-loopback
 listener or an untrusted host.
@@ -133,6 +170,8 @@ listener or an untrusted host.
 
 - `GET /healthz` reports process liveness and `GET /readyz` reports readiness;
   both are unauthenticated and intentionally disclose only minimal state.
+- `GET /v2/info` reports protocol/capabilities, and `GET /v2/queries` lists the
+  authenticated principal's visible Queries. Admin can list across principals.
 - `GET /metrics` uses Prometheus text format and requires an Admin bearer token.
 - `--log-format json` writes structured events to stderr. Set `RUST_LOG` for
   filtering; logs use SQL fingerprints instead of SQL text.
@@ -148,11 +187,15 @@ curl --fail --cacert /secure/ca.pem \
   https://analytics.example.com:7400/metrics
 ```
 
-Alert on readiness failure, query rejections/failures, sustained running-query
-growth, result and database filesystem pressure, and audit-write errors in the
-service log. Metrics are low-cardinality process counters and gauges; they do
-not contain principal or query-ID labels. The Beta audit log is operational
-evidence, not a compliance-grade immutable ledger.
+Alert on readiness failure, Query rejections/failures/interruption, sustained
+running-query growth, result and database filesystem pressure, and audit-write
+errors in the service log. An interrupted Query may expose only its committed
+Arrow prefix and must be resubmitted when a complete answer is required.
+Metrics are low-cardinality process counters and gauges; they do
+not contain principal or query-ID labels. RSS metrics expose the current
+pressure ratio/decision and cumulative throttles, rejections, and cancellations.
+The Beta audit log is operational evidence, not a compliance-grade immutable
+ledger.
 
 ## Check, diagnostics, repair, and backup
 
@@ -163,6 +206,8 @@ rustdb native check /srv/rustdb/database
 rustdb native check /srv/rustdb/database --json
 rustdb diagnostics --database /srv/rustdb/database \
   --output /secure/rustdb-diagnostics.json
+rustdb service check --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --result-directory /srv/rustdb/results
 ```
 
 `native check` is read-only. Diagnostics produces a versioned, redacted JSON
@@ -181,27 +226,46 @@ rustdb native check /srv/rustdb/database
 Always take a full verified backup before `--apply`. The repair command creates
 only a metadata backup, revalidates its plan under the database lock, and never
 reconstructs missing user data. See [Native check and repair](native-repair.md).
+Service-state repair is similarly marker-gated and plan-first:
+
+```sh
+rustdb service repair --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --result-directory /srv/rustdb/results --json
+rustdb service repair --database /srv/rustdb/database \
+  --state-root /srv/rustdb/state --result-directory /srv/rustdb/results --apply --json
+```
+
+It can remove only owned incomplete journal tails/temporary files and invalid
+owned result artifacts. Unknown directories and unowned files are never
+guessed safe to delete.
 
 Backup and restore into a new, empty destination:
 
 ```sh
-rustdb backup /srv/rustdb/database /backup/rustdb-2026-07-19
+rustdb backup /srv/rustdb/database /backup/rustdb-2026-07-19 \
+  --state-root /srv/rustdb/state
+rustdb backup-check /backup/rustdb-2026-07-19
 rustdb --s3-region us-east-1 backup \
-  /srv/rustdb/database s3://backup-bucket/rustdb/2026-07-19
-rustdb restore /backup/rustdb-2026-07-19 /srv/rustdb/restore-check
+  /srv/rustdb/database s3://backup-bucket/rustdb/2026-07-19 \
+  --state-root /srv/rustdb/state
+rustdb restore /backup/rustdb-2026-07-19 /srv/rustdb/restore-check \
+  --state-root /srv/rustdb/restore-state
 rustdb native check /srv/rustdb/restore-check
 ```
 
-The manifest is published only after backup validation; restore refuses to
-replace an existing destination. Periodically perform a full restore and query
-checksum check. Configure an S3 incomplete-multipart lifecycle policy and use a
-dedicated empty prefix per backup.
+The versioned, self-checksummed manifest is published only after validation;
+restore refuses to replace either an existing database target or an existing
+per-database state target. Backup holds the service-state lock and includes
+sensitive control material, so protect the bundle like a credential. Periodically
+perform a full restore and query checksum check. Configure an S3 incomplete-
+multipart lifecycle policy and use a dedicated empty prefix per backup.
 
 ## Incident sequence
 
 1. Stop new traffic and preserve the first stable error code, request ID, and
    query ID; never collect credentials or raw profile bundles.
-2. Send `SIGTERM` and wait for shutdown. Copy logs and the private audit files.
+2. Prefer `rustdb service shutdown --database ...` or send `SIGTERM`, then wait
+   for bounded shutdown. Copy logs and the private audit files.
 3. Run `native check --json` and `diagnostics` without opening the database for
    writes.
 4. Restore the latest backup to a new path. Do not overwrite the source.
@@ -250,12 +314,15 @@ fixture and canonical `queries.sql`; the repository supplies the versioned
 deterministic derivative used for execution. The gate binds both query
 identities and runs ClickBench with four CPUs, a 12-GiB container limit, a
 4-GiB engine budget, batch 8192, and I/O concurrency 16. It runs
-`scripts/ci/orbstack.sh all` once, those four external runs, and one ClickBench
-pass. It records the commit, host/profile, normalized fixture inventories,
+`scripts/ci/orbstack.sh all` once, TPC-H SF1 once on local and MinIO, those four
+external runs, one ClickBench pass, and one bounded 60-minute lifecycle/fault
+stage. It records the commit, host/profile, normalized fixture inventories,
 commands, logs, runner build ID, resource summaries, and outcome in
 `<output>/evidence.json`. A failed or interrupted run also writes failed
-evidence and must not be reused. Dedicated low-memory Spill stress is not
-repeated.
+evidence and must not be reused. The lifecycle stage exercises bounded shutdown,
+interrupted Arrow recovery, state check/repair, backup, cleanup, and resource
+convergence; it is not a production soak. Dedicated low-memory Spill stress is
+not repeated.
 
 The 100-GiB `count(*)` path is the discovery, snapshot, metadata, concurrency,
 and memory-accounting part of the gate. The functional ClickBench pass checks

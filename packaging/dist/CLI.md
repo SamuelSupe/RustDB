@@ -79,9 +79,8 @@ rustdb shell --profile analytics -f report.sql --format csv >report.csv
 The remote boundary is intentionally read-only. It accepts query, metadata,
 and explain statements over Native/system tables and server-local registered
 sources. It rejects DDL/DML, maintenance, uploads, direct `read_csv` or
-`read_parquet`, and remote source administration. See `docs/HTTP-SHELL.md` and
-`docs/openapi-v1.yaml` in the distribution for the lifecycle and public `/v1`
-contract.
+`read_parquet`, and remote source administration. See `http-shell.md` and
+`openapi-v2.yaml` beside this file for the lifecycle and public `/v2` contract.
 
 `serve` accepts result-retention controls independently of the engine Spill
 limits: `--result-directory`, `--result-ttl-secs`, `--result-global-limit`, and
@@ -94,6 +93,18 @@ engine enforces the corresponding Spill hard limits through
 `--s3-endpoint`, `--s3-path-style`, `--s3-allow-http`, and `--s3-anonymous`
 for server-local registered sources. Use HTTP only for trusted development
 endpoints and anonymous mode only for public objects.
+
+Beta 2 service files use configuration `schema_version = 2`; older schemas are
+rejected instead of being upgraded in place. The default RSS guardian samples
+the process against the smaller of physical memory and the active Linux cgroup
+limit. At 70% it throttles new submissions, at 80% it rejects new submissions,
+and at 90% it also cancels the running query with the largest live reservation.
+Configure the three ratios and sampling interval in the `[server]` TOML section.
+
+Blocking query-journal, retained-result, credential, and certificate work runs
+on a bounded service I/O pool (`service_io_threads`, default `2`). The server
+checks the managed TLS leaf periodically (`tls_renew_interval_secs`, default
+six hours) and hot-loads a renewed identity without restarting the listener.
 
 Persistent CSV/Parquet registrations are changed only on the server host while
 `rustdb serve` is stopped:
@@ -124,11 +135,12 @@ rustdb --database ./warehouse -c \
   "BEGIN READ ONLY; SELECT count(*) FROM events; COMMIT"
 ```
 
-RustDB v0.8 Native databases use a checksummed WAL and snapshot-isolation
+RustDB Beta 2 Native databases use a checksummed WAL and snapshot-isolation
 transactions. A transaction pins one catalog/data snapshot. Consume or drop
 every streaming result before `COMMIT`. Mutation results must be consumed to
-end-of-stream; cancellation or abandonment after staging rolls back the whole
-transaction because v0.8 has no statement savepoints.
+end-of-stream. Each transactional statement has an internal savepoint, so a
+failed, cancelled, or abandoned statement rolls back only its own staged
+changes and leaves the transaction usable. SQL `SAVEPOINT` remains unsupported.
 
 If `COMMIT` reports an unknown outcome, do not repeat it: reopen the database
 and inspect the recovered Catalog. A post-commit failure explicitly means the
@@ -143,30 +155,46 @@ retried. If COPY instead reports an existing incomplete staging file or remote
 child object, inspect and remove that incomplete destination before retrying;
 RustDB does not delete crash leftovers automatically.
 
-Opening a v0.7 database is read-only until it is migrated explicitly:
+Beta 2 creates Native marker epoch `4`. Epochs `1`, `2`, and `3` are rejected
+before permission changes, locking, WAL recovery, or cleanup. `migrate` only
+validates that a database already uses the current epoch; it does not convert
+older databases:
 
 ```sh
 rustdb migrate ./warehouse
 ```
 
-Migration validates the source first and keeps a sibling
-`warehouse.v0.7-backup`. An existing backup must match the current source
-catalog snapshot exactly. It never silently upgrades a database during open.
+Create a fresh Beta 2 database and import the source CSV or Parquet data. Open
+never silently upgrades an older database.
 
 Create or restore a verified backup with the standalone database commands:
 
 ```sh
-rustdb backup ./warehouse ./warehouse-backup
-rustdb restore ./warehouse-backup ./warehouse-restored
+rustdb backup ./warehouse ./warehouse-backup --state-root ./service-state
+rustdb backup-check ./warehouse-backup
+rustdb restore ./warehouse-backup ./warehouse-restored \
+  --state-root ./restored-service-state
 
 rustdb --s3-region us-east-1 \
-  backup ./warehouse s3://analytics/rustdb/warehouse-2026-07-18
+  backup ./warehouse s3://analytics/rustdb/warehouse-2026-07-18 \
+  --state-root ./service-state
 rustdb --s3-region us-east-1 \
-  restore s3://analytics/rustdb/warehouse-2026-07-18 ./warehouse-restored
+  backup-check s3://analytics/rustdb/warehouse-2026-07-18
+rustdb --s3-region us-east-1 \
+  restore s3://analytics/rustdb/warehouse-2026-07-18 ./warehouse-restored \
+  --state-root ./restored-service-state
 ```
 
+This is one service bundle: it includes Native data plus safe HTTP control
+state when that state exists, including principals, Token/Profile material,
+the local CA, and the managed TLS identity. Treat the bundle as sensitive. It
+deliberately excludes query journals and retained results, audit logs, Spill
+and temporary data, locks, and the Admin socket. `backup-check` validates the
+versioned manifest, inventory, permissions, checksums, and embedded Native
+database without restoring it. Restore validates again and requires both a new
+database path and a fresh per-database state target.
+
 Remote backup uploads immutable objects first and publishes its manifest last.
-Restore validates object size and hash and requires a new local destination.
 S3 endpoint/path-style/HTTP/anonymous flags are the same as query scans; secret
 keys are still resolved only by the default credential chain.
 
@@ -175,6 +203,34 @@ it publishes the manifest or removes unfinished objects. Configure an S3
 incomplete-multipart lifecycle policy for process or host crashes. If a crash
 leaves a completed object before the manifest, RustDB rejects that non-empty
 destination; inspect and remove its dedicated prefix before retrying.
+
+## Service integrity and local administration
+
+With `serve` stopped, verify service-owned principals, the query journal, and
+retained-result manifests and chunks. Repair is a dry run unless `--apply` is
+present, and can remove only incomplete or invalid artifacts whose ownership
+is proven by RustDB markers:
+
+```sh
+rustdb service check --database ./warehouse --state-root ./service-state
+rustdb service repair --database ./warehouse --state-root ./service-state
+rustdb service repair --database ./warehouse --state-root ./service-state --apply
+```
+
+While `serve` is running, use the private local Unix Admin socket for status,
+atomic credential reload/rotation/revocation, and graceful shutdown. The socket
+defaults inside the per-database state directory and is mode `0600`;
+`--admin-socket` selects an explicit path.
+
+```sh
+rustdb service status --database ./warehouse --state-root ./service-state
+rustdb service reload-tokens --database ./warehouse --state-root ./service-state
+rustdb service rotate-token --database ./warehouse --state-root ./service-state \
+  --principal analyst
+rustdb service revoke-token --database ./warehouse --state-root ./service-state \
+  --token-id <UUID>
+rustdb service shutdown --database ./warehouse --state-root ./service-state
+```
 
 ## Data sources
 

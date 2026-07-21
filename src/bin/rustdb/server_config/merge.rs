@@ -35,6 +35,26 @@ pub(super) fn apply_file(
     if let Some(value) = file.server.max_query_time_secs {
         server.query.max_query_time = Duration::from_secs(value);
     }
+    assign(
+        &mut server.rss_guard.warning_ratio,
+        file.server.rss_warning_ratio,
+    );
+    assign(&mut server.rss_guard.high_ratio, file.server.rss_high_ratio);
+    assign(
+        &mut server.rss_guard.critical_ratio,
+        file.server.rss_critical_ratio,
+    );
+    if let Some(value) = file.server.rss_sample_interval_ms {
+        server.rss_sample_interval = Duration::from_millis(value);
+    }
+    assign(
+        &mut server.service_io_threads,
+        file.server.service_io_threads,
+    );
+    assign_some(&mut server.admin_socket, file.server.admin_socket);
+    if let Some(value) = file.server.tls_renew_interval_secs {
+        server.tls_renew_interval = Duration::from_secs(value);
+    }
     assign(&mut server.no_auth, file.server.no_auth);
     if let Some(value) = file.engine.memory_limit {
         engine.memory_limit = parse_size("engine.memory_limit", &value)?;
@@ -105,6 +125,17 @@ pub(super) fn apply_environment(
     apply_query_environment(server)?;
     if let Some(value) = environment("RUSTDB_NO_AUTH")? {
         server.no_auth = parse_bool("RUSTDB_NO_AUTH", &value)?;
+    }
+    if let Some(value) = environment("RUSTDB_SERVICE_IO_THREADS")? {
+        server.service_io_threads = parse_number("RUSTDB_SERVICE_IO_THREADS", &value)?;
+    }
+    assign_some(
+        &mut server.admin_socket,
+        environment("RUSTDB_ADMIN_SOCKET")?.map(PathBuf::from),
+    );
+    if let Some(value) = environment("RUSTDB_TLS_RENEW_INTERVAL_SECS")? {
+        server.tls_renew_interval =
+            Duration::from_secs(parse_number("RUSTDB_TLS_RENEW_INTERVAL_SECS", &value)?);
     }
     if let Some(value) = environment("RUSTDB_MEMORY_LIMIT")? {
         engine.memory_limit = parse_size("RUSTDB_MEMORY_LIMIT", &value)?;
@@ -214,6 +245,11 @@ pub(super) fn apply_cli(
     }
     if args.s3_anonymous {
         engine.s3.anonymous = true;
+    }
+    assign(&mut server.service_io_threads, args.service_io_threads);
+    assign_some(&mut server.admin_socket, args.admin_socket.clone());
+    if let Some(value) = args.tls_renew_interval_secs {
+        server.tls_renew_interval = Duration::from_secs(value);
     }
     if args.no_auth {
         server.no_auth = true;

@@ -62,6 +62,29 @@ impl SecurityState {
         Self::open(state_root, &marker.database_id)
     }
 
+    /// Resolves existing service state without creating directories. This is
+    /// used by offline checks and local admin clients.
+    pub fn locate_for_native_database(
+        state_root: impl AsRef<Path>,
+        database_directory: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let marker_path = database_directory.as_ref().join(".rustdb");
+        let encoded = read_regular_file(&marker_path, MAX_DATABASE_MARKER_BYTES, false)?;
+        let marker: NativeDatabaseMarker = serde_json::from_slice(&encoded).map_err(|error| {
+            Error::InvalidArgument(format!(
+                "invalid native database marker at {}: {error}",
+                marker_path.display()
+            ))
+        })?;
+        validate_database_id(&marker.database_id)?;
+        let directory = state_root.as_ref().join(&marker.database_id);
+        super::files::check_secure_directory(&directory)?;
+        Ok(Self {
+            database_id: marker.database_id,
+            directory,
+        })
+    }
+
     pub fn database_id(&self) -> &str {
         &self.database_id
     }
@@ -92,6 +115,10 @@ impl SecurityState {
 
     pub fn principals_path(&self) -> PathBuf {
         self.directory.join("principals.json")
+    }
+
+    pub fn admin_socket_path(&self) -> PathBuf {
+        self.directory.join("admin.sock")
     }
 
     #[doc(hidden)]
@@ -153,6 +180,53 @@ impl SecurityState {
                 .and_then(|_| file.sync_all())
                 .map_err(|error| Error::io(path.clone(), error))?;
         } else if marker != SERVER_LOCK_MARKER {
+            return Err(Error::InvalidArgument(format!(
+                "invalid HTTP server lock marker at {}",
+                path.display()
+            )));
+        }
+        Ok(ServerStateLock { _file: file })
+    }
+
+    #[doc(hidden)]
+    pub fn acquire_existing_server_lock(&self) -> Result<ServerStateLock> {
+        let path = self.directory.join(SERVER_LOCK_FILE);
+        let path_metadata =
+            std::fs::symlink_metadata(&path).map_err(|error| Error::io(path.clone(), error))?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return Err(Error::InvalidArgument(format!(
+                "refusing insecure HTTP server lock {}",
+                path.display()
+            )));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| Error::io(path.clone(), error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| Error::io(path.clone(), error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "HTTP server lock {} must be private",
+                    path.display()
+                )));
+            }
+        }
+        file.try_lock().map_err(|error| {
+            Error::InvalidArgument(format!(
+                "HTTP service state is in use by a running server: {error}"
+            ))
+        })?;
+        let mut marker = Vec::new();
+        file.rewind()
+            .and_then(|_| file.read_to_end(&mut marker))
+            .map_err(|error| Error::io(path.clone(), error))?;
+        if marker != SERVER_LOCK_MARKER {
             return Err(Error::InvalidArgument(format!(
                 "invalid HTTP server lock marker at {}",
                 path.display()

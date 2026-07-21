@@ -41,6 +41,9 @@ struct LocalCatalogState {
     hidden_persistent: HashSet<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct TransactionCatalogCheckpoint(LocalCatalogState);
+
 #[derive(Clone, Default)]
 pub struct Catalog {
     local: Arc<RwLock<LocalCatalogState>>,
@@ -130,6 +133,14 @@ impl Catalog {
         local.tables.remove(&key);
         local.views.remove(&key);
         local.hidden_persistent.insert(key);
+    }
+
+    pub(crate) fn transaction_checkpoint(&self) -> TransactionCatalogCheckpoint {
+        TransactionCatalogCheckpoint(self.local.read().clone())
+    }
+
+    pub(crate) fn restore_transaction_checkpoint(&self, checkpoint: TransactionCatalogCheckpoint) {
+        *self.local.write() = checkpoint.0;
     }
 
     pub(crate) fn replace_provider(

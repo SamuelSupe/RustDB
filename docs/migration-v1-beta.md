@@ -1,26 +1,25 @@
-# Moving from RustDB alpha to v1.0 Beta
+# Rebuilding data for RustDB v1.0.0-beta.2
 
-RustDB Beta starts a new Native compatibility epoch. There is intentionally no
-in-place migration from v0.x alpha databases.
+RustDB Beta 2 starts Native format epoch `4`. There is intentionally no in-place
+migration from any earlier RustDB database, including `v1.0.0-beta.1`.
 
 ## Required procedure
 
-1. Keep the alpha database and binary unchanged as the rollback source.
+1. Keep the earlier database and binary unchanged as a reference.
 2. Export or identify the original CSV/Parquet objects used to build it.
-3. Install the Beta binary and create a new, empty Native database directory.
+3. Install the Beta 2 binary and create a new, empty Native database directory.
 4. Import the source data into that directory and verify row counts and query
    checksums.
-5. Create and verify a Beta snapshot before redirecting local readers or the
+5. Create and verify a Beta 2 snapshot before redirecting local readers or the
    read-only HTTP service.
 
-Opening an alpha marker with Beta returns `native.format_unsupported`. The check
+Opening an epoch `1`, `2`, or `3` marker with Beta 2 returns
+`native.format_unsupported`. The check
 happens before chmod, locking, WAL recovery, or cleanup, so inspecting an old
 directory cannot mutate it. `rustdb migrate PATH` remains as a format validation
-command for callers that used the historical API; on a current Beta database it
-is a no-op, and on an alpha database it explains that re-import is required.
-
-Compatibility and N-2 support begin with `v1.0.0-beta.1`; they do not apply
-retroactively to alpha artifacts.
+command; on an epoch `4` database it is a no-op, and on any earlier database it
+explains that re-import is required. Beta 2 does not provide a compatibility,
+migration, or rollback contract for Beta 1 artifacts.
 
 Embedded callers that construct `S3Config` with a custom
 `AwsCredentialProvider` must rebuild against `object_store` `0.14.1`. The
@@ -35,10 +34,11 @@ HTTP state or retained results into a Beta deployment.
 
 ## 中文说明
 
-Beta 启用新的 Native 格式 epoch，不提供从 v0.x alpha 数据库原地升级。请保留
-alpha 目录作为回滚来源，在新的空 Beta 目录中从 CSV/Parquet 重新导入，校验行数和
-查询 checksum，并在切流前创建及验证 Beta 快照。Beta 遇到 alpha marker 会返回
-`native.format_unsupported`，且在报错前不会修改旧目录的权限、锁、WAL 或临时文件。
+Beta 2 启用 Native 格式 epoch `4`，不提供从任何旧版数据库（包括 Beta 1）原地
+升级。请保留旧目录作为参考，在新的空 Beta 2 目录中从 CSV/Parquet 重新导入，校验
+行数和查询 checksum，并在切流前创建及验证 Beta 2 快照。Beta 2 遇到 epoch `1`、
+`2` 或 `3` marker 会返回 `native.format_unsupported`，且在报错前不会修改旧目录的
+权限、锁、WAL 或临时文件。
 重建前请核对[兼容矩阵](compatibility.md)，部署、身份、备份验证和发行门禁以
 [中文运维指南](operator-guide.zh-CN.md)为准；不要把 alpha HTTP 状态或保留结果复制到
 Beta 部署。

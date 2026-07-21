@@ -5,7 +5,7 @@ use crate::{Error, Result};
 
 use super::{DeleteReason, PersistedQuery};
 
-pub(super) const FORMAT_EPOCH: u32 = 1;
+pub(super) const FORMAT_EPOCH: u32 = 2;
 pub(super) const MAX_EVENT_BYTES: usize = 512 * 1024;
 pub(super) const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 

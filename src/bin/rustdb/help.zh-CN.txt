@@ -22,7 +22,7 @@ Native 数据库：
       --native-table-limit <表=大小>  单表硬配额，可重复；支持 schema.table
       --native-min-free-bytes <大小>  Native 文件系统至少保留空间，默认 1GiB
       --native-min-free-ratio <比例>  Native 文件系统至少保留比例，默认 0.10
-  migrate <路径>                      验证数据库使用当前 Beta 格式；alpha 数据需重新导入
+  migrate <路径>                      验证数据库使用当前 Beta 格式；旧格式数据需重新导入
   native check <路径> [--json]        严格只读检查 marker、manifest 与全部数据文件
   native repair <路径> [--json]       只输出保守修复计划，不修改任何文件
   native repair <路径> --apply [--json]
@@ -32,12 +32,15 @@ Native 数据库：
          [--header <auto|present|absent>] [--delimiter <字符>]
          [--compression <auto|none|gzip|zstd>] [--json]
                                       幂等导入到新的 Native 表；同一请求重放不重复写入
-  backup <数据库> <目标>              备份到本地目录或 s3:// 前缀
-  restore <备份> <新数据库>           从本地目录或 s3:// 前缀恢复
+  backup <数据库> <目标> [--state-root <路径>]
+                                      备份 Native 与安全 HTTP 控制状态
+  backup-check <备份> [--json]        校验本地目录或 s3:// 服务备份
+  restore <备份> <新数据库> [--state-root <新路径>]
+                                      恢复到全新数据库与服务状态目标
   diagnostics --database <路径> [--output <JSON>]
                                       生成脱敏、版本化的只读诊断报告
 
-v0.8 Native 数据库使用校验和 WAL 和快照隔离事务。SQL 支持 BEGIN、COMMIT、
+Beta 2 Native 数据库使用校验和 WAL 和快照隔离事务。SQL 支持 BEGIN、COMMIT、
 ROLLBACK；提交前必须消费完或丢弃事务内的所有流式结果。
 
 Beta 只读 HTTPS Shell：
@@ -71,7 +74,29 @@ Beta 只读 HTTPS Shell：
         [--s3-path-style]               服务端强制使用 S3 path-style 请求
         [--s3-allow-http]               服务端允许明文 S3 HTTP，仅限可信开发环境
         [--s3-anonymous]                服务端 S3 请求不签名，仅用于公开对象
+        [--service-io-threads <数量>]  服务状态和结果 I/O 的固定线程数，默认 2
+        [--admin-socket <路径>]        本机管理 socket；默认位于数据库服务状态目录
+        [--tls-renew-interval-secs <秒>]
+                                      检查并热加载临近过期 TLS 叶证书的周期
         [--no-auth]                     显式关闭认证，仅用于隔离开发环境
+
+  service check --database <路径> [--state-root <路径>] [--result-directory <路径>]
+                                      只读校验 principal、Query journal 与结果
+  service repair --database <路径> [--state-root <路径>] [--result-directory <路径>]
+        [--apply] [--json]
+                                      仅修复可由 marker 证明归属的服务状态
+  service status --database <路径> [--state-root <路径>] [--admin-socket <路径>]
+                                      通过本机 socket 查看运行状态
+  service reload-tokens --database <路径> [--state-root <路径>] [--admin-socket <路径>]
+                                      原子重载持久化 principal/Token
+  service rotate-token --database <路径> [--state-root <路径>] [--admin-socket <路径>]
+        --principal <ID>
+                                      在线添加重叠 Token 并立即重载
+  service revoke-token --database <路径> [--state-root <路径>] [--admin-socket <路径>]
+        --token-id <UUID>
+                                      在线撤销 Token 并立即重载
+  service shutdown --database <路径> [--state-root <路径>] [--admin-socket <路径>]
+                                      请求有界优雅停服
 
   shell --profile <名称>               通过已导入 Profile 连接远程 HTTPS Shell
         [-c <SQL> | -f <文件>]         执行 SQL 文本或文件，两者都不指定时进入交互模式
@@ -178,9 +203,9 @@ S3/MinIO：
   rustdb native repair ./warehouse --apply --json
   rustdb import --database ./warehouse --table events --location ./events.csv \
     --format csv --import-id events-2026-07-19 --header present
-  rustdb backup ./warehouse ./warehouse-backup
-  rustdb --s3-region us-east-1 backup ./warehouse s3://bucket/rustdb/snapshot
-  rustdb restore ./warehouse-backup ./warehouse-restored
+  rustdb backup ./warehouse ./warehouse-backup --state-root ./service-state
+  rustdb backup-check ./warehouse-backup
+  rustdb restore ./warehouse-backup ./warehouse-restored --state-root ./restored-state
   rustdb diagnostics --database ./warehouse --output diagnostics.json
   rustdb --s3-region us-east-1 -c \
     "SELECT * FROM read_parquet('s3://bucket/events/*.parquet') LIMIT 10"

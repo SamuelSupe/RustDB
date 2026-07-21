@@ -10,13 +10,14 @@ use arrow::datatypes::Schema;
 
 use super::{QueryManager, QueryManagerConfig, QueryRecord, cancel_and_persist, now_ms};
 use crate::{
-    Engine, EngineConfig,
+    Engine, EngineConfig, QueryMetrics, RetryClass, RssGuardian,
     http_shell::{
-        QueryRequest, QueryState,
+        QueryListRequest, QueryRequest, QueryState,
         result_store::ResultStore,
         result_store::ResultStoreConfig,
         security::{AuthenticatedActor, PrincipalId, QueryOwner, Role},
     },
+    runtime::MemoryPool,
 };
 
 fn actor(id: &str, role: Role) -> AuthenticatedActor {
@@ -97,6 +98,117 @@ async fn idempotency_and_query_access_are_principal_scoped() {
             .is_ok()
     );
 
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_listing_is_owner_scoped_filterable_and_cursor_paginated() {
+    let temporary = tempfile::tempdir().unwrap();
+    let manager = open_manager(&temporary.path().join("results"));
+    let alice = actor("alice", Role::Query);
+    let bob = actor("bob", Role::Query);
+    let admin = actor("admin", Role::Admin);
+
+    let first = http_ok(manager.submit(
+        &alice,
+        "list-alice-first",
+        QueryRequest {
+            sql: "SELECT 1".into(),
+            parameters: Vec::new(),
+            timeout_ms: None,
+        },
+        "submit-a1",
+    ));
+    let second = http_ok(manager.submit(
+        &alice,
+        "list-alice-second",
+        QueryRequest {
+            sql: "SELECT 2".into(),
+            parameters: Vec::new(),
+            timeout_ms: None,
+        },
+        "submit-a2",
+    ));
+    let bob_query = http_ok(manager.submit(
+        &bob,
+        "list-bob-only-query",
+        QueryRequest {
+            sql: "SELECT 3".into(),
+            parameters: Vec::new(),
+            timeout_ms: None,
+        },
+        "submit-b",
+    ));
+    for (actor, id) in [
+        (&alice, first.query_id.as_str()),
+        (&alice, second.query_id.as_str()),
+        (&bob, bob_query.query_id.as_str()),
+    ] {
+        assert_eq!(
+            wait_for_terminal(&manager, actor, id).await,
+            QueryState::Succeeded
+        );
+    }
+
+    let alice_page = http_ok(manager.list(
+        &alice,
+        QueryListRequest {
+            state: Some(QueryState::Succeeded),
+            created_after_ms: None,
+            limit: Some(1),
+            cursor: None,
+        },
+        "list-a1",
+    ));
+    assert_eq!(alice_page.queries.len(), 1);
+    assert!(alice_page.next_cursor.is_some());
+    assert_ne!(alice_page.queries[0].query_id, bob_query.query_id);
+
+    let alice_next = http_ok(manager.list(
+        &alice,
+        QueryListRequest {
+            state: Some(QueryState::Succeeded),
+            created_after_ms: None,
+            limit: Some(1),
+            cursor: alice_page.next_cursor,
+        },
+        "list-a2",
+    ));
+    assert_eq!(alice_next.queries.len(), 1);
+    assert_ne!(
+        alice_page.queries[0].query_id,
+        alice_next.queries[0].query_id
+    );
+    assert!(alice_next.next_cursor.is_none());
+
+    let all = http_ok(manager.list(
+        &admin,
+        QueryListRequest {
+            state: Some(QueryState::Succeeded),
+            created_after_ms: None,
+            limit: Some(10),
+            cursor: None,
+        },
+        "list-admin",
+    ));
+    assert_eq!(all.queries.len(), 3);
+    assert!(
+        all.queries
+            .iter()
+            .any(|query| query.query_id == bob_query.query_id)
+    );
+
+    let invalid = manager.list(
+        &alice,
+        QueryListRequest {
+            state: None,
+            created_after_ms: None,
+            limit: Some(1),
+            cursor: Some("not-base64!".into()),
+        },
+        "list-invalid",
+    );
+    assert_eq!(invalid.unwrap_err().body.error, "request.invalid");
     manager.shutdown().await.unwrap();
 }
 
@@ -224,6 +336,47 @@ async fn successful_result_is_not_published_before_its_journal_record() {
     manager.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn shutdown_forced_abort_seals_and_quiesces_before_deadline() {
+    let temporary = tempfile::tempdir().unwrap();
+    let manager = open_manager(&temporary.path().join("results"));
+    let record = Arc::new(QueryRecord::new(
+        QueryOwner::AuthenticationDisabled,
+        "e".repeat(64),
+        "f".repeat(64),
+    ));
+    {
+        let mut state = record.state.write();
+        state.phase = QueryState::Running;
+        state.started_at_ms = Some(now_ms());
+    }
+    manager.inner.journal.upsert(record.persisted()).unwrap();
+    manager
+        .inner
+        .records
+        .write()
+        .insert(record.id.clone(), Arc::clone(&record));
+    manager.inner.tasks.spawn(std::future::pending());
+
+    manager
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(record.state.read().phase, QueryState::Interrupted);
+    let persisted = manager
+        .inner
+        .journal
+        .load()
+        .into_iter()
+        .find(|query| query.query_id == record.id)
+        .unwrap();
+    assert_eq!(persisted.state, QueryState::Interrupted);
+    assert_eq!(persisted.error.unwrap().error, "query.interrupted");
+    assert_eq!(manager.inner.tasks.active(), 0);
+
+    manager.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_cannot_regress_a_durable_success_to_running() {
     let temporary = tempfile::tempdir().unwrap();
@@ -251,7 +404,7 @@ async fn cancel_cannot_regress_a_durable_success_to_running() {
         .await
         .unwrap();
 
-    let transition = record.lock_transition();
+    let transition = record.lock_transition().await;
     let finished_at_ms = now_ms();
     journal
         .upsert(record.pending_success(
@@ -303,7 +456,7 @@ fn queued_shutdown_cancellation_is_durable_after_reopen() {
     ));
     journal.upsert(record.persisted()).unwrap();
 
-    let transition = record.lock_transition();
+    let transition = record.blocking_lock_transition();
     let (started_tx, started_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let cancel_record = Arc::clone(&record);
@@ -329,4 +482,105 @@ fn queued_shutdown_cancellation_is_durable_after_reopen() {
     let durable = reopened.load().pop().unwrap();
     assert_eq!(durable.state, QueryState::Cancelled);
     assert!(!durable.result_available);
+}
+
+#[tokio::test]
+async fn rss_pressure_throttles_or_rejects_only_new_submissions() {
+    let temporary = tempfile::tempdir().unwrap();
+    let manager = open_manager(&temporary.path().join("results"));
+    let alice = actor("alice", Role::Query);
+    let request = QueryRequest {
+        sql: "SELECT 1".into(),
+        parameters: Vec::new(),
+        timeout_ms: None,
+    };
+    let accepted = http_ok(manager.submit(&alice, "rss-existing-key", request.clone(), "normal"));
+    assert_eq!(
+        wait_for_terminal(&manager, &alice, &accepted.query_id).await,
+        QueryState::Succeeded
+    );
+
+    manager
+        .inner
+        .rss_pressure
+        .observe(RssGuardian::default().assess(750, 1_000, None));
+    let replay = http_ok(manager.submit(&alice, "rss-existing-key", request.clone(), "replay"));
+    assert!(replay.replayed);
+    assert_eq!(replay.query_id, accepted.query_id);
+    let throttled = manager
+        .submit(&alice, "rss-throttle-key", request.clone(), "throttle")
+        .unwrap_err();
+    assert_eq!(throttled.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(throttled.body.error, "admission.rss_throttled");
+    assert_eq!(throttled.body.retry, RetryClass::Safe);
+    assert_eq!(throttled.retry_after, Some(1));
+
+    manager
+        .inner
+        .rss_pressure
+        .observe(RssGuardian::default().assess(850, 1_000, None));
+    let rejected = manager
+        .submit(&alice, "rss-reject-key", request, "reject")
+        .unwrap_err();
+    assert_eq!(rejected.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.body.error, "admission.rss_rejected");
+    assert_eq!(rejected.body.retry, RetryClass::Safe);
+    assert_eq!(manager.inner.records.read().len(), 1);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn critical_pressure_prefers_largest_live_reservation_then_earliest_running() {
+    let temporary = tempfile::tempdir().unwrap();
+    let manager = open_manager(&temporary.path().join("results"));
+    let running = |started_at_ms| {
+        let record = Arc::new(QueryRecord::new(
+            QueryOwner::AuthenticationDisabled,
+            "a".repeat(64),
+            "b".repeat(64),
+        ));
+        let mut state = record.state.write();
+        state.phase = QueryState::Running;
+        state.started_at_ms = Some(started_at_ms);
+        drop(state);
+        record
+    };
+
+    let small = running(10);
+    let large = running(20);
+    let small_pool = MemoryPool::new(1_024);
+    let large_pool = MemoryPool::new(1_024);
+    let _small_reservation = small_pool.try_reserve(100).unwrap();
+    let _large_reservation = large_pool.try_reserve(700).unwrap();
+    let small_live = small.register_live_metrics(QueryMetrics::with_memory_pool(small_pool));
+    let large_live = large.register_live_metrics(QueryMetrics::with_memory_pool(large_pool));
+    manager.inner.records.write().extend([
+        (small.id.clone(), Arc::clone(&small)),
+        (large.id.clone(), Arc::clone(&large)),
+    ]);
+
+    assert_eq!(
+        manager.cancel_largest_for_rss_pressure().as_deref(),
+        Some(large.id.as_str())
+    );
+    assert!(large.cancel.is_cancelled());
+    assert!(!small.cancel.is_cancelled());
+    drop(small_live);
+    drop(large_live);
+    assert_eq!(small.current_memory_bytes(), None);
+    assert_eq!(large.current_memory_bytes(), None);
+
+    let earliest = running(100);
+    let later = running(200);
+    manager.inner.records.write().clear();
+    manager.inner.records.write().extend([
+        (later.id.clone(), Arc::clone(&later)),
+        (earliest.id.clone(), Arc::clone(&earliest)),
+    ]);
+    assert_eq!(
+        manager.cancel_largest_for_rss_pressure().as_deref(),
+        Some(earliest.id.as_str())
+    );
+    manager.inner.records.write().clear();
+    manager.shutdown().await.unwrap();
 }

@@ -163,14 +163,28 @@ async fn arrow_result(
         .ok_or_else(|| shutting_down(query_id, request_id))?;
     let status = state.queries.status(actor, query_id, request_id)?;
     let Some(snapshot) = state.queries.result_snapshot(actor, query_id, request_id)? else {
-        if status.state == crate::http_shell::QueryState::Succeeded {
-            return Err(HttpError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "query.result_unavailable",
-                "completed query result is unavailable",
-                request_id.to_owned(),
-            )
-            .query(query_id));
+        match status.state {
+            crate::http_shell::QueryState::Queued | crate::http_shell::QueryState::Running => {}
+            crate::http_shell::QueryState::Succeeded => {
+                return Err(HttpError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "query.result_unavailable",
+                    "completed query result is unavailable",
+                    request_id.to_owned(),
+                )
+                .query(query_id));
+            }
+            crate::http_shell::QueryState::Failed
+            | crate::http_shell::QueryState::Cancelled
+            | crate::http_shell::QueryState::Interrupted => {
+                return Err(HttpError::new(
+                    StatusCode::CONFLICT,
+                    "query.no_result",
+                    "the query did not produce a result",
+                    request_id.to_owned(),
+                )
+                .query(query_id));
+            }
         }
         if batch_seq != 0 {
             return Err(invalid_request(
@@ -193,8 +207,10 @@ async fn arrow_result(
                 HttpError::from_engine(&error, request_id.to_owned()).query(query_id)
             })?;
         let next = chunk.seq.saturating_add(1);
-        let complete =
-            snapshot.state() == StoredResultState::Completed && next == snapshot.next_batch_seq();
+        let complete = matches!(
+            snapshot.state(),
+            StoredResultState::Completed | StoredResultState::Interrupted
+        ) && next == snapshot.next_batch_seq();
         state.metrics.result_bytes(bytes.len() as u64);
         return Ok(arrow_bytes(
             bytes,
@@ -216,7 +232,8 @@ async fn arrow_result(
                 request_id,
             ))
         }
-        StoredResultState::Completed => {
+        StoredResultState::Completed | StoredResultState::Interrupted => {
+            let result_state = snapshot.state();
             let bytes = empty_arrow(snapshot.schema()).map_err(|error| {
                 HttpError::from_engine(&error, request_id.to_owned()).query(query_id)
             })?;
@@ -227,7 +244,7 @@ async fn arrow_result(
                 batch_seq,
                 batch_seq,
                 0,
-                StoredResultState::Completed,
+                result_state,
                 true,
                 request_id,
             ))
@@ -343,6 +360,7 @@ fn query_state_name(state: crate::http_shell::QueryState) -> &'static str {
         crate::http_shell::QueryState::Succeeded => "succeeded",
         crate::http_shell::QueryState::Failed => "failed",
         crate::http_shell::QueryState::Cancelled => "cancelled",
+        crate::http_shell::QueryState::Interrupted => "interrupted",
     }
 }
 
@@ -350,6 +368,7 @@ fn stored_state_name(state: StoredResultState) -> &'static str {
     match state {
         StoredResultState::Running => "running",
         StoredResultState::Completed => "succeeded",
+        StoredResultState::Interrupted => "interrupted",
         StoredResultState::Failed => "failed",
         StoredResultState::Invalidated => "invalidated",
     }

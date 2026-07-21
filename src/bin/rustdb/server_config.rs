@@ -13,7 +13,7 @@ mod validate;
 
 use file::FileConfig;
 
-pub(super) const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub(super) const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 pub(super) fn load(args: &ServeArgs, global: &Args) -> Result<(EngineConfig, HttpServerConfig)> {
     let file = FileConfig::load_optional(args.config.as_deref())?;

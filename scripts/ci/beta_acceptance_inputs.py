@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from beta_acceptance_common import atomic_json, command
+from beta_acceptance_common import atomic_json, command, sha256
 from beta_acceptance_fixtures import (
     absolute_path,
     clickbench_fixture,
@@ -22,7 +22,10 @@ from beta_acceptance_fixtures import (
 )
 
 
-SCHEMA = "rustdb-beta-acceptance-inputs-v1"
+SCHEMA = "rustdb-beta-acceptance-inputs-v2"
+RELEASE_VERSION = "1.0.0-beta.2"
+NATIVE_EPOCH = 4
+CONFIG_SCHEMA = 2
 MIN_MEMORY = 16 * 1024**3
 
 
@@ -74,7 +77,7 @@ def create_output(args: argparse.Namespace) -> int:
     if output.exists():
         raise ValueError(f"acceptance output already exists: {output}")
     output.mkdir(mode=0o700, parents=True)
-    for child in ("logs", "reports", "clickbench"):
+    for child in ("logs", "reports", "clickbench", "tpch"):
         (output / child).mkdir(mode=0o700)
     print(output)
     return 0
@@ -116,6 +119,50 @@ def git_facts(workspace: Path) -> dict[str, Any]:
     }
 
 
+def release_contract(workspace: Path) -> dict[str, Any]:
+    cargo = workspace / "Cargo.toml"
+    native = workspace / "src" / "storage" / "native" / "format.rs"
+    config = workspace / "src" / "bin" / "rustdb" / "server_config.rs"
+    server = workspace / "src" / "http_shell" / "server.rs"
+    package = re.search(
+        r'^version = "([^"]+)"$', cargo.read_text(encoding="utf-8"), re.MULTILINE
+    )
+    epoch = re.search(
+        r"CURRENT_DATABASE_VERSION: u32 = (\d+)",
+        native.read_text(encoding="utf-8"),
+    )
+    schema = re.search(
+        r"CONFIG_SCHEMA_VERSION: u32 = (\d+)",
+        config.read_text(encoding="utf-8"),
+    )
+    routes = server.read_text(encoding="utf-8")
+    actual = (
+        package.group(1) if package else None,
+        int(epoch.group(1)) if epoch else None,
+        int(schema.group(1)) if schema else None,
+    )
+    expected = (RELEASE_VERSION, NATIVE_EPOCH, CONFIG_SCHEMA)
+    if actual != expected:
+        raise ValueError(
+            "Beta 2 release boundary differs from "
+            f"version={expected[0]}, Native epoch={expected[1]}, config schema={expected[2]}"
+        )
+    if '"/v2/info"' not in routes or '"/v2/queries"' not in routes or '"/v1/' in routes:
+        raise ValueError("Beta 2 HTTP routes must expose /v2 and must not expose /v1")
+    return {
+        "version": RELEASE_VERSION,
+        "native_epoch": NATIVE_EPOCH,
+        "config_schema": CONFIG_SCHEMA,
+        "http_api": "v2",
+        "source_sha256": {
+            "cargo": sha256(cargo),
+            "native_format": sha256(native),
+            "service_config": sha256(config),
+            "http_server": sha256(server),
+        },
+    }
+
+
 def preflight(args: argparse.Namespace) -> int:
     output = args.output.resolve()
     result: dict[str, Any] = {
@@ -139,6 +186,7 @@ def preflight(args: argparse.Namespace) -> int:
         host = host_facts()
         result["host"] = host
         result["profile"] = acceptance_profile()
+        result["release"] = release_contract(args.workspace.resolve())
         if host["logical_cpus"] < 4 or host["total_memory_bytes"] < MIN_MEMORY:
             raise ValueError("Beta acceptance requires at least 4 logical CPUs and 16 GiB RAM")
         result["git"] = git_facts(args.workspace.resolve())

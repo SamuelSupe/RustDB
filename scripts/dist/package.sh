@@ -90,7 +90,7 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 
 name="rustdb-v${version}-${target}"
 stage="$temporary/$name"
-mkdir -p "$stage/bin" "$stage/docs"
+mkdir -p "$stage/bin" "$stage/docs" "$stage/packaging/config"
 install -m 0755 "$binary" "$stage/bin/rustdb"
 install -m 0755 "$root/packaging/dist/install.sh" "$stage/install.sh"
 install -m 0755 "$root/packaging/dist/uninstall.sh" "$stage/uninstall.sh"
@@ -101,17 +101,24 @@ install -m 0644 "$root/packaging/dist/CLI.md" "$stage/docs/CLI.md"
 install -m 0644 "$root/packaging/dist/CLI.zh-CN.md" "$stage/docs/CLI.zh-CN.md"
 install -m 0644 "$root/packaging/dist/INSTALL.md" "$stage/docs/INSTALL.md"
 install -m 0644 "$root/packaging/dist/INSTALL.zh-CN.md" "$stage/docs/INSTALL.zh-CN.md"
-install -m 0644 "$root/docs/http-shell.md" "$stage/docs/HTTP-SHELL.md"
-install -m 0644 "$root/docs/http-shell.zh-CN.md" "$stage/docs/HTTP-SHELL.zh-CN.md"
-install -m 0644 "$root/docs/operator-guide.md" "$stage/docs/OPERATOR-GUIDE.md"
-install -m 0644 "$root/docs/operator-guide.zh-CN.md" "$stage/docs/OPERATOR-GUIDE.zh-CN.md"
-install -m 0644 "$root/docs/diagnostics.md" "$stage/docs/DIAGNOSTICS.md"
-install -m 0644 "$root/docs/diagnostics.zh-CN.md" "$stage/docs/DIAGNOSTICS.zh-CN.md"
-install -m 0644 "$root/docs/native-import.md" "$stage/docs/NATIVE-IMPORT.md"
-install -m 0644 "$root/docs/native-repair.md" "$stage/docs/NATIVE-REPAIR.md"
-install -m 0644 "$root/docs/compatibility.md" "$stage/docs/COMPATIBILITY.md"
+install -m 0644 "$root/docs/http-shell.md" "$stage/docs/http-shell.md"
+install -m 0644 "$root/docs/http-shell.zh-CN.md" "$stage/docs/http-shell.zh-CN.md"
+install -m 0644 "$root/docs/operator-guide.md" "$stage/docs/operator-guide.md"
+install -m 0644 "$root/docs/operator-guide.zh-CN.md" "$stage/docs/operator-guide.zh-CN.md"
+install -m 0644 "$root/docs/diagnostics.md" "$stage/docs/diagnostics.md"
+install -m 0644 "$root/docs/diagnostics.zh-CN.md" "$stage/docs/diagnostics.zh-CN.md"
+install -m 0644 "$root/docs/native-import.md" "$stage/docs/native-import.md"
+install -m 0644 "$root/docs/native-repair.md" "$stage/docs/native-repair.md"
+install -m 0644 "$root/docs/compatibility.md" "$stage/docs/compatibility.md"
+install -m 0644 "$root/docs/troubleshooting.md" "$stage/docs/troubleshooting.md"
+install -m 0644 "$root/docs/migration-v0.5.md" "$stage/docs/migration-v0.5.md"
+install -m 0644 "$root/docs/migration-v1-beta.md" "$stage/docs/migration-v1-beta.md"
+install -m 0644 "$root/docs/parquet-pruning.md" "$stage/docs/parquet-pruning.md"
+install -m 0644 "$root/docs/s3.md" "$stage/docs/s3.md"
+install -m 0644 "$root/packaging/config/rustdb.example.toml" \
+  "$stage/packaging/config/rustdb.example.toml"
 install -m 0644 "$root/docs/releases/v${version}.md" "$stage/RELEASE-NOTES.md"
-install -m 0644 "$root/docs/openapi-v1.yaml" "$stage/docs/openapi-v1.yaml"
+install -m 0644 "$root/docs/openapi-v2.yaml" "$stage/docs/openapi-v2.yaml"
 printf '%s\n' "$version" >"$stage/VERSION"
 
 sha256() {
@@ -127,11 +134,14 @@ for file in \
   LICENSE README.md README.zh-CN.md VERSION \
   bin/rustdb docs/CLI.md docs/CLI.zh-CN.md \
   docs/INSTALL.md docs/INSTALL.zh-CN.md \
-  docs/HTTP-SHELL.md docs/HTTP-SHELL.zh-CN.md \
-  docs/OPERATOR-GUIDE.md docs/OPERATOR-GUIDE.zh-CN.md \
-  docs/DIAGNOSTICS.md docs/DIAGNOSTICS.zh-CN.md \
-  docs/NATIVE-IMPORT.md docs/NATIVE-REPAIR.md docs/COMPATIBILITY.md \
-  docs/openapi-v1.yaml RELEASE-NOTES.md \
+  docs/http-shell.md docs/http-shell.zh-CN.md \
+  docs/operator-guide.md docs/operator-guide.zh-CN.md \
+  docs/diagnostics.md docs/diagnostics.zh-CN.md \
+  docs/native-import.md docs/native-repair.md docs/compatibility.md \
+  docs/troubleshooting.md docs/migration-v0.5.md docs/migration-v1-beta.md \
+  docs/parquet-pruning.md docs/s3.md \
+  packaging/config/rustdb.example.toml \
+  docs/openapi-v2.yaml RELEASE-NOTES.md \
   install.sh uninstall.sh
 do
   digest=$(sha256 "$stage/$file")

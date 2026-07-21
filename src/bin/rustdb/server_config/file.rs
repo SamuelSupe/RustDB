@@ -42,6 +42,13 @@ pub(super) struct FileServer {
     pub(super) principal_spill_limit: Option<String>,
     pub(super) principal_result_limit: Option<String>,
     pub(super) principal_weight: Option<u32>,
+    pub(super) rss_warning_ratio: Option<f64>,
+    pub(super) rss_high_ratio: Option<f64>,
+    pub(super) rss_critical_ratio: Option<f64>,
+    pub(super) rss_sample_interval_ms: Option<u64>,
+    pub(super) service_io_threads: Option<usize>,
+    pub(super) admin_socket: Option<std::path::PathBuf>,
+    pub(super) tls_renew_interval_secs: Option<u64>,
     pub(super) no_auth: Option<bool>,
 }
 
@@ -140,13 +147,19 @@ mod tests {
         fs::write(&missing, "[server]\nmax_running = 1\n").unwrap();
         let error = FileConfig::load_required(&missing).unwrap_err();
         assert!(matches!(error, Error::InvalidArgument(_)));
-        assert!(error.to_string().contains("schema_version = 1 is required"));
+        assert!(error.to_string().contains("schema_version = 2 is required"));
+
+        let legacy = directory.path().join("legacy.toml");
+        fs::write(&legacy, "schema_version = 1\n").unwrap();
+        let error = FileConfig::load_required(&legacy).unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(error.to_string().contains("unsupported schema_version 1"));
 
         let unknown = directory.path().join("unknown.toml");
-        fs::write(&unknown, "schema_version = 2\n").unwrap();
+        fs::write(&unknown, "schema_version = 9\n").unwrap();
         let error = FileConfig::load_required(&unknown).unwrap_err();
         assert!(matches!(error, Error::InvalidArgument(_)));
-        assert!(error.to_string().contains("unsupported schema_version 2"));
+        assert!(error.to_string().contains("unsupported schema_version 9"));
     }
 
     #[test]

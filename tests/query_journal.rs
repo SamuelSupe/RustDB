@@ -1,6 +1,10 @@
 pub use rustdb::{Error, Result, RetryClass};
 
+#[path = "../src/http_shell/service_io.rs"]
+pub(crate) mod service_io;
+
 mod http_shell {
+    pub(crate) use crate::service_io;
     pub use rustdb::http_shell::{ErrorBody, HttpQueryMetrics, QueryState};
 
     pub mod security {
@@ -8,6 +12,7 @@ mod http_shell {
     }
 }
 
+#[allow(dead_code)]
 #[path = "../src/http_shell/query/journal.rs"]
 mod journal;
 
@@ -89,7 +94,7 @@ fn completed_query_survives_compaction_without_persisting_secrets() {
 }
 
 #[test]
-fn restart_fails_active_queries_and_persists_the_transition_once() {
+fn restart_interrupts_active_queries_and_persists_the_transition_once() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("journal");
     let config = QueryJournalConfig::new(&root);
@@ -107,9 +112,13 @@ fn restart_fails_active_queries_and_persists_the_transition_once() {
     {
         let journal = QueryJournal::open(config.clone()).unwrap();
         let loaded = journal.load();
-        assert!(loaded.iter().all(|query| query.state == QueryState::Failed));
+        assert!(
+            loaded
+                .iter()
+                .all(|query| query.state == QueryState::Interrupted)
+        );
         assert!(loaded.iter().all(|query| {
-            query.error.as_ref().unwrap().error == "query.server_restarted"
+            query.error.as_ref().unwrap().error == "query.interrupted"
                 && query.error.as_ref().unwrap().request_id.is_none()
         }));
         first_length = fs::metadata(root.join("journal.jsonl")).unwrap().len();
@@ -123,12 +132,12 @@ fn restart_fails_active_queries_and_persists_the_transition_once() {
         journal
             .load()
             .iter()
-            .all(|query| query.state == QueryState::Failed)
+            .all(|query| query.state == QueryState::Interrupted)
     );
 }
 
 #[test]
-fn producer_upgrade_invalidates_completed_results() {
+fn producer_version_is_diagnostic_within_the_journal_epoch() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("journal");
     let config = QueryJournalConfig::new(&root);
@@ -143,12 +152,12 @@ fn producer_upgrade_invalidates_completed_results() {
     {
         let journal = QueryJournal::open_with_producer(config.clone(), "new-beta").unwrap();
         let query = journal.load().pop().unwrap();
-        assert_eq!(query.state, QueryState::Failed);
-        assert!(!query.result_available);
-        assert_eq!(query.error.unwrap().error, "query.result_invalidated");
+        assert_eq!(query.state, QueryState::Succeeded);
+        assert!(query.result_available);
+        assert!(query.error.is_none());
     }
     let journal = QueryJournal::open_with_producer(config, "new-beta").unwrap();
-    assert_eq!(journal.load()[0].state, QueryState::Failed);
+    assert_eq!(journal.load()[0].state, QueryState::Succeeded);
 }
 
 #[test]
