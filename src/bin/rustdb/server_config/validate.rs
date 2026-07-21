@@ -2,17 +2,7 @@ use rustdb::http_shell::security::ServerEndpoint;
 use rustdb::{EngineConfig, Error, Result, http_shell::HttpServerConfig};
 
 pub(super) fn all(server: &HttpServerConfig, engine: &EngineConfig) -> Result<()> {
-    if server.state_root.as_os_str().is_empty() {
-        return Err(Error::InvalidArgument(
-            "server.state_root must not be empty".into(),
-        ));
-    }
-    server.rss_guard.validate()?;
-    if server.rss_sample_interval.is_zero() {
-        return Err(Error::InvalidArgument(
-            "server.rss_sample_interval_ms must be greater than zero".into(),
-        ));
-    }
+    server.validate()?;
     if server.query.max_running == 0 {
         return Err(Error::InvalidArgument(
             "server.max_running must be greater than zero".into(),
