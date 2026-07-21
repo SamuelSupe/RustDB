@@ -292,7 +292,12 @@ jobs:
 
   manual-release:
     name: Publish manual runnable packages
-    if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish_release == true &&
+      needs.tag-contract.result == 'success' &&
+      needs.package.result == 'success'
     needs: [tag-contract, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
