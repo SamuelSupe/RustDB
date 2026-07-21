@@ -127,6 +127,24 @@ class BetaAcceptanceTpchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "status and checksum"):
             evidence.accepted_tpch(self.output, ROOT, self.commit)
 
+    def test_rejects_extra_status_and_checksum_rows(self) -> None:
+        status = self.output / "tpch" / "local" / "status.tsv"
+        status.write_text(
+            status.read_text(encoding="utf-8")
+            + f"q23\tpass\t{'f' * 64}\t-\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "Q1-Q22 exactly once"):
+            tpch.parse_status(status)
+
+        checksums = self.output / "tpch" / "local" / "checksums.sha256"
+        checksums.write_text(
+            checksums.read_text(encoding="utf-8") + f"{'f' * 64}  q23\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "Q1-Q22 exactly once"):
+            tpch.parse_checksums(checksums)
+
     def test_rejects_commit_dataset_and_execution_drift(self) -> None:
         provenance = self.output / "tpch" / "minio" / "provenance.json"
         value = json.loads(provenance.read_text())

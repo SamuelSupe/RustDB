@@ -98,8 +98,11 @@ def parse_status(path: Path) -> dict[str, str]:
     lines = path.read_text(encoding="utf-8").splitlines()
     if not lines or lines[0] != "query\tstatus\tchecksum\tdiagnostic":
         raise ValueError("TPC-H status has the wrong header")
+    rows = lines[1:]
+    if len(rows) != len(QUERIES):
+        raise ValueError("TPC-H status must contain Q1-Q22 exactly once")
     result: dict[str, str] = {}
-    for expected, line in zip(QUERIES, lines[1:], strict=False):
+    for expected, line in zip(QUERIES, rows):
         fields = line.split("\t")
         if (
             len(fields) != 4
@@ -110,7 +113,7 @@ def parse_status(path: Path) -> dict[str, str]:
         ):
             raise ValueError(f"TPC-H status is invalid for {expected}")
         result[expected] = fields[2]
-    if len(lines) != len(QUERIES) + 1 or tuple(result) != QUERIES:
+    if tuple(result) != QUERIES:
         raise ValueError("TPC-H status must contain Q1-Q22 exactly once")
     return result
 
@@ -118,12 +121,14 @@ def parse_status(path: Path) -> dict[str, str]:
 def parse_checksums(path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     lines = path.read_text(encoding="utf-8").splitlines()
-    for expected, line in zip(QUERIES, lines, strict=False):
+    if len(lines) != len(QUERIES):
+        raise ValueError("TPC-H checksums must contain Q1-Q22 exactly once")
+    for expected, line in zip(QUERIES, lines):
         match = re.fullmatch(r"([0-9a-f]{64})  (q[0-9]{2})", line)
         if match is None or match.group(2) != expected:
             raise ValueError(f"TPC-H checksum is invalid for {expected}")
         result[expected] = match.group(1)
-    if len(lines) != len(QUERIES) or tuple(result) != QUERIES:
+    if tuple(result) != QUERIES:
         raise ValueError("TPC-H checksums must contain Q1-Q22 exactly once")
     return result
 
