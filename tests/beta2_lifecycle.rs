@@ -8,7 +8,6 @@ use rustdb::{
 
 #[test]
 fn beta2_requires_fresh_epoch4_and_config_schema2() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.0-beta.2");
     let temporary = tempfile::tempdir().unwrap();
     let database = temporary.path().join("database");
     let engine = Engine::open(&database, config(temporary.path())).unwrap();
