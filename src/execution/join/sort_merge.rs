@@ -520,6 +520,7 @@ fn process_equal_run(
                     right_batch.batch(),
                     &left_indices,
                     &right_indices,
+                        predicates.candidate_projection(),
                 )?;
                 let candidate_memory = context
                     .reserve_memory_while_holding(

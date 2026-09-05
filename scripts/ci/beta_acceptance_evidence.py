@@ -120,7 +120,7 @@ def validate_release(inputs: dict[str, Any], workspace: Path) -> None:
         raise ValueError("acceptance inputs use the wrong schema")
     release = inputs.get("release", {})
     expected = {
-        "version": "1.0.0-beta.2",
+        "version": "1.0.0-beta.3",
         "native_epoch": 4,
         "config_schema": 2,
         "http_api": "v2",
@@ -179,7 +179,7 @@ def local_verification(output: Path, inputs: dict[str, Any]) -> dict[str, Any]:
 def execution_contract() -> dict[str, Any]:
     return {
         "release": {
-            "version": "1.0.0-beta.2",
+            "version": "1.0.0-beta.3",
             "native_epoch": 4,
             "service_config_schema": 2,
             "http_api": "v2",

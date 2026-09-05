@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-1.0.0--beta.2-blue)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.0.0--beta.3-blue)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -378,7 +378,7 @@ Scan 和嵌套 LIST/STRUCT/MAP 执行同样排除。没有最外层 `ORDER BY` �
 | [幂等 Native 导入](docs/native-import.md) | CSV/Parquet 导入回执、重放与冲突处理 |
 | [Native 检查与修复](docs/native-repair.md) | 只读完整性检查和保守修复 |
 | [验收说明](docs/acceptance.md) | 正确性与版本发布检查 |
-| [Beta 2 发行说明](docs/releases/v1.0.0-beta.2.md) | 可靠性重置、全新部署边界、安装包与已知限制 |
+| [Beta 3 发行说明](docs/releases/v1.0.0-beta.3.md) | 查询执行优化、资源处理、安装包与已知限制 |
 | [Beta 2 全新部署](docs/migration-v1-beta.md) | 强制重新导入与不提供迁移的边界 |
 | [Beta 2 契约](docs/roadmap-v1-beta.md) | 完成契约与发行证据 |
 | [v0.8 发行说明](docs/releases/v0.8.0-alpha.1.md) | 新增事务 Native 存储、SQL、COPY 与运维能力 |

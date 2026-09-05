@@ -17,22 +17,38 @@ pub(in crate::execution::join) fn candidate_workspace_bytes(
     right: &RecordBatch,
     left_indices: &[u32],
     right_indices: &[u32],
+    projection: Option<&[usize]>,
 ) -> Result<usize> {
-    let left_bytes = selected_rows_bytes(left, left_indices.iter().copied().map(Some))?;
-    let right_bytes = selected_rows_bytes(right, right_indices.iter().copied().map(Some))?;
-    Ok(left_bytes
-        .saturating_add(right_bytes)
+    let (payload_bytes, columns) = if let Some(projection) = projection {
+        let bytes = projection.iter().try_fold(0usize, |bytes, index| {
+            let (column, rows) = if *index < left.num_columns() {
+                (left.column(*index), left_indices)
+            } else {
+                (right.column(*index - left.num_columns()), right_indices)
+            };
+            Ok::<_, crate::Error>(bytes.saturating_add(selected_column_bytes(
+                column,
+                column.data_type(),
+                rows.iter().copied().map(Some),
+            )?))
+        })?;
+        (bytes, projection.len())
+    } else {
+        let left_bytes = selected_rows_bytes(left, left_indices.iter().copied().map(Some))?;
+        let right_bytes = selected_rows_bytes(right, right_indices.iter().copied().map(Some))?;
+        (
+            left_bytes.saturating_add(right_bytes),
+            left.num_columns() + right.num_columns(),
+        )
+    };
+    Ok(payload_bytes
         .saturating_mul(3)
         .saturating_add(
             left_indices
                 .len()
                 .saturating_mul(size_of::<u32>().saturating_mul(4)),
         )
-        .saturating_add(
-            left.num_columns()
-                .saturating_add(right.num_columns())
-                .saturating_mul(512),
-        )
+        .saturating_add(columns.saturating_mul(512))
         .saturating_add(1_024)
         .max(1))
 }

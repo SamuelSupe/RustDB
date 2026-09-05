@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SamuelSupe/RustDB/actions/workflows/ci.yml)
 [![Distribution](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml/badge.svg)](https://github.com/SamuelSupe/RustDB/actions/workflows/dist.yml)
-[![Version](https://img.shields.io/badge/version-1.0.0--beta.2-blue)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.0.0--beta.3-blue)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.97.0-dea584?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -415,7 +415,7 @@ excluded. Result order is unspecified without an outer `ORDER BY`.
 | [Idempotent Native import](docs/native-import.md) | CSV/Parquet import receipts, replay, and conflict handling |
 | [Native check and repair](docs/native-repair.md) | Read-only integrity checks and conservative repair |
 | [Acceptance](docs/acceptance.md) | Correctness and release checks |
-| [Beta 2 release notes](docs/releases/v1.0.0-beta.2.md) | Reliability reset, fresh-start boundary, packages, and known limits |
+| [Beta 3 release notes](docs/releases/v1.0.0-beta.3.md) | Query execution optimizations, resource handling, packages, and known limits |
 | [Beta 2 fresh start](docs/migration-v1-beta.md) | Required re-import and no-migration boundary |
 | [Beta 2 contract](docs/roadmap-v1-beta.md) | Completion contract and release evidence |
 | [v0.8 release notes](docs/releases/v0.8.0-alpha.1.md) | New transactional Native storage, SQL, COPY, and operations surface |

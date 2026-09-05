@@ -1,3 +1,5 @@
+mod index;
+
 use std::{mem::size_of, sync::Arc};
 
 use arrow::{
@@ -66,6 +68,13 @@ pub(super) fn build(
         .writer("window-frame-aggregate", Arc::clone(&schema))?;
     let mut frame_cursor = FrameCursor::new(frames, Arc::clone(context))?;
     let mut buffer = ResultBuffer::new(indices.len(), capacity);
+    let partition_index = if rows > capacity as u64 && indices.iter().any(|index| {
+        matches!(&expressions[*index].function, WindowFunction::Aggregate(aggregate) if aggregate.expr.is_some())
+    }) {
+        index::PartitionIndex::build(partition, context, rows)?
+    } else {
+        None
+    };
 
     for _ in 0..rows {
         context.check_cancelled()?;
@@ -74,11 +83,28 @@ pub(super) fn build(
             let WindowFunction::Aggregate(aggregate) = &expressions[*index].function else {
                 unreachable!()
             };
+            if aggregate.function == AggregateFunction::Count && aggregate.expr.is_none() {
+                let count = i64::try_from(end - start)
+                    .map_err(|_| Error::Execution("count overflowed INT64".into()))?;
+                buffer.push(column, CellValue::Int64(count), 0);
+                continue;
+            }
             let mut state = AggregateState::new(aggregate);
             let mut retained = 0usize;
             if let Some(expression) = &aggregate.expr {
-                let mut cursor =
-                    ValueCursor::new(partition, expression.clone(), Arc::clone(context))?;
+                let mut cursor = match partition_index
+                    .as_ref()
+                    .and_then(|index| index.locate(start))
+                {
+                    Some((row, offset)) => ValueCursor::new_at(
+                        partition,
+                        expression.clone(),
+                        Arc::clone(context),
+                        row,
+                        offset,
+                    )?,
+                    None => ValueCursor::new(partition, expression.clone(), Arc::clone(context))?,
+                };
                 for row in start..end {
                     let value = cursor.value_at(row)?;
                     let payload =

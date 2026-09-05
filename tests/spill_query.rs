@@ -166,7 +166,10 @@ async fn high_cardinality_aggregate_spills_and_cleans_query_directory() -> Resul
 
 #[tokio::test]
 async fn hash_join_spills_and_cleans_query_directory() -> Result<()> {
-    const ROWS: i64 = 20_000;
+    // The 2 MiB query budget gives the build side a 512 KiB buffer. Two Int64
+    // columns need more than that at this cardinality, so the test must enter
+    // the spill path instead of merely exercising an in-memory join.
+    const ROWS: i64 = 40_000;
     const MEMORY_LIMIT: usize = 2 * MIB;
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -253,8 +256,8 @@ async fn hash_join_spills_and_cleans_query_directory() -> Result<()> {
 
 #[tokio::test]
 async fn left_hash_join_spills_preserves_unmatched_rows_and_cleans_up() -> Result<()> {
-    const LEFT_ROWS: i64 = 24_000;
-    const RIGHT_ROWS: i64 = 20_000;
+    const LEFT_ROWS: i64 = 48_000;
+    const RIGHT_ROWS: i64 = 40_000;
     const MEMORY_LIMIT: usize = 2 * MIB;
 
     let temp = tempfile::tempdir().expect("tempdir");

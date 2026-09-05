@@ -393,10 +393,7 @@ impl SpillManager {
         self.read_file(spill_file)?.collect()
     }
 
-    pub(crate) fn read_file(
-        &self,
-        spill_file: &SpillFile,
-    ) -> Result<impl Iterator<Item = Result<RecordBatch>> + use<>> {
+    pub(crate) fn read_file(&self, spill_file: &SpillFile) -> Result<SpillReader> {
         self.ensure_active()?;
         self.validate_file(spill_file)?;
         SpillReader::open(Arc::clone(&self.state), spill_file)

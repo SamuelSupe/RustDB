@@ -43,6 +43,27 @@ impl ValueCursor {
         })
     }
 
+    pub(in crate::execution::window) fn new_at(
+        file: &SpillFile,
+        expression: BoundExpr,
+        context: Arc<QueryContext>,
+        row: u64,
+        offset: u64,
+    ) -> Result<Self> {
+        let mut reader = context.spill.read_file(file)?;
+        reader.seek_batch(offset)?;
+        Ok(Self {
+            reader: Box::new(reader),
+            context,
+            expression,
+            batch: None,
+            values: None,
+            workspace: None,
+            start: row,
+            end: row,
+        })
+    }
+
     pub(in crate::execution::window) fn value_at(&mut self, target: u64) -> Result<CellValue> {
         while self.values.is_none() || target >= self.end {
             self.load_next()?.ok_or_else(|| {

@@ -8,7 +8,12 @@ use arrow::{
 use futures::{StreamExt, TryStreamExt, stream};
 use tempfile::tempdir;
 
-use super::{MERGE_FAN_IN, merge::MergeIterator, run::MAX_PENDING_RUNS, sort};
+use super::{
+    MERGE_FAN_IN, make_converter,
+    merge::MergeIterator,
+    run::{MAX_PENDING_RUNS, sort_batches},
+    sort,
+};
 use crate::sql::{BoundExpr, SortExpr};
 use crate::{
     Error,
@@ -705,4 +710,123 @@ async fn compacts_run_metadata_during_a_long_spilling_input() {
     );
     assert!(context.metrics.snapshot().spill_partitions > MAX_PENDING_RUNS as u64);
     assert!(context.memory.peak() <= context.memory.limit());
+}
+
+#[test]
+fn top_k_interleaves_selected_rows_from_multiple_batches() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("priority", DataType::Int64, true),
+        Field::new("tie", DataType::Int64, true),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(3), None, Some(3), Some(1)])),
+            Arc::new(Int64Array::from(vec![Some(2), Some(0), None, Some(9)])),
+            Arc::new(StringArray::from(vec!["3/2-a", "null/0", "3/null", "1/9"])),
+        ],
+    )
+    .unwrap();
+    let empty = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+            Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ],
+    )
+    .unwrap();
+    let second = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(4), Some(2), None, Some(3)])),
+            Arc::new(Int64Array::from(vec![Some(1), Some(9), None, Some(1)])),
+            Arc::new(StringArray::from(vec!["4/1", "2/9", "null/null", "3/1"])),
+        ],
+    )
+    .unwrap();
+    let expressions = vec![
+        SortExpr {
+            expr: BoundExpr::column(0, DataType::Int64, "priority"),
+            descending: true,
+            nulls_first: false,
+        },
+        SortExpr {
+            expr: BoundExpr::column(1, DataType::Int64, "tie"),
+            descending: false,
+            nulls_first: true,
+        },
+    ];
+    let converter = make_converter(&expressions).unwrap();
+    let output = sort_batches(
+        &[first, empty, second],
+        &expressions,
+        &converter,
+        Some(5),
+        &schema,
+    )
+    .unwrap();
+
+    let priority = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let tie = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let payload = output
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        priority.iter().collect::<Vec<_>>(),
+        vec![Some(4), Some(3), Some(3), Some(3), Some(2),]
+    );
+    assert_eq!(
+        tie.iter().collect::<Vec<_>>(),
+        vec![Some(1), None, Some(1), Some(2), Some(9),]
+    );
+    assert_eq!(
+        payload
+            .iter()
+            .map(|value| value.map(str::to_owned))
+            .collect::<Vec<_>>(),
+        vec![
+            Some("4/1".to_owned()),
+            Some("3/null".to_owned()),
+            Some("3/1".to_owned()),
+            Some("3/2-a".to_owned()),
+            Some("2/9".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn top_k_fetch_zero_returns_an_empty_batch() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("priority", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2_i64, 1])),
+            Arc::new(StringArray::from(vec!["two", "one"])),
+        ],
+    )
+    .unwrap();
+    let expressions = vec![SortExpr {
+        expr: BoundExpr::column(0, DataType::Int64, "priority"),
+        descending: false,
+        nulls_first: false,
+    }];
+    let converter = make_converter(&expressions).unwrap();
+    let output = sort_batches(&[batch], &expressions, &converter, Some(0), &schema).unwrap();
+    assert_eq!(output.num_rows(), 0);
+    assert_eq!(output.num_columns(), 2);
 }

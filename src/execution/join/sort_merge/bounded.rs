@@ -202,6 +202,7 @@ fn process_right_chunk(
                         &right,
                         &left_indices,
                         &right_indices,
+                        predicates.candidate_projection(),
                     )?,
                     &context,
                     held_bytes,

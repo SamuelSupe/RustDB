@@ -29,6 +29,11 @@ use super::{
 mod composite;
 mod simple;
 
+// Output construction needs room beside the build hash table, probe batch,
+// and selection vectors. Keep tiny-memory queries on bounded output chunks
+// instead of waiting for one batch sized for a normal query.
+const MIN_OUTPUT_MEMORY_PER_ROW: usize = 2 << 10;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GlobalMembershipState {
     rhs_nonempty: bool,
@@ -414,6 +419,14 @@ impl<'a> ProbeCursor<'a> {
         context: &QueryContext,
     ) -> Result<JoinEmission> {
         context.check_cancelled()?;
+        self.batch_size = self.batch_size.min(
+            context
+                .memory
+                .limit()
+                .checked_div(MIN_OUTPUT_MEMORY_PER_ROW)
+                .unwrap_or(0)
+                .max(1),
+        );
         self.prepare_composite(context).await?;
         let held_bytes = self
             .held_bytes
@@ -528,6 +541,7 @@ impl<'a> ProbeCursor<'a> {
                             self.right,
                             &candidate_left,
                             &candidate_right,
+                            self.predicates.candidate_projection(),
                         )?),
                         context,
                         held_bytes,

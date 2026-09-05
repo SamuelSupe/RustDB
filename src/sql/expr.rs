@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::Result;
+
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,6 +197,46 @@ impl BoundExpr {
             data_type,
             display_name,
         }
+    }
+
+    pub(crate) fn rewrite_columns<F>(&mut self, map: &mut F) -> Result<()>
+    where
+        F: FnMut(usize) -> Result<usize>,
+    {
+        match &mut self.kind {
+            ExprKind::Column(index) => *index = map(*index)?,
+            ExprKind::OuterRef { .. }
+            | ExprKind::DeferredGroup(_)
+            | ExprKind::DeferredAggregate(_)
+            | ExprKind::Literal(_) => {}
+            ExprKind::Binary { left, right, .. } => {
+                left.rewrite_columns(map)?;
+                right.rewrite_columns(map)?;
+            }
+            ExprKind::Unary { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::Cast { expr } => expr.rewrite_columns(map)?,
+            ExprKind::Like { expr, pattern, .. } => {
+                expr.rewrite_columns(map)?;
+                pattern.rewrite_columns(map)?;
+            }
+            ExprKind::Case {
+                when_then,
+                else_expr,
+            } => {
+                for (when, then) in when_then {
+                    when.rewrite_columns(map)?;
+                    then.rewrite_columns(map)?;
+                }
+                else_expr.rewrite_columns(map)?;
+            }
+            ExprKind::ScalarFunction { args, .. } => {
+                for arg in args {
+                    arg.rewrite_columns(map)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn referenced_columns(&self, output: &mut Vec<usize>) {

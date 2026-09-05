@@ -171,20 +171,13 @@ impl ScanTask {
         owner: &'static str,
     ) -> Self {
         let stream = boxed_memory_batch_stream(async_stream::try_stream! {
-            loop {
-                // Acquire before polling the decoder. A returned batch is
-                // reconciled immediately and never waits while unleased.
-                let reservation = context
-                    .reserve_memory(preclaim_bytes.max(1), owner)
-                    .await?;
-                let next = tokio::select! {
-                    _ = context.control.cancelled() => Err(Error::Cancelled),
-                    next = stream.next() => Ok(next),
-                }?;
-                let Some(batch) = next else {
-                    break;
-                };
-                yield BatchEnvelope::from_reservation(batch?, reservation, owner)?;
+            while let Some(batch) = next_public_batch(
+                &mut stream,
+                &context,
+                preclaim_bytes,
+                owner,
+            ).await? {
+                yield batch;
             }
         });
         Self::new(id, stream)
@@ -197,6 +190,50 @@ impl ScanTask {
     pub(crate) fn into_stream(self) -> MemoryBatchStream {
         self.stream
     }
+}
+
+async fn next_public_batch(
+    stream: &mut RecordBatchStream,
+    context: &QueryContext,
+    preclaim_bytes: usize,
+    owner: &'static str,
+) -> Result<Option<BatchEnvelope>> {
+    let preclaim = preclaim_bytes.max(1);
+    // A source can be exhausted without allocating another batch. Probe that
+    // terminal state when admission is temporarily full; otherwise a
+    // downstream operator retaining its state could wait forever for an EOF
+    // reservation that EOF does not need.
+    let reservation = match context.memory.try_reserve(preclaim) {
+        Ok(reservation) => reservation,
+        Err(_) => {
+            tokio::select! {
+                biased;
+                _ = context.control.cancelled() => return Err(Error::Cancelled),
+                next = stream.next() => {
+                    let Some(batch) = next else {
+                        return Ok(None);
+                    };
+                    // The source already allocated this batch before admission
+                    // was available. Do not wait while retaining it; fail
+                    // immediately if it cannot fit.
+                    return BatchEnvelope::try_new(batch?, &context.memory, owner).map(Some);
+                }
+                reservation = context.reserve_memory(preclaim, owner) => reservation?,
+            }
+        }
+    };
+    let next = tokio::select! {
+        _ = context.control.cancelled() => return Err(Error::Cancelled),
+        next = stream.next() => next,
+    };
+    let Some(batch) = next else {
+        return Ok(None);
+    };
+    Ok(Some(BatchEnvelope::from_reservation(
+        batch?,
+        reservation,
+        owner,
+    )?))
 }
 
 impl ScanRequest {

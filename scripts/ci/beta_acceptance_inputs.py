@@ -23,7 +23,7 @@ from beta_acceptance_fixtures import (
 
 
 SCHEMA = "rustdb-beta-acceptance-inputs-v2"
-RELEASE_VERSION = "1.0.0-beta.2"
+RELEASE_VERSION = "1.0.0-beta.3"
 NATIVE_EPOCH = 4
 CONFIG_SCHEMA = 2
 MIN_MEMORY = 16 * 1024**3

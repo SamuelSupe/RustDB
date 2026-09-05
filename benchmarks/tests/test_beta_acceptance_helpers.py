@@ -66,7 +66,7 @@ finish
 
     def test_beta2_release_boundary_and_lifecycle_stage_are_pinned(self):
         contract = inputs.release_contract(ROOT)
-        self.assertEqual(contract["version"], "1.0.0-beta.2")
+        self.assertEqual(contract["version"], "1.0.0-beta.3")
         self.assertEqual(contract["native_epoch"], 4)
         self.assertEqual(contract["config_schema"], 2)
         self.assertEqual(contract["http_api"], "v2")
@@ -357,7 +357,7 @@ finish
                     "schema": inputs.SCHEMA,
                     "preflight_complete": True,
                     "release": {
-                        "version": "1.0.0-beta.2",
+                        "version": "1.0.0-beta.3",
                         "native_epoch": 4,
                         "config_schema": 2,
                         "http_api": "v2",

@@ -17,11 +17,13 @@ pub(super) fn supports(aggregates: &[AggregateExpr]) -> bool {
     !aggregates.is_empty()
         && aggregates.iter().all(|aggregate| match aggregate.function {
             AggregateFunction::Count => true,
-            AggregateFunction::Sum | AggregateFunction::Avg => aggregate
+            AggregateFunction::Sum
+            | AggregateFunction::Avg
+            | AggregateFunction::Min
+            | AggregateFunction::Max => aggregate
                 .expr
                 .as_ref()
                 .is_some_and(|expr| supported_numeric(&expr.data_type)),
-            AggregateFunction::Min | AggregateFunction::Max => false,
         })
 }
 
@@ -80,9 +82,55 @@ fn update_one(
         AggregateState::AvgDecimal { sum, count, .. } => {
             update_decimal_average(sum, count, required(array, aggregate)?)
         }
-        AggregateState::Min(_) | AggregateState::Max(_) => Err(Error::Internal(
-            "MIN/MAX reached the numeric global aggregate batch path".into(),
-        )),
+        AggregateState::Min(_) | AggregateState::Max(_) => {
+            update_extreme_batch(state, aggregate, required(array, aggregate)?)
+        }
+    }
+}
+
+fn update_extreme_batch(
+    state: &mut AggregateState,
+    aggregate: &AggregateExpr,
+    array: &ArrayRef,
+) -> Result<()> {
+    use crate::execution::value::CellValue;
+    let maximum = aggregate.function == AggregateFunction::Max;
+    macro_rules! extreme {
+        ($ty:ty, $convert:expr) => {{
+            let mut best: Option<CellValue> = None;
+            for value in downcast::<$ty>(array)?.iter().flatten() {
+                let value = ($convert)(value);
+                let replace = match &best {
+                    None => true,
+                    Some(current) => {
+                        let ordering = current.compare(&value)?;
+                        if maximum {
+                            ordering.is_lt()
+                        } else {
+                            ordering.is_gt()
+                        }
+                    }
+                };
+                if replace {
+                    best = Some(value);
+                }
+            }
+            state.update(aggregate, best)
+        }};
+    }
+    match array.data_type() {
+        DataType::Int8 => extreme!(Int8Array, |v| CellValue::Int64(i64::from(v))),
+        DataType::Int16 => extreme!(Int16Array, |v| CellValue::Int64(i64::from(v))),
+        DataType::Int32 => extreme!(Int32Array, |v| CellValue::Int64(i64::from(v))),
+        DataType::Int64 => extreme!(Int64Array, CellValue::Int64),
+        DataType::UInt8 => extreme!(UInt8Array, |v| CellValue::UInt64(u64::from(v))),
+        DataType::UInt16 => extreme!(UInt16Array, |v| CellValue::UInt64(u64::from(v))),
+        DataType::UInt32 => extreme!(UInt32Array, |v| CellValue::UInt64(u64::from(v))),
+        DataType::UInt64 => extreme!(UInt64Array, CellValue::UInt64),
+        DataType::Float32 => extreme!(Float32Array, |v| CellValue::Float64(f64::from(v))),
+        DataType::Float64 => extreme!(Float64Array, CellValue::Float64),
+        DataType::Decimal128(_, _) => extreme!(Decimal128Array, CellValue::Decimal128),
+        other => type_error("MIN/MAX", other),
     }
 }
 

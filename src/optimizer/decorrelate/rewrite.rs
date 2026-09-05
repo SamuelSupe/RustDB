@@ -225,38 +225,5 @@ fn rewrite<F>(expr: &mut BoundExpr, map: &mut F) -> Result<()>
 where
     F: FnMut(usize) -> Result<usize>,
 {
-    match &mut expr.kind {
-        ExprKind::Column(index) => *index = map(*index)?,
-        ExprKind::OuterRef { .. }
-        | ExprKind::DeferredGroup(_)
-        | ExprKind::DeferredAggregate(_)
-        | ExprKind::Literal(_) => {}
-        ExprKind::Binary { left, right, .. } => {
-            rewrite(left, map)?;
-            rewrite(right, map)?;
-        }
-        ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } | ExprKind::Cast { expr } => {
-            rewrite(expr, map)?
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            rewrite(expr, map)?;
-            rewrite(pattern, map)?;
-        }
-        ExprKind::Case {
-            when_then,
-            else_expr,
-        } => {
-            for (when, then) in when_then {
-                rewrite(when, map)?;
-                rewrite(then, map)?;
-            }
-            rewrite(else_expr, map)?;
-        }
-        ExprKind::ScalarFunction { args, .. } => {
-            for arg in args {
-                rewrite(arg, map)?;
-            }
-        }
-    }
-    Ok(())
+    expr.rewrite_columns(map)
 }

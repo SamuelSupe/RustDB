@@ -11,8 +11,8 @@ use futures::{TryStreamExt, stream};
 use crate::datasource::{ScanRequest, TableProvider, TableStatistics};
 use crate::runtime::{MemoryPool, QueryContext, RecordBatchStream, boxed_record_batch_stream};
 use crate::sql::{
-    BoundExpr, SortExpr, WindowExpr, WindowFrame, WindowFrameBound, WindowFrameUnits,
-    WindowFunction, plan_sql,
+    AggregateExpr, AggregateFunction, BoundExpr, SortExpr, WindowExpr, WindowFrame,
+    WindowFrameBound, WindowFrameUnits, WindowFunction, plan_sql,
 };
 use crate::{Catalog, Engine, EngineConfig, Result, TableEntry};
 
@@ -95,7 +95,13 @@ async fn executes_bounded_rows_range_and_groups_frames() {
          sum(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW), \
          sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW), \
          first_value(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING), \
-         last_value(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+         last_value(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING), \
+         count(*) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS rows_count, \
+         count(*) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS range_count, \
+         count(*) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS groups_count, \
+         count(*) OVER (ORDER BY v ROWS BETWEEN 10 FOLLOWING AND 10 FOLLOWING) AS rows_empty, \
+         count(*) OVER (ORDER BY v RANGE BETWEEN 10 FOLLOWING AND 10 FOLLOWING) AS range_empty, \
+         count(*) OVER (ORDER BY v GROUPS BETWEEN 10 FOLLOWING AND 10 FOLLOWING) AS groups_empty \
          FROM events ORDER BY v, row_number() OVER (ORDER BY v)")
     .await;
     assert_eq!(ints(&batches, 0), vec![1, 1, 2, 5]);
@@ -104,6 +110,127 @@ async fn executes_bounded_rows_range_and_groups_frames() {
     assert_eq!(decimals(&batches, 3), vec![2, 2, 4, 7]);
     assert_eq!(ints(&batches, 4), vec![1, 1, 1, 2]);
     assert_eq!(ints(&batches, 5), vec![2, 2, 5, 5]);
+    assert_eq!(ints(&batches, 6), vec![2, 3, 3, 2]);
+    assert_eq!(ints(&batches, 7), vec![2, 2, 3, 1]);
+    assert_eq!(ints(&batches, 8), vec![2, 2, 3, 2]);
+    assert_eq!(ints(&batches, 9), vec![0, 0, 0, 0]);
+    assert_eq!(ints(&batches, 10), vec![0, 0, 0, 0]);
+    assert_eq!(ints(&batches, 11), vec![0, 0, 0, 0]);
+}
+
+#[tokio::test]
+async fn bounded_window_aggregate_seeks_across_spilled_batches_and_empty_input() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+        Field::new("total", DataType::Decimal128(38, 0), true),
+    ]));
+    let first = RecordBatch::try_new(
+        Arc::clone(&input_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "a"])),
+            Arc::new(Int64Array::from(vec![3, 1])),
+        ],
+    )
+    .unwrap();
+    let empty = RecordBatch::new_empty(Arc::clone(&input_schema));
+    let second = RecordBatch::try_new(
+        Arc::clone(&input_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(Int64Array::from(vec![2, 7])),
+        ],
+    )
+    .unwrap();
+    let third = RecordBatch::try_new(
+        Arc::clone(&input_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(Int64Array::from(vec![4, 5])),
+        ],
+    )
+    .unwrap();
+    let aggregate = AggregateExpr {
+        function: AggregateFunction::Sum,
+        expr: Some(BoundExpr::column(1, DataType::Int64, "v")),
+        distinct: false,
+        data_type: DataType::Decimal128(38, 0),
+        display_name: "sum(v)".into(),
+    };
+    let expression = WindowExpr {
+        function: WindowFunction::Aggregate(aggregate),
+        partition_by: vec![BoundExpr::column(0, DataType::Utf8, "g")],
+        order_by: vec![SortExpr {
+            expr: BoundExpr::column(1, DataType::Int64, "v"),
+            descending: false,
+            nulls_first: false,
+        }],
+        frame: WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start: WindowFrameBound::Preceding(1),
+            end: WindowFrameBound::Following(1),
+        },
+        data_type: DataType::Decimal128(38, 0),
+        display_name: "sum(v) OVER (...)".into(),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let context = QueryContext::shared(MemoryPool::new(16 << 20), temp.path()).unwrap();
+    let input =
+        boxed_record_batch_stream(stream::iter([Ok(first), Ok(empty), Ok(second), Ok(third)]));
+    let batches = super::window(
+        input,
+        vec![expression],
+        input_schema,
+        output_schema,
+        Arc::clone(&context),
+        2,
+    )
+    .map_ok(|batch| batch.into_public())
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    assert_eq!(strings(&batches, 0), vec!["a", "a", "a", "a", "b", "b"]);
+    assert_eq!(ints(&batches, 1), vec![1, 2, 3, 4, 5, 7]);
+    assert_eq!(decimals(&batches, 2), vec![3, 6, 9, 7, 12, 12]);
+    assert!(context.metrics.snapshot().spill_write_bytes > 0);
+    assert!(context.metrics.snapshot().spill_read_bytes > 0);
+    assert_eq!(context.tasks.active_tasks(), 0);
+    assert_eq!(context.memory.used(), 0);
+    assert_eq!(
+        std::fs::read_dir(context.spill.directory())
+            .unwrap()
+            .filter(|entry| {
+                entry.as_ref().is_ok_and(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "arrow")
+                })
+            })
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn count_star_respects_partition_boundaries_and_count_expr_ignores_nulls() {
+    let batches = run(
+        "SELECT g, v, \
+         count(*) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS rows_count, \
+         count(CASE WHEN v = 1 OR g = 'b' THEN NULL ELSE v END) OVER \
+             (PARTITION BY g ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS non_null_count \
+         FROM events ORDER BY g, v, row_number() OVER (PARTITION BY g ORDER BY v)",
+    )
+    .await;
+    assert_eq!(strings(&batches, 0), vec!["a", "a", "a", "b"]);
+    assert_eq!(ints(&batches, 1), vec![1, 1, 2, 5]);
+    assert_eq!(ints(&batches, 2), vec![2, 3, 2, 1]);
+    assert_eq!(ints(&batches, 3), vec![0, 1, 1, 0]);
 }
 
 #[tokio::test]

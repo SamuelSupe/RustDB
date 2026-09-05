@@ -1,3 +1,5 @@
+mod top_k;
+
 use std::sync::Arc;
 
 use arrow::{
@@ -25,6 +27,20 @@ pub(super) fn sort_batches(
     fetch: Option<usize>,
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
+    let row_count = batches.iter().try_fold(0usize, |rows, batch| {
+        rows.checked_add(batch.num_rows())
+            .ok_or_else(|| Error::ResourceExhausted("sort run row count overflowed usize".into()))
+    })?;
+    if row_count > u32::MAX as usize {
+        return Err(Error::ResourceExhausted(
+            "a sort run cannot contain more than u32::MAX rows".into(),
+        ));
+    }
+    if let Some(limit) = fetch.filter(|limit| *limit < row_count)
+        && !expressions.is_empty()
+    {
+        return top_k::select(batches, expressions, converter, limit, schema, row_count);
+    }
     let combined = concat_batches(schema, batches)?;
     let keys = evaluate_keys(expressions, &combined)?;
     let rows = converter.convert_columns(&keys)?;

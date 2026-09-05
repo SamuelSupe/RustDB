@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -43,7 +43,7 @@ pub(super) struct WriterMemory {
     writer: MemoryReservation,
 }
 
-pub(super) struct SpillReader {
+pub(crate) struct SpillReader {
     state: Arc<State>,
     reader: StreamReader<BufReader<SpillInput>>,
     io_error: Arc<IoErrorState>,
@@ -246,6 +246,29 @@ impl SpillWriter {
 }
 
 impl SpillReader {
+    pub(crate) fn position(&mut self) -> Result<u64> {
+        self.reader.get_mut().stream_position().map_err(|error| {
+            take_io_error(&self.io_error).unwrap_or_else(|| Error::io(None, error))
+        })
+    }
+
+    pub(crate) fn seek_batch(&mut self, offset: u64) -> Result<()> {
+        if self.finished {
+            return Err(Error::Internal(
+                "cannot seek an exhausted spill reader".into(),
+            ));
+        }
+        // Spill writers reject dictionary arrays, so record batches have no
+        // dictionary state that would need replaying after a seek.
+        self.reader
+            .get_mut()
+            .seek(SeekFrom::Start(offset))
+            .map_err(|error| {
+                take_io_error(&self.io_error).unwrap_or_else(|| Error::io(None, error))
+            })?;
+        Ok(())
+    }
+
     pub(super) fn open(state: Arc<State>, spill_file: &SpillFile) -> Result<Self> {
         let path = spill_file.path().to_path_buf();
         let open_path = path.clone();
@@ -427,6 +450,27 @@ impl Write for SpillOutput {
                 file.lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .flush()
+                    .map_err(|error| Error::io(Some(path), error))
+            })
+            .map_err(|error| store_io_error(&self.io_error, error))
+    }
+}
+
+impl Seek for SpillInput {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        if let Some(error) = existing_io_error(&self.io_error) {
+            return Err(error);
+        }
+        self.state
+            .ensure_active()
+            .map_err(|error| store_io_error(&self.io_error, error))?;
+        let file = Arc::clone(&self.file);
+        let path = self.path.clone();
+        self.state
+            .run_io(move || {
+                file.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .seek(position)
                     .map_err(|error| Error::io(Some(path), error))
             })
             .map_err(|error| store_io_error(&self.io_error, error))

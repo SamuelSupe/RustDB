@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{ArrayRef, Decimal128Array, Int64Array},
+    array::{Array, ArrayRef, Decimal128Array, Float64Array, Int8Array, Int64Array, UInt16Array},
     datatypes::DataType,
 };
 
 use super::{supports, update};
 use crate::{
-    execution::{aggregate::state::AggregateState, value::CellValue},
+    execution::{
+        aggregate::state::AggregateState,
+        value::{CellValue, cell},
+    },
     sql::{AggregateExpr, AggregateFunction, BoundExpr},
 };
 
@@ -90,13 +93,157 @@ fn decimal_batch_updates_keep_scale_and_nulls() {
 }
 
 #[test]
-fn min_and_max_keep_the_generic_path() {
-    let aggregate = expression(
-        AggregateFunction::Min,
-        Some(DataType::Int64),
-        DataType::Int64,
+fn numeric_min_and_max_use_the_batch_path() {
+    let aggregates = vec![
+        expression(
+            AggregateFunction::Min,
+            Some(DataType::Int64),
+            DataType::Int64,
+        ),
+        expression(
+            AggregateFunction::Max,
+            Some(DataType::Int64),
+            DataType::Int64,
+        ),
+    ];
+    assert!(supports(&aggregates));
+
+    let string_min = expression(AggregateFunction::Min, Some(DataType::Utf8), DataType::Utf8);
+    assert!(!supports(&[string_min]));
+}
+
+#[test]
+fn numeric_min_and_max_match_scalar_updates_across_batches() {
+    let aggregates = vec![
+        expression(AggregateFunction::Min, Some(DataType::Int8), DataType::Int8),
+        expression(AggregateFunction::Max, Some(DataType::Int8), DataType::Int8),
+        expression(
+            AggregateFunction::Min,
+            Some(DataType::UInt16),
+            DataType::UInt16,
+        ),
+        expression(
+            AggregateFunction::Max,
+            Some(DataType::UInt16),
+            DataType::UInt16,
+        ),
+        expression(
+            AggregateFunction::Min,
+            Some(DataType::Float64),
+            DataType::Float64,
+        ),
+        expression(
+            AggregateFunction::Max,
+            Some(DataType::Float64),
+            DataType::Float64,
+        ),
+        expression(
+            AggregateFunction::Min,
+            Some(DataType::Decimal128(10, 2)),
+            DataType::Decimal128(10, 2),
+        ),
+        expression(
+            AggregateFunction::Max,
+            Some(DataType::Decimal128(10, 2)),
+            DataType::Decimal128(10, 2),
+        ),
+    ];
+    let first = vec![
+        Arc::new(Int8Array::from(vec![Some(4), None, Some(-2), Some(0)])) as ArrayRef,
+        Arc::new(Int8Array::from(vec![Some(4), None, Some(-2), Some(0)])) as ArrayRef,
+        Arc::new(UInt16Array::from(vec![Some(4), None, Some(2), Some(0)])) as ArrayRef,
+        Arc::new(UInt16Array::from(vec![Some(4), None, Some(2), Some(0)])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![
+            Some(f64::NAN),
+            Some(-0.0),
+            None,
+            Some(7.0),
+        ])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![
+            Some(f64::NAN),
+            Some(-0.0),
+            None,
+            Some(7.0),
+        ])) as ArrayRef,
+        Arc::new(
+            Decimal128Array::from(vec![Some(125), None, Some(275), Some(0)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        ) as ArrayRef,
+        Arc::new(
+            Decimal128Array::from(vec![Some(125), None, Some(275), Some(0)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        ) as ArrayRef,
+    ];
+    let second = vec![
+        Arc::new(Int8Array::from(vec![Some(7), Some(-8), None, Some(3)])) as ArrayRef,
+        Arc::new(Int8Array::from(vec![Some(7), Some(-8), None, Some(3)])) as ArrayRef,
+        Arc::new(UInt16Array::from(vec![Some(7), Some(8), None, Some(3)])) as ArrayRef,
+        Arc::new(UInt16Array::from(vec![Some(7), Some(8), None, Some(3)])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(-3.5),
+            Some(f64::NAN),
+            None,
+        ])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(-3.5),
+            Some(f64::NAN),
+            None,
+        ])) as ArrayRef,
+        Arc::new(
+            Decimal128Array::from(vec![Some(300), Some(75), None, Some(250)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        ) as ArrayRef,
+        Arc::new(
+            Decimal128Array::from(vec![Some(300), Some(75), None, Some(250)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        ) as ArrayRef,
+    ];
+
+    let mut batch_states = aggregates
+        .iter()
+        .map(AggregateState::new)
+        .collect::<Vec<_>>();
+    let mut scalar_states = aggregates
+        .iter()
+        .map(AggregateState::new)
+        .collect::<Vec<_>>();
+    for arrays in [first, second] {
+        let inputs = arrays.iter().cloned().map(Some).collect::<Vec<_>>();
+        update(&mut batch_states, &aggregates, &inputs, arrays[0].len()).unwrap();
+        for row in 0..arrays[0].len() {
+            for ((state, aggregate), array) in
+                scalar_states.iter_mut().zip(&aggregates).zip(&arrays)
+            {
+                state
+                    .update(aggregate, Some(cell(array, row).unwrap()))
+                    .unwrap();
+            }
+        }
+    }
+
+    for (batch, scalar) in batch_states.iter().zip(&scalar_states) {
+        assert_eq!(batch.finish().unwrap(), scalar.finish().unwrap());
+    }
+    assert_eq!(batch_states[0].finish().unwrap(), CellValue::Int64(-8));
+    assert_eq!(batch_states[1].finish().unwrap(), CellValue::Int64(7));
+    assert_eq!(batch_states[2].finish().unwrap(), CellValue::UInt64(0));
+    assert_eq!(batch_states[3].finish().unwrap(), CellValue::UInt64(8));
+    assert_eq!(batch_states[4].finish().unwrap(), CellValue::Float64(-3.5));
+    let CellValue::Float64(max_float) = batch_states[5].finish().unwrap() else {
+        panic!("float MAX should return FLOAT64");
+    };
+    assert!(max_float.is_nan());
+    assert_eq!(batch_states[6].finish().unwrap(), CellValue::Decimal128(0));
+    assert_eq!(
+        batch_states[7].finish().unwrap(),
+        CellValue::Decimal128(300)
     );
-    assert!(!supports(&[aggregate]));
 }
 
 fn expression(
