@@ -40,7 +40,7 @@ getrandom = "0.3"
 glob = "0.3"
 hashbrown = "0.16"
 hyper-util = { version = "=0.1.20", features = ["server-auto", "tokio"] }
-lru = "0.16"
+lru = "0.18.2"
 memchr = "=2.8.3"
 object_store = { version = "=0.14.1", features = ["aws"] }
 parquet = { version = "=59.1.0", features = ["async"] }
